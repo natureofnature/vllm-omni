@@ -1,0 +1,18 @@
+/* Custom CSS for vLLM-omni documentation */
+
+/* Improve code block readability */
+.highlight {
+    border-radius: 4px;
+}
+
+/* Style API documentation */
+.md-typeset .doc-contents {
+    margin-bottom: 1.5em;
+}
+
+/* Improve table readability */
+.md-typeset table {
+    display: table;
+    width: 100%;
+}
+

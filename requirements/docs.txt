@@ -1,0 +1,18 @@
+# Documentation building dependencies
+# For building MkDocs documentation
+
+# Include common dependencies
+-r common.txt
+
+# Documentation tools
+mkdocs>=1.5.0
+mkdocs-api-autonav
+mkdocs-material
+mkdocstrings-python
+mkdocs-gen-files
+# mkdocs-awesome-nav  # Not available on PyPI, may be custom or internal package
+mkdocs-glightbox
+mkdocs-git-revision-date-localized-plugin
+mkdocs-minify-plugin
+regex
+pydantic
