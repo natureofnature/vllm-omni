@@ -24,25 +24,14 @@ From the project root:
 
 ```bash
 # Serve documentation locally (auto-reload on changes)
+# This starts a local web server at http://127.0.0.1:8000
 mkdocs serve
 
-# Build static site
+# Build static site (generates HTML files in site/ directory)
 mkdocs build
 ```
 
-The documentation will be available at `http://127.0.0.1:8000` when using `mkdocs serve`.
-
-### View Documentation
-
-After building, open `site/index.html` in your browser:
-
-```bash
-# On macOS
-open site/index.html
-
-# On Linux
-xdg-open site/index.html
-```
+When using `mkdocs serve`, the documentation will be automatically available at `http://127.0.0.1:8000`. The server will automatically reload when you make changes to the documentation files.
 
 ## Auto-generating API Documentation
 
@@ -84,11 +73,40 @@ docs/
 └── stylesheets/         # Custom CSS
 ```
 
-## Publishing to Read the Docs
+## Publishing Documentation
 
-1. Push your changes to GitHub
-2. Read the Docs will automatically build the documentation using MkDocs
-3. Documentation will be available at: https://vllm-omni.readthedocs.io
+### GitHub Pages (Recommended)
+
+The documentation is automatically deployed to GitHub Pages using GitHub Actions.
+
+1. **Enable GitHub Pages**:
+   - Go to repository `Settings` → `Pages`
+   - Set `Source` to `GitHub Actions`
+   - Save settings
+
+2. **Push changes**:
+   ```bash
+   git push origin main
+   ```
+
+3. **Documentation will be available at**:
+   - `https://vllm-project.github.io/vllm-omni/`
+
+The GitHub Actions workflow (`.github/workflows/docs.yml`) will automatically:
+- Build the documentation when you push to `main` branch
+- Deploy it to GitHub Pages
+- Update the documentation whenever you make changes
+
+For more details, see [Deployment Guide](DEPLOYMENT.md).
+
+### Read the Docs (Alternative)
+
+You can also use Read the Docs for hosting:
+
+1. Sign up at https://readthedocs.org/
+2. Import the `vllm-project/vllm-omni` repository
+3. Read the Docs will automatically build using `.readthedocs.yml`
+4. Documentation will be available at: `https://vllm-omni.readthedocs.io/`
 
 ## Configuration
 
@@ -96,7 +114,33 @@ The documentation configuration is in `mkdocs.yml` at the project root.
 
 ## Tips
 
-- Use `::: module.name` syntax for auto-generated API docs
-- Use `--8<-- "path/to/file.py"` for including code snippets
-- Use Markdown for all documentation (no need for RST)
-- Use Material theme features like admonitions and tabs
+- **API Documentation**: API docs are automatically generated using `mkdocs-api-autonav` and `mkdocstrings`
+  - No need to manually create API pages - they're generated automatically
+  - Use `[module.name.ClassName][]` syntax for cross-references in Summary pages
+- **Code Snippets**: Use `--8<-- "path/to/file.py"` for including code snippets
+- **Markdown**: Use Markdown for all documentation (no need for RST)
+- **Material Theme**: Use Material theme features like:
+  - Admonitions: `!!! note`, `!!! warning`, etc.
+  - Code blocks with syntax highlighting
+  - Tabs for organizing content
+  - Math formulas using `pymdownx.arithmatex`
+
+## Troubleshooting
+
+### Documentation not updating
+
+- Make sure you've saved all files
+- If using `mkdocs serve`, it should auto-reload
+- Check for syntax errors in `mkdocs.yml`
+
+### API links not working
+
+- Ensure class names match exactly (case-sensitive)
+- Check that the module is imported correctly
+- Run `mkdocs build --strict` to check for errors
+
+### Build errors
+
+- Check Python version (requires 3.9+)
+- Ensure all dependencies are installed: `pip install -e ".[docs]"`
+- Check `mkdocs.yml` syntax with `mkdocs build --strict`

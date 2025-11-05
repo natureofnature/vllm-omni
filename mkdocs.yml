@@ -1,7 +1,7 @@
 site_name: vLLM-omni
 site_description: Multi-modality models inference and serving with non-autoregressive structures
 site_author: vLLM-omni Team
-site_url: https://vllm-omni.readthedocs.io/
+site_url: https://vllm-project.github.io/vllm-omni/
 
 repo_name: vllm-project/vllm-omni
 repo_url: https://github.com/vllm-project/vllm-omni
