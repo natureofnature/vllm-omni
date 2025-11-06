@@ -50,6 +50,9 @@ theme:
   icon:
     repo: fontawesome/brands/github
 
+hooks:
+  - docs/mkdocs/hooks/generate_examples.py
+
 # Plugins
 plugins:
   - meta
@@ -141,13 +144,18 @@ markdown_extensions:
 # Navigation
 nav:
   - Home: index.md
-  - Getting Started:
-    - getting_started/quickstart.md
+  - User Guide:
+    - Getting Started:
+      - user_guide/getting_started/quickstart.md
+    - Examples:
+      - user_guide/examples/index.md
+      - Offline Inference:
+        - user_guide/examples/offline_inference/qwen_2_5_omni.md
+      - Online Serving:
+        - user_guide/examples/online_serving/index.md
   - API Reference:
       - Summary: api/README.md
       - API: api
-  - Examples:
-    - examples/index.md
   - Developer Guide:
     - contributing/README.md
     - Design Documents:
@@ -164,7 +172,7 @@ extra:
 
 # Extra CSS
 extra_css:
-  - stylesheets/extra.css
+  - mkdocs/stylesheets/extra.css
 
 # Makes the url format end in .html rather than act as a dir
 # So index.md generates as index.html and is available under URL /index.html

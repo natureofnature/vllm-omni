@@ -1,4 +1,4 @@
-# Getting Started
+# Quickstart
 
 This guide will help you get started with vLLM-omni.
 
@@ -77,7 +77,7 @@ The output audio is saved in ./output_audio
 
 ## Next Steps
 
-- Read the [architecture documentation](../contributing/design_documents/vllm_omni_design.md)
-- Check out the [API reference](../api/README.md)
+- Read the [architecture documentation](../../contributing/design_documents/vllm_omni_design.md)
+- Check out the [API reference](../../api/README.md)
 - Explore the [examples](../examples/index.md)
 
