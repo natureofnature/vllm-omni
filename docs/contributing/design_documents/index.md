@@ -10,5 +10,4 @@ This section contains design documents and architecture specifications for vLLM-
 ## API Design Documentation
 
 - [vLLM-omni API Documentation](api_design_doc.md)
-- [API Design Template](api_design_template.md)
 

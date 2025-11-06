@@ -163,7 +163,6 @@ nav:
       - contributing/design_documents/vllm_omni_design.md
       - contributing/design_documents/architecture_overview.md
       - contributing/design_documents/api_design_doc.md
-      - contributing/design_documents/api_design_template.md
 
 # Extra
 extra:

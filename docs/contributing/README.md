@@ -128,7 +128,7 @@ Only specific types of PRs will be reviewed. The PR title is prefixed appropriat
 - `[Frontend]` For changes on the vLLM-omni frontend (e.g., OpenAI API server, `OmniLLM` class, etc.)
 - `[Kernel]` for changes affecting CUDA kernels or other compute kernels.
 - `[Core]` for changes in the core vLLM-omni logic (e.g., `OmniProcessor`, `OmniScheduler`, etc.)
-- `[Hardware][Vendor]` for hardware-specific changes. Vendor name should appear in the prefix (e.g., `[Hardware][AMD]`).
+- `[Hardware][Vendor]` for hardware-specific changes. Vendor name should appear in the prefix, such as [Ascend] for Ascend NPUs.
 - `[Misc]` for PRs that do not fit the above categories. Please use this sparingly.
 
 !!! note

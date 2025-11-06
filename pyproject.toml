@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.9"  # numpy 2.x and other modern packages require Python 3.9+
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "vLLM-omni Team", email = "hsliuustc@gmail.com"}
+    {name = "vLLM-omni Team", email = "vllm-project@gmail.com"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
 classifiers = [
