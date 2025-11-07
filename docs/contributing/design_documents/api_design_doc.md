@@ -159,7 +159,7 @@ Each API template follows this standardized structure:
    cd vllm-omni
 
    # Install dependencies
-   pip install -r requirements-dev.txt
+   pip install -e ".[dev]"
 
    # Set up pre-commit hooks
    pre-commit install

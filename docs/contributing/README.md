@@ -56,7 +56,7 @@ MkDocs is a fast, simple and downright gorgeous static site generator that's gea
 Get started with:
 
 ```bash
-uv pip install -r requirements/docs.txt
+uv pip install -e ".[docs]"
 ```
 
 MkDocs comes with a built-in dev-server that lets you preview your documentation as you work on it. From the root of the repository, run:
@@ -79,7 +79,7 @@ vLLM-omni uses `pytest` to test the codebase.
 
 ```bash
 # Install the test dependencies used in CI (CUDA only)
-uv pip install -r requirements/common.txt -r requirements/dev.txt --torch-backend=auto
+uv pip install -e ".[dev]" --torch-backend=auto
 
 # Install some common test dependencies (hardware agnostic)
 uv pip install pytest pytest-asyncio

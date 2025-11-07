@@ -54,7 +54,7 @@ Install additional requirements for vllm-omni
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm_omni
-uv pip install -r requirements/gpu.txt
+uv pip install -e .
 ```
 
 ## Quick Start

@@ -12,12 +12,6 @@ Install documentation dependencies:
 pip install -e ".[docs]"
 ```
 
-Or using requirements file:
-
-```bash
-pip install -r requirements/docs.txt
-```
-
 ### Build and Serve Documentation
 
 From the project root:
