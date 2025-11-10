@@ -12,10 +12,13 @@ build:
       - git fetch --unshallow || true
 
 mkdocs:
-  configuration: mkdocs.yaml
+  configuration: mkdocs.yml
   fail_on_warning: true
 
 # Optionally declare the Python requirements required to build your docs
 python:
   install:
-    - requirements: requirements/docs.txt
+    - method: pip
+      path: .
+      extra_requirements:
+        - docs
