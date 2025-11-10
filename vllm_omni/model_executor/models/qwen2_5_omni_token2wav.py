@@ -1716,7 +1716,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
     hf_to_vllm_mapper = _Vllm_WeightsMapper(
         orig_to_new_prefix={
             # HF root is 'model.'
-            "model.": "token2wav_model.",
+            "": "token2wav.",
         }
     )
 
@@ -1843,15 +1843,15 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         return loaded_buffers
 
     def load_weights(
-        self, weights: Iterable[Tuple[str, torch.Tensor]], spk_dict_path: str
+        self, weights: Iterable[Tuple[str, torch.Tensor]]
     ) -> Set[str]:
         buffers = self.find_all_registers()
-        weights_to_load = self.remove_buffers_from_weights(weights, buffers)
-        loaded = self.load_weights_without_buffers(weights_to_load)
+        loader = _Vllm_AutoWeightsLoader(self, skip_substrs=[".inv_freq"])
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        # reload buffers
         loaded_buffers = self.reload_buffers_to_model(buffers)
         # merge loaded and loaded_buffers
         loaded.update(loaded_buffers)
-        self.spk_dict = torch.load(spk_dict_path)
         return loaded
 
     # ============== Optional chunked helpers for API parity ==============

@@ -29,6 +29,8 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import SamplerOutput
 from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
+from vllm.model_executor.model_loader import DefaultModelLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm_omni.model_executor.model_loader.weight_utils import (
     download_weights_from_hf_specific,
 )
@@ -57,6 +59,14 @@ logger = init_logger(__name__)
 class Qwen2_5OmniForConditionalGeneration(
     nn.Module, SupportsMultiModal, SupportsPP, Qwen2_5OmniConditionalGenerationMixin
 ):
+
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "thinker.lm_head.": "language_model.lm_head.",
+            "thinker.model.": "language_model.model.",
+            "thinker.": "",
+        }
+    )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -767,73 +777,83 @@ class Qwen2_5OmniForConditionalGeneration(
         waveform = np.concatenate(wav_chunks)
         return torch.as_tensor(waveform, device=token2wav_dev)
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights for all components of the omni model."""
-        loaded_weights = set()
-        thinker_weights = []
-        talker_weights = []
-        token2wav_weights = []
-        for k, v in weights:
-            if k.startswith("thinker."):
-                thinker_weights.append((k, v))
-            elif k.startswith("talker."):
-                talker_weights.append((k, v))
-            elif k.startswith("token2wav."):
-                token2wav_weights.append((k, v))
-            else:
-                raise ValueError(f"Unknown weight prefix: {k}")
+        stages_skip = {
+            "thinker": ["talker.", "token2wav."],
+            "talker": ["thinker.", "token2wav."],
+            "code2wav": ["thinker.", "talker."],
+        }
+        loader = AutoWeightsLoader(self, skip_prefixes=stages_skip[self.model_stage])
+        return loader.load_weights(weights)
 
-        # Load thinker weights
-        if self.thinker:
-            if thinker_weights:
-                thinker_loaded = self.thinker.load_weights(thinker_weights)
-            else:
-                thinker_loaded = set([k for k, v in thinker_weights])
-            thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
-            loaded_weights.update(thinker_loaded)
+    # def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> Set[str]:
+    #     """Load weights for all components of the omni model."""
+    #     loaded_weights = set()
+    #     thinker_weights = []
+    #     talker_weights = []
+    #     token2wav_weights = []
+    #     for k, v in weights:
+    #         if k.startswith("thinker."):
+    #             thinker_weights.append((k, v))
+    #         elif k.startswith("talker."):
+    #             talker_weights.append((k, v))
+    #         elif k.startswith("token2wav."):
+    #             token2wav_weights.append((k, v))
+    #         else:
+    #             raise ValueError(f"Unknown weight prefix: {k}")
 
-        # Load talker weights
-        if talker_weights and self.talker is not None:
-            # Map talker weights to appropriate components
-            if self.thinker is None:
-                thinker_embedding_weights = [
-                    w
-                    for n, w in thinker_weights
-                    if n == "thinker.model.embed_tokens.weight"
-                ]
-                if thinker_embedding_weights:
-                    self.thinker_embedding = nn.Embedding(
-                        thinker_embedding_weights[0].shape[0],
-                        thinker_embedding_weights[0].shape[1],
-                    )
-                    self.thinker_embedding.weight = nn.Parameter(
-                        thinker_embedding_weights[0].to(
-                            self._module_device(self.talker)
-                        )
-                    )
-            talker_loaded = self.talker.load_weights(talker_weights)
-            talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
-            loaded_weights.update(talker_loaded)
-            loaded_weights.update(self._init_special_tokens_embeddings())
+    #     # Load thinker weights
+    #     if self.thinker:
+    #         if thinker_weights:
+    #             thinker_loaded = self.thinker.load_weights(thinker_weights)
+    #         else:
+    #             thinker_loaded = set([k for k, v in thinker_weights])
+    #         thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
+    #         loaded_weights.update(thinker_loaded)
 
-        # Load token2wav weights (if any)
-        if token2wav_weights and self.token2wav is not None:
-            # download weights from huggingface for spk_dict.pt
-            model_path = self.vllm_config.model_config.model
-            download_dir = self.vllm_config.load_config.download_dir
-            if os.path.exists(model_path):
-                hf_model_folder = model_path
-            else:
-                hf_model_folder = download_weights_from_hf_specific(
-                    model_path,
-                    download_dir,
-                    allow_patterns=["*.pt"],
-                )
-            self._init_token2wav_model(hf_model_folder)
-            t2w_loaded = self.token2wav.load_weights(
-                token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt")
-            )
-            t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, "token2wav")
-            loaded_weights.update(t2w_loaded)
+    #     # Load talker weights
+    #     if talker_weights and self.talker is not None:
+    #         # Map talker weights to appropriate components
+    #         if self.thinker is None:
+    #             thinker_embedding_weights = [
+    #                 w
+    #                 for n, w in thinker_weights
+    #                 if n == "thinker.model.embed_tokens.weight"
+    #             ]
+    #             if thinker_embedding_weights:
+    #                 self.thinker_embedding = nn.Embedding(
+    #                     thinker_embedding_weights[0].shape[0],
+    #                     thinker_embedding_weights[0].shape[1],
+    #                 )
+    #                 self.thinker_embedding.weight = nn.Parameter(
+    #                     thinker_embedding_weights[0].to(
+    #                         self._module_device(self.talker)
+    #                     )
+    #                 )
+    #         talker_loaded = self.talker.load_weights(talker_weights)
+    #         talker_loaded = add_prefix_to_loaded_weights(talker_loaded, "talker")
+    #         loaded_weights.update(talker_loaded)
+    #         loaded_weights.update(self._init_special_tokens_embeddings())
 
-        return loaded_weights
+    #     # Load token2wav weights (if any)
+    #     if token2wav_weights and self.token2wav is not None:
+    #         # download weights from huggingface for spk_dict.pt
+    #         model_path = self.vllm_config.model_config.model
+    #         download_dir = self.vllm_config.load_config.download_dir
+    #         if os.path.exists(model_path):
+    #             hf_model_folder = model_path
+    #         else:
+    #             hf_model_folder = download_weights_from_hf_specific(
+    #                 model_path,
+    #                 download_dir,
+    #                 allow_patterns=["*.pt"],
+    #             )
+    #         self._init_token2wav_model(hf_model_folder)
+    #         t2w_loaded = self.token2wav.load_weights(
+    #             token2wav_weights, os.path.join(hf_model_folder, "spk_dict.pt")
+    #         )
+    #         t2w_loaded = add_prefix_to_loaded_weights(t2w_loaded, "token2wav")
+    #         loaded_weights.update(t2w_loaded)
+
+    #     return loaded_weights

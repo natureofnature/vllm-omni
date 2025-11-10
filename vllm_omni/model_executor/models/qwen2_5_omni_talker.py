@@ -52,13 +52,9 @@ class Qwen2_5OmniTalkerForConditionalGeneration(
     # Align to thinker-style static mapper for clarity
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_prefix={
-            # text LM head/body in talker
-            "talker.codec_head.": "language_model.lm_head.",
-            "talker.model.": "language_model.model.",
-            # projection weights
-            "talker.thinker_to_talker_proj.": "thinker_to_talker_proj.",
-            # fallback root
             "talker.": "",
+            "codec_head.": "language_model.lm_head.",
+            "model.": "language_model.model.",
         }
     )
 
