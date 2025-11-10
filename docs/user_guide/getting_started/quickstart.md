@@ -4,14 +4,6 @@ This guide will help you get started with vLLM-omni.
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.9 or higher
-- CUDA-capable GPU (for GPU acceleration)
-- vLLM installed (see installation instructions below)
-
-### Install vLLM
-
 Use Docker to keep consistent basic environment (Optional, Recommended)
 
 ```bash
@@ -26,30 +18,13 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
 
-Install certain version of vllm with commitid: 808a7b69df479b6b3a16181711cac7ca28a9b941
+Install vLLM
 
 ```bash
-git clone https://github.com/vllm-project/vllm.git
-cd vllm
-git checkout 808a7b69df479b6b3a16181711cac7ca28a9b941
+uv pip install vllm==0.11.0 --torch-backend=auto
 ```
 
-Set up environment variables to get pre-built wheels. If there are internet problems, just download the whl file manually. And set VLLM_PRECOMPILED_WHEEL_LOCATION as your local absolute path of whl file.
-
-```bash
-export VLLM_COMMIT=808a7b69df479b6b3a16181711cac7ca28a9b941
-export VLLM_PRECOMPILED_WHEEL_LOCATION=https://wheels.vllm.ai/${VLLM_COMMIT}/vllm-1.0.0.dev-cp38-abi3-manylinux1_x86_64.whl
-```
-
-Install vllm with command below.
-
-```bash
-uv pip install --editable .
-```
-
-### Install vLLM-omni
-
-Install additional requirements for vllm-omni
+Install vLLM-omni
 
 ```bash
 git clone https://github.com/vllm-project/vllm-omni.git
@@ -57,9 +32,7 @@ cd vllm_omni
 uv pip install -e .
 ```
 
-## Quick Start
-
-### Run examples (Qwen2.5-omni)
+## Run examples (Qwen2.5-omni)
 
 Get into the example folder
 
@@ -78,6 +51,6 @@ The output audio is saved in ./output_audio
 ## Next Steps
 
 - Read the [architecture documentation](../../contributing/design_documents/vllm_omni_design.md)
-- Check out the [API reference](../../api/README.md)
+- Check out the [API reference](../../api/overview.md)
 - Explore the [examples](../examples/index.md)
 

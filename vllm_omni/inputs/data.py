@@ -45,8 +45,7 @@ def token_inputs_omni(
     prompt_embeds: Optional[torch.Tensor] = None,
     additional_information: Optional[dict[str, Any]] = None,
 ) -> OmniTokenInputs:
-    """Construct [`TokenInputs`][vllm.inputs.data.TokenInputs] from optional
-    values."""
+    """Construct token inputs with optional embeddings and metadata."""
     inputs = OmniTokenInputs(type="token", prompt_token_ids=prompt_token_ids)
 
     if prompt is not None:

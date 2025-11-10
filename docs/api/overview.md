@@ -66,6 +66,4 @@ Worker classes and model runners for distributed inference.
 - [vllm_omni.worker.gpu_model_runner.OmniGPUModelRunner][]
 - [vllm_omni.worker.gpu_ar_model_runner.GPUARModelRunner][]
 - [vllm_omni.worker.gpu_diffusion_model_runner.GPUDiffusionModelRunner][]
-- [vllm_omni.worker.model_runner.OmniModelInputForGPU][]
-- [vllm_omni.worker.model_runner.OmniModelInputForGPUBuilder][]
 

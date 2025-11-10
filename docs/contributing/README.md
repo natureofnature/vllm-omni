@@ -13,22 +13,25 @@ uv venv --python 3.12 --seed
 source .venv/bin/activate
 ```
 
-If you are only developing vLLM-omni's Python code, install vLLM-omni using:
+Install vLLM from source:
 
 ```bash
+git clone https://github.com/vllm-project/vllm.git
+cd vllm
+git checkout v0.11.0
 VLLM_USE_PRECOMPILED=1 uv pip install -e .
 ```
 
-If you are developing vLLM-omni's Python and CUDA/C++ code, install vLLM-omni using:
+Install vLLM-omni from source:
 
 ```bash
+git clone https://github.com/vllm-project/vllm-omni.git
+cd vllm_omni
 uv pip install -e .
 ```
 
-For more details about installing from source, check the installation instructions in the repository.
-
 !!! tip
-    vLLM-omni is compatible with Python versions 3.9 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
+    vLLM-omni is compatible with Python versions 3.10 to 3.12. However, we recommend developing with Python 3.12 to minimize the chance of your local environment clashing with our CI environment.
 
 ### Linting
 
