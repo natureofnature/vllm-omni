@@ -40,7 +40,7 @@ Get into the example folder
 cd examples/offline_inference/qwen_2_5_omni
 ```
 
-Modify PYTHONPATH in run.sh as your path of vllm_omni. Then run.
+Then run.
 
 ```bash
 bash run.sh
