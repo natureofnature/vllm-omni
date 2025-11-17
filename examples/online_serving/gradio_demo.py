@@ -7,7 +7,7 @@ import random
 import signal
 import sys
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Optional
 
 import gradio as gr
 import numpy as np
@@ -25,19 +25,44 @@ from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../offline_inference/qwen2_5_omni"))
 from utils import make_omni_prompt
 
-_os_env_toggle.environ["VLLM_USE_V1"] = "1"
-
 SEED = 42
 ASYNC_INIT_TIMEOUT = 600
 
-SUPPORTED_MODELS: dict[str, dict[str, str]] = {
+SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
     "Qwen/Qwen2.5-Omni-7B": {
-        "display_name": "Qwen2.5-Omni",
-    },
-    "Qwen/Qwen3-Omni-30B-A3B-Instruct": {
-        "display_name": "Qwen3-Omni",
+        "sampling_params": {
+            "thinker": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "max_tokens": 2048,
+                "detokenize": True,
+                "repetition_penalty": 1.1,
+            },
+            "talker": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "max_tokens": 2048,
+                "detokenize": True,
+                "repetition_penalty": 1.1,
+                "stop_token_ids": [8294],
+            },
+            "code2wav": {
+                "temperature": 0.0,
+                "top_p": 1.0,
+                "top_k": -1,
+                "max_tokens": 2048,
+                "detokenize": True,
+                "repetition_penalty": 1.1,
+            },
+        },
     },
 }
+
+
+def resolve_supported_model_key(model_name: str) -> str:
+    """Return the canonical supported model key for the given model string."""
 
 
 # Ensure deterministic behavior across runs.
@@ -54,15 +79,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Gradio demo for Qwen Omni (Qwen2.5/Qwen3) online inference."
-    )
-    parser.add_argument(
-        "--mode",
-        type=str,
-        choices=["async_omni_llm", "http_api"],
-        default="async_omni_llm",
-        help="Inference mode: 'async_omni_llm' for direct AsyncOmniLLM, "
-        "'http_api' for vllm serve HTTP API (default: async_omni_llm)",
+        description="Gradio demo for Qwen2.5-Omni online inference."
     )
     parser.add_argument(
         "--model",
@@ -73,6 +90,11 @@ def parse_args():
         "--api-base",
         default="http://localhost:8091/v1",
         help="Base URL for vllm serve API (only used in http_api mode).",
+    )
+    parser.add_argument(
+        "--use-api-server",
+        action="store_true",
+        help="If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.",
     )
     parser.add_argument(
         "--ip",
@@ -94,77 +116,27 @@ def parse_args():
     return parser.parse_args()
 
 
-def build_sampling_params(seed: int) -> list[SamplingParams]:
-    thinker_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=2048,
-        seed=seed,
-        detokenize=True,
-        repetition_penalty=1.1,
-    )
-    talker_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=2048,
-        seed=seed,
-        detokenize=True,
-        repetition_penalty=1.1,
-        stop_token_ids=[8294],
-    )
-    code2wav_sampling_params = SamplingParams(
-        temperature=0.0,
-        top_p=1.0,
-        top_k=-1,
-        max_tokens=2048,
-        seed=seed,
-        detokenize=True,
-        repetition_penalty=1.1,
-    )
+def build_sampling_params(seed: int, model_key: str) -> list[SamplingParams]:
+    """Build SamplingParams objects by reusing the dict definitions."""
     return [
-        thinker_sampling_params,
-        talker_sampling_params,
-        code2wav_sampling_params,
+        SamplingParams(**params_dict)
+        for params_dict in build_sampling_params_dict(seed, model_key)
     ]
 
 
-def build_sampling_params_dict(seed: int) -> list[dict]:
+def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
     """Build sampling params as dict for HTTP API mode."""
-    thinker_sampling_params = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "max_tokens": 2048,
-        "seed": seed,
-        "detokenize": True,
-        "repetition_penalty": 1.1,
-    }
-    talker_sampling_params = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "max_tokens": 2048,
-        "seed": seed,
-        "detokenize": True,
-        "repetition_penalty": 1.1,
-        "stop_token_ids": [8294],
-    }
-    code2wav_sampling_params = {
-        "temperature": 0.0,
-        "top_p": 1.0,
-        "top_k": -1,
-        "max_tokens": 2048,
-        "seed": seed,
-        "detokenize": True,
-        "repetition_penalty": 1.1,
-    }
-    return [
-        thinker_sampling_params,
-        talker_sampling_params,
-        code2wav_sampling_params,
-    ]
+    model_conf = SUPPORTED_MODELS.get(model_key)
+    if model_conf is None:
+        raise ValueError(f"Unsupported model '{model_key}'")
+
+    sampling_templates: dict[str, dict[str, Any]] = model_conf["sampling_params"]
+    sampling_params: list[dict] = []
+    for stage_name, template in sampling_templates.items():
+        params = dict(template)
+        params["seed"] = seed
+        sampling_params.append(params)
+    return sampling_params
 
 
 def create_prompt_args(base_args: argparse.Namespace) -> SimpleNamespace:
@@ -302,7 +274,7 @@ def run_inference_http_api(
 
 
 def build_interface(
-    mode: str,
+    use_api_server: bool,
     omni_llm: Optional[AsyncOmniLLM],
     sampling_params: Optional[list[SamplingParams]],
     prompt_args_template: Optional[SimpleNamespace],
@@ -313,8 +285,7 @@ def build_interface(
 ):
     """Build Gradio interface based on the selected mode."""
 
-    model_display_name = SUPPORTED_MODELS[model]["display_name"]  # type: ignore[index]
-    if mode == "async_omni_llm":
+    if not use_api_server:
         # AsyncOmniLLM mode - Gradio supports async functions directly
         async def run_inference(user_prompt: str):
             return await run_inference_async_omni_llm(
@@ -329,9 +300,9 @@ def build_interface(
             )
 
     with gr.Blocks() as demo:
-        gr.Markdown(f"# vLLM {model_display_name} Online Serving Demo")
+        gr.Markdown("# vLLM-Omni Online Serving Demo")
         info_text = f"**Model:** {model} \n\n"
-        if mode == "http_api" and api_base:
+        if use_api_server and api_base:
             info_text += f"**API Base:** {api_base}\n\n"
         gr.Markdown(info_text)
         with gr.Row():
@@ -359,6 +330,9 @@ def main():
     args = parse_args()
     omni_llm = None
 
+    model_name = "/".join(args.model.split("/")[-2:])
+    assert model_name in SUPPORTED_MODELS, f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
+
     # Register signal handlers for graceful shutdown
     def signal_handler(sig, frame):
         print("\nReceived interrupt signal, shutting down...")
@@ -372,52 +346,41 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if args.mode == "async_omni_llm":
+    if not args.use_api_server:
         # Initialize AsyncOmniLLM
         print(f"Initializing AsyncOmniLLM with model: {args.model}")
         if args.stage_configs_path:
             print(f"Using custom stage configs: {args.stage_configs_path}")
         
-        try:
-            sampling_params = build_sampling_params(SEED)
-            omni_llm = AsyncOmniLLM(
-                model=args.model,
-                stage_configs_path=args.stage_configs_path,
-                init_timeout=ASYNC_INIT_TIMEOUT,
-            )
-            print("✓ AsyncOmniLLM initialized successfully")
-            prompt_args_template = create_prompt_args(args)
-            client = None
-            sampling_params_dict = None
-        except Exception as e:
-            error_msg = str(e)
-            print(f"\n✗ Failed to initialize AsyncOmniLLM: {error_msg}")
-            
-            if omni_llm is not None:
-                try:
-                    omni_llm.shutdown()
-                except Exception:
-                    pass
-            sys.exit(1)
+        sampling_params = build_sampling_params(SEED, model_name)
+        omni_llm = AsyncOmniLLM(
+            model=args.model,
+            stage_configs_path=args.stage_configs_path,
+            init_timeout=ASYNC_INIT_TIMEOUT,
+        )
+        print("✓ AsyncOmniLLM initialized successfully")
+        prompt_args_template = create_prompt_args(args)
+        client = None
+        sampling_params_dict = None
     else:
         # HTTP API mode
         print(f"Using HTTP API mode with base URL: {args.api_base}")
         print(f"Make sure vllm serve is running: vllm serve {args.model} --omni --port {args.api_base.split(':')[-1].rstrip('/v1')}")
         client = OpenAI(api_key="EMPTY", base_url=args.api_base)
-        sampling_params_dict = build_sampling_params_dict(SEED)
+        sampling_params_dict = build_sampling_params_dict(SEED, model_name)
         omni_llm = None
         sampling_params = None
         prompt_args_template = None
 
     demo = build_interface(
-        args.mode,
+        args.use_api_server,
         omni_llm,
         sampling_params,
         prompt_args_template,
         client,
         args.model,
         sampling_params_dict,
-        api_base=args.api_base if args.mode == "http_api" else None,
+        api_base=args.api_base if args.use_api_server else None,
     )
     try:
         demo.launch(
