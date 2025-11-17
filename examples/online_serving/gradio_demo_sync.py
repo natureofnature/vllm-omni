@@ -1,6 +1,5 @@
 import argparse
 import os
-import os as _os_env_toggle
 import random
 from types import SimpleNamespace
 
@@ -13,7 +12,6 @@ from utils import make_omni_prompt
 from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.omni_llm import OmniLLM
 
-_os_env_toggle.environ["VLLM_USE_V1"] = "1"
 
 SEED = 42
 
@@ -35,32 +33,16 @@ def parse_args():
     )
     parser.add_argument(
         "--model",
-        required=True,
+        default="Qwen/Qwen2.5-Omni-7B",
         help="Path to merged model directory (will be created if downloading).",
     )
     parser.add_argument(
-        "--tokenize",
-        action="store_true",
-        help="Return tokenized prompts instead of raw text prompts.",
-    )
-    parser.add_argument(
-        "--use-torchvision",
-        action="store_true",
-        help="Use torchvision to decode videos when applicable.",
-    )
-    parser.add_argument(
-        "--prompt-type",
-        default="text",
-        choices=["text"],
-        help="Prompt type to build with the demo interface.",
-    )
-    parser.add_argument(
-        "--server-name",
+        "--ip",
         default="127.0.0.1",
         help="Host/IP for gradio `launch`.",
     )
     parser.add_argument(
-        "--server-port", type=int, default=7860, help="Port for gradio `launch`."
+        "--port", type=int, default=7861, help="Port for gradio `launch`."
     )
     parser.add_argument(
         "--share", action="store_true", help="Share the Gradio demo publicly."
@@ -108,9 +90,9 @@ def create_prompt_args(base_args: argparse.Namespace) -> SimpleNamespace:
     # The prompt builder expects a minimal namespace with these attributes.
     return SimpleNamespace(
         model=base_args.model,
-        prompt_type=base_args.prompt_type,
-        tokenize=base_args.tokenize,
-        use_torchvision=base_args.use_torchvision,
+        prompt_type="text",
+        tokenize=True,
+        use_torchvision=True,
         legacy_omni_video=False,
     )
 
@@ -144,8 +126,8 @@ def build_interface(
                 for output in stage_outputs.request_output:
                     audio_tensor = output.multimodal_output["audio"]
                     audio_np = audio_tensor.detach().cpu().numpy()
-                    audio_output = (
-                        24000,
+                    audio_output = ( 
+                        24000, # sampling rate in Hz
                         audio_np,
                     )
 
@@ -153,11 +135,11 @@ def build_interface(
         return text_response, audio_output
 
     with gr.Blocks() as demo:
-        gr.Markdown("# Qwen2.5-Omni Offline Inference Gradio Demo")
+        gr.Markdown("# vLLM Qwen2.5-Omni Demo")
         with gr.Row():
             input_box = gr.Textbox(
                 label="Input Prompt",
-                placeholder="For example: Please introduce Qwen2.5-Omni.",
+                placeholder="For example: Please tell me a joke in 30 words.",
                 lines=4,
             )
         with gr.Row():
@@ -171,7 +153,7 @@ def build_interface(
             inputs=[input_box],
             outputs=[text_output, audio_output],
         )
-        demo.queue(concurrency_count=1)
+        demo.queue()
     return demo
 
 
@@ -183,8 +165,8 @@ def main():
 
     demo = build_interface(omni_llm, sampling_params, prompt_args_template)
     demo.launch(
-        server_name=args.server_name,
-        server_port=args.server_port,
+        server_name=args.ip,
+        server_port=args.port,
         share=args.share,
     )
 
