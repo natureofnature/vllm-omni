@@ -77,32 +77,8 @@ vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 where = ["."]
 include = ["vllm_omni*"]
 
-[tool.black]
-line-length = 160
-target-version = ['py312', 'py313']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | build
-  | dist
-)/
-'''
-
-[tool.isort]
-profile = "black"
-multi_line_output = 3
-line_length = 160
-known_first_party = ["vllm_omni"]
-
 [tool.ruff]
-line-length = 160
+line-length = 120
 exclude = [
     ".eggs",
     ".git",
