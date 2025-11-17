@@ -28,6 +28,12 @@ vLLM were originally designed to support text-based, autoregressive generation. 
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
 - **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
 
+<p align="center">
+  <picture>
+    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality model architecture.png" width=55%>
+  </picture>
+</p>
+
 vLLM-omni is fast with:
 
 - Seamless AR support for efficient KV Cache management with vLLM
