@@ -41,8 +41,34 @@ sudo apt install ffmpeg
 
 ## Gradio Demo
 
+### Run with AsyncOmniLLM
+
 ```bash
 python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
 ```
 
-Then open `http://localhost:7861/` on the local browser.
+Then open `http://localhost:7861/` on your local browser.
+
+If you want to deploy the gradio demo with an existing api server, you can run 
+
+### Options
+
+The gradio demo also supports running with an existing API server and can be customized with the following arguments.
+
+
+```bash
+python gradio_demo.py \
+    --model Qwen/Qwen2.5-Omni-7B \
+    --use-api-server \
+    --api-base http://localhost:8091/v1 \
+    --ip 127.0.0.1 \
+    --port 7861
+```
+
+- `--model`: Model name
+- `--use-api-server`: If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.
+- `--api-base`: Base URL for vllm serve (only used when `use-api-server` is set, default: http://localhost:8091/v1)
+- `--ip`: Host/IP for Gradio server (default: 127.0.0.1)
+- `--port`: Port for Gradio server (default: 7861)
+- `--stage-configs-path`: Path to custom stage configs YAML file (optional)
+- `--share`: Share the Gradio demo publicly (creates a public link)

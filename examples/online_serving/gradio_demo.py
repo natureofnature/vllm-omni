@@ -8,6 +8,9 @@ import signal
 import sys
 from types import SimpleNamespace
 from typing import Any, Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import urlparse
 
 import gradio as gr
 import numpy as np
@@ -59,12 +62,6 @@ SUPPORTED_MODELS: dict[str, dict[str, Any]] = {
         },
     },
 }
-
-
-def resolve_supported_model_key(model_name: str) -> str:
-    """Return the canonical supported model key for the given model string."""
-
-
 # Ensure deterministic behavior across runs.
 random.seed(SEED)
 np.random.seed(SEED)
@@ -89,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--api-base",
         default="http://localhost:8091/v1",
-        help="Base URL for vllm serve API (only used in http_api mode).",
+        help="Base URL for vllm serve API (only used when use-api-server is set).",
     )
     parser.add_argument(
         "--use-api-server",
@@ -365,7 +362,7 @@ def main():
     else:
         # HTTP API mode
         print(f"Using HTTP API mode with base URL: {args.api_base}")
-        print(f"Make sure vllm serve is running: vllm serve {args.model} --omni --port {args.api_base.split(':')[-1].rstrip('/v1')}")
+        print(f"Please make sure vllm serve is running: vllm serve {args.model} --omni --port 8091")
         client = OpenAI(api_key="EMPTY", base_url=args.api_base)
         sampling_params_dict = build_sampling_params_dict(SEED, model_name)
         omni_llm = None
