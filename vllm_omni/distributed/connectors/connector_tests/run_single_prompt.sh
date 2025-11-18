@@ -1,5 +1,3 @@
-#python end2end.py --output-wav output_audio \
-#                  --query-type use_audio_in_video
 export PYTHONPATH=/workspace/omni/vllm-omni/:$PYTHONPATH
 CUDA_VISIBLE_DEVICES=0,1,2,3 python end2end.py --model /workspace/Qwen2.5-Omni-7B/ \
                                  --voice-type "m02" \

@@ -2,6 +2,7 @@ import multiprocessing as mp
 import os
 import sys
 import time
+import uuid
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Optional, Union
@@ -22,6 +23,11 @@ from vllm.utils import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
 # Internal imports (our code)
+from vllm_omni.distributed.connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.connectors import (
+    initialize_orchestrator_connectors,
+    get_stage_connector_config,
+)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.processor import OmniProcessor
@@ -35,7 +41,11 @@ from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
-from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
+from vllm_omni.entrypoints.utils import (
+    load_stage_configs_from_model,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -63,11 +73,17 @@ class OmniLLM:
     ):
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
+
         # Do NOT call super().__init__ to avoid creating OmniStageLLM instances in parent.
         if stage_configs_path is None:
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.config_path = resolve_model_config_path(model)
+            self.stage_configs = load_stage_configs_from_yaml(str(self.config_path))
         else:
+            self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+
+        # Initialize connectors
+        self.omni_transfer_config,self.connectors = initialize_orchestrator_connectors(self.config_path)
 
         # Optional file handler for orchestrator
         self._log_file = log_file
@@ -121,12 +137,20 @@ class OmniLLM:
 
             # Attach queues and start Stage-owned worker process
             stage.attach_queues(in_q, out_q)
+
+            # Build connectors config for this stage
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
             stage.init_stage_worker(
                 model,
                 log_file=self._log_file,
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx,
                 batch_timeout=self.batch_timeout,
+                connectors_config=stage_connectors_config,
             )
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
             time.sleep(self._init_sleep_seconds)
@@ -157,6 +181,7 @@ class OmniLLM:
         prompts: Union[PromptType, Sequence[PromptType]],
         sampling_params_list: Optional[Union[SamplingParams, Sequence[SamplingParams]]] = None,
     ) -> list[OmniRequestOutput]:
+        print("=====> run generation==========")
         try:
             return self._run_generation(prompts, sampling_params_list)
         except Exception as e:
@@ -187,11 +212,14 @@ class OmniLLM:
         # Orchestrator keeps stage objects for input derivation
         num_stages = len(self.stage_list)
 
-        # Map from request_id to original prompt
-        request_id_to_prompt: dict[int, PromptType] = {i: p for i, p in enumerate(request_prompts)}
+        # Generate globally unique request IDs and map them to original prompts
+        request_ids: list[str] = [f"{i}_{uuid.uuid4()}" for i in range(len(request_prompts))]
+        request_id_to_prompt: dict[str, PromptType] = {
+            rid: p for rid, p in zip(request_ids, request_prompts)
+        }
 
         # Track per-request start time for end-to-end timing
-        _req_start_ts: dict[int, float] = {}
+        _req_start_ts: dict[str, float] = {}
         _wall_start_ts: float = time.time()
 
         # Determine the final stage for E2E stats (highest stage_id with final_output=True; fallback to last stage)
@@ -328,51 +356,72 @@ class OmniLLM:
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, [request_id_to_prompt[req_id]])
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]  # type: ignore[index]
-                    try:
-                        # Measure transfer size and time (encode + enqueue)
-                        size_bytes = 0
+
+                    # Check if we have a connector for this edge
+                    connector_key = (str(stage_id), str(next_stage_id))
+                    connector = self.connectors.get(connector_key)
+                    print(f"connectors: {self.connectors}")
+
+                    sent_via_connector = False
+                    if connector:
+                        sent_via_connector = try_send_via_connector(
+                            connector=connector,
+                            stage_id=stage_id,
+                            next_stage_id=next_stage_id,
+                            req_id=req_id,
+                            next_inputs=next_inputs,
+                            sampling_params=sp_next,
+                            original_prompt=request_id_to_prompt[req_id],
+                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            metrics=metrics
+                        )
+
+                    if not sent_via_connector:
+                        # Use original queue mechanism
                         try:
-                            size_bytes = len(_set(next_inputs))
-                        except Exception:
                             size_bytes = 0
-                        t0 = time.time()
-                        ipc_payload = _encode(
-                            next_inputs,
-                            getattr(self, "_shm_threshold_bytes", 65536),
-                            obj_key="engine_inputs",
-                            shm_key="engine_inputs_shm",
-                        )
-                        ipc_payload.update(
-                            {
-                                "request_id": req_id,
-                                "sampling_params": sp_next,
-                                "sent_ts": time.time(),
-                            }
-                        )
-                        self.stage_list[next_stage_id].submit(ipc_payload)
-                        t1 = time.time()
-                        tx_ms = (t1 - t0) * 1000.0
-                        metrics.on_forward(
-                            stage_id,
-                            next_stage_id,
-                            req_id,
-                            int(size_bytes),
-                            float(tx_ms),
-                            bool("engine_inputs_shm" in ipc_payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[Orchestrator] IPC encode failed for req %s: %s; falling back to inline payload",
-                            req_id,
-                            e,
-                        )
-                        self.stage_list[next_stage_id].submit(
-                            {
-                                "request_id": req_id,
-                                "engine_inputs": next_inputs,
-                                "sampling_params": sp_next,
-                            }
-                        )
+                            try:
+                                size_bytes = len(_set(next_inputs))
+                            except Exception:
+                                size_bytes = 0
+                            t0 = time.time()
+                            ipc_payload = _encode(
+                                next_inputs,
+                                getattr(self, "_shm_threshold_bytes", 65536),
+                                obj_key="engine_inputs",
+                                shm_key="engine_inputs_shm",
+                            )
+                            ipc_payload.update(
+                                {
+                                    "request_id": req_id,
+                                    "sampling_params": sp_next,
+                                    "sent_ts": time.time(),
+                                }
+                            )
+                            self.stage_list[next_stage_id].submit(ipc_payload)
+                            t1 = time.time()
+                            tx_ms = (t1 - t0) * 1000.0
+                            metrics.on_forward(
+                                stage_id,
+                                next_stage_id,
+                                req_id,
+                                int(size_bytes),
+                                float(tx_ms),
+                                bool("engine_inputs_shm" in ipc_payload),
+                            )
+                        except Exception as e:
+                            logger.warning(
+                                "[Orchestrator] IPC encode failed for req %s: %s; falling back to inline payload",
+                                req_id,
+                                e,
+                            )
+                            self.stage_list[next_stage_id].submit(
+                                {
+                                    "request_id": req_id,
+                                    "engine_inputs": next_inputs,
+                                    "sampling_params": sp_next,
+                                }
+                            )
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
                         req_id,

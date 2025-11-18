@@ -10,7 +10,7 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.3
       enforce_eager: true  # need to discuss
       trust_remote_code: true
       engine_output_type: latent  # change the param name,such as pooling_output
@@ -26,6 +26,9 @@ stage_args:
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
+    # Distributed connector configuration (optional)
+    output_connectors:
+      to_stage_1: connector_thinker2talker # thinker -> talker: use local mooncake
   - stage_id: 1
     runtime:
       process: true
@@ -36,7 +39,7 @@ stage_args:
       model_arch: Qwen2_5OmniForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.scheduler.OmniScheduler
-      gpu_memory_utilization: 0.8
+      gpu_memory_utilization: 0.3
       enforce_eager: true
       trust_remote_code: true
       enable_prefix_caching: false
@@ -52,6 +55,11 @@ stage_args:
       detokenize: True
       repetition_penalty: 1.05
       stop_token_ids: [8294]
+    # Distributed connector configuration (optional)
+    input_connectors:
+      from_stage_0: connector_thinker2talker # talker <- thinker: use local mooncake
+    output_connectors:
+      to_stage_2: connector_talker2generator # talker -> code2wav: use remote mooncake (example)
   - stage_id: 2
     runtime:
       process: true
@@ -78,6 +86,9 @@ stage_args:
       seed: 42
       detokenize: True
       repetition_penalty: 1.1
+    # Distributed connector configuration (optional)
+    input_connectors:
+      from_stage_1: connector_talker2generator # code2wav <- talker: use remote mooncake
 
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
@@ -85,6 +96,31 @@ runtime:
   defaults:
     window_size: -1             # Simplified: trigger downstream only after full upstream completion
     max_inflight: 1             # Simplified: process serially within each stage
+
+  # Distributed connectors configuration (optional)
+  connectors:
+    # Local mooncake for same-node communication
+    connector_thinker2talker:
+      name: MooncakeConnector
+      extra:
+        host: "127.0.0.1"
+        metadata_server: "http://10.90.67.86:8080/metadata"
+        master: "10.90.67.86:50051"
+        segment: 512000000    # 512MB
+        localbuf: 64000000     # 64MB
+        proto: "tcp"
+
+    # Remote mooncake for cross-node communication (example)
+    connector_talker2generator:
+      name: MooncakeConnector
+      extra:
+        host: "127.0.0.1"
+        metadata_server: "http://10.90.67.86:8080/metadata"
+        master: "10.90.67.86:50051"
+        segment: 1073741824    # 1GB
+        localbuf: 134217728     # 128MB
+        proto: "tcp"
+
   edges:
     - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
       to: 1

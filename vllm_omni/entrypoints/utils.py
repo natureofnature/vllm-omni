@@ -13,14 +13,20 @@ logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 
 
-def load_stage_configs_from_model(model: str):
-    """Load stage configs from model."""
+def resolve_model_config_path(model: str) -> Path:
+    """Resolve the stage config file path from the model name."""
     hf_config = get_config(model, trust_remote_code=True)
     model_type = hf_config.model_type
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
         raise FileNotFoundError(f"Stage config file {stage_config_path} not found")
+    return stage_config_path
+
+
+def load_stage_configs_from_model(model: str):
+    """Load stage configs from model."""
+    stage_config_path = resolve_model_config_path(model)
     stage_configs = load_stage_configs_from_yaml(config_path=str(stage_config_path))
     return stage_configs
 
