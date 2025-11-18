@@ -39,17 +39,20 @@ sudo apt update
 sudo apt install ffmpeg
 ```
 
-## Gradio Demo
+## Run Local Web UI Demo
 
-### Run with AsyncOmniLLM
+This Web UI demo allows users to interact with the model through a web browser.
+
+### Running Gradio Demo
+
+Once vllm and vllm-omni are installed, you can launch the web service built on AsyncOmniLLM by
 
 ```bash
 python gradio_demo.py  --model Qwen/Qwen2.5-Omni-7B --port 7861
 ```
 
-Then open `http://localhost:7861/` on your local browser.
+Then open `http://localhost:7861/` on your local browser to interact with the web UI.
 
-If you want to deploy the gradio demo with an existing api server, you can run 
 
 ### Options
 
