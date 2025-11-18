@@ -1,6 +1,7 @@
 import asyncio
 import multiprocessing as mp
 import os
+import sys
 import socket
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -41,11 +42,20 @@ from vllm_omni.entrypoints.log_utils import (
     init_stats_paths,
     remove_old_logs,
 )
+from vllm_omni.distributed.connectors.adapter import try_send_via_connector
+from vllm_omni.distributed.connectors import (
+    initialize_orchestrator_connectors,
+    get_stage_connector_config,
+)
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
-from vllm_omni.entrypoints.utils import load_stage_configs_from_model, load_stage_configs_from_yaml
+from vllm_omni.entrypoints.utils import (
+    load_stage_configs_from_model,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -96,13 +106,21 @@ class AsyncOmni(EngineClient):
         init_timeout: int = 60000,
         **kwargs: Any,
     ):
+        self.worker_backend = kwargs.get("worker_backend", "process")
+        self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
+        self._ray_pg = None
 
         if stage_configs_path is None:
-            self.stage_configs = load_stage_configs_from_model(model)
+            self.config_path = resolve_model_config_path(model)
+            self.stage_configs = load_stage_configs_from_yaml(self.config_path)
         else:
+            self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
+
+        # Initialize connectors
+        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(self.config_path)
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
@@ -139,26 +157,49 @@ class AsyncOmni(EngineClient):
         self.default_sampling_params_list = [st.default_sampling_params for st in self.stage_list]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
-        self._ctx = mp.get_context("spawn")
+        if self.worker_backend == "ray":
+            try:
+                import ray
+                from ray.util.queue import Queue as RayQueue
+            except ImportError:
+                raise ImportError("ray is required for worker_backend='ray'")
+            self._queue_cls = lambda: RayQueue(maxsize=0)
+        else:
+            self._ctx = mp.get_context("spawn")
+            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
+
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
-        self._start_stage_processes(model)
+        self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._stages_ready: set[int] = set()
         self._wait_for_stages_ready(timeout=init_timeout)
 
-    def _start_stage_processes(self, model: str) -> None:
+    def _start_stages(self, model: str) -> None:
+        if self.worker_backend == "ray":
+            self._start_stage_actors_ray(model)
+        else:
+            self._start_stage_processes_mp(model)
+
+    def _start_stage_processes_mp(self, model: str) -> None:
         for stage_id, stage in enumerate(self.stage_list):
             # Use unbounded queues to avoid deadlock when seeding many requests
-            in_q: mp.Queue = self._ctx.Queue(maxsize=0)
-            out_q: mp.Queue = self._ctx.Queue(maxsize=0)
+            in_q: mp.Queue = self._queue_cls()
+            out_q: mp.Queue = self._queue_cls()
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
 
             # Attach queues and start Stage-owned worker process
             stage.attach_queues(in_q, out_q)
+
+            # Build connectors config for this stage
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
             stage.init_stage_worker(
                 model,
                 is_async=True,
@@ -166,8 +207,98 @@ class AsyncOmni(EngineClient):
                 shm_threshold_bytes=self._shm_threshold_bytes,
                 ctx=self._ctx,
                 batch_timeout=self.batch_timeout,
+                connectors_config=stage_connectors_config,
             )
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
+            time.sleep(self._init_sleep_seconds)
+
+    def _start_stage_actors_ray(self, model: str) -> None:
+        import ray
+        import os
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+        from vllm_omni.distributed.connectors import get_stage_connector_config
+        from vllm_omni.entrypoints.stage_utils import _to_dict
+
+        # Initialize Ray Cluster
+        if not ray.is_initialized():
+             # Create a dummy parallel config just to reuse vLLM's init logic if needed
+             # or just call ray.init()
+             # Pass current PYTHONPATH to workers to ensure they can find vllm_omni
+             runtime_env = {
+                 "env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+             }
+             ray.init(address=self.ray_address, ignore_reinit_error=True, runtime_env=runtime_env)
+
+        # Create Placement Group
+        # We allocate 1 bundle per stage. Assume 1 GPU per stage for now.
+        # Must include CPU=1 because default Actor request includes 1 CPU.
+        bundles = [{"GPU": 1.0, "CPU": 1.0} for _ in self.stage_list]
+        # Use PACK strategy to minimize cross-node traffic if possible, consistent with vLLM.
+        self._ray_pg = ray.util.placement_group(bundles, strategy="PACK")
+        ray.get(self._ray_pg.ready())
+        logger.info("[Orchestrator] Ray Placement Group created")
+
+        # Define Actor Wrapper
+        @ray.remote(num_gpus=1)
+        class OmniStageRayWorker:
+            def run(self, func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+        from vllm_omni.entrypoints.omni_stage import _stage_worker_async_entry
+
+        for stage_id, stage in enumerate(self.stage_list):
+            in_q = self._queue_cls()
+            out_q = self._queue_cls()
+            self._stage_in_queues.append(in_q)
+            self._stage_out_queues.append(out_q)
+            stage.attach_queues(in_q, out_q)
+
+            # Prepare payload
+            # Reuse logic from OmniStage.init_stage_worker but do not start process
+            engine_args = _to_dict(stage.engine_args)
+            runtime_cfg = _to_dict(getattr(stage.stage_config, "runtime", {}))
+            
+            # Build connectors config for this stage
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
+            stage_payload = {
+                "stage_id": stage.stage_id,
+                "engine_args": engine_args,
+                "runtime": runtime_cfg,
+                "shm_threshold_bytes": sys.maxsize, # Disable SHM for Ray mode
+                "connectors_config": stage_connectors_config or {},
+                "is_async": True, 
+            }
+
+            # Start Actor
+            # Inject PYTHONPATH again for the specific actor to be safe
+            worker_actor = OmniStageRayWorker.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=self._ray_pg,
+                    placement_group_bundle_index=stage_id
+                ),
+                runtime_env={
+                    "env_vars": {
+                        "PYTHONPATH": os.environ.get("PYTHONPATH", "")
+                    },
+                    "CUDA_LAUNCH_BLOCKING": "1"
+                    }
+            ).remote()
+
+            # Start worker loop asynchronously
+            worker_actor.run.remote(
+                _stage_worker_async_entry,
+                stage,
+                model=model,
+                stage_payload=stage_payload,
+                batch_timeout=self.batch_timeout,
+            )
+            
+            stage._ray_actor = worker_actor
+            logger.debug("[Orchestrator] Stage-%s Ray Actor started", stage_id)
             time.sleep(self._init_sleep_seconds)
 
     def close(self) -> None:
@@ -188,13 +319,23 @@ class AsyncOmni(EngineClient):
                 )
         for stage in self.stage_list:
             try:
-                stage.stop_stage_worker()
+                if self.worker_backend == "ray" and hasattr(stage, "_ray_actor"):
+                    import ray
+                    # Ray kill
+                    ray.kill(stage._ray_actor)
+                else:
+                    stage.stop_stage_worker()
             except Exception as e:
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
+        if self.worker_backend == "ray" and self._ray_pg:
+            try:
+                import ray
+                ray.util.remove_placement_group(self._ray_pg)
+            except Exception as e:
+                logger.warning("[Orchestrator] Failed to remove placement group: %s", e)
+
     def __del__(self) -> None:  # best-effort
-        print("[AsyncOmni] __del__ close()", flush=True)
-        raise Exception("test")
         try:
             self.close()
         except Exception as e:
@@ -393,52 +534,99 @@ class AsyncOmni(EngineClient):
                     next_stage: OmniStage = self.stage_list[next_stage_id]
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                     sp_next: SamplingParams = sampling_params_list[next_stage_id]
-                    try:
-                        # Measure transfer size and time (encode + enqueue)
-                        size_bytes = 0
+
+                    # Check if we have a connector for this edge
+                    connector_key = (str(stage_id), str(next_stage_id))
+                    connector = self.connectors.get(connector_key)
+
+                    sent_via_connector = False
+                    if connector:
+                        sent_via_connector = try_send_via_connector(
+                            connector=connector,
+                            stage_id=stage_id,
+                            next_stage_id=next_stage_id,
+                            req_id=req_id,
+                            next_inputs=next_inputs,
+                            sampling_params=sp_next,
+                            original_prompt=prompt,
+                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
+                            metrics=metrics
+                        )
+
+                    if not sent_via_connector:
                         try:
-                            size_bytes = len(_set(next_inputs))
-                        except Exception:
-                            size_bytes = 0
-                        t0 = time.time()
-                        ipc_payload = _encode(
-                            next_inputs,
-                            getattr(self, "_shm_threshold_bytes", 65536),
-                            obj_key="engine_inputs",
-                            shm_key="engine_inputs_shm",
-                        )
-                        ipc_payload.update(
-                            {
-                                "request_id": req_id,
-                                "sampling_params": sp_next,
-                                "sent_ts": time.time(),
-                            }
-                        )
-                        self.stage_list[next_stage_id].submit(ipc_payload)
-                        t1 = time.time()
-                        tx_ms = (t1 - t0) * 1000.0
-                        metrics.on_forward(
-                            stage_id,
-                            next_stage_id,
-                            req_id,
-                            int(size_bytes),
-                            float(tx_ms),
-                            bool("engine_inputs_shm" in ipc_payload),
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            "[Orchestrator] IPC encode failed for req %s: %s; \
-                                falling back to inline payload",
-                            req_id,
-                            e,
-                        )
-                        self.stage_list[next_stage_id].submit(
-                            {
-                                "request_id": req_id,
-                                "engine_inputs": next_inputs,
-                                "sampling_params": sp_next,
-                            }
-                        )
+                            if self.worker_backend == "ray":
+                                # Ray mode: Skip SHM fallback, just send object via Queue
+                                ipc_payload = {
+                                    "request_id": req_id,
+                                    "engine_inputs": next_inputs,
+                                    "sampling_params": sp_next,
+                                    "sent_ts": time.time(),
+                                }
+                                # Approximate size for stats
+                                size_bytes = 0
+                                try:
+                                    size_bytes = len(_set(next_inputs))
+                                except:
+                                    pass
+                                t0 = time.time()
+                                self.stage_list[next_stage_id].submit(ipc_payload)
+                                t1 = time.time()
+                                tx_ms = (t1 - t0) * 1000.0
+                                metrics.on_forward(
+                                    stage_id,
+                                    next_stage_id,
+                                    req_id,
+                                    int(size_bytes),
+                                    float(tx_ms),
+                                    False, # No SHM
+                                )
+                            else:
+                                # Measure transfer size and time (encode + enqueue)
+                                size_bytes = 0
+                                try:
+                                    size_bytes = len(_set(next_inputs))
+                                except Exception:
+                                    size_bytes = 0
+                                t0 = time.time()
+                                ipc_payload = _encode(
+                                    next_inputs,
+                                    getattr(self, "_shm_threshold_bytes", 65536),
+                                    obj_key="engine_inputs",
+                                    shm_key="engine_inputs_shm",
+                                )
+                                ipc_payload.update(
+                                    {
+                                        "request_id": req_id,
+                                        "sampling_params": sp_next,
+                                        "sent_ts": time.time(),
+                                    }
+                                )
+                                self.stage_list[next_stage_id].submit(ipc_payload)
+                                t1 = time.time()
+                                tx_ms = (t1 - t0) * 1000.0
+                                metrics.on_forward(
+                                    stage_id,
+                                    next_stage_id,
+                                    req_id,
+                                    int(size_bytes),
+                                    float(tx_ms),
+                                    bool("engine_inputs_shm" in ipc_payload),
+                                )
+                        except Exception as e:
+                            logger.warning(
+                                "[Orchestrator] IPC encode failed for req %s: %s; \
+                                    falling back to inline payload",
+                                req_id,
+                                e,
+                            )
+                            self.stage_list[next_stage_id].submit(
+                                {
+                                    "request_id": req_id,
+                                    "engine_inputs": next_inputs,
+                                    "sampling_params": sp_next,
+                                }
+                            )
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
                         req_id,

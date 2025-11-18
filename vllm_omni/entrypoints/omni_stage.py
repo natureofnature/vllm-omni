@@ -163,6 +163,7 @@ class OmniStage:
         shm_threshold_bytes: int = 65536,
         ctx: Optional[mp.context.BaseContext] = None,
         batch_timeout: int = 10,
+        connectors_config: Optional[dict] = None,  # New parameter
     ) -> None:
         """Initialize and start the stage worker process.
 
@@ -192,6 +193,7 @@ class OmniStage:
             "engine_args": engine_args,
             "runtime": runtime_cfg,
             "shm_threshold_bytes": self._shm_threshold_bytes,
+            "connectors_config": connectors_config or {},
         }
         if is_async:
             self._proc = ctx.Process(
@@ -340,6 +342,8 @@ def _stage_worker(
         log_stage_batch_stats,
         log_stage_running_avg,
     )
+    from vllm_omni.distributed.connectors.adapter import try_recv_via_connector
+    from vllm_omni.distributed.connectors.utils import build_stage_connectors
     from vllm_omni.entrypoints.omni_llm import OmniStageLLM
     # no inline JSONL/serialization imports; logging handled by utilities
 
@@ -347,6 +351,7 @@ def _stage_worker(
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
+    connectors_config = stage_payload.get("connectors_config", {})
 
     # Per-stage logger: clear inherited handlers to avoid broken parent streams
     try:
@@ -440,6 +445,18 @@ def _stage_worker(
     )
     stage_engine = OmniStageLLM(model=model, **engine_args)
     _logging.getLogger(__name__).debug("[Stage-%s] Engine initialized", stage_id)
+
+    # Initialize OmniConnectors if configured
+    connectors = {}
+    if connectors_config:
+        built_connectors = build_stage_connectors(
+            stage_id=stage_id,
+            connectors_config=connectors_config,
+        )
+        if built_connectors is None:
+            return
+        connectors = built_connectors
+
     # Signal readiness to orchestrator
     try:
         out_q.put({"type": "stage_ready", "stage_id": stage_id})
@@ -496,9 +513,21 @@ def _stage_worker(
                     _in_flight_ms_by_rid[rid] = 0.0
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
-            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(t, obj_key="engine_inputs", shm_key="engine_inputs_shm")
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
+            # Resolve input data (via Connector or IPC)
+            ein, _rx_metrics = try_recv_via_connector(
+                task=t,
+                connectors=connectors,
+                stage_id=stage_id
+            )
+
+            if ein is None or _rx_metrics is None:
+                ein, _rx_metrics = maybe_load_from_ipc_with_metrics(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
+
+            if _rx_metrics:
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+
             batch_request_ids.append(rid)
             if isinstance(ein, list):
                 batch_engine_inputs.extend(ein)
@@ -671,6 +700,8 @@ async def _stage_worker_async(
     import logging as _logging
     import time as _time
 
+    from vllm_omni.distributed.connectors.adapter import try_recv_via_connector
+    from vllm_omni.distributed.connectors.utils import build_stage_connectors
     from vllm_omni.entrypoints.async_omni import AsyncOmniStageLLM
     from vllm_omni.entrypoints.log_utils import (
         compute_and_log_stage_request_stats,
@@ -685,6 +716,7 @@ async def _stage_worker_async(
     engine_args = stage_payload.get("engine_args", {})
     runtime_cfg = stage_payload.get("runtime", {})
     shm_threshold_bytes = int(stage_payload.get("shm_threshold_bytes", 65536))
+    connectors_config = stage_payload.get("connectors_config", {})
 
     log_file = omni_stage._log_file
     in_q = omni_stage._in_q
@@ -728,6 +760,17 @@ async def _stage_worker_async(
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
         _logging.getLogger(__name__).warning("[Stage-%s] Device setup failed: %s", stage_id, e)
+
+    # Initialize OmniConnectors if configured to match sync worker behavior
+    connectors: dict[Any, Any] = {}
+    if connectors_config:
+        built_connectors = build_stage_connectors(
+            stage_id=stage_id,
+            connectors_config=connectors_config,
+        )
+        if built_connectors is None:
+            return
+        connectors = built_connectors
 
     # Init LLM
     _logging.getLogger(__name__).debug(
@@ -788,7 +831,20 @@ async def _stage_worker_async(
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        ein, _rx_metrics = maybe_load_from_ipc_with_metrics(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
+        ein = None
+        _rx_metrics = None
+        if connectors:
+            ein, _rx_metrics = try_recv_via_connector(
+                task=task,
+                connectors=connectors,
+                stage_id=stage_id,
+            )
+        if ein is None or _rx_metrics is None:
+            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(
+                task,
+                obj_key="engine_inputs",
+                shm_key="engine_inputs_shm",
+            )
         _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
