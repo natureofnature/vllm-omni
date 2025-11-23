@@ -16,7 +16,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 *Latest News* 🔥
 
-- [2025/11] vLLM community officially created [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) repo in order to support omni-modality models serving.
+- [2025/11] vLLM community officially released [vllm-project/vllm-omni](https://github.com/vllm-project/vllm-omni) in order to support omni-modality models serving.
 
 ---
 
