@@ -129,7 +129,7 @@ Please check out [Contributing to vLLM-omni](https://docs.vllm.ai/en/latest/cont
 
 ## Weekly Meeting
 
-- vLLM Ascend Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
+- vLLM Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
 - Wednesday, 11:30 - 12:30 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
 
 ## License
