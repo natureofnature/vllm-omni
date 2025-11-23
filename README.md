@@ -24,7 +24,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 [vLLM](https://github.com/vllm-project/vllm) was originally designed to support large language models for text-based autoregressive generation tasks. vLLM-Omni extends its support for omni-modality model inference and serving:
 
-- **Multi-modal Inputs**: Text, image, video, and audio data processing
+- **Omni-modality**: Text, image, video, and audio data processing
 - **Non-autoregressive Architectures**: extend the AR support of vLLM to Diffusion Transformers (DiT) and other parallel generation models
 - **Heterogeneous Outputs**: Beyond traditional text generation to multimodal outputs
 
