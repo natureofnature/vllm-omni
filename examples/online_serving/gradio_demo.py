@@ -399,40 +399,82 @@ def build_interface(
             audio_file, image_file, video_file, use_audio_in_video
         )
 
-    with gr.Blocks() as demo:
+    css = """
+    .media-input-container {
+        display: flex;
+        gap: 10px;
+    }
+    .media-input-container > div {
+        flex: 1;
+    }
+    .media-input-container .image-input,
+    .media-input-container .audio-input {
+        height: 300px;
+    }
+    .media-input-container .video-column {
+        height: 300px;
+        display: flex;
+        flex-direction: column;
+    }
+    .media-input-container .video-input {
+        flex: 1;
+        min-height: 0;
+    }
+    #generate-btn button {
+        width: 100%;
+    }
+    """
+    
+    with gr.Blocks(css=css) as demo:
         gr.Markdown("# vLLM-Omni Online Serving Demo")
         gr.Markdown(f"**Model:** {model} \n\n")
-        
-        with gr.Row():
-            with gr.Column(scale=1):
+
+        with gr.Column():
+            with gr.Row():
                 input_box = gr.Textbox(
                     label="Text Prompt",
-                    placeholder="For example: Please tell me a joke in 30 words.",
+                    placeholder="For example: Describe what happens in the media inputs.",
                     lines=4,
+                    scale=1,
                 )
-                audio_input = gr.Audio(
-                    label="Audio Input (optional)",
-                    type="numpy",
-                    sources=["upload", "microphone"],
-                )
+            with gr.Row(elem_classes="media-input-container"):
                 image_input = gr.Image(
                     label="Image Input (optional)",
                     type="pil",
                     sources=["upload"],
+                    scale=1,
+                    elem_classes="image-input",
                 )
-                video_input = gr.Video(
-                    label="Video Input (optional)",
-                    sources=["upload"],
+                with gr.Column(scale=1, elem_classes="video-column"):
+                    video_input = gr.Video(
+                        label="Video Input (optional)",
+                        sources=["upload"],
+                        elem_classes="video-input",
+                    )
+                    use_audio_in_video_checkbox = gr.Checkbox(
+                        label="Use audio from video",
+                        value=False,
+                        info="Extract the video's audio track when provided.",
+                    )
+                audio_input = gr.Audio(
+                    label="Audio Input (optional)",
+                    type="numpy",
+                    sources=["upload", "microphone"],
+                    scale=1,
+                    elem_classes="audio-input",
                 )
-                use_audio_in_video_checkbox = gr.Checkbox(
-                    label="Use audio from video",
-                    value=False,
-                    info="Extract and use audio track from video input",
-                )
-            with gr.Column(scale=1):
-                generate_btn = gr.Button("Generate", variant="primary", size="lg")
-                text_output = gr.Textbox(label="Text Output", lines=10)
-                audio_output = gr.Audio(label="Audio Output", interactive=False)
+
+        with gr.Row():
+            generate_btn = gr.Button(
+                "Generate",
+                variant="primary",
+                size="lg",
+                elem_id="generate-btn",
+            )
+
+        with gr.Row():
+            text_output = gr.Textbox(label="Text Output", lines=10, scale=2)
+            audio_output = gr.Audio(label="Audio Output", interactive=False, scale=1)
 
         generate_btn.click(
             fn=run_inference,
