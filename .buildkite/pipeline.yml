@@ -1,0 +1,6 @@
+steps:
+  - label: ":toolbox: Qwen2.5 omni offline example"
+    commands:
+      - ".buildkite/scripts/run_qwen_offline_example.sh"
+    agents:
+      queue: "gpu"
