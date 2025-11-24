@@ -1,30 +1,21 @@
 import argparse
-import base64
 import io
 import os
 import os as _os_env_toggle
 import random
 import signal
 import sys
-import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Optional, Tuple
-from urllib import error as urllib_error
-from urllib import request as urllib_request
-from urllib.parse import urlparse
 
 import gradio as gr
 import numpy as np
 import soundfile as sf
-from PIL import Image
 import torch
+from PIL import Image
 from vllm.assets.video import video_get_metadata, video_to_ndarrays
 
-# For HTTP API mode
-from openai import OpenAI
-
-# For AsyncOmniLLM mode
 from vllm.sampling_params import SamplingParams
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 
@@ -89,17 +80,7 @@ def parse_args():
     parser.add_argument(
         "--model",
         default="Qwen/Qwen2.5-Omni-7B",
-        help="Path to model (for async_omni_llm mode) or model name (for http_api mode).",
-    )
-    parser.add_argument(
-        "--api-base",
-        default="http://localhost:8091/v1",
-        help="Base URL for vllm serve API (only used when use-api-server is set).",
-    )
-    parser.add_argument(
-        "--use-api-server",
-        action="store_true",
-        help="If set, connect to an existing vLLM HTTP API server instead of running AsyncOmniLLM locally.",
+        help="Path to local model checkpoint.",
     )
     parser.add_argument(
         "--ip",
@@ -153,23 +134,6 @@ def create_prompt_args(base_args: argparse.Namespace) -> SimpleNamespace:
         use_torchvision=True,
         legacy_omni_video=False,
     )
-
-
-def get_system_prompt():
-    """Get system prompt for HTTP API mode."""
-    return {
-        "role": "system",
-        "content": [
-            {
-                "type": "text",
-                "text": (
-                    "You are Qwen, a virtual human developed by the Qwen Team, "
-                    "Alibaba Group, capable of perceiving auditory and visual inputs, "
-                    "as well as generating text and speech."
-                ),
-            }
-        ],
-    }
 
 
 def process_audio_file(
@@ -415,180 +379,29 @@ async def run_inference_async_omni_llm(
         return f"Inference failed: {exc}", None
 
 
-def run_inference_http_api(
-    client: OpenAI,
-    model: str,
-    sampling_params_list: list[dict],
-    user_prompt: str,
-    audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]] = None,
-    image_file: Optional[Image.Image] = None,
-    video_file: Optional[str] = None,
-    use_audio_in_video: bool = False,
-):
-    """Run inference using HTTP API (vllm serve) with multimodal support."""
-    if not user_prompt.strip() and not audio_file and not image_file and not video_file:
-        return "Please provide at least a text prompt or multimodal input.", None
-
-    try:
-        # Build user content array
-        user_content = []
-        
-        # Add audio if provided
-        if audio_file is not None:
-            # For HTTP API, encode audio as base64 data URL
-            audio_data = process_audio_file(audio_file)
-            if audio_data is not None:
-                audio_array, sample_rate = audio_data
-                # Save to temporary file and encode as base64
-                with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_file:
-                    sf.write(tmp_file.name, audio_array, sample_rate)
-                    tmp_path = tmp_file.name
-                    # Read back and encode
-                    with open(tmp_path, "rb") as f:
-                        audio_bytes = f.read()
-                    os.unlink(tmp_path)  # Clean up temp file
-                    audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
-                    user_content.append({
-                        "type": "audio_url",
-                        "audio_url": {"url": f"data:audio/wav;base64,{audio_base64}"}
-                    })
-        
-        # Add image if provided
-        if image_file is not None:
-            image_data = process_image_file(image_file)
-            if image_data is not None:
-                # Convert PIL Image to base64
-                buffered = io.BytesIO()
-                image_data.save(buffered, format="JPEG")
-                img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-                user_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
-                })
-        
-        # Add video if provided
-        if video_file is not None:
-            video_path = Path(video_file)
-            if video_path.exists():
-                try:
-                    with open(video_path, "rb") as f:
-                        video_bytes = f.read()
-                    video_base64 = base64.b64encode(video_bytes).decode("utf-8")
-                    ext = video_path.suffix.lower()
-                    mime_type = {
-                        ".mp4": "video/mp4",
-                        ".avi": "video/x-msvideo",
-                        ".mov": "video/quicktime",
-                        ".mkv": "video/x-matroska",
-                    }.get(ext, "video/mp4")
-                    user_content.append({
-                        "type": "video_url",
-                        "video_url": {"url": f"data:{mime_type};base64,{video_base64}"}
-                    })
-                except Exception:
-                    user_content.append({
-                        "type": "video_url",
-                        "video_url": {"url": f"file://{video_path.resolve()}"}
-                    })
-        
-        # Add text prompt
-        if user_prompt.strip():
-            user_content.append({
-                "type": "text",
-                "text": user_prompt,
-            })
-        
-        messages = [
-            get_system_prompt(),
-            {
-                "role": "user",
-                "content": user_content,
-            },
-        ]
-
-        extra_body = {
-            "sampling_params_list": sampling_params_list
-        }
-        
-        # Add mm_processor_kwargs if needed
-        if use_audio_in_video:
-            extra_body["mm_processor_kwargs"] = {"use_audio_in_video": True}
-
-        chat_completion = client.chat.completions.create(
-            messages=messages,
-            model=model,
-            extra_body=extra_body,
-        )
-
-        text_outputs: list[str] = []
-        audio_output = None
-
-        for choice in chat_completion.choices:
-            if choice.message.audio:
-                # Decode base64 audio data (already in WAV format)
-                audio_data = base64.b64decode(choice.message.audio.data)
-                # Use soundfile to read WAV from bytes
-                audio_io = io.BytesIO(audio_data)
-                audio_np, sample_rate = sf.read(audio_io)
-                # Ensure mono audio
-                if len(audio_np.shape) > 1:
-                    audio_np = audio_np[:, 0]
-                audio_output = (sample_rate, audio_np)
-            elif choice.message.content:
-                text_outputs.append(choice.message.content)
-
-        text_response = "\n\n".join(text_outputs) if text_outputs else "No text output."
-        return text_response, audio_output
-    except Exception as exc:  # pylint: disable=broad-except
-        return f"Inference failed: {exc}", None
-
-
 def build_interface(
-    use_api_server: bool,
-    omni_llm: Optional[AsyncOmniLLM],
-    sampling_params: Optional[list[SamplingParams]],
-    prompt_args_template: Optional[SimpleNamespace],
-    client: Optional[OpenAI],
+    omni_llm: AsyncOmniLLM,
+    sampling_params: list[SamplingParams],
+    prompt_args_template: SimpleNamespace,
     model: str,
-    sampling_params_dict: Optional[list[dict]],
-    api_base: Optional[str] = None,
 ):
-    """Build Gradio interface based on the selected mode."""
+    """Build Gradio interface for AsyncOmniLLM mode."""
 
-    if not use_api_server:
-        # AsyncOmniLLM mode - Gradio supports async functions directly
-        async def run_inference(
-            user_prompt: str,
-            audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]],
-            image_file: Optional[Image.Image],
-            video_file: Optional[str],
-            use_audio_in_video: bool,
-        ):
-            return await run_inference_async_omni_llm(
-                omni_llm, sampling_params, prompt_args_template, user_prompt,
-                audio_file, image_file, video_file, use_audio_in_video
-            )
-
-    else:
-        # HTTP API mode
-        def run_inference(
-            user_prompt: str,
-            audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]],
-            image_file: Optional[Image.Image],
-            video_file: Optional[str],
-            use_audio_in_video: bool,
-        ):
-            return run_inference_http_api(
-                client, model, sampling_params_dict, user_prompt,
-                audio_file, image_file, video_file, use_audio_in_video
-            )
+    async def run_inference(
+        user_prompt: str,
+        audio_file: Optional[Tuple[str, Tuple[int, np.ndarray]]],
+        image_file: Optional[Image.Image],
+        video_file: Optional[str],
+        use_audio_in_video: bool,
+    ):
+        return await run_inference_async_omni_llm(
+            omni_llm, sampling_params, prompt_args_template, user_prompt,
+            audio_file, image_file, video_file, use_audio_in_video
+        )
 
     with gr.Blocks() as demo:
         gr.Markdown("# vLLM-Omni Online Serving Demo")
-        info_text = f"**Model:** {model} \n\n"
-        if use_api_server and api_base:
-            info_text += f"**API Base:** {api_base}\n\n"
-        gr.Markdown(info_text)
+        gr.Markdown(f"**Model:** {model} \n\n")
         
         with gr.Row():
             with gr.Column(scale=1):
@@ -650,41 +463,24 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
-    if not args.use_api_server:
-        # Initialize AsyncOmniLLM
-        print(f"Initializing AsyncOmniLLM with model: {args.model}")
-        if args.stage_configs_path:
-            print(f"Using custom stage configs: {args.stage_configs_path}")
-        
-        sampling_params = build_sampling_params(SEED, model_name)
-        omni_llm = AsyncOmniLLM(
-            model=args.model,
-            stage_configs_path=args.stage_configs_path,
-            init_timeout=ASYNC_INIT_TIMEOUT,
-        )
-        print("✓ AsyncOmniLLM initialized successfully")
-        prompt_args_template = create_prompt_args(args)
-        client = None
-        sampling_params_dict = None
-    else:
-        # HTTP API mode
-        print(f"Using HTTP API mode with base URL: {args.api_base}")
-        print(f"Please make sure vllm serve is running: vllm serve {args.model} --omni --port 8091")
-        client = OpenAI(api_key="EMPTY", base_url=args.api_base)
-        sampling_params_dict = build_sampling_params_dict(SEED, model_name)
-        omni_llm = None
-        sampling_params = None
-        prompt_args_template = None
+    print(f"Initializing AsyncOmniLLM with model: {args.model}")
+    if args.stage_configs_path:
+        print(f"Using custom stage configs: {args.stage_configs_path}")
+
+    sampling_params = build_sampling_params(SEED, model_name)
+    omni_llm = AsyncOmniLLM(
+        model=args.model,
+        stage_configs_path=args.stage_configs_path,
+        init_timeout=ASYNC_INIT_TIMEOUT,
+    )
+    print("✓ AsyncOmniLLM initialized successfully")
+    prompt_args_template = create_prompt_args(args)
 
     demo = build_interface(
-        args.use_api_server,
         omni_llm,
         sampling_params,
         prompt_args_template,
-        client,
         args.model,
-        sampling_params_dict,
-        api_base=args.api_base if args.use_api_server else None,
     )
     try:
         demo.launch(
