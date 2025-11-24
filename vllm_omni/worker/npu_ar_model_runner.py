@@ -513,7 +513,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             and self.speculative_config.use_eagle()
             and not self.speculative_config.disable_padded_drafter_batch
         )
-        effective_drafter_max_model_len = self.self.model_config.max_model_len.max_model_len
+        effective_drafter_max_model_len = self.model_config.max_model_len
         if effective_drafter_max_model_len is None:
             effective_drafter_max_model_len = self.model_config.max_model_len
         if (
