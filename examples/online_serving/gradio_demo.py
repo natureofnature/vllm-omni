@@ -1,7 +1,5 @@
 import argparse
-import io
 import os
-import os as _os_env_toggle
 import random
 import signal
 import sys
@@ -15,8 +13,8 @@ import soundfile as sf
 import torch
 from PIL import Image
 from vllm.assets.video import video_get_metadata, video_to_ndarrays
-
 from vllm.sampling_params import SamplingParams
+
 from vllm_omni.entrypoints.async_omni_llm import AsyncOmniLLM
 
 # Import utils from offline inference example
@@ -74,9 +72,7 @@ os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Gradio demo for Qwen2.5-Omni online inference."
-    )
+    parser = argparse.ArgumentParser(description="Gradio demo for Qwen2.5-Omni online inference.")
     parser.add_argument(
         "--model",
         default="Qwen/Qwen2.5-Omni-7B",
@@ -87,12 +83,8 @@ def parse_args():
         default="127.0.0.1",
         help="Host/IP for gradio `launch`.",
     )
-    parser.add_argument(
-        "--port", type=int, default=7861, help="Port for gradio `launch`."
-    )
-    parser.add_argument(
-        "--share", action="store_true", help="Share the Gradio demo publicly."
-    )
+    parser.add_argument("--port", type=int, default=7861, help="Port for gradio `launch`.")
+    parser.add_argument("--share", action="store_true", help="Share the Gradio demo publicly.")
     parser.add_argument(
         "--stage-configs-path",
         type=str,
@@ -104,10 +96,7 @@ def parse_args():
 
 def build_sampling_params(seed: int, model_key: str) -> list[SamplingParams]:
     """Build SamplingParams objects by reusing the dict definitions."""
-    return [
-        SamplingParams(**params_dict)
-        for params_dict in build_sampling_params_dict(seed, model_key)
-    ]
+    return [SamplingParams(**params_dict) for params_dict in build_sampling_params_dict(seed, model_key)]
 
 
 def build_sampling_params_dict(seed: int, model_key: str) -> list[dict]:
@@ -168,9 +157,7 @@ def process_audio_file(
             elif isinstance(first, str):
                 if isinstance(second, tuple) and len(second) == 2:
                     sr_candidate, data_candidate = second
-                    if isinstance(sr_candidate, (int, float)) and isinstance(
-                        data_candidate, np.ndarray
-                    ):
+                    if isinstance(sr_candidate, (int, float)) and isinstance(data_candidate, np.ndarray):
                         sample_rate = int(sr_candidate)
                         audio_np = data_candidate
                 if audio_np is None:
@@ -180,9 +167,7 @@ def process_audio_file(
             # Case 3: (None, (sample_rate, np.ndarray))
             elif first is None and isinstance(second, tuple) and len(second) == 2:
                 sr_candidate, data_candidate = second
-                if isinstance(sr_candidate, (int, float)) and isinstance(
-                    data_candidate, np.ndarray
-                ):
+                if isinstance(sr_candidate, (int, float)) and isinstance(data_candidate, np.ndarray):
                     sample_rate = int(sr_candidate)
                     audio_np = data_candidate
         elif len(audio_file) == 1 and isinstance(audio_file[0], str):
@@ -205,7 +190,7 @@ def process_audio_file(
 
 def process_image_file(image_file: Optional[Image.Image]) -> Optional[Image.Image]:
     """Process image file from Gradio input.
-    
+
     Returns:
         PIL Image in RGB mode or None if no image provided.
     """
@@ -268,21 +253,21 @@ async def run_inference_async_omni_llm(
     try:
         # Build prompt with multimodal data
         prompt_args = SimpleNamespace(**prompt_args_template.__dict__)
-        
+
         # Process multimodal inputs
         multi_modal_data = {}
         mm_processor_kwargs = {}
-        
+
         # Process audio
         audio_data = process_audio_file(audio_file)
         if audio_data is not None:
             multi_modal_data["audio"] = audio_data
-        
+
         # Process image
         image_data = process_image_file(image_file)
         if image_data is not None:
             multi_modal_data["image"] = image_data
-        
+
         # Process video
         video_payload = process_video_file(video_file, enable_audio_in_video=use_audio_in_video)
         if video_payload is not None:
@@ -296,7 +281,7 @@ async def run_inference_async_omni_llm(
             if use_audio_in_video and extracted_audio is not None and "audio" not in multi_modal_data:
                 multi_modal_data["audio"] = extracted_audio
                 mm_processor_kwargs["use_audio_in_video"] = True
-        
+
         # Build the prompt input
         if make_omni_prompt is not None:
             omni_prompt = make_omni_prompt(prompt_args, user_prompt)
@@ -321,10 +306,7 @@ async def run_inference_async_omni_llm(
                 "Alibaba Group, capable of perceiving auditory and visual inputs, "
                 "as well as generating text and speech."
             )
-            prompt = (
-                f"<|im_start|>system\n{default_system}<|im_end|>\n"
-                "<|im_start|>user\n"
-            )
+            prompt = f"<|im_start|>system\n{default_system}<|im_end|>\n<|im_start|>user\n"
             if audio_data:
                 prompt += "<|audio_bos|><|AUDIO|><|audio_eos|>"
             if image_data:
@@ -334,7 +316,7 @@ async def run_inference_async_omni_llm(
             if user_prompt.strip():
                 prompt += f"{user_prompt}"
             prompt += "<|im_end|>\n<|im_start|>assistant\n"
-            
+
             omni_prompt = {
                 "prompt": prompt,
                 "multi_modal_data": multi_modal_data,
@@ -395,8 +377,14 @@ def build_interface(
         use_audio_in_video: bool,
     ):
         return await run_inference_async_omni_llm(
-            omni_llm, sampling_params, prompt_args_template, user_prompt,
-            audio_file, image_file, video_file, use_audio_in_video
+            omni_llm,
+            sampling_params,
+            prompt_args_template,
+            user_prompt,
+            audio_file,
+            image_file,
+            video_file,
+            use_audio_in_video,
         )
 
     css = """
@@ -424,7 +412,7 @@ def build_interface(
         width: 100%;
     }
     """
-    
+
     with gr.Blocks(css=css) as demo:
         gr.Markdown("# vLLM-Omni Online Serving Demo")
         gr.Markdown(f"**Model:** {model} \n\n")
@@ -490,7 +478,9 @@ def main():
     omni_llm = None
 
     model_name = "/".join(args.model.split("/")[-2:])
-    assert model_name in SUPPORTED_MODELS, f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
+    assert model_name in SUPPORTED_MODELS, (
+        f"Unsupported model '{model_name}'. Supported models: {SUPPORTED_MODELS.keys()}"
+    )
 
     # Register signal handlers for graceful shutdown
     def signal_handler(sig, frame):
@@ -543,4 +533,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
