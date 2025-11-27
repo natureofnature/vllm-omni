@@ -250,7 +250,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     src = pe_cpu[num_computed_tokens : num_computed_tokens + overlay_len].to(
                         dtype=self.dtype, device=self.device, non_blocking=True
                     )
-                    start_offset = int(self.query_start_loc.cpu[req_index])
+                    start_offset = int(self.query_start_loc_cpu[req_index])
                     self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
                 # Build per-request additional information (no cross-request concat)
                 if addi_cpu is not None and isinstance(addi_cpu, dict):
@@ -363,7 +363,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
 
             # Make AscendCommonAttentionMetadata
             common_attn_metadata = AscendCommonAttentionMetadata(
-                query_start_loc=self.query_start_loc[: num_reqs + 1],
+                query_start_loc=self.query_start_loc_cpu[: num_reqs + 1],
                 query_start_loc_cpu=self.query_start_loc_cpu[: num_reqs + 1],
                 seq_lens_cpu=self.seq_lens_cpu,
                 seq_lens=self.seq_lens_cpu[:num_reqs],
@@ -446,6 +446,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
         with ProfileExecuteDuration().capture_async("prepare input"):
             self._update_states(scheduler_output)
 
+            #  -------------------------------------- Omni-new -------------------------------------------------
             # Omni-new: Decode per-request prompt_embeds / additional_hidden_states payloads
             # (if present) into CPU tensors
             try:
@@ -498,6 +499,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
             except Exception as e:
                 logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
                 pass
+
+            #  ------------------------------------------------------------------------------------------------
 
             if not scheduler_output.total_num_scheduled_tokens:
                 if not has_kv_transfer_group():
@@ -573,12 +576,13 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     # enabling the model to map decode/prefill by request
                     req_token_spans = []
                     for req_index in range(len(self.input_batch.req_ids)):
-                        start_offset = int(self.query_start_loc.cpu[req_index])
+                        start_offset = int(self.query_start_loc_cpu[req_index])
                         sched_tokens = int(num_scheduled_tokens_np[req_index])
                         req_token_spans.append((start_offset, start_offset + sched_tokens))
                     model_kwargs_extra["request_token_spans"] = req_token_spans
                 except Exception:
                     pass
+                #  ---------------------------------------------------------------------------------------
 
                 hidden_states = self._generate_process_reqs_hidden_states(
                     attn_metadata,
@@ -606,6 +610,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # to make sure we are synced across pp ranks
             # TODO: Support overlapping mirco-batches
             # https://github.com/vllm-project/vllm/issues/18019
+
+            #  ---------------------------------------------------------------------------------------
             # Omni-new
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             # The model side may return per-request additional_information updates (model-agnostic channel).
@@ -638,6 +644,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     f"Error merging for requests:{self.input_batch.req_ids} additional \
                         information update: {e}, with the multimodal_outputs as {multimodal_outputs}"
                 )
+            #  ---------------------------------------------------------------------------------------
             broadcast_pp_output = (
                 self.parallel_config.distributed_executor_backend == "external_launcher"
                 and len(get_pp_group().ranks) > 0
@@ -825,6 +832,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
 
+        #  ---------------------------------------------------------------------------------------
         # Omni-new: Convert to per-request tensors on CPU
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         pooler_output: list[torch.Tensor | None] = []
@@ -843,6 +851,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
             kv_connector_output=kv_connector_output,
         )
+        #  ---------------------------------------------------------------------------------------
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
@@ -860,6 +869,30 @@ class NPUARModelRunner(OmniNPUModelRunner):
             invalid_req_indices=invalid_req_indices,
             async_output_copy_stream=self.async_output_copy_stream,
         )
+
+    def _merge_additional_information_update(self, req_id: str, upd: dict) -> None:
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return
+        existing = getattr(req_state, "additional_information_cpu", {})
+        if not isinstance(existing, dict):
+            existing = {}
+        merged = dict(existing)
+        for k, v in upd.items():
+            if isinstance(v, torch.Tensor):
+                merged[k] = v.detach().to("cpu").contiguous()
+            elif isinstance(v, list):
+                new_list = []
+                for item in v:
+                    if isinstance(item, torch.Tensor):
+                        new_list.append(item.detach().to("cpu").contiguous())
+                    else:
+                        new_list.append(item)
+                merged[k] = new_list
+            else:
+                merged[k] = v
+        setattr(req_state, "additional_information_cpu", merged)
+
 
     def _generate_process_reqs_hidden_states(
         self,
