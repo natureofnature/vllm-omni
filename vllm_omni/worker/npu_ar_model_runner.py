@@ -227,6 +227,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds[:total_num_scheduled_tokens].copy_(inputs_embeds)
 
+            #  -------------------------------------- Omni-new -------------------------------------------------
             # Omni-new: Reset per-step additional information collector (deprecated concat path)
             if hasattr(self, "_forward_additional_information"):
                 self._forward_additional_information = None
@@ -277,6 +278,8 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         else:
                             req_info[k] = v
                     per_req_additional_information[req_id] = req_info
+            #  ------------------------------------------------------------------------------------------------
+
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
             input_ids = self.input_ids[:num_input_tokens]
         else:
@@ -499,7 +502,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             except Exception as e:
                 logger.error(f"Error decoding prompt_embeds / additional_information: {e}")
                 pass
-
             #  ------------------------------------------------------------------------------------------------
 
             if not scheduler_output.total_num_scheduled_tokens:
@@ -557,8 +559,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 weight_prefetch_method=self.weight_prefetch_method,
             ):
                 self.maybe_setup_kv_connector(scheduler_output)
-
-                # Omni-new
+                #  -------------------------------------- Omni-new -------------------------------------------------
                 model_kwargs_extra = {}
                 # Pass per-request additional information map for this step (no concat)
                 if per_req_additional_information:
@@ -582,7 +583,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     model_kwargs_extra["request_token_spans"] = req_token_spans
                 except Exception:
                     pass
-                #  ---------------------------------------------------------------------------------------
+                #  ------------------------------------------------------------------------------------------------
 
                 hidden_states = self._generate_process_reqs_hidden_states(
                     attn_metadata,
@@ -611,8 +612,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             # TODO: Support overlapping mirco-batches
             # https://github.com/vllm-project/vllm/issues/18019
 
-            #  ---------------------------------------------------------------------------------------
-            # Omni-new
+            #  -------------------------------------- Omni-new -------------------------------------------------
             hidden_states, multimodal_outputs = self.extract_multimodal_outputs(hidden_states)
             # The model side may return per-request additional_information updates (model-agnostic channel).
             # Convention: multimodal_outputs["additional_information_update"] is a list[dict] in batch order;
@@ -644,7 +644,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                     f"Error merging for requests:{self.input_batch.req_ids} additional \
                         information update: {e}, with the multimodal_outputs as {multimodal_outputs}"
                 )
-            #  ---------------------------------------------------------------------------------------
+            #  ------------------------------------------------------------------------------------------------
             broadcast_pp_output = (
                 self.parallel_config.distributed_executor_backend == "external_launcher"
                 and len(get_pp_group().ranks) > 0
@@ -832,7 +832,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             if has_kv_transfer_group():
                 get_kv_transfer_group().clear_connector_metadata()
 
-        #  ---------------------------------------------------------------------------------------
+        #  -------------------------------------- Omni-new -------------------------------------------------
         # Omni-new: Convert to per-request tensors on CPU
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         pooler_output: list[torch.Tensor | None] = []
@@ -851,7 +851,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
             pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
             kv_connector_output=kv_connector_output,
         )
-        #  ---------------------------------------------------------------------------------------
+        #  ------------------------------------------------------------------------------------------------
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
@@ -892,7 +892,6 @@ class NPUARModelRunner(OmniNPUModelRunner):
             else:
                 merged[k] = v
         setattr(req_state, "additional_information_cpu", merged)
-
 
     def _generate_process_reqs_hidden_states(
         self,

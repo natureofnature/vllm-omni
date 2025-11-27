@@ -108,8 +108,6 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             num_input_tokens = math.ceil(total_num_scheduled_tokens / tp_size) * tp_size
         else:
             # Eager mode.
-            # (NOTE)Omni-new: Maybe we should remove the below ACLGraph logic
-            # But for eager, the logic is consistent with GPUDiffusionModelRunner
             num_input_tokens = total_num_scheduled_tokens
 
         # Get the attention state.
@@ -218,6 +216,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             self._execute_mm_encoder(scheduler_output)
             mm_embeds = self._gather_mm_embeddings(scheduler_output)
 
+            # -------------------------------------- Omni-new -------------------------------------------------
             # NOTE(woosuk): To unify token ids and soft tokens (vision
             # embeddings), we always use embeddings (rather than token ids)
             # as input to the multimodal model, even when the input is text.
@@ -229,12 +228,13 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             # TODO(woosuk): Avoid the copy. Optimize.
             self.inputs_embeds[:num_input_tokens].copy_(inputs_embeds)
             inputs_embeds = self.inputs_embeds[:num_input_tokens]
-            # NOTE: Need to
+
             model_kwargs = {
                 **self._init_model_kwargs(num_input_tokens),
                 **self._extract_mm_kwargs(scheduler_output),
             }
             # (NOTE) Omni-new: input_ids isn't set as None
+            # -------------------------------------------------------------------------------------------------
         else:
             # For text-only models, we use token ids as input.
             # While it is possible to use embeddings as input just like the
@@ -429,9 +429,11 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
 
         moe_comm_type = self._select_moe_comm_method(num_input_tokens, self.with_prefill)
 
+        # -------------------------------------- Omni-new -------------------------------------------------
         # Omni-new: don't use cudagraph_dispatcher
         # and remove ubatch_slices
         aclgraph_runtime_mode = CUDAGraphMode.NONE
+        # -------------------------------------------------------------------------------------------------
 
         # Run forward pass
         with ProfileExecuteDuration().capture_async("forward"):
@@ -472,6 +474,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
         finished_sending = None
         finished_recving = None
 
+        # -------------------------------------- Omni-new -------------------------------------------------
         # Omni-new: extract_multimodal_outputs
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
         # Ensure one tensor per request, map to CPU for output struct
@@ -500,6 +503,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
             kv_connector_output=kv_connector_output,
             num_nans_in_logits={},
         )
+        # -------------------------------------------------------------------------------------------------
 
         durations = ProfileExecuteDuration().pop_captured_sync()
         if durations:
@@ -737,5 +741,7 @@ class NPUDiffusionModelRunner(OmniNPUModelRunner):
                 self.eplb_updator.take_update_info_from_eplb_process()
                 self.eplb_updator.forward_end()
 
+            # -------------------------------------- Omni-new -------------------------------------------------
             hidden_states, _ = self.extract_multimodal_outputs(hidden_states)
+            # -------------------------------------------------------------------------------------------------
             return hidden_states
