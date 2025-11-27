@@ -283,6 +283,19 @@ def parse_args():
         default=None,
         help="Path to a .txt file with one prompt per line (preferred).",
     )
+    parser.add_argument(
+        "--worker-backend",
+        type=str,
+        default="process",
+        choices=["process","ray"],
+        help="backend"
+    )
+    parser.add_argument(
+        "--ray-address",
+        type=str,
+        default=None,
+        help="Path to a .txt file with one prompt per line (preferred).",
+
 
     return parser.parse_args()
 

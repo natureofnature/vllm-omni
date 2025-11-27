@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.log_utils import (
 )
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import encode_for_ipc as _encode
+from vllm_omni.entrypoints.stage_utils import _to_dict
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.stage_utils import serialize_obj as _set
 from vllm_omni.entrypoints.utils import (
@@ -71,8 +72,11 @@ class OmniLLM:
         init_timeout: int = 300,
         **kwargs,
     ):
+        self.worker_backend = kwargs.get("worker_backend", "process")
+        self.ray_address = kwargs.get("ray_address", None)
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
+        self._ray_pg = None
 
         # Do NOT call super().__init__ to avoid creating OmniStageLLM instances in parent.
         if stage_configs_path is None:
@@ -117,21 +121,37 @@ class OmniLLM:
         self.stage_list = [st for _, st in results]
         logger.debug("[Orchestrator] Loaded %d stages", len(self.stage_list))
 
-        self._ctx = mp.get_context("spawn")
+        if self.worker_backend == "ray":
+            try:
+                import ray
+                from ray.util.queue import Queue as RayQueue
+            except ImportError:
+                raise ImportError("ray is required for worker_backend='ray'")
+            self._queue_cls = lambda: RayQueue(maxsize=0)
+        else:
+            self._ctx = mp.get_context("spawn")
+            self._queue_cls = lambda: self._ctx.Queue(maxsize=0)
+
         self._stage_in_queues: list[mp.Queue] = []
         self._stage_out_queues: list[mp.Queue] = []
         self._init_sleep_seconds = max(0, int(init_sleep_seconds))
         self._shm_threshold_bytes = max(0, int(shm_threshold_bytes))
-        self._start_stage_processes(model)
+        self._start_stages(model)
         # Wait for all stages to report readiness before seeding
         self._stages_ready: set[int] = set()
         self._wait_for_stages_ready(timeout=init_timeout)
 
-    def _start_stage_processes(self, model: str) -> None:
+    def _start_stages(self, model: str) -> None:
+        if self.worker_backend == "ray":
+            self._start_stage_actors_ray(model)
+        else:
+            self._start_stage_processes_mp(model)
+
+    def _start_stage_processes_mp(self, model: str) -> None:
         for stage_id, stage in enumerate(self.stage_list):
             # Use unbounded queues to avoid deadlock when seeding many requests
-            in_q: mp.Queue = self._ctx.Queue(maxsize=0)
-            out_q: mp.Queue = self._ctx.Queue(maxsize=0)
+            in_q: mp.Queue = self._queue_cls()
+            out_q: mp.Queue = self._queue_cls()
             self._stage_in_queues.append(in_q)
             self._stage_out_queues.append(out_q)
 
@@ -155,7 +175,88 @@ class OmniLLM:
             logger.debug("[Orchestrator] Stage-%s process started", stage_id)
             time.sleep(self._init_sleep_seconds)
 
+    def _start_stage_actors_ray(self, model: str) -> None:
+        import ray
+        import os
+        from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+
+        # Initialize Ray Cluster
+        if not ray.is_initialized():
+             # Create a dummy parallel config just to reuse vLLM's init logic if needed
+             # or just call ray.init()
+             # Pass current PYTHONPATH to workers to ensure they can find vllm_omni
+             runtime_env = {
+                 "env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}
+             }
+             ray.init(address=self.ray_address, ignore_reinit_error=True, runtime_env=runtime_env)
+
+        # Create Placement Group
+        # We allocate 1 bundle per stage. Assume 1 GPU per stage for now.
+        # Must include CPU=1 because default Actor request includes 1 CPU.
+        bundles = [{"GPU": 1.0, "CPU": 1.0} for _ in self.stage_list]
+        self._ray_pg = ray.util.placement_group(bundles, strategy="SPREAD")
+        ray.get(self._ray_pg.ready())
+        logger.info("[Orchestrator] Ray Placement Group created")
+
+        # Define Actor Wrapper
+        @ray.remote(num_gpus=1)
+        class OmniStageRayWorker:
+            def run(self, func, *args, **kwargs):
+                return func(*args, **kwargs)
+
+        from vllm_omni.entrypoints.omni_stage import _stage_worker
+
+        for stage_id, stage in enumerate(self.stage_list):
+            in_q = self._queue_cls()
+            out_q = self._queue_cls()
+            self._stage_in_queues.append(in_q)
+            self._stage_out_queues.append(out_q)
+            stage.attach_queues(in_q, out_q)
+
+            stage_connectors_config = get_stage_connector_config(
+                self.omni_transfer_config,
+                stage_id,
+            )
+
+            # Prepare payload
+            # Reuse logic from OmniStage.init_stage_worker but do not start process
+            engine_args = _to_dict(stage.engine_args)
+            runtime_cfg = _to_dict(getattr(stage.stage_config, "runtime", {}))
+            stage_payload = {
+                "stage_id": stage.stage_id,
+                "engine_args": engine_args,
+                "runtime": runtime_cfg,
+                "shm_threshold_bytes": sys.maxsize, # Disable SHM for Ray mode by setting huge threshold
+                "connectors_config": stage_connectors_config or {},
+            }
+
+            # Start Actor
+            # Inject PYTHONPATH again for the specific actor to be safe
+            worker_actor = OmniStageRayWorker.options(
+                scheduling_strategy=PlacementGroupSchedulingStrategy(
+                    placement_group=self._ray_pg,
+                    placement_group_bundle_index=stage_id
+                ),
+                runtime_env={"env_vars": {"PYTHONPATH": os.environ.get("PYTHONPATH", "")}}
+            ).remote()
+
+            # Start worker loop asynchronously
+            worker_actor.run.remote(
+                _stage_worker,
+                model=model,
+                stage_payload=stage_payload,
+                in_q=in_q,
+                out_q=out_q,
+                log_file=self._log_file,
+                batch_timeout=self.batch_timeout,
+            )
+            
+            stage._ray_actor = worker_actor
+            logger.debug("[Orchestrator] Stage-%s Ray Actor started", stage_id)
+            time.sleep(self._init_sleep_seconds)
+
     def close(self) -> None:
+        import ray
         for q in self._stage_in_queues:
             try:
                 q.put_nowait(None)
@@ -166,9 +267,19 @@ class OmniLLM:
                 )
         for stage in self.stage_list:
             try:
-                stage.stop_stage_worker()
+                if self.worker_backend == "ray" and hasattr(stage, "_ray_actor"):
+                     # Ray kill
+                     ray.kill(stage._ray_actor)
+                else:
+                    stage.stop_stage_worker()
             except Exception as e:
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
+
+        if self.worker_backend == "ray" and self._ray_pg:
+            try:
+                ray.util.remove_placement_group(self._ray_pg)
+            except Exception as e:
+                logger.warning("[Orchestrator] Failed to remove placement group: %s", e)
 
     def __del__(self) -> None:  # best-effort
         try:
@@ -379,25 +490,43 @@ class OmniLLM:
                     if not sent_via_connector:
                         # Use original queue mechanism
                         try:
-                            size_bytes = 0
-                            try:
-                                size_bytes = len(_set(next_inputs))
-                            except Exception:
-                                size_bytes = 0
-                            t0 = time.time()
-                            ipc_payload = _encode(
-                                next_inputs,
-                                getattr(self, "_shm_threshold_bytes", 65536),
-                                obj_key="engine_inputs",
-                                shm_key="engine_inputs_shm",
-                            )
-                            ipc_payload.update(
-                                {
+                            if self.worker_backend == "ray":
+                                # Ray mode: Skip SHM fallback, just send object via Queue (Ray handles serialization)
+                                # This prevents SHM access errors across nodes
+                                ipc_payload = {
                                     "request_id": req_id,
+                                    "engine_inputs": next_inputs,
                                     "sampling_params": sp_next,
                                     "sent_ts": time.time(),
                                 }
-                            )
+                                size_bytes = 0 # Approximation or calculate size if needed
+                                try:
+                                    # Approximate size for stats
+                                    size_bytes = len(_set(next_inputs))
+                                except:
+                                    pass
+                                t0 = time.time()
+                                # Direct submit to Ray Queue
+                            else:
+                                size_bytes = 0
+                                try:
+                                    size_bytes = len(_set(next_inputs))
+                                except Exception:
+                                    size_bytes = 0
+                                t0 = time.time()
+                                ipc_payload = _encode(
+                                    next_inputs,
+                                    getattr(self, "_shm_threshold_bytes", 65536),
+                                    obj_key="engine_inputs",
+                                    shm_key="engine_inputs_shm",
+                                )
+                                ipc_payload.update(
+                                    {
+                                        "request_id": req_id,
+                                        "sampling_params": sp_next,
+                                        "sent_ts": time.time(),
+                                    }
+                                )
                             self.stage_list[next_stage_id].submit(ipc_payload)
                             t1 = time.time()
                             tx_ms = (t1 - t0) * 1000.0
