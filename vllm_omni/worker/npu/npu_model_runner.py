@@ -3,7 +3,7 @@
 
 import math
 from contextlib import contextmanager
-from typing import TYPE_CHECKING, Any, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Optional, Union, cast
 
 import numpy as np
 import torch
@@ -339,8 +339,8 @@ class OmniNPUModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def extract_multimodal_outputs(
-        self, hidden_states: Union[torch.Tensor, List[torch.Tensor]]
-    ) -> tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor], dict]]:
+        self, hidden_states: Union[torch.Tensor, list[torch.Tensor]]
+    ) -> tuple[torch.Tensor, Union[torch.Tensor, list[torch.Tensor], dict]]:
         """Extract multimodal outputs from hidden states."""
         if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
@@ -349,7 +349,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         elif isinstance(hidden_states, torch.Tensor):
             text_hidden_states = hidden_states
             multimodal_outputs = {}
-        elif isinstance(hidden_states, List):
+        elif isinstance(hidden_states, list):
             text_hidden_states = hidden_states[0]
             multimodal_outputs = {}
         else:

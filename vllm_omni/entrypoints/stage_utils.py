@@ -5,7 +5,7 @@ import logging
 import os
 import pickle
 from multiprocessing import shared_memory as _shm
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any
 
 import cloudpickle
 from omegaconf import OmegaConf
@@ -15,8 +15,8 @@ logger = logging.getLogger(__name__)
 
 def set_stage_devices(
     stage_id: int,
-    devices: Optional[Union[str, int]],
-    device_type: Optional[str] = None,
+    devices: str | int | None,
+    device_type: str | None = None,
 ) -> None:
     """Configure per-stage device visibility and current device (CUDA or NPU).
 
@@ -77,8 +77,8 @@ def set_stage_devices(
         return
 
     try:
-        selected_physical: Optional[int] = None
-        logical_idx: Optional[int] = None
+        selected_physical: int | None = None
+        logical_idx: int | None = None
 
         if isinstance(devices, str) and "," in devices:
             os.environ[env_var] = devices
@@ -159,7 +159,7 @@ def serialize_obj(obj: Any) -> bytes:
     return cloudpickle.dumps(obj)
 
 
-def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
+def shm_write_bytes(payload: bytes) -> dict[str, Any]:
     """Write bytes into SharedMemory and return meta dict {name,size}.
 
     Caller should close the segment; the receiver should unlink.
@@ -176,7 +176,7 @@ def shm_write_bytes(payload: bytes) -> Dict[str, Any]:
     return meta
 
 
-def shm_read_bytes(meta: Dict[str, Any]) -> bytes:
+def shm_read_bytes(meta: dict[str, Any]) -> bytes:
     """Read bytes from SharedMemory by meta {name,size} and cleanup."""
     shm = _shm.SharedMemory(name=meta["name"])  # type: ignore[index]
     mv = memoryview(shm.buf)
@@ -203,7 +203,7 @@ def _ensure_parent_dir(path: str) -> None:
         pass
 
 
-def append_jsonl(path: str, record: Dict[str, Any]) -> None:
+def append_jsonl(path: str, record: dict[str, Any]) -> None:
     """Append a JSON record as one line to a JSONL file (best-effort).
 
     This is safe to call from multiple processes when each process writes
@@ -220,7 +220,7 @@ def append_jsonl(path: str, record: Dict[str, Any]) -> None:
         logger.exception("Failed to append JSONL to %s", path)
 
 
-def maybe_dump_to_shm(obj: Any, threshold: int) -> Tuple[bool, Any]:
+def maybe_dump_to_shm(obj: Any, threshold: int) -> tuple[bool, Any]:
     """Dump object to SHM if serialized size exceeds threshold.
 
     Returns (True, meta) when dumped; otherwise (False, original_obj).
@@ -231,7 +231,7 @@ def maybe_dump_to_shm(obj: Any, threshold: int) -> Tuple[bool, Any]:
     return False, obj
 
 
-def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -> Any:
+def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
     """Load object from container that may carry SHM or inline object.
 
     Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
@@ -243,8 +243,8 @@ def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -
 
 
 def maybe_load_from_ipc_with_metrics(
-    container: Dict[str, Any], obj_key: str, shm_key: str
-) -> tuple[Any, Dict[str, float]]:
+    container: dict[str, Any], obj_key: str, shm_key: str
+) -> tuple[Any, dict[str, float]]:
     """Load object and return (object, metrics) with RX bytes and decode time.
 
     Metrics keys:
@@ -276,13 +276,13 @@ def maybe_load_from_ipc_with_metrics(
     }
 
 
-def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict[str, Any]:
+def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> dict[str, Any]:
     """Return a dict payload for IPC: inline (obj_key) or SHM (shm_key).
 
     When serialized size exceeds threshold, returns {shm_key: {name,size}};
     otherwise returns {obj_key: obj}.
     """
-    payload: Dict[str, Any] = {}
+    payload: dict[str, Any] = {}
     use_shm, data = maybe_dump_to_shm(obj, threshold)
     if use_shm:
         payload[shm_key] = data
@@ -292,7 +292,7 @@ def encode_for_ipc(obj: Any, threshold: int, obj_key: str, shm_key: str) -> Dict
 
 
 # Convert OmegaConf/objects to plain dicts
-def _to_dict(x: Any) -> Dict[str, Any]:
+def _to_dict(x: Any) -> dict[str, Any]:
     try:
         if isinstance(x, dict):
             return dict(x)

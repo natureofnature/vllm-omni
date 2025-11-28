@@ -45,9 +45,9 @@ from vllm_ascend.utils import (
     lmhead_tp_enable,
 )
 from vllm_ascend.worker.model_runner_v1 import AsyncNPUModelRunnerOutput
+from vllm_omni.worker.npu_model_runner import OmniNPUModelRunner
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.worker.npu_model_runner import OmniNPUModelRunner
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
