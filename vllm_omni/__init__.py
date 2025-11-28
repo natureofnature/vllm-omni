@@ -23,16 +23,16 @@ from .config import OmniModelConfig
 from .entrypoints.async_omni_llm import AsyncOmniLLM
 
 # Main entry points
-from .entrypoints.omni_llm import OmniLLM
+from .entrypoints.omni import Omni
 
-# from .version import __version__, __version_tuple__  # isort:skip
+from .version import __version__, __version_tuple__  # isort:skip
 
 
 __all__ = [
-    # "__version__",  # TODO: add __version__ back when it is implemented
-    # "__version_tuple__",  # TODO: add __version_tuple__ back when it is implemented
+    "__version__",
+    "__version_tuple__",
     # Main components
-    "OmniLLM",
+    "Omni",
     "AsyncOmniLLM",
     # Configuration
     "OmniModelConfig",
