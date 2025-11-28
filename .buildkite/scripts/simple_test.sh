@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 PYTHON_BIN="${PYTHON:-python3}"
 UV_BIN="uv"
+VENV_DIR="${VENV_DIR:-${REPO_ROOT}/.venv-simple-test}"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
@@ -27,6 +28,13 @@ if ! command -v "${UV_BIN}" >/dev/null 2>&1; then
   hash -r
 fi
 
-"${UV_BIN}" pip install --python "${PYTHON_BIN}" vllm==0.11.0
-"${UV_BIN}" pip install --python "${PYTHON_BIN}" -e ".[dev]"
-"${PYTHON_BIN}" -m pytest tests/test_omni_llm.py
+if [[ ! -d "${VENV_DIR}" ]]; then
+  "${UV_BIN}" venv --python "${PYTHON_BIN}" "${VENV_DIR}"
+fi
+
+VENV_PYTHON="${VENV_DIR}/bin/python"
+[[ -x "${VENV_PYTHON}" ]] || { echo "Python not found in ${VENV_DIR}"; exit 1; }
+
+"${UV_BIN}" pip install --python "${VENV_PYTHON}" vllm==0.11.0
+"${UV_BIN}" pip install --python "${VENV_PYTHON}" -e ".[dev]"
+"${VENV_PYTHON}" -m pytest tests/test_omni_llm.py
