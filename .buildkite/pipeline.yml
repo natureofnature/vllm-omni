@@ -3,4 +3,4 @@ steps:
     commands:
       - ".buildkite/scripts/simple_test.sh"
     agents:
-      queue: "gpu_1_queue" # g6.4xlarge instance on AWS, has 1 L4 GPU
+      queue: "cpu_queue_premerge"
