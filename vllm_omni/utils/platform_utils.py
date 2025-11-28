@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-from typing import Callable
-
 import torch
-
 from vllm.platforms import current_platform
 
 
@@ -28,8 +25,8 @@ def get_device_control_env_var() -> str:
         env_var = getattr(current_platform, "device_control_env_var", None)
         if isinstance(env_var, str) and env_var:
             return env_var
-    
+
     device_type = detect_device_type()
     if device_type == "npu":
         return "ASCEND_RT_VISIBLE_DEVICES"
-    return "CUDA_VISIBLE_DEVICES" # fallback
+    return "CUDA_VISIBLE_DEVICES"  # fallback

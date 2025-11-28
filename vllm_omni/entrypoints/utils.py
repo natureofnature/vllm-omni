@@ -3,8 +3,8 @@ from pathlib import Path
 from typing import Optional
 
 from omegaconf import OmegaConf
-
 from vllm.transformers_utils.config import get_config
+
 from vllm_omni.utils import detect_device_type
 
 # Get the project root directory (2 levels up from this file)

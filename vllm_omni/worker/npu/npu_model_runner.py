@@ -1,26 +1,20 @@
-"""NPU Model Runner base class for vLLM-omni.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-Provides multimodality extensions for NPU model runners, including payload
-decoding and multimodal output extraction.
-"""
-
+import math
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Union, cast
 
-import math
 import numpy as np
 import torch
-
 import vllm.envs as envs
 from vllm.config import CUDAGraphMode
-from vllm.distributed.kv_transfer import has_kv_transfer_group
+from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
 from vllm.distributed.parallel_state import get_pp_group
-from vllm.distributed.kv_transfer import get_kv_transfer_group
 from vllm.forward_context import BatchDescriptor, DPMetadata, get_forward_context
 from vllm.logger import init_logger
-from vllm.model_executor.models.interfaces import supports_mrope
-from vllm.model_executor.models.interfaces import SupportsMultiModal
+from vllm.model_executor.models.interfaces import SupportsMultiModal, supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.multimodal.inputs import MultiModalKwargsItem
@@ -30,14 +24,13 @@ from vllm.utils import cdiv, round_up
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata, split_attn_metadata
 from vllm.v1.outputs import KVConnectorOutput, LogprobsLists, LogprobsTensors, SamplerOutput
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
-from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.worker.utils import is_residual_scattered_for_sp, MultiModalBudget
 from vllm.v1.worker.gpu_model_runner import IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_splitting import ubatch_split
+from vllm.v1.worker.utils import MultiModalBudget, is_residual_scattered_for_sp
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.utils import enable_sp, lmhead_tp_enable, vllm_version_is
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 from vllm_ascend.worker.npu_input_batch import CachedRequestState
-from vllm_ascend.utils import enable_sp, vllm_version_is, lmhead_tp_enable
 
 from vllm_omni.engine import AdditionalInformationPayload, PromptEmbedsPayload
 
@@ -59,23 +52,25 @@ class OmniNPUModelRunner(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        
-        self.is_multimodal_raw_input_only_model = (
-            self.model_config.is_multimodal_raw_input_only_model)
+
+        self.is_multimodal_raw_input_only_model = self.model_config.is_multimodal_raw_input_only_model
         self.mm_registry = MULTIMODAL_REGISTRY
-        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(
-            self.model_config)
-        
+        self.supports_mm_inputs = self.mm_registry.supports_multimodal_inputs(self.model_config)
+
         self._mm_budget = None
 
     @property
     def mm_budget(self):
         if self._mm_budget is None:
-            self._mm_budget = MultiModalBudget(
-                self.model_config,
-                self.scheduler_config,
-                self.mm_registry,
-            ) if self.supports_mm_inputs else None
+            self._mm_budget = (
+                MultiModalBudget(
+                    self.model_config,
+                    self.scheduler_config,
+                    self.mm_registry,
+                )
+                if self.supports_mm_inputs
+                else None
+            )
         return self._mm_budget
 
     def _init_mrope_positions(self, req_state: CachedRequestState):
@@ -162,10 +157,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
 
-            if (
-                sampling_params
-                and sampling_params.sampling_type == SamplingType.RANDOM_SEED
-            ):
+            if sampling_params and sampling_params.sampling_type == SamplingType.RANDOM_SEED:
                 generator = torch.Generator(device=self.device)
                 generator.manual_seed(sampling_params.seed)
             else:
@@ -237,9 +229,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                     elif isinstance(payload_info, AdditionalInformationPayload):
                         for k, entry in payload_info.entries.items():
                             if entry.tensor_data is not None:
-                                dt = np.dtype(
-                                    getattr(entry, "tensor_dtype", "float32")
-                                )
+                                dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
                                 arr = np.frombuffer(entry.tensor_data, dtype=dt)
                                 arr = arr.reshape(entry.tensor_shape)
                                 info_dict[k] = torch.from_numpy(arr)
@@ -283,9 +273,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                 new_token_ids = req_data.new_token_ids[i]
                 # Add the sampled token(s) from the previous step (if any).
                 # This doesn't include "unverified" tokens like spec tokens.
-                num_new_tokens = (
-                    num_computed_tokens + len(new_token_ids) - req_state.num_tokens
-                )
+                num_new_tokens = num_computed_tokens + len(new_token_ids) - req_state.num_tokens
                 if num_new_tokens == 1:
                     # Avoid slicing list in most common case.
                     req_state.output_token_ids.append(new_token_ids[-1])
@@ -323,23 +311,17 @@ class OmniNPUModelRunner(NPUModelRunner):
                 # Add new_token_ids to token_ids_cpu.
                 start_token_index = num_computed_tokens
                 end_token_index = num_computed_tokens + len(new_token_ids)
-                self.input_batch.token_ids_cpu[
-                    req_index, start_token_index:end_token_index
-                ] = new_token_ids
+                self.input_batch.token_ids_cpu[req_index, start_token_index:end_token_index] = new_token_ids
                 self.input_batch.num_tokens_no_spec[req_index] = end_token_index
                 self.input_batch.num_tokens[req_index] = end_token_index
 
             # Add spec_token_ids to token_ids_cpu.
-            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(
-                req_id, ()
-            )
+            spec_token_ids = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
             if spec_token_ids:
                 num_spec_tokens = len(spec_token_ids)
                 start_index = self.input_batch.num_tokens_no_spec[req_index]
                 end_token_index = start_index + num_spec_tokens
-                self.input_batch.token_ids_cpu[
-                    req_index, start_index:end_token_index
-                ] = spec_token_ids
+                self.input_batch.token_ids_cpu[req_index, start_index:end_token_index] = spec_token_ids
                 # NOTE(woosuk): `num_tokens` here may include spec tokens.
                 self.input_batch.num_tokens[req_index] += num_spec_tokens
 
@@ -360,10 +342,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         self, hidden_states: Union[torch.Tensor, List[torch.Tensor]]
     ) -> tuple[torch.Tensor, Union[torch.Tensor, List[torch.Tensor], dict]]:
         """Extract multimodal outputs from hidden states."""
-        if (
-            hasattr(self.model, "have_multimodal_outputs")
-            and self.model.have_multimodal_outputs
-        ):
+        if hasattr(self.model, "have_multimodal_outputs") and self.model.have_multimodal_outputs:
             text_hidden_states = hidden_states.text_hidden_states
             multimodal_outputs = hidden_states.multimodal_outputs
 
@@ -378,8 +357,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         return text_hidden_states, multimodal_outputs
 
     def _sample(
-        self, logits: Optional[torch.Tensor],
-        spec_decode_metadata: Optional[SpecDecodeMetadata]
+        self, logits: Optional[torch.Tensor], spec_decode_metadata: Optional[SpecDecodeMetadata]
     ) -> SamplerOutput:
         sampling_metadata = self.input_batch.sampling_metadata
         if spec_decode_metadata is None:
@@ -411,9 +389,12 @@ class OmniNPUModelRunner(NPUModelRunner):
         return sampler_output
 
     def _bookkeeping_sync(
-        self, scheduler_output: "SchedulerOutput",
-        sampler_output: SamplerOutput, logits: Optional[torch.Tensor],
-        hidden_states: torch.Tensor, num_scheduled_tokens: int
+        self,
+        scheduler_output: "SchedulerOutput",
+        sampler_output: SamplerOutput,
+        logits: Optional[torch.Tensor],
+        hidden_states: torch.Tensor,
+        num_scheduled_tokens: int,
     ) -> tuple[
         dict[str, int],
         Optional[LogprobsLists],
@@ -432,8 +413,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         req_id_to_index_output_copy = self.input_batch.req_id_to_index.copy()
 
         logprobs_tensors = sampler_output.logprobs_tensors
-        logprobs_lists = logprobs_tensors.tolists() \
-            if logprobs_tensors is not None else None
+        logprobs_lists = logprobs_tensors.tolists() if logprobs_tensors is not None else None
 
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
@@ -443,7 +423,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         num_sampled_tokens = sampler_output.sampled_token_ids.shape[0]
         sampled_token_ids = sampler_output.sampled_token_ids
         invalid_req_indices = []
-        
+
         if not self.use_async_scheduling:
             max_gen_len = sampled_token_ids.shape[-1]
             if max_gen_len == 1:
@@ -456,8 +436,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             discard_sampled_tokens_req_indices = []
             for i, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests[req_id]
-                seq_len = (req_state.num_computed_tokens +
-                          scheduler_output.num_scheduled_tokens[req_id])
+                seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
                 if seq_len < req_state.num_tokens:
                     discard_sampled_tokens_req_indices.append(i)
             for i in discard_sampled_tokens_req_indices:
@@ -467,8 +446,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             discard_sampled_tokens_req_indices = []
             for i, req_id in enumerate(self.input_batch.req_ids):
                 req_state = self.requests[req_id]
-                seq_len = (req_state.num_computed_tokens +
-                          scheduler_output.num_scheduled_tokens[req_id])
+                seq_len = req_state.num_computed_tokens + scheduler_output.num_scheduled_tokens[req_id]
                 if seq_len < req_state.num_tokens:
                     discard_sampled_tokens_req_indices.append(i)
             invalid_req_indices = discard_sampled_tokens_req_indices
@@ -478,10 +456,8 @@ class OmniNPUModelRunner(NPUModelRunner):
             self.input_batch.prev_sampled_token_ids = sampled_token_ids
             self.input_batch.prev_sampled_token_ids_invalid_indices = invalid_req_indices_set
             self.input_batch.prev_req_id_to_index = {
-                req_id: i
-                for i, req_id in enumerate(self.input_batch.req_ids)
-                    if i not in invalid_req_indices_set
-                }
+                req_id: i for i, req_id in enumerate(self.input_batch.req_ids) if i not in invalid_req_indices_set
+            }
 
         req_ids = self.input_batch.req_ids
         for req_idx in range(num_sampled_tokens):
@@ -497,7 +473,8 @@ class OmniNPUModelRunner(NPUModelRunner):
             assert end_idx <= self.model_config.max_model_len, (
                 "Sampled token IDs exceed the max model length. "
                 f"Total number of tokens: {end_idx} > max_model_len: "
-                f"{self.model_config.max_model_len}")
+                f"{self.model_config.max_model_len}"
+            )
 
             self.input_batch.token_ids_cpu[req_idx, start_idx:end_idx] = sampled_ids
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
@@ -517,9 +494,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             invalid_req_indices,
         )
 
-    def get_dp_padding(
-        self, num_tokens: int
-    ) -> tuple[int, Optional[torch.Tensor]]:
+    def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         """Determines the total number of tokens that each rank will run."""
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         dp_rank = self.vllm_config.parallel_config.data_parallel_rank
@@ -527,19 +502,14 @@ class OmniNPUModelRunner(NPUModelRunner):
         if dp_size == 1 or self.vllm_config.model_config.enforce_eager:
             return 0, None
 
-        num_tokens_across_dp = DPMetadata.num_tokens_across_dp(
-            num_tokens, dp_size, dp_rank)
+        num_tokens_across_dp = DPMetadata.num_tokens_across_dp(num_tokens, dp_size, dp_rank)
         max_tokens_across_dp_cpu = torch.max(num_tokens_across_dp).item()
-        num_tokens_after_padding = torch.tensor([max_tokens_across_dp_cpu] *
-                                                dp_size,
-                                                device="cpu",
-                                                dtype=torch.int32)
+        num_tokens_after_padding = torch.tensor([max_tokens_across_dp_cpu] * dp_size, device="cpu", dtype=torch.int32)
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_after_padding
 
     def _get_num_input_tokens(self, num_scheduled_tokens: int) -> int:
         """Calculate input token count with padding if needed."""
-        if (self.use_aclgraph and num_scheduled_tokens
-                <= self.aclgraph_batch_sizes[-1]):
+        if self.use_aclgraph and num_scheduled_tokens <= self.aclgraph_batch_sizes[-1]:
             # Add padding to the batch size for ACLGraph.
             # Note: pad_for_cudagraph works for both CUDA graphs and ACLGraph
             return self.vllm_config.pad_for_cudagraph(num_scheduled_tokens)
@@ -548,42 +518,47 @@ class OmniNPUModelRunner(NPUModelRunner):
         # Pad tokens to multiple of tensor_parallel_size when
         # enabled collective fusion for SP
         tp_size = self.vllm_config.parallel_config.tensor_parallel_size
-        if (self.compilation_config.pass_config.enable_sequence_parallelism
-                and tp_size > 1):
+        if self.compilation_config.pass_config.enable_sequence_parallelism and tp_size > 1:
             return round_up(num_scheduled_tokens, tp_size)
         return num_scheduled_tokens
 
-    def _generate_dummy_run_hidden_states(self, with_prefill,
-                                          is_torchair_compile, input_ids,
-                                          positions, attn_metadata, num_tokens,
-                                          intermediate_tensors, inputs_embeds,
-                                          model_kwargs=None):
+    def _generate_dummy_run_hidden_states(
+        self,
+        with_prefill,
+        is_torchair_compile,
+        input_ids,
+        positions,
+        attn_metadata,
+        num_tokens,
+        intermediate_tensors,
+        inputs_embeds,
+        model_kwargs=None,
+    ):
         """Override to support model_kwargs for multimodal/pooling models."""
         if model_kwargs is None:
             model_kwargs = {}
 
-        hidden_states = self.model(input_ids=input_ids,
-                                   positions=positions,
-                                   intermediate_tensors=intermediate_tensors,
-                                   inputs_embeds=inputs_embeds,
-                                   **model_kwargs)
-        
+        hidden_states = self.model(
+            input_ids=input_ids,
+            positions=positions,
+            intermediate_tensors=intermediate_tensors,
+            inputs_embeds=inputs_embeds,
+            **model_kwargs,
+        )
+
         from vllm_ascend.compilation.acl_graph import update_attn_params, update_mla_attn_params
-        
+
         forward_context = get_forward_context()
         assert forward_context is not None
-        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and \
-            not forward_context.capturing:
+        if forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL and not forward_context.capturing:
             if self.vllm_config.model_config.use_mla:
                 # FIXME: Try using `auto_dispatch_capture=True`
-                update_mla_attn_params(self.update_stream, forward_context,
-                                   positions.shape[0],
-                                   self.speculative_config)
+                update_mla_attn_params(self.update_stream, forward_context, positions.shape[0], self.speculative_config)
             else:
-                update_attn_params(self.update_stream, forward_context,
-                                   positions.shape[0])
+                update_attn_params(self.update_stream, forward_context, positions.shape[0])
 
         from vllm_ascend.spec_decode.interface import SpecDcodeType
+
         if self.drafter and self.drafter.name == SpecDcodeType.EAGLE3:
             hidden_states, _ = hidden_states
         else:
@@ -602,9 +577,10 @@ class OmniNPUModelRunner(NPUModelRunner):
 
         token_type_id_requests = dict[int, Any]()
         for i, param in enumerate(pooling_params):
-            if param.extra_kwargs is not None and \
-            (token_types := param.extra_kwargs.get(
-                "compressed_token_type_ids")) is not None:
+            if (
+                param.extra_kwargs is not None
+                and (token_types := param.extra_kwargs.get("compressed_token_type_ids")) is not None
+            ):
                 token_type_id_requests[i] = token_types
 
         if len(token_type_id_requests) == 0:
@@ -618,13 +594,11 @@ class OmniNPUModelRunner(NPUModelRunner):
             ids = (torch.arange(seq_lens[i]) >= pos).int()
             token_type_ids.append(ids)
 
-        model_kwargs["token_type_ids"] = torch.concat(token_type_ids).to(
-            device=self.device)
+        model_kwargs["token_type_ids"] = torch.concat(token_type_ids).to(device=self.device)
         return model_kwargs
 
     def sync_and_slice_intermediate_tensors(
-        self, num_tokens: int, intermediate_tensors: IntermediateTensors,
-        sync_self: bool
+        self, num_tokens: int, intermediate_tensors: IntermediateTensors, sync_self: bool
     ) -> IntermediateTensors:
         """Sync and slice intermediate tensors for pipeline parallelism."""
         assert self.intermediate_tensors is not None
@@ -637,13 +611,14 @@ class OmniNPUModelRunner(NPUModelRunner):
             for k, v in intermediate_tensors.items():
                 is_scattered = k == "residual" and is_rs
                 copy_len = num_tokens // tp if is_scattered else num_tokens
-                self.intermediate_tensors[k][:copy_len].copy_(
-                    v[:copy_len], non_blocking=True)
+                self.intermediate_tensors[k][:copy_len].copy_(v[:copy_len], non_blocking=True)
 
-        return IntermediateTensors({
-            k: v[:num_tokens // tp] if k == "residual" and is_rs else v[:num_tokens]
-            for k, v in self.intermediate_tensors.items()
-        })
+        return IntermediateTensors(
+            {
+                k: v[: num_tokens // tp] if k == "residual" and is_rs else v[:num_tokens]
+                for k, v in self.intermediate_tensors.items()
+            }
+        )
 
     def _extract_mm_kwargs(
         self,
@@ -660,7 +635,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                 mm_features = getattr(req, "mm_features", None)
             else:
                 mm_features = getattr(req, "mm_kwargs", None)
-            
+
             if mm_features:
                 if isinstance(mm_features, list):
                     for feature in mm_features:
@@ -675,10 +650,10 @@ class OmniNPUModelRunner(NPUModelRunner):
         model = cast(SupportsMultiModal, self.model)
         mm_kwargs_combined: dict = {}
         for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
-                mm_kwargs,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                merge_by_field_config=model.merge_by_field_config,
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            merge_by_field_config=model.merge_by_field_config,
         ):
             mm_kwargs_combined.update(mm_kwargs_group)
 
@@ -700,10 +675,10 @@ class OmniNPUModelRunner(NPUModelRunner):
         model = cast(SupportsMultiModal, self.model)
         encoder_features = {}
         for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
-                mm_kwargs,
-                device=self.device,
-                pin_memory=self.pin_memory,
-                merge_by_field_config=model.merge_by_field_config,
+            mm_kwargs,
+            device=self.device,
+            pin_memory=self.pin_memory,
+            merge_by_field_config=model.merge_by_field_config,
         ):
             encoder_features.update(mm_kwargs_group)
 
@@ -712,11 +687,11 @@ class OmniNPUModelRunner(NPUModelRunner):
     @contextmanager
     def synchronize_input_prep(self):
         """Synchronize input preparation for async scheduling."""
-        if getattr(self, 'use_async_scheduling', False):
+        if getattr(self, "use_async_scheduling", False):
             if not hasattr(self, "prepare_inputs_event") or self.prepare_inputs_event is None:
                 self.prepare_inputs_event = torch.npu.Event()
                 self.prepare_inputs_event.record(torch.npu.current_stream())
-        
+
         if not hasattr(self, "prepare_inputs_event") or self.prepare_inputs_event is None:
             yield
             return
@@ -728,9 +703,7 @@ class OmniNPUModelRunner(NPUModelRunner):
             self.prepare_inputs_event.record()
 
     @contextmanager
-    def maybe_get_kv_connector_output(
-        self, scheduler_output: "SchedulerOutput"
-    ):
+    def maybe_get_kv_connector_output(self, scheduler_output: "SchedulerOutput"):
         """KV connector context manager."""
         if not has_kv_transfer_group():
             yield None
@@ -741,28 +714,27 @@ class OmniNPUModelRunner(NPUModelRunner):
         kv_connector = get_kv_transfer_group()
         assert isinstance(kv_connector, KVConnectorBase_V1)
         assert scheduler_output.kv_connector_metadata is not None
-        kv_connector.bind_connector_metadata(
-            scheduler_output.kv_connector_metadata)
+        kv_connector.bind_connector_metadata(scheduler_output.kv_connector_metadata)
 
         kv_connector.start_load_kv(get_forward_context())
         try:
             yield output
         finally:
             kv_connector.wait_for_save()
-            output.finished_sending, output.finished_recving = (
-                kv_connector.get_finished(scheduler_output.finished_req_ids))
+            output.finished_sending, output.finished_recving = kv_connector.get_finished(
+                scheduler_output.finished_req_ids
+            )
             output.kv_connector_stats = kv_connector.get_kv_connector_stats()
             kv_connector.clear_connector_metadata()
 
     def pad_out_ubatch_slice(self, ubatch_slices, num_total_tokens: int):
         """Pad ubatch slice for DBO (Dynamic Batch Overlap)."""
         from vllm.v1.worker.ubatch_utils import UBatchSlice
+
         if len(ubatch_slices) < 2:
             return
-        padded_second_ubatch_slice = slice(ubatch_slices[1].token_slice.start,
-                                           num_total_tokens)
-        ubatch_slices[1] = UBatchSlice(padded_second_ubatch_slice,
-                                       padded_second_ubatch_slice)
+        padded_second_ubatch_slice = slice(ubatch_slices[1].token_slice.start, num_total_tokens)
+        ubatch_slices[1] = UBatchSlice(padded_second_ubatch_slice, padded_second_ubatch_slice)
 
     def eplb_step(self, is_dummy: bool = False, is_profile: bool = False) -> None:
         """Step for EPLB (Expert Parallelism Load Balancing)."""
@@ -777,7 +749,7 @@ class OmniNPUModelRunner(NPUModelRunner):
     ) -> dict:
         """Dummy data for profiling and precompiling multimodal models."""
         assert self.mm_budget is not None
-        
+
         dummy_decoder_data = self.mm_registry.get_decoder_dummy_data(
             model_config=self.model_config,
             seq_len=self.max_model_len,
@@ -785,27 +757,29 @@ class OmniNPUModelRunner(NPUModelRunner):
             cache=self.mm_budget.cache,
         )
         dummy_mm_data = dummy_decoder_data.multi_modal_data
-        
+
         dummy_mm_item = dummy_mm_data[modality][0]
         dummy_mm_items = [dummy_mm_item] * max_items_per_batch
-        
+
         model = cast(SupportsMultiModal, self.model)
-        return next(mm_kwargs_group
-                    for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
-                        dummy_mm_items,
-                        device=self.device,
-                        pin_memory=getattr(self, "pin_memory", False),
-                        merge_by_field_config=model.merge_by_field_config,
-                    ))
+        return next(
+            mm_kwargs_group
+            for _, _, mm_kwargs_group in group_mm_kwargs_by_modality(
+                dummy_mm_items,
+                device=self.device,
+                pin_memory=getattr(self, "pin_memory", False),
+                merge_by_field_config=model.merge_by_field_config,
+            )
+        )
 
     def _dummy_mm_kwargs(self, num_seqs: int) -> dict:
         """Return dummy multimodal kwargs for dummy runs."""
         if not self.is_multimodal_raw_input_only_model:
             return {}
-        
+
         mm_budget = self.mm_budget
         assert mm_budget is not None
-        
+
         dummy_modality = mm_budget.get_modality_with_max_tokens()
         return self._get_mm_dummy_batch(dummy_modality, num_seqs)
 
@@ -814,31 +788,28 @@ class OmniNPUModelRunner(NPUModelRunner):
         """Randomize input_ids if VLLM_RANDOMIZE_DP_DUMMY_INPUTS is set."""
         dp_size = self.vllm_config.parallel_config.data_parallel_size
         randomize_inputs = envs.VLLM_RANDOMIZE_DP_DUMMY_INPUTS and dp_size > 1
-        
+
         if not randomize_inputs:
             yield
             return
-        
+
         if input_ids is None:
             yield
             return
-        
+
         import functools
-        
+
         @functools.cache
         def rand_input_ids() -> torch.Tensor:
             return torch.randint_like(
                 self.input_ids,
                 low=0,
                 high=self.model_config.get_vocab_size(),
-                dtype=input_ids.dtype, 
+                dtype=input_ids.dtype,
             )
-        
+
         logger.debug_once("Randomizing dummy data for DP Rank")
-        input_ids.copy_(
-            rand_input_ids()[:input_ids.size(0)],
-            non_blocking=True
-        )
+        input_ids.copy_(rand_input_ids()[: input_ids.size(0)], non_blocking=True)
         yield
         input_ids.fill_(0)
 
@@ -857,7 +828,7 @@ class OmniNPUModelRunner(NPUModelRunner):
         remove_lora: bool = True,
     ) -> torch.Tensor:
         """Run a dummy forward pass to warm up/profile run or capture the ACL graph for the model.
-        
+
         Args:
             num_tokens: Number of tokens to run the dummy forward pass.
             cudagraph_runtime_mode: Used to control the behavior.
@@ -887,14 +858,19 @@ class OmniNPUModelRunner(NPUModelRunner):
             num_tokens = math.ceil(num_tokens / tp_size) * tp_size
 
         with_prefill = create_mixed_batch or (not uniform_decode and num_tokens > 1)
-        
-        if hasattr(self, "is_kv_producer") and self.is_kv_producer and \
-           hasattr(self, "is_kv_consumer") and not self.is_kv_consumer:
+
+        if (
+            hasattr(self, "is_kv_producer")
+            and self.is_kv_producer
+            and hasattr(self, "is_kv_consumer")
+            and not self.is_kv_consumer
+        ):
             with_prefill = True
 
         if hasattr(self, "_sync_metadata_across_dp"):
-            (num_tokens, num_tokens_across_dp, with_prefill, _) = \
-                self._sync_metadata_across_dp(num_tokens, with_prefill, False)
+            (num_tokens, num_tokens_across_dp, with_prefill, _) = self._sync_metadata_across_dp(
+                num_tokens, with_prefill, False
+            )
         else:
             num_tokens_across_dp = None
 
@@ -907,7 +883,7 @@ class OmniNPUModelRunner(NPUModelRunner):
 
         assert num_tokens <= self.scheduler_config.max_num_batched_tokens
         max_num_reqs = self.scheduler_config.max_num_seqs
-        
+
         if create_mixed_batch:
             assert not uniform_decode
             num_decode_tokens = num_tokens // 2
@@ -940,7 +916,7 @@ class OmniNPUModelRunner(NPUModelRunner):
 
         ubatch_slices = None
         num_tokens_after_padding = None
-        
+
         if self.parallel_config.enable_dbo and allow_microbatching:
             ubatch_slices, ubatch_num_tokens_after_padding = ubatch_split(
                 num_scheduled_tokens,
@@ -962,7 +938,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                 num_tokens_after_padding = int(num_tokens_after_padding[0])
 
         attn_metadata: Optional[PerLayerAttnMetadata] = None
-        
+
         if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
             attn_metadata = {}
             if ubatch_slices is not None:
@@ -973,7 +949,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                 seq_lens = [1] * num_decode_tokens + [num_prefill_tokens + 1]
             else:
                 seq_lens = max_query_len
-            
+
             self.seq_lens_np[:num_reqs] = seq_lens
             self.seq_lens_np[num_reqs:] = 0
             if isinstance(seq_lens, list):
@@ -989,40 +965,27 @@ class OmniNPUModelRunner(NPUModelRunner):
             self.query_start_loc_np[1 : num_reqs + 1] = cum_num_tokens
             self.query_start_loc_cpu[0] = 0
             self.query_start_loc_cpu[1 : num_reqs + 1] = torch.from_numpy(cum_num_tokens)
-            self.query_start_loc[:num_reqs + 1].copy_(
-                self.query_start_loc_cpu[:num_reqs + 1], non_blocking=True)
+            self.query_start_loc[: num_reqs + 1].copy_(self.query_start_loc_cpu[: num_reqs + 1], non_blocking=True)
 
-            for kv_cache_group_id, kv_cache_group_spec in enumerate(
-                self.kv_cache_config.kv_cache_groups
-            ):
+            for kv_cache_group_id, kv_cache_group_spec in enumerate(self.kv_cache_config.kv_cache_groups):
                 common_attn_metadata = CommonAttentionMetadata(
                     query_start_loc=self.query_start_loc[: num_reqs + 1],
                     query_start_loc_cpu=self.query_start_loc_cpu[: num_reqs + 1],
                     seq_lens=self.seq_lens[:num_reqs],
                     seq_lens_cpu=self.seq_lens_cpu[:num_reqs],
-                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[
-                        :num_reqs
-                    ],
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
                     num_reqs=num_reqs,
                     num_actual_tokens=num_tokens,
                     max_query_len=max_query_len,
                     max_seq_len=self.max_model_len,
-                    block_table_tensor=self.input_batch.block_table[
-                        kv_cache_group_id
-                    ].get_device_tensor(num_reqs),
-                    slot_mapping=self.input_batch.block_table[
-                        kv_cache_group_id
-                    ].slot_mapping[:num_tokens],
+                    block_table_tensor=self.input_batch.block_table[kv_cache_group_id].get_device_tensor(num_reqs),
+                    slot_mapping=self.input_batch.block_table[kv_cache_group_id].slot_mapping[:num_tokens],
                     causal=True,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
                     if ubatch_slices is not None:
-                        common_attn_metadata_list = split_attn_metadata(
-                            ubatch_slices, common_attn_metadata
-                        )
-                        for ubid, common_attn_metadata in enumerate(
-                            common_attn_metadata_list
-                        ):
+                        common_attn_metadata_list = split_attn_metadata(ubatch_slices, common_attn_metadata)
+                        for ubid, common_attn_metadata in enumerate(common_attn_metadata_list):
                             assert common_attn_metadata.max_query_len == 1
                             attn_metadata_i = attn_group.get_metadata_builder(
                                 ubatch_id=ubid
@@ -1038,11 +1001,9 @@ class OmniNPUModelRunner(NPUModelRunner):
                         for layer_name in attn_group.layer_names:
                             attn_metadata[layer_name] = attn_metadata_i
 
-        with self.maybe_dummy_run_with_lora(
-            self.lora_config, num_scheduled_tokens, remove_lora
-        ):
+        with self.maybe_dummy_run_with_lora(self.lora_config, num_scheduled_tokens, remove_lora):
             model_kwargs = self._init_model_kwargs(num_tokens)
-            
+
             # Prepare inputs (NPU uses direct tensor access, not .gpu buffers)
             if self.supports_mm_inputs and not self.model_config.is_encoder_decoder:
                 input_ids = None
@@ -1069,12 +1030,10 @@ class OmniNPUModelRunner(NPUModelRunner):
                 intermediate_tensors = None
             else:
                 if self.intermediate_tensors is None:
-                    self.intermediate_tensors = (
-                        self.model.make_empty_intermediate_tensors(
-                            batch_size=self.max_num_tokens,
-                            dtype=self.model_config.dtype,
-                            device=self.device,
-                        )
+                    self.intermediate_tensors = self.model.make_empty_intermediate_tensors(
+                        batch_size=self.max_num_tokens,
+                        dtype=self.model_config.dtype,
+                        device=self.device,
                     )
                 intermediate_tensors = self.sync_and_slice_intermediate_tensors(
                     num_tokens, self.intermediate_tensors, False
@@ -1090,14 +1049,11 @@ class OmniNPUModelRunner(NPUModelRunner):
                 )
             else:
                 _cg_mode, batch_descriptor = (CUDAGraphMode.NONE, None)
-            
+
             # Map GPU parameter name to NPU internal name for clarity
             # cudagraph_runtime_mode (GPU signature) → aclgraph_runtime_mode (NPU internal)
             if cudagraph_runtime_mode is not None:
-                assert (
-                    cudagraph_runtime_mode == CUDAGraphMode.NONE
-                    or cudagraph_runtime_mode == _cg_mode
-                ), (
+                assert cudagraph_runtime_mode == CUDAGraphMode.NONE or cudagraph_runtime_mode == _cg_mode, (
                     f"ACL graph runtime mode mismatch at dummy_run. "
                     f"Expected {_cg_mode}, but got {cudagraph_runtime_mode}."
                 )
@@ -1118,33 +1074,36 @@ class OmniNPUModelRunner(NPUModelRunner):
                 if hasattr(self, "eplb_updator"):
                     self.eplb_updator.forward_before()
 
-            need_dummy_logits = (not self.in_profile_run and lmhead_tp_enable())
+            need_dummy_logits = not self.in_profile_run and lmhead_tp_enable()
             dummy_indices = None
             dummy_compute_logits = None
-            
+
             if need_dummy_logits:
                 max_num_reqs_across_dp = num_tokens if not with_prefill else max_num_reqs
                 dummy_indices = torch.zeros(max_num_reqs_across_dp, dtype=torch.int32, device=self.device)
-                
+
                 def dummy_compute_logits(hidden_states):
                     return self.model.compute_logits(hidden_states[dummy_indices])
 
             try:
-                with self.maybe_randomize_inputs(input_ids), set_ascend_forward_context(
-                    attn_metadata,
-                    self.vllm_config,
-                    num_tokens=num_tokens_after_padding,
-                    num_tokens_across_dp=num_tokens_across_dp,
-                    with_prefill=with_prefill,
-                    in_profile_run=self.in_profile_run,
-                    reserved_mc2_mask=getattr(self, "reserved_mc2_mask", None),
-                    moe_comm_type=moe_comm_type,
-                    num_actual_tokens=0,
-                    aclgraph_runtime_mode=aclgraph_runtime_mode,
-                    batch_descriptor=batch_descriptor,
-                    prefetch_stream=getattr(self, "prefetch_stream", None),
-                    model_instance=self.model,
-                    weight_prefetch_method=getattr(self, "weight_prefetch_method", None),
+                with (
+                    self.maybe_randomize_inputs(input_ids),
+                    set_ascend_forward_context(
+                        attn_metadata,
+                        self.vllm_config,
+                        num_tokens=num_tokens_after_padding,
+                        num_tokens_across_dp=num_tokens_across_dp,
+                        with_prefill=with_prefill,
+                        in_profile_run=self.in_profile_run,
+                        reserved_mc2_mask=getattr(self, "reserved_mc2_mask", None),
+                        moe_comm_type=moe_comm_type,
+                        num_actual_tokens=0,
+                        aclgraph_runtime_mode=aclgraph_runtime_mode,
+                        batch_descriptor=batch_descriptor,
+                        prefetch_stream=getattr(self, "prefetch_stream", None),
+                        model_instance=self.model,
+                        weight_prefetch_method=getattr(self, "weight_prefetch_method", None),
+                    ),
                 ):
                     hidden_states = self._generate_dummy_run_hidden_states(
                         with_prefill=with_prefill,
@@ -1157,7 +1116,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                         inputs_embeds=inputs_embeds,
                         model_kwargs=model_kwargs,
                     )
-                    
+
                     if need_dummy_logits:
                         dummy_compute_logits(hidden_states)
 
@@ -1173,7 +1132,7 @@ class OmniNPUModelRunner(NPUModelRunner):
                     )
                     if need_dummy_logits:
                         self.drafter.model.compute_logits(hidden_states[dummy_indices])
-                
+
                 if self.in_profile_run and hasattr(self, "dynamic_eplb") and self.dynamic_eplb:
                     if hasattr(self, "model"):
                         self.model.clear_all_moe_loads()

@@ -724,17 +724,17 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
     else:
         beta = 0.0
 
-    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32, device='cpu')
+    kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu")
 
     # Compute time indices
     if is_even:
-        time_indices = torch.arange(-half_size, half_size, device='cpu') + 0.5
+        time_indices = torch.arange(-half_size, half_size, device="cpu") + 0.5
     else:
-        time_indices = torch.arange(kernel_size, device='cpu') - half_size
+        time_indices = torch.arange(kernel_size, device="cpu") - half_size
 
     # Compute sinc filter
     if cutoff == 0:
-        return torch.zeros((1, 1, kernel_size), dtype=torch.float32, device='cpu')  # Ensures correct shape
+        return torch.zeros((1, 1, kernel_size), dtype=torch.float32, device="cpu")  # Ensures correct shape
 
     sinc_filter = torch.sinc(2 * cutoff * time_indices)
     normalized_filter = 2 * cutoff * kaiser_window * sinc_filter
@@ -744,24 +744,22 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
 
     return normalized_filter.view(1, 1, kernel_size)
 
-def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int,
-                       pad_right: int) -> torch.Tensor:
+
+def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: int) -> torch.Tensor:
     """Manual replicate padding to avoid replication_pad1d kernel limits on NPU."""
-    # NOTE: a immature implmentation for running in Ascend NPU. Need to discuss.
+    # NOTE: a immature implementation for running in Ascend NPU. Need to discuss.
     if pad_left == 0 and pad_right == 0:
         return hidden_states
 
     segments = []
     if pad_left > 0:
-        left = hidden_states[..., :1].expand(
-            *hidden_states.shape[:-1], pad_left)
+        left = hidden_states[..., :1].expand(*hidden_states.shape[:-1], pad_left)
         segments.append(left)
 
     segments.append(hidden_states)
 
     if pad_right > 0:
-        right = hidden_states[..., -1:].expand(
-            *hidden_states.shape[:-1], pad_right)
+        right = hidden_states[..., -1:].expand(*hidden_states.shape[:-1], pad_right)
         segments.append(right)
 
     return torch.cat(segments, dim=-1)
@@ -785,12 +783,8 @@ class UpSample1d(nn.Module):
         input_dtype = hidden_states.dtype
         # F.pad in Ascend doesn't support BF16 when mode is replicate.
         # To ensure the accuracy, manually pad the input tensor.
-        hidden_states = replication_pad_1d(
-            hidden_states.to(self.filter.dtype), self.pad, self.pad
-        )
-        filter_on_device = self.filter.to(
-            device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad, self.pad)
+        filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
         hidden_states = self.ratio * F.conv_transpose1d(
             hidden_states,
             filter_on_device.expand(channels, -1, -1),
@@ -825,12 +819,8 @@ class DownSample1d(nn.Module):
         input_dtype = hidden_states.dtype
         # F.pad in Ascend doesn't support BF16 when mode is replicate.
         # To ensure the accuracy, manually pad the input tensor.
-        hidden_states = replication_pad_1d(
-            hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right
-        )
-        filter_on_device = self.filter.to(
-            device=hidden_states.device, dtype=hidden_states.dtype
-        )
+        hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right)
+        filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
         out = F.conv1d(
             hidden_states,
             filter_on_device.expand(channels, -1, -1),

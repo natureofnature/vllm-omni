@@ -426,6 +426,7 @@ def _stage_worker(
     # Device mapping
     try:
         from vllm_omni.utils import detect_device_type
+
         device_type = detect_device_type()
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:
@@ -720,6 +721,7 @@ async def _stage_worker_async(
     # Device mapping
     try:
         from vllm_omni.utils import detect_device_type
+
         device_type = detect_device_type()
         set_stage_devices(stage_id, runtime_cfg.get("devices"), device_type=device_type)
     except Exception as e:

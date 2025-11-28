@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple, Union
-
-import logging
 import json
+import logging
 import os
 import pickle
 from multiprocessing import shared_memory as _shm
-from omegaconf import OmegaConf
+from typing import Any, Dict, Optional, Tuple, Union
+
 import cloudpickle
+from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +88,10 @@ def set_stage_devices(
                     selected_physical = int(toks[0])
                     logger.debug(
                         "[Stage-%s] Set %s to %s; logical 0 -> physical %s",
-                        stage_id, env_var, devices, selected_physical,
+                        stage_id,
+                        env_var,
+                        devices,
+                        selected_physical,
                     )
                 except Exception as e:
                     logger.debug("[Stage-%s] Failed to parse first %s device: %s", stage_id, device_type_label, e)
@@ -109,7 +112,10 @@ def set_stage_devices(
             os.environ[env_var] = str(selected_physical)
             logger.debug(
                 "[Stage-%s] Logical index %d -> physical %s; set %s to single device",
-                stage_id, logical_idx + 1, selected_physical, env_var,
+                stage_id,
+                logical_idx + 1,
+                selected_physical,
+                env_var,
             )
         elif devices in (None, "cpu"):
             logger.debug("[Stage-%s] Using default device visibility (devices=%s)", stage_id, devices)
@@ -120,22 +126,27 @@ def set_stage_devices(
 
         try:
             import torch  # noqa: WPS433
+
             if is_available_fn():
                 try:
                     set_device_fn(0)
                 except Exception as e:
-                    logger.debug("[Stage-%s] %s set_device(0) failed: %s", stage_id, device_type_label, e, exc_info=True)
+                    logger.debug(
+                        "[Stage-%s] %s set_device(0) failed: %s", stage_id, device_type_label, e, exc_info=True
+                    )
                 num = device_count_fn()
                 info = []
                 for i in range(num):
                     total = get_device_properties_fn(i).total_memory
                     free, _ = mem_get_info_fn(i)
-                    info.append({
-                        "idx": i,
-                        "name": get_device_name_fn(i),
-                        "total": int(total),
-                        "free": int(free),
-                    })
+                    info.append(
+                        {
+                            "idx": i,
+                            "name": get_device_name_fn(i),
+                            "total": int(total),
+                            "free": int(free),
+                        }
+                    )
                 logger.debug("[Stage-%s] %s devices visible=%s info=%s", stage_id, device_type_label, num, info)
         except Exception as e:
             logger.debug("[Stage-%s] Failed to query %s devices: %s", stage_id, device_type_label, e, exc_info=True)
@@ -231,7 +242,9 @@ def maybe_load_from_ipc(container: Dict[str, Any], obj_key: str, shm_key: str) -
     return container[obj_key]
 
 
-def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, shm_key: str) -> tuple[Any, Dict[str, float]]:
+def maybe_load_from_ipc_with_metrics(
+    container: Dict[str, Any], obj_key: str, shm_key: str
+) -> tuple[Any, Dict[str, float]]:
     """Load object and return (object, metrics) with RX bytes and decode time.
 
     Metrics keys:
@@ -239,6 +252,7 @@ def maybe_load_from_ipc_with_metrics(container: Dict[str, Any], obj_key: str, sh
       - rx_decode_time_ms: float
     """
     import time as _time  # local import to avoid overhead at module import
+
     t0 = _time.time()
     if shm_key in container:
         meta = container[shm_key]  # type: ignore[index]
