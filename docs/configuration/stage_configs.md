@@ -1,6 +1,6 @@
 # Stage configs for vLLM-Omni
 
-In vLLM-Omni, it divides models in vLLM-omni into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other kinds of engines. According to different types of stages, such as AR stage or DiT stage, each stage can choose corresponding schedulers, model workers to load into Engines with a plug-in way.
+In vLLM-Omni, it divides models in vLLM-Omni into multiple stages, which are processed by different LLMEngines, DiffusionEngines or other kinds of engines. According to different types of stages, such as AR stage or DiT stage, each stage can choose corresponding schedulers, model workers to load into Engines with a plug-in way.
 
 Therefore, the stage configs for a model have several main functions:
 

@@ -66,7 +66,7 @@ Visit our documentation to learn more.
 ## Contributing
 
 We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM-omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
+Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en/latest/contributing/) for how to get involved.
 
 ## Weekly Meeting
 

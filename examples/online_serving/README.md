@@ -1,4 +1,4 @@
-# Online serving Example of vLLM-omni for Qwen2.5-omni
+# Online serving Example of vLLM-Omni for Qwen2.5-omni
 
 ## 🛠️ Installation
 

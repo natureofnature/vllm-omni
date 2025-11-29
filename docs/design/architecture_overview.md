@@ -2,11 +2,11 @@
 
 # Introduction
 
-This document outlines the architectural design for vLLM-omni, a new repository developed under the vLLM project. vLLM-omni supports multi-modality models with non-autoregressive structures and non-textual outputs, extending vLLM beyond traditional text-based, autoregressive generation.
+This document outlines the architectural design for vLLM-Omni, a new repository developed under the vLLM project. vLLM-Omni supports multi-modality models with non-autoregressive structures and non-textual outputs, extending vLLM beyond traditional text-based, autoregressive generation.
 
 # Goals
 
-The primary goals for vLLM-omni are:
+The primary goals for vLLM-Omni are:
 
 * **Support for Non-textual Output:** Enables the integration, efficient processing and output of various data types, including but not limited to, images, audio, and video, alongside text.  
 * **Non-Autoregressive Structure:** Support model structure beyond autoregressive, especially Diffusion Transformer (DiT), which is widely used in visual and audio generation.  
@@ -57,12 +57,12 @@ According to analysis for current popular open-source models, most of them have 
 
 # Architectural Overview
 
-vLLM-omni will import core modules from existing vLLM framework and introduce several new components and modifications to achieve its goals. The core architecture will be based on a modular design, allowing for independent development and integration of different modality handlers and output generators.  
+vLLM-Omni will import core modules from existing vLLM framework and introduce several new components and modifications to achieve its goals. The core architecture will be based on a modular design, allowing for independent development and integration of different modality handlers and output generators.  
 ![][image6]
 
 ## General ideas
 
-* It divides models in vLLM-omni into multiple stages, which are processed by different Engine Cores. Each stage can choose AR Engine Core for AR model part, and Diffusion Engine Core for diffusion model part.  
+* It divides models in vLLM-Omni into multiple stages, which are processed by different Engine Cores. Each stage can choose AR Engine Core for AR model part, and Diffusion Engine Core for diffusion model part.  
 * Designed a specialized diffusion engine core for DiT or dLLM.  
 * Plug-in with external DiT acceleration modules such as xDiT, Cache-DiT.  
 * Output linked with Higress API, Gradio for online demo, ComfyUI for less-code process.
