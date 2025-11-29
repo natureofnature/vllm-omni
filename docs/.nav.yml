@@ -29,6 +29,7 @@ nav:
       - design/index.md
       - design/architecture_overview.md
       - design/vllm_omni_design.md
+      - design/mrs_design.md
       - design/api_design_doc.md
     - Docs Guide: contributing/DOCS_GUIDE.md
   - API Reference:
