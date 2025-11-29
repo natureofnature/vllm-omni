@@ -1,12 +1,6 @@
 # NPU
 
-vLLM-Omni is a Python library that supports the following NPU variants. Select your NPU type to see vendor specific instructions:
-
-[](){ #npu }
-
-=== "NPU"
-
-    --8<-- "docs/getting_started/installation/npu/npu.inc.md:installation"
+vLLM-Omni supports NPU through the vLLM Ascend Plugin (vllm-ascend). This is a community maintained hardware plugin for running vLLM on NPU.
 
 ## Requirements
 
@@ -14,16 +8,16 @@ vLLM-Omni is a Python library that supports the following NPU variants. Select y
 - Python: 3.12
 
 !!! note
-    vLLM-Omni does not support Windows natively.
+    vLLM-Omni is currently not natively supported on Windows.
 
 === "NPU"
 
     --8<-- "docs/getting_started/installation/npu/npu.inc.md:requirements"
 
-## Set up using Docker
+## Installation
 
-### Pre-built images
+### Recommended
 
 === "NPU"
 
-    --8<-- "docs/getting_started/installation/npu/npu.inc.md:pre-built-images"
+    --8<-- "docs/getting_started/installation/npu/npu.inc.md:installation"

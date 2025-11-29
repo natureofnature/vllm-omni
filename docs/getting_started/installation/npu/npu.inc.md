@@ -1,14 +1,9 @@
-# --8<-- [start:installation]
-
-vLLM-Omni supports NPU through the vLLM Ascend Plugin (vllm-ascend). This is a community maintained hardware plugin for running vLLM on NPU.
-
-# --8<-- [end:installation]
 # --8<-- [start:requirements]
 
 For detailed hardware and software requirements, please refer to the [vllm-ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
 # --8<-- [end:requirements]
-# --8<-- [start:pre-built-images]
+# --8<-- [start:installation]
 
 The recommended way to use vLLM-Omni on NPU is through the vllm-ascend pre-built Docker images:
 
@@ -68,4 +63,4 @@ The default workdir is `/workspace`, with vLLM, vLLM-Ascend and vLLM-Omni code p
 
 For other installation methods (pip installation, building from source, custom Docker builds), please refer to the [vllm-ascend installation guide](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
-# --8<-- [end:pre-built-images]
+# --8<-- [end:installation]
