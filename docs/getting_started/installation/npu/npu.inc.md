@@ -7,12 +7,6 @@ vLLM-Omni supports Ascend NPU through the vLLM Ascend Plugin (vllm-ascend). This
 
 For detailed hardware and software requirements, please refer to the [vllm-ascend installation documentation](https://docs.vllm.ai/projects/ascend/en/latest/installation.html).
 
-**Key requirements summary:**
-- **NPU**: Atlas A2/A3 training and inference series
-- **CANN**: >= 8.3.RC1
-- **PyTorch**: 2.7.1
-- **torch-npu**: 2.7.1 (auto-installed with vllm-ascend)
-
 # --8<-- [end:requirements]
 # --8<-- [start:pre-built-images]
 
@@ -27,7 +21,7 @@ export DEVICE1=/dev/davinci1
 # export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2
 # Atlas A3:
 # export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2-a3
-export IMAGE=quay.io/ascend/vllm-ascend:v0.11.0rc2
+export IMAGE=quay.nju.edu.cn/ascend/vllm-ascend:v0.11.0rc2
 docker run --rm \
     --name vllm-omni-npu \
     --device $DEVICE0 \
@@ -44,11 +38,30 @@ docker run --rm \
     -p 8000:8000 \
     -it $IMAGE bash
 
+docker run -d \
+  --privileged \
+  --name vllm-omni-npu\
+  --device /dev/davinci3 \
+  --device /dev/davinci4 \
+  --device /dev/davinci_manager \
+  --device /dev/devmm_svm \
+  --device /dev/hisi_hdc \
+  -v /usr/local/dcmi:/usr/local/dcmi \
+  -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi \
+  -v /usr/local/Ascend/driver/lib64/:/usr/local/Ascend/driver/lib64/ \
+  -v /usr/local/Ascend/driver/version.info:/usr/local/Ascend/driver/version.info \
+  -v /etc/ascend_install.info:/etc/ascend_install.info \
+  -v /mnt/sfs_turbo/ascend-ci-share-nv-action-vllm-benchmarks:/root/.cache \
+  -p 7777:7777 \
+  -e PYTORCH_NPU_ALLOC_CONF=max_split_size_mb:256 \
+  -it $IMAGE bash
+
 # Inside the container, install vLLM-Omni from source
 cd /vllm-workspace
 git clone https://github.com/vllm-project/vllm-omni.git
 cd vllm-omni
 pip install -v -e .
+export VLLM_WORKER_MULTIPROC_METHOD=spawn
 ```
 
 The default workdir is `/workspace`, with vLLM and vLLM-Ascend code placed in `/vllm-workspace` installed in development mode.
