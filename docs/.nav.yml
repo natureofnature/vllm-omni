@@ -16,7 +16,6 @@ nav:
       - configuration/*
     - Models:
       - models/supported_models.md
-    - Features: features
   - Developer Guide:
     - contributing/README.md
     - General:
