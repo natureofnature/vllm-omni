@@ -1,10 +1,10 @@
-# Ascend-NPU
+# NPU
 
 vLLM-Omni is a Python library that supports the following NPU variants. Select your NPU type to see vendor specific instructions:
 
-[](){ #ascend-npu }
+[](){ #npu }
 
-=== "Ascend NPU"
+=== "NPU"
 
     --8<-- "docs/getting_started/installation/npu/npu.inc.md:installation"
 
@@ -16,7 +16,7 @@ vLLM-Omni is a Python library that supports the following NPU variants. Select y
 !!! note
     vLLM-Omni does not support Windows natively.
 
-=== "Ascend NPU"
+=== "NPU"
 
     --8<-- "docs/getting_started/installation/npu/npu.inc.md:requirements"
 
@@ -24,6 +24,6 @@ vLLM-Omni is a Python library that supports the following NPU variants. Select y
 
 ### Pre-built images
 
-=== "Ascend NPU"
+=== "NPU"
 
     --8<-- "docs/getting_started/installation/npu/npu.inc.md:pre-built-images"
