@@ -8,7 +8,7 @@ vLLM-Omni is a Python library that supports the following GPU variants. The libr
 - Python: 3.12
 
 !!! note
-    vLLM-Omni does not support Windows natively.
+    vLLM-Omni is currently not natively supported on Windows.
 
 === "NVIDIA CUDA"
 
