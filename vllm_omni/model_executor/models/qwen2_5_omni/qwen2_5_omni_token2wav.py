@@ -765,7 +765,7 @@ def replication_pad_1d(hidden_states: torch.Tensor, pad_left: int, pad_right: in
     Manual replicate padding to avoid replication_pad1d kernel limits on NPU.
     TODO: remove when F.pad supports replicate mode on NPU.
     """
-    # NOTE: a immature implementation for running in Ascend NPU. Need to discuss.
+    # NOTE: a immature implementation for running in NPU. Need to discuss.
     if pad_left == 0 and pad_right == 0:
         return hidden_states
 
@@ -845,17 +845,29 @@ class DownSample1d(nn.Module):
 
     def forward(self, hidden_states):
         channels = hidden_states.shape[1]
-        input_dtype = hidden_states.dtype
-        # F.pad in Ascend doesn't support BF16 when mode is replicate.
-        # To ensure the accuracy, manually pad the input tensor.
-        hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right)
-        filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
-        out = F.conv1d(
-            hidden_states,
-            filter_on_device.expand(channels, -1, -1),
-            stride=self.stride,
-            groups=channels,
-        ).to(input_dtype)
+        if is_npu():
+            input_dtype = hidden_states.dtype
+            # F.pad in NPU doesn't support BF16 when mode is replicate.
+            # To ensure the accuracy, manually pad the input tensor.
+            hidden_states = replication_pad_1d(hidden_states.to(self.filter.dtype), self.pad_left, self.pad_right)
+            filter_on_device = self.filter.to(device=hidden_states.device, dtype=hidden_states.dtype)
+            out = F.conv1d(
+                hidden_states,
+                filter_on_device.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(input_dtype)
+        else:
+            hidden_states_dtype = hidden_states.dtype
+            hidden_states = F.pad(hidden_states, (self.pad_left, self.pad_right), mode="replicate").to(
+                self.filter.dtype
+            )
+            out = F.conv1d(
+                hidden_states,
+                self.filter.expand(channels, -1, -1),
+                stride=self.stride,
+                groups=channels,
+            ).to(hidden_states_dtype)
         return out
 
 
