@@ -30,7 +30,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 
 <p align="center">
   <picture>
-    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality model architecture.png" width=55%>
+    <img alt="vllm-omni" src="./docs/source/architecture/omni-modality-model-architecture.png" width=55%>
   </picture>
 </p>
 
