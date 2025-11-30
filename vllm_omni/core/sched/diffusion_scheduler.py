@@ -14,12 +14,22 @@ from vllm_omni.outputs import OmniModelRunnerOutput
 
 
 class DiffusionScheduler(OmniScheduler):
+    """Scheduler for diffusion-based non-autoregressive stages.
+
+    Implements a fast-path scheduling strategy for diffusion models where
+    all input tokens are fed at once. Falls back to standard vLLM scheduling
+    if the token budget cannot accommodate all tokens in a single iteration.
+    """
+
     def schedule(self) -> SchedulerOutput:
-        """Diffusion fast path:
-        - Feed all input tokens of the request at once
-          (if 0, allocate 1 placeholder token).
-        - If the token budget cannot be satisfied at once, fall back to the
-          default vLLM scheduling.
+        """Schedule requests for diffusion model execution.
+
+        Uses a fast-path approach that feeds all input tokens at once
+        (or 1 placeholder token if input is empty). Falls back to
+        standard scheduling if token budget is insufficient.
+
+        Returns:
+            SchedulerOutput containing scheduled requests and token allocations
         """
 
         # Select requests with zero prompt and using pooling
@@ -239,6 +249,12 @@ class DiffusionScheduler(OmniScheduler):
 
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
+            # Convert pooler_output tensor to dict format expected by OmniEngineCoreOutput
+            pooling_output_dict = None
+            if pooler_output is not None:
+                # Wrap tensor in dict to match OmniEngineCoreOutput.pooling_output type
+                # which expects Optional[dict[str, torch.Tensor]]
+                pooling_output_dict = {"model_outputs": pooler_output}
             if new_token_ids or pooler_output is not None or kv_transfer_params:
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
@@ -248,7 +264,7 @@ class DiffusionScheduler(OmniScheduler):
                         finish_reason=request.get_finished_reason(),
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
-                        pooling_output=pooler_output,
+                        pooling_output=pooling_output_dict,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         kv_transfer_params=kv_transfer_params,

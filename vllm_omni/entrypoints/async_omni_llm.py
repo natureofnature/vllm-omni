@@ -2,7 +2,6 @@ import asyncio
 import multiprocessing as mp
 import os
 import socket
-import sys
 import time
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -53,6 +52,38 @@ logger = init_logger(__name__)
 
 
 class AsyncOmniLLM(EngineClient):
+    """Async entry point for vLLM-Omni inference.
+
+    This class provides an asynchronous interface for running multi-modal
+    comprehension and generation models. It orchestrates multiple
+    stages in a pipeline, where each stage runs in a separate process.
+    Designed for use with async/await patterns and streaming generation.
+
+    Args:
+        model: Model name or path to load
+        stage_configs_path: Optional path to YAML file containing stage
+            configurations. If None, configurations are loaded from the model.
+        log_stats: Whether to enable statistics logging
+        log_file: Optional path prefix for log files. If provided, logs will
+            be written to files with stage-specific suffixes.
+        init_sleep_seconds: Number of seconds to sleep between starting
+            each stage process during initialization
+        shm_threshold_bytes: Threshold in bytes for using shared memory
+            for IPC. Objects larger than this threshold will use shared memory.
+        batch_timeout: Timeout in seconds for batching requests within a stage
+        init_timeout: Timeout in seconds for waiting for all stages to initialize
+        **kwargs: Additional keyword arguments passed to stage engines
+
+    Example:
+        >>> async_llm = AsyncOmniLLM(model="Qwen/Qwen2.5-Omni-7B")
+        >>> async for output in async_llm.generate(
+        ...     prompt="Hello",
+        ...     request_id="req-1",
+        ...     sampling_params_list=[SamplingParams(), SamplingParams()]
+        ... ):
+        ...     print(output)
+    """
+
     def __init__(
         self,
         model: str,
@@ -62,7 +93,7 @@ class AsyncOmniLLM(EngineClient):
         init_sleep_seconds: int = 20,
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
-        init_timeout: int = 300,
+        init_timeout: int = 60000,
         **kwargs,
     ):
         self.batch_timeout = batch_timeout
@@ -78,7 +109,7 @@ class AsyncOmniLLM(EngineClient):
         # Optional file handler for orchestrator
         self._log_file = log_file
         if self._log_file:
-            remove_old_logs(self._log_file, len(self.stage_list))
+            remove_old_logs(self._log_file, len(self.stage_configs))
             configure_orchestrator_logger(logger, self._log_file)
 
         self._stats_file, self._overall_stats_file = init_stats_paths(self._enable_stats, self._log_file)
@@ -140,6 +171,12 @@ class AsyncOmniLLM(EngineClient):
             time.sleep(self._init_sleep_seconds)
 
     def close(self) -> None:
+        """Close all stage processes and clean up resources.
+
+        Sends shutdown signals to all stage input queues and stops
+        all stage worker processes. This method should be called
+        when done using the AsyncOmniLLM instance.
+        """
         for q in self._stage_in_queues:
             try:
                 q.put_nowait(None)
@@ -156,13 +193,19 @@ class AsyncOmniLLM(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
+        print("[AsyncOmniLLM] __del__ close()", flush=True)
+        raise Exception("test")
         try:
             self.close()
         except Exception as e:
             logger.debug("[Orchestrator] __del__ close() raised: %s", e, exc_info=True)
 
     def shutdown(self):
-        """Shutdown, cleaning up the background proc and IPC."""
+        """Shutdown, cleaning up the background proc and IPC.
+
+        Alias for close() method. Cleans up all stage processes
+        and inter-process communication resources.
+        """
         try:
             self.close()
         except Exception as e:
@@ -178,6 +221,33 @@ class AsyncOmniLLM(EngineClient):
         priority: int = 0,
         data_parallel_rank: Optional[int] = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
+        """Generate outputs for the given prompt asynchronously.
+
+        Processes the prompt through all stages in the pipeline and yields
+        outputs as they become available. Each stage uses its corresponding
+        sampling parameters from the sampling_params_list.
+
+        Args:
+            prompt: Prompt to process. Can be a text string, token IDs,
+                or multimodal prompt.
+            request_id: Unique identifier for this request
+            sampling_params_list: List of SamplingParams, one for each stage.
+                Must have the same length as the number of stages.
+                If None, uses default sampling params for each stage.
+            lora_request: Optional LoRA adapter request for this generation
+            trace_headers: Optional tracing headers for observability
+            priority: Request priority (higher values processed first)
+            data_parallel_rank: Optional data parallel rank for distributed
+                inference
+
+        Yields:
+            OmniRequestOutput objects as they are produced by each stage.
+            Each output contains the stage_id, final_output_type, and
+            the request_output from that stage.
+
+        Raises:
+            ValueError: If sampling_params_list has incorrect length.
+        """
         logger.debug("[Orchestrator] generate() called")
         if sampling_params_list is None:
             sampling_params_list = self.default_sampling_params_list
@@ -391,9 +461,8 @@ class AsyncOmniLLM(EngineClient):
             logger.exception("[Orchestrator] Failed to build/log summary: %s", e)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
-        deadline = time.time() + max(0, int(timeout))
         num_stages = len(self.stage_list)
-        while len(self._stages_ready) < num_stages and time.time() < deadline:
+        while len(self._stages_ready) < num_stages:
             progressed = False
             for stage_id, stage in enumerate(self.stage_list):
                 if stage_id in self._stages_ready:
@@ -459,20 +528,6 @@ class AsyncOmniLLM(EngineClient):
                         occurred while logging suggestions",
                 )
 
-            # Attempt graceful shutdown of all stages before exiting
-            try:
-                self.close()
-            except Exception:
-                pass
-
-            # Terminate the current process with non-zero exit code
-            try:
-                sys.exit(1)
-            except SystemExit:
-                raise
-            except Exception:
-                os._exit(1)
-
     @property
     def is_running(self) -> bool:
         # Is None before the loop is started.
@@ -510,9 +565,6 @@ class AsyncOmniLLM(EngineClient):
         return None
 
     async def get_input_preprocessor(self) -> InputPreprocessor:
-        # for stage in self.stage_list:
-        #     if stage.is_comprehension:
-        #         return stage.input_preprocessor
         return None
 
     async def get_tokenizer(self) -> AnyTokenizer:
@@ -569,6 +621,31 @@ class AsyncOmniLLM(EngineClient):
 
 
 class AsyncOmniStageLLM(AsyncLLM):
+    """Async single-stage LLM engine for use within a stage worker process.
+
+    This class extends the base vLLM AsyncLLM class with omni-specific
+    processors for handling multimodal inputs and outputs. It is used
+    internally by AsyncOmniStage workers and should not be instantiated
+    directly by users.
+
+    Args:
+        engine_args: AsyncOmniEngineArgs containing engine configuration
+        vllm_config: Global vLLM configuration
+        executor_class: Executor implementation class, e.g. MultiprocExecutor
+        log_stats: Whether to log statistics
+        usage_context: Usage context of the LLM (default: ENGINE_CONTEXT)
+        mm_registry: Multi-modal registry for processing multimodal inputs
+        use_cached_outputs: Whether to use cached outputs
+        log_requests: Whether to log requests
+        start_engine_loop: Whether to start the engine loop automatically
+        stat_loggers: Customized stat loggers for the engine.
+            If not provided, default stat loggers will be used.
+            Note: Stat logger interface may change in V1.
+        client_addresses: Optional dictionary mapping client names to addresses
+        client_count: Total number of clients (default: 1)
+        client_index: Index of this client (default: 0)
+    """
+
     def __init__(
         self,
         engine_args: AsyncOmniEngineArgs,

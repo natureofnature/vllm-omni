@@ -1,3 +1,4 @@
+from ast import Dict
 from typing import Any, Callable, Optional, Union
 
 import torch
@@ -19,6 +20,13 @@ logger = init_logger(__name__)
 
 
 class OmniRequestState(RequestState):
+    """Request state for omni models, tracking multimodal outputs.
+
+    Extends the base RequestState with support for accumulating
+    multimodal tensor outputs (e.g., images, audio, latents) that
+    are produced incrementally during generation.
+    """
+
     def __init__(
         self,
         *args,
@@ -26,7 +34,7 @@ class OmniRequestState(RequestState):
     ):
         super().__init__(*args, **kwargs)
         self.mm_type: Optional[str] = None
-        self.mm_accumulated: Optional[torch.Tensor] = None
+        self.mm_accumulated: Optional[Dict[str, Any]] = None
 
     @classmethod
     def from_new_request(
@@ -85,22 +93,71 @@ class OmniRequestState(RequestState):
             log_stats=log_stats,
         )
 
-    def add_multimodal_tensor(self, tensor: Optional[torch.Tensor], mm_type: Optional[str]) -> None:
-        if tensor is None:
+    def add_multimodal_tensor(self, payload: Optional[Any], mm_type: Optional[str]) -> None:
+        if payload is None:
             return
         try:
             if mm_type:
                 self.mm_type = (mm_type or "").lower()
-            t = tensor.detach()
-            try:
-                t = t.to("cpu")
-            except Exception:
-                # Best-effort CPU move; keep original device if conversion fails
-                logger.debug("Failed to move multimodal tensor to CPU", exc_info=True)
-            if self.mm_accumulated is None:
-                self.mm_accumulated = t
+
+            # Normalize incoming payload to dict on CPU
+            def _to_cpu(x):
+                if isinstance(x, torch.Tensor):
+                    try:
+                        return x.detach().to("cpu").contiguous()
+                    except Exception:
+                        return x
+                return x
+
+            if isinstance(payload, dict):
+                incoming: Dict[str, Any] = {}
+                # Optional remap: if producer used "model_outputs" or "hidden", rename to mm_type
+                # to keep a consistent key namespace per engine_core_output_type.
+                remapped_tensor = dict(payload)
+                target_key = self.mm_type or "hidden"
+                if "model_outputs" in remapped_tensor:
+                    remapped_tensor[target_key] = remapped_tensor.pop("model_outputs")
+                elif "hidden" in remapped_tensor and target_key != "hidden":
+                    remapped_tensor[target_key] = remapped_tensor.pop("hidden")
+                for k, v in remapped_tensor.items():
+                    if isinstance(v, dict):
+                        incoming[k] = {str(sk): _to_cpu(sv) for sk, sv in v.items()}
+                    else:
+                        incoming[k] = _to_cpu(v)
             else:
-                self.mm_accumulated = torch.cat([self.mm_accumulated, t], dim=0)
+                key = self.mm_type or "hidden"
+                incoming = {key: _to_cpu(payload)}
+
+            if self.mm_accumulated is None:
+                self.mm_accumulated = incoming
+            else:
+                # Merge keys; concatenate tensors along token dim when possible
+                for k, v in incoming.items():
+                    if k not in self.mm_accumulated:
+                        self.mm_accumulated[k] = v
+                    else:
+                        existing = self.mm_accumulated[k]
+                        if isinstance(v, torch.Tensor) and isinstance(existing, torch.Tensor):
+                            try:
+                                self.mm_accumulated[k] = torch.cat([existing, v], dim=0)  # type: ignore[index]
+                            except Exception:
+                                self.mm_accumulated[k] = v
+                        elif isinstance(v, dict) and isinstance(existing, dict):
+                            # Merge nested dicts by concatenating tensors along token dim when possible
+                            for sk, sv in v.items():
+                                if sk not in existing:
+                                    existing[sk] = sv
+                                    continue
+                                ev = existing[sk]
+                                if isinstance(sv, torch.Tensor) and isinstance(ev, torch.Tensor):
+                                    try:
+                                        existing[sk] = torch.cat([ev, sv], dim=0)
+                                    except Exception:
+                                        existing[sk] = sv
+                                else:
+                                    existing[sk] = sv
+                        else:
+                            self.mm_accumulated[k] = v
         except Exception:
             # Log and continue without crashing the output pipeline
             logger.exception("Error accumulating multimodal tensor")
@@ -115,6 +172,23 @@ class OmniRequestState(RequestState):
         stop_reason: Optional[Union[int, str]],
         kv_transfer_params: Optional[dict[str, Any]] = None,
     ) -> Optional[Union[OmniRequestOutput, PoolingRequestOutput]]:
+        """Create a request output from generation results.
+
+        Creates a RequestOutput or PoolingRequestOutput from the generated
+        tokens and accumulated multimodal outputs. Attaches multimodal
+        tensors to the completion output if available.
+
+        Args:
+            new_token_ids: List of newly generated token IDs
+            pooling_output: Optional pooling output tensor
+            finish_reason: Optional finish reason indicating why generation stopped
+            stop_reason: Optional stop reason (token ID or stop string)
+            kv_transfer_params: Optional KV cache transfer parameters
+
+        Returns:
+            OmniRequestOutput or PoolingRequestOutput if output should be
+            emitted (based on finish status and output kind), None otherwise
+        """
         finished = finish_reason is not None
         final_only = self.output_kind == RequestOutputKind.FINAL_ONLY
 
@@ -143,18 +217,15 @@ class OmniRequestState(RequestState):
         base_output = super()._new_completion_output(token_ids, finish_reason, stop_reason)
         try:
             if self.mm_accumulated is not None:
-                tensor = self.mm_accumulated
-                try:
-                    tensor = tensor.detach().to("cpu")
-                except Exception:
-                    logger.debug(
-                        "Failed to move accumulated multimodal tensor to CPU",
-                        exc_info=True,
-                    )
-                # Attach on the completion output for downstream consumers.
+                # Attach accumulated multimodal dict on the completion output
                 if not hasattr(base_output, "multimodal_output"):
                     setattr(base_output, "multimodal_output", {})
-                setattr(base_output, "multimodal_output", {self.mm_type: tensor})
+                mm_out = getattr(base_output, "multimodal_output")
+                if isinstance(mm_out, dict):
+                    for k, v in self.mm_accumulated.items():
+                        mm_out[k] = v
+                else:
+                    setattr(base_output, "multimodal_output", self.mm_accumulated)
         except Exception:
             logger.exception("Error in _new_completion_output")
         return base_output
@@ -179,6 +250,15 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         log_stats: bool,
         engine_core_output_type: Optional[str] = None,
     ):
+        """Initialize the multimodal output processor.
+
+        Args:
+            tokenizer: Tokenizer for detokenizing text outputs
+            log_stats: Whether to log statistics
+            engine_core_output_type: Optional output type specification
+                (e.g., "image", "audio", "latents"). Used to route outputs
+                to appropriate processors. If None, output type is inferred.
+        """
         super().__init__(tokenizer=tokenizer, log_stats=log_stats)
         self.output_handlers: dict[str, Callable[[EngineCoreOutput], None]] = {}
         self._reqid_to_mm_type: dict[str, str] = {}
@@ -186,6 +266,16 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self.engine_core_output_type = engine_core_output_type
 
     def register_handler(self, modality: str, handler: Callable[[EngineCoreOutput], None]) -> None:
+        """Register a custom handler for a specific modality.
+
+        Allows custom processing logic for specific output modalities.
+        The handler is called before default processing for outputs
+        matching the specified modality.
+
+        Args:
+            modality: Modality name (e.g., "image", "audio", "latents")
+            handler: Callable that takes an EngineCoreOutput and processes it
+        """
         self.output_handlers[modality.lower()] = handler
 
     def add_request(
@@ -196,6 +286,21 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         request_index: int = 0,
         queue: Optional[RequestOutputCollector] = None,
     ) -> None:
+        """Add a new request to be processed.
+
+        Creates an OmniRequestState for the request and registers it
+        for output processing.
+
+        Args:
+            request: Engine core request to add
+            prompt: Optional prompt string for the request
+            parent_req: Optional parent request for parallel sampling
+            request_index: Index of the request in the batch
+            queue: Optional queue for collecting outputs
+
+        Raises:
+            ValueError: If the request ID is already registered
+        """
         request_id = request.request_id
         if request_id in self.request_states:
             raise ValueError(f"Request id {request_id} already running.")
@@ -220,6 +325,21 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         engine_core_timestamp: Optional[float] = None,
         iteration_stats: Optional[IterationStats] = None,
     ) -> OutputProcessorOutput:
+        """Process engine core outputs into request outputs.
+
+        Converts EngineCoreOutput objects into RequestOutput objects,
+        handling multimodal outputs by routing them through appropriate
+        processors and accumulating tensors in request states.
+
+        Args:
+            engine_core_outputs: List of engine core outputs to process
+            engine_core_timestamp: Optional timestamp for the outputs
+            iteration_stats: Optional iteration statistics
+
+        Returns:
+            OutputProcessorOutput containing processed request outputs
+            and list of request IDs to abort
+        """
         self._reqid_to_mm_type.clear()
         for eco in engine_core_outputs:
             mm_type = (self.engine_core_output_type or "").lower()
@@ -285,10 +405,9 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 # Attach accumulated multimodal payload if any
                 try:
                     if isinstance(req_state, OmniRequestState) and req_state.mm_accumulated is not None:
-                        mm_key = req_state.mm_type or "latents"
                         if not hasattr(ro, "multimodal_output"):
                             setattr(ro, "multimodal_output", {})
-                        ro.multimodal_output[mm_key] = req_state.mm_accumulated
+                        ro.multimodal_output = req_state.mm_accumulated
                 except Exception:
                     logger.exception("Error attaching multimodal payload in process_outputs")
                 if req_state.queue is not None:

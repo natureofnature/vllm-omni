@@ -5,12 +5,12 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "vllm-omni"
 version = "0.11.0rc1"
-description = "vLLM-omni: Multi-modality models inference and serving with non-autoregressive structures"
+description = "vLLM-Omni: Multi-modality models inference and serving with non-autoregressive structures"
 readme = "README.md"
 requires-python = ">=3.9,<3.14"  # Align with vLLM v0.11 supported Python versions
 license = {text = "Apache-2.0"}
 authors = [
-    {name = "vLLM-omni Team", email = "vllm-project@gmail.com"}
+    {name = "vLLM-Omni Team", email = "vllm-project@gmail.com"}
 ]
 keywords = ["vllm", "multimodal", "diffusion", "transformer", "inference", "serving"]
 classifiers = [
@@ -30,10 +30,14 @@ classifiers = [
 dependencies = [
     # Core runtime dependencies (required for actual usage)
     "omegaconf>=2.3.0",
-    "decord>=0.6.0",
+    # "decord>=0.6.0", # install manually
     "librosa>=0.11.0",
     "resampy>=0.4.3",
-    # "vllm==0.11.0", # install manually
+    "diffusers==0.35.2",
+    "accelerate==1.12.0",
+    "gradio==5.50",
+    "soundfile>=0.13.1"
+    # "vllm==0.11.0",  # TODO: fix the entrypoints overwrite problem
 ]
 
 [project.optional-dependencies]
@@ -54,12 +58,13 @@ docs = [
     "mkdocs-material",
     "mkdocstrings-python",
     "mkdocs-gen-files",
-    # "mkdocs-awesome-nav",  # Not available on PyPI
+    "mkdocs-awesome-nav",
     "mkdocs-glightbox",
     "mkdocs-git-revision-date-localized-plugin",
     "mkdocs-minify-plugin",
     "regex",
     "pydantic",
+    "black>=23.0.0",
 ]
 
 
@@ -73,9 +78,13 @@ Documentation = "https://vllm-omni.readthedocs.io"
 vllm = "vllm_omni.entrypoints.cli.main:main"
 vllm-omni = "vllm_omni.entrypoints.cli.main:main"
 
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["vllm_omni*"]
+
+[tool.setuptools.package-data]
+"vllm_omni.model_executor.stage_configs" = ["*.yaml"]
 
 [tool.ruff]
 line-length = 120
@@ -153,5 +162,9 @@ extend-ignore-identifiers-re = [
     ".*_thw",
     ".*thw",
     "ein",
-    ".*arange"
+    ".*arange",
+    ".*MoBA",
+    ".*temperal_downsample",
+    ".*nothink.*",
+    ".*NOTHINK.*"
 ]

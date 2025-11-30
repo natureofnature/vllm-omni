@@ -1,4 +1,4 @@
-# Offline Example of vLLM-omni for Qwen2.5-omni
+# Offline Example of vLLM-Omni for Qwen2.5-omni
 
 ## 🛠️ Installation
 
@@ -31,4 +31,12 @@ cd examples/offline_inference/qwen2_5_omni
 Then run the command below.
 ```bash
 bash run_single_prompt.sh
+```
+
+### FAQ
+
+If you encounter error about backend of librosa, try to install ffmpeg with command below.
+```
+sudo apt update
+sudo apt install ffmpeg
 ```

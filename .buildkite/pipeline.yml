@@ -1,0 +1,6 @@
+steps:
+  - label: "Simple Unit Test"
+    commands:
+      - ".buildkite/scripts/simple_test.sh"
+    agents:
+      queue: "cpu_queue_premerge"

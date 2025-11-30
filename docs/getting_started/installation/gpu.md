@@ -1,0 +1,40 @@
+# GPU
+
+vLLM-Omni is a Python library that supports the following GPU variants. The library itself mainly contains python implementations for framework and models.
+
+## Requirements
+
+- OS: Linux
+- Python: 3.12
+
+!!! note
+    vLLM-Omni is currently not natively supported on Windows.
+
+=== "NVIDIA CUDA"
+
+    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:requirements"
+
+## Set up using Python
+
+### Create a new Python environment
+
+--8<-- "docs/getting_started/installation/python_env_setup.inc.md"
+
+### Pre-built wheels
+
+=== "NVIDIA CUDA"
+
+    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:pre-built-wheels"
+
+[](){ #build-from-source }
+
+### Build wheel from source
+
+=== "NVIDIA CUDA"
+
+    --8<-- "docs/getting_started/installation/gpu/cuda.inc.md:build-wheel-from-source"
+
+## Set up using Docker
+
+### Pre-built images
+To be released... Stay tuned!
