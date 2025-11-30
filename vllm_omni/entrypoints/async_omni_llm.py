@@ -193,6 +193,8 @@ class AsyncOmniLLM(EngineClient):
                 logger.warning("[Orchestrator] Failed to stop stage worker: %s", e)
 
     def __del__(self) -> None:  # best-effort
+        print("[AsyncOmniLLM] __del__ close()", flush=True)
+        raise Exception("test")
         try:
             self.close()
         except Exception as e:
@@ -309,16 +311,6 @@ class AsyncOmniLLM(EngineClient):
             for stage_id, stage in enumerate(self.stage_list):
                 result = stage.try_collect()
                 if result is None:
-                    continue
-
-                # Ensure result is a dictionary
-                if not isinstance(result, dict):
-                    logger.error(
-                        "[Orchestrator] Stage-%s returned non-dict result: type=%s, value=%s",
-                        stage_id,
-                        type(result),
-                        result,
-                    )
                     continue
 
                 made_progress = True
@@ -477,15 +469,6 @@ class AsyncOmniLLM(EngineClient):
                     continue
                 result = stage.try_collect()
                 if result is None:
-                    continue
-                # Ensure result is a dictionary
-                if not isinstance(result, dict):
-                    logger.warning(
-                        "[Orchestrator] Stage-%s returned non-dict result during init: type=%s, value=%s",
-                        stage_id,
-                        type(result),
-                        result,
-                    )
                     continue
                 progressed = True
                 if result.get("type") == "stage_ready":
