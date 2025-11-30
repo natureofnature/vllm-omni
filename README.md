@@ -9,7 +9,7 @@ Easy, fast, and cheap omni-modality model serving for everyone
 </h3>
 
 <p align="center">
-| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://tinyurl.com/vllm-omni-meeting"><b>Weekly Meeting</b></a> |
+| <a href="https://vllm-omni.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://tinyurl.com/vllm-omni-meeting"><b>Weekly Meeting</b></a> |<a href="https://tinyurl.com/vllm-omni-meeting"><b>Developer Slack</b></a> |
 </p>
 
 ---
@@ -61,19 +61,6 @@ Visit our [documentation](https://vllm-omni.readthedocs.io/en/latest/) to learn 
 - [Quickstart](https://vllm-omni.readthedocs.io/en/latest/getting_started/quickstart/)
 - [List of Supported Models](https://vllm-omni.readthedocs.io/en/latest/models/supported_models/)
 
-### Installation of vLLM-omni
-
-Install additional requirements for vllm-omni
-```bash
-git clone https://github.com/vllm-project/vllm-omni.git
-cd vllm_omni
-uv pip install -e .
-```
-
-## Run examples (Qwen2.5-omni)
-
-Please check the folder of [examples](examples)
-
 ## Contributing
 
 We welcome and value any contributions and collaborations.
@@ -81,7 +68,7 @@ Please check out [Contributing to vLLM-Omni](https://vllm-omni.readthedocs.io/en
 
 ## Weekly Meeting
 
-- vLLM-Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
+- vLLM Omni Weekly Meeting: https://tinyurl.com/vllm-omni-meeting
 - Wednesday, 11:30 - 12:30 (UTC+8, [Convert to your timezone](https://dateful.com/convert/gmt8?t=15))
 
 ## License
