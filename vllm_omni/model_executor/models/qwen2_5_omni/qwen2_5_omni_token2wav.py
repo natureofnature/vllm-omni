@@ -728,7 +728,9 @@ def kaiser_sinc_filter1d(cutoff: float, half_width: float, kernel_size: int) -> 
 
     # TODO: When torch.kaiser_window supports NPU, remove the device="cpu" argument
     if is_npu():
-        kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu").to("npu")
+        kaiser_window = torch.kaiser_window(
+            kernel_size, beta=beta, periodic=False, dtype=torch.float32, device="cpu"
+        ).to("npu")
     else:
         kaiser_window = torch.kaiser_window(kernel_size, beta=beta, periodic=False, dtype=torch.float32)
 
