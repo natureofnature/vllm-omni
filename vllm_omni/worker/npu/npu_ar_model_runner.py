@@ -838,8 +838,38 @@ class NPUARModelRunner(OmniNPUModelRunner):
         hidden_states_cpu = hidden_states.detach().to("cpu").contiguous()
         pooler_output: list[torch.Tensor | None] = []
         prev_logits_index = 0
-        for logits_index in logits_indices:
-            pooler_output.append(hidden_states_cpu[prev_logits_index : logits_index + 1])
+        for rid, logits_index in zip(req_ids_output_copy, logits_indices):
+            # Base payload: hidden slice for this request in this iteration
+            hidden_slice = hidden_states_cpu[prev_logits_index : logits_index + 1]
+            payload: dict[str, object] = {"hidden": hidden_slice}
+            # Merge multimodal_outputs if present
+            if isinstance(multimodal_outputs, dict) and multimodal_outputs:
+                mm_payload: dict[str, object] = {}
+                for k, v in multimodal_outputs.items():
+                    try:
+                        # Case 1: tensor aligned on token dimension
+                        if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
+                            mm_payload[k] = v.detach().to("cpu")[prev_logits_index : logits_index + 1].contiguous()
+                        # Case 2: nested dict of tensors aligned on token dimension (e.g., selected_hidden_layers)
+                        elif isinstance(v, dict):
+                            sub_dict: dict[str, torch.Tensor] = {}
+                            for sk, sv in v.items():
+                                if isinstance(sv, torch.Tensor) and sv.shape[0] == hidden_states_cpu.shape[0]:
+                                    sub_dict[str(sk)] = (
+                                        sv.detach().to("cpu")[prev_logits_index : logits_index + 1].contiguous()
+                                    )
+                            if sub_dict:
+                                mm_payload[k] = sub_dict
+                        elif isinstance(v, list):
+                            element: torch.Tensor = v[0]
+                            multimodal_outputs[k] = v[1:] if len(v) > 1 else v
+                            mm_payload[k] = element
+                    except Exception as e:
+                        # Best-effort; skip malformed entries
+                        logger.error(f"Error in merge multimodal outputs: {e}")
+                if mm_payload:
+                    payload.update(mm_payload)
+            pooler_output.append(payload)  # type: ignore[arg-type]
             prev_logits_index = logits_index + 1
 
         # Omni-new
