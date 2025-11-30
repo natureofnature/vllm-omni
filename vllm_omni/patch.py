@@ -14,7 +14,6 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.layers.mrope import MRotaryEmbedding
 from vllm_omni.request import OmniRequest
 
-
 for module_name, module in sys.modules.items():
     if hasattr(module, "EngineCoreOutput") and module.EngineCoreOutput == _OriginalEngineCoreOutput:
         module.EngineCoreOutput = OmniEngineCoreOutput
