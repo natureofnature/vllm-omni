@@ -82,6 +82,19 @@ def _create_in_memory_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return InMemoryOmniConnector()
 
 
+def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .shm_connector import SharedMemoryConnector
+    except ImportError:
+        # Fallback import
+        import sys
+        import os
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from connectors.shm_connector import SharedMemoryConnector
+    return SharedMemoryConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("InMemoryConnector", _create_in_memory_connector)
+OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)

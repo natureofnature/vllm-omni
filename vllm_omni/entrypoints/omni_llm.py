@@ -110,8 +110,15 @@ class OmniLLM:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
+        # Adjust threshold for Ray to avoid SHM issues by default
+        if self.worker_backend == "ray":
+            shm_threshold_bytes = sys.maxsize
+
         # Initialize connectors
-        self.omni_transfer_config,self.connectors = initialize_orchestrator_connectors(self.config_path)
+        self.omni_transfer_config,self.connectors = initialize_orchestrator_connectors(
+            self.config_path,
+            default_shm_threshold=shm_threshold_bytes
+        )
 
         # Optional file handler for orchestrator
         self._log_file = log_file
@@ -530,8 +537,6 @@ class OmniLLM:
                     # Check if we have a connector for this edge
                     connector_key = (str(stage_id), str(next_stage_id))
                     connector = self.connectors.get(connector_key)
-                    logger.info(f"connectors: {self.connectors}")
-
                     sent_via_connector = False
                     if connector:
                         sent_via_connector = try_send_via_connector(
@@ -547,69 +552,10 @@ class OmniLLM:
                         )
 
                     if not sent_via_connector:
-                        # Use original queue mechanism
-                        try:
-                            if self.worker_backend == "ray":
-                                # Ray mode: Skip SHM fallback, just send object via Queue (Ray handles serialization)
-                                # This prevents SHM access errors across nodes
-                                ipc_payload = {
-                                    "request_id": req_id,
-                                    "engine_inputs": next_inputs,
-                                    "sampling_params": sp_next,
-                                    "sent_ts": time.time(),
-                                }
-                                size_bytes = 0 # Approximation or calculate size if needed
-                                try:
-                                    # Approximate size for stats
-                                    size_bytes = len(_set(next_inputs))
-                                except:
-                                    pass
-                                t0 = time.time()
-                                # Direct submit to Ray Queue
-                            else:
-                                size_bytes = 0
-                                try:
-                                    size_bytes = len(_set(next_inputs))
-                                except Exception:
-                                    size_bytes = 0
-                                t0 = time.time()
-                                ipc_payload = _encode(
-                                    next_inputs,
-                                    getattr(self, "_shm_threshold_bytes", 65536),
-                                    obj_key="engine_inputs",
-                                    shm_key="engine_inputs_shm",
-                                )
-                                ipc_payload.update(
-                                    {
-                                        "request_id": req_id,
-                                        "sampling_params": sp_next,
-                                        "sent_ts": time.time(),
-                                    }
-                                )
-                            self.stage_list[next_stage_id].submit(ipc_payload)
-                            t1 = time.time()
-                            tx_ms = (t1 - t0) * 1000.0
-                            metrics.on_forward(
-                                stage_id,
-                                next_stage_id,
-                                req_id,
-                                int(size_bytes),
-                                float(tx_ms),
-                                bool("engine_inputs_shm" in ipc_payload),
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                "[Orchestrator] IPC encode failed for req %s: %s; falling back to inline payload",
-                                req_id,
-                                e,
-                            )
-                            self.stage_list[next_stage_id].submit(
-                                {
-                                    "request_id": req_id,
-                                    "engine_inputs": next_inputs,
-                                    "sampling_params": sp_next,
-                                }
-                            )
+                        raise RuntimeError(
+                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                            "Configure a connector for this edge or inspect connector logs for details."
+                        )
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
                         req_id,

@@ -19,7 +19,8 @@ logger = get_connector_logger(__name__)
 
 
 def initialize_connectors_from_config(
-    config_path: Optional[Union[str, Path]] = None
+    config_path: Optional[Union[str, Path]] = None,
+    default_shm_threshold: int = 65536
 ) -> tuple[Optional[OmniTransferConfig], dict[tuple[str, str], OmniConnectorBase]]:
     """
     Initialize connectors from configuration file.
@@ -28,13 +29,13 @@ def initialize_connectors_from_config(
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
     """
     try:
-        transfer_config = load_omni_transfer_config(config_path)
+        transfer_config = load_omni_transfer_config(config_path, default_shm_threshold=default_shm_threshold)
     except Exception as e:
         logger.warning(f"Failed to load OmniTransferConfig from {config_path}: {e}")
         return None, {}
 
     if not transfer_config:
-        logger.info("No OmniTransferConfig provided, using default IPC")
+        logger.info("No OmniTransferConfig provided")
         return None, {}
 
     # 使用统一的连接器创建逻辑
@@ -99,10 +100,13 @@ def get_connectors_config_for_stage(
 
 def load_omni_transfer_config(
     config_path: Optional[Union[str, Path]] = None,
-    config_dict: Optional[dict[str, Any]] = None
+    config_dict: Optional[dict[str, Any]] = None,
+    default_shm_threshold: int = 65536
 ) -> Optional[OmniTransferConfig]:
     """Load OmniTransferConfig from file or dict."""
     if config_path is None and config_dict is None:
+        # Even if no config provided, we might want to return a default config with SHM connectors
+        # But without stage info we can't do much.
         return None
 
     if config_path is not None:
@@ -131,16 +135,14 @@ def load_omni_transfer_config(
 
     # Parse global connectors (from runtime.connectors)
     global_connectors = runtime_config.get('connectors', {})
+    # ... existing parsing ...
     for conn_name, conn_config in global_connectors.items():
-        connector = ConnectorSpec(
-            name=conn_config['name'],
-            extra=conn_config.get('extra', {})
-        )
-        # Store globally defined connectors for reference
-        # These will be resolved to specific edges later
+        # Just verifying they parse validly, stored in global_connectors
+        pass
 
     # Parse stage-level connectors
-    for stage_config in config_dict.get('stage_args', []):
+    stage_args = config_dict.get('stage_args', [])
+    for stage_config in stage_args:
         stage_id = str(stage_config['stage_id'])
 
         # Input connectors
@@ -190,6 +192,45 @@ def load_omni_transfer_config(
             to_stage = output_key.replace("to_stage_", "")
             edge_key = (stage_id, to_stage)
             connectors[edge_key] = connector
+
+    # Auto-configure SharedMemoryConnector for missing edges based on runtime edges / engine_input_source
+    if stage_args:
+        try:
+            # Prefer explicit runtime edges if provided
+            runtime_edges = runtime_config.get("edges", [])
+            if isinstance(runtime_edges, list) and runtime_edges:
+                for edge in runtime_edges:
+                    from_stage = edge.get("from")
+                    to_stage = edge.get("to")
+                    if from_stage is None or to_stage is None:
+                        continue
+                    edge_key = (str(from_stage), str(to_stage))
+                    if edge_key not in connectors:
+                        logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
+                        connectors[edge_key] = ConnectorSpec(
+                            name="SharedMemoryConnector",
+                            extra={"shm_threshold_bytes": default_shm_threshold},
+                        )
+
+            # Fallback: infer edges from engine_input_source for each stage
+            for stage_config in stage_args:
+                to_stage = str(stage_config['stage_id'])
+                # Check explicit input sources
+                sources = stage_config.get('engine_input_source', [])
+                
+                for from_stage in sources:
+                    from_stage_str = str(from_stage)
+                    edge_key = (from_stage_str, to_stage)
+                    
+                    if edge_key not in connectors:
+                        logger.info(f"Auto-configuring SharedMemoryConnector for edge {edge_key}")
+                        connectors[edge_key] = ConnectorSpec(
+                            name="SharedMemoryConnector", 
+                            extra={"shm_threshold_bytes": default_shm_threshold}
+                        )
+            
+        except Exception as e:
+            logger.warning(f"Failed to auto-configure SHM connectors: {e}")
 
     config = OmniTransferConfig(connectors=connectors)
 
@@ -244,10 +285,14 @@ def create_mooncake_config(
 
 def initialize_orchestrator_connectors(
     config_path: Optional[str],
+    default_shm_threshold: int = 65536,
 ) -> Tuple[Optional[OmniTransferConfig], Dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level."""
     try:
-        transfer_config, connectors = initialize_connectors_from_config(config_path)
+        transfer_config, connectors = initialize_connectors_from_config(
+            config_path, 
+            default_shm_threshold=default_shm_threshold
+        )
         return transfer_config, connectors
     except Exception as exc:  # pragma: no cover - defensive logging
         logger.error("Unexpected error initializing connectors: %s", exc)

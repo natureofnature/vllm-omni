@@ -119,8 +119,15 @@ class AsyncOmni(EngineClient):
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
+        # Adjust threshold for Ray to avoid SHM issues by default
+        if self.worker_backend == "ray":
+            shm_threshold_bytes = sys.maxsize
+
         # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(self.config_path)
+        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+            self.config_path,
+            default_shm_threshold=shm_threshold_bytes
+        )
 
         self.stage_list: list[OmniStage] = []
         self.default_sampling_params_list: list[SamplingParams] = []
@@ -554,79 +561,16 @@ class AsyncOmni(EngineClient):
                         )
 
                     if not sent_via_connector:
-                        try:
-                            if self.worker_backend == "ray":
-                                # Ray mode: Skip SHM fallback, just send object via Queue
-                                ipc_payload = {
-                                    "request_id": req_id,
-                                    "engine_inputs": next_inputs,
-                                    "sampling_params": sp_next,
-                                    "sent_ts": time.time(),
-                                }
-                                # Approximate size for stats
-                                size_bytes = 0
-                                try:
-                                    size_bytes = len(_set(next_inputs))
-                                except:
-                                    pass
-                                t0 = time.time()
-                                self.stage_list[next_stage_id].submit(ipc_payload)
-                                t1 = time.time()
-                                tx_ms = (t1 - t0) * 1000.0
-                                metrics.on_forward(
-                                    stage_id,
-                                    next_stage_id,
-                                    req_id,
-                                    int(size_bytes),
-                                    float(tx_ms),
-                                    False, # No SHM
-                                )
-                            else:
-                                # Measure transfer size and time (encode + enqueue)
-                                size_bytes = 0
-                                try:
-                                    size_bytes = len(_set(next_inputs))
-                                except Exception:
-                                    size_bytes = 0
-                                t0 = time.time()
-                                ipc_payload = _encode(
-                                    next_inputs,
-                                    getattr(self, "_shm_threshold_bytes", 65536),
-                                    obj_key="engine_inputs",
-                                    shm_key="engine_inputs_shm",
-                                )
-                                ipc_payload.update(
-                                    {
-                                        "request_id": req_id,
-                                        "sampling_params": sp_next,
-                                        "sent_ts": time.time(),
-                                    }
-                                )
-                                self.stage_list[next_stage_id].submit(ipc_payload)
-                                t1 = time.time()
-                                tx_ms = (t1 - t0) * 1000.0
-                                metrics.on_forward(
-                                    stage_id,
-                                    next_stage_id,
-                                    req_id,
-                                    int(size_bytes),
-                                    float(tx_ms),
-                                    bool("engine_inputs_shm" in ipc_payload),
-                                )
-                        except Exception as e:
-                            logger.warning(
-                                "[Orchestrator] IPC encode failed for req %s: %s; \
-                                    falling back to inline payload",
-                                req_id,
-                                e,
-                            )
-                            self.stage_list[next_stage_id].submit(
-                                {
-                                    "request_id": req_id,
-                                    "engine_inputs": next_inputs,
-                                    "sampling_params": sp_next,
-                                }
-                            )
+                        # Fallback logic removed as we now enforce connector usage.
+                        # If no connector is found or send fails, we log an error and raise,
+                        # because continuing would cause the request to be silently dropped
+                        # and the orchestrator to hang waiting for completion.
+                        error_msg = (
+                            f"[Orchestrator] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
+                            "Configure a connector for this edge or inspect connector logs for details."
+                        )
+                        logger.error(error_msg)
+                        raise RuntimeError(error_msg)
                     logger.debug(
                         "[Orchestrator] Forwarded request %s to stage-%s",
                         req_id,

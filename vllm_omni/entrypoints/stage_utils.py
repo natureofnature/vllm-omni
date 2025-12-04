@@ -155,8 +155,9 @@ def set_stage_devices(
 
 
 def serialize_obj(obj: Any) -> bytes:
-    """Serialize a Python object to bytes using cloudpickle."""
-    return cloudpickle.dumps(obj)
+    """Serialize a Python object to bytes using centralized serializer (defaults to cloudpickle)."""
+    from vllm_omni.distributed.connectors.serialization import OmniSerializer
+    return OmniSerializer.serialize(obj)
 
 
 def shm_write_bytes(payload: bytes) -> dict[str, Any]:
@@ -238,7 +239,8 @@ def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -
     decode-time and size metrics.
     """
     if shm_key in container:
-        return pickle.loads(shm_read_bytes(container[shm_key]))
+        from vllm_omni.distributed.connectors.serialization import OmniSerializer
+        return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
     return container[obj_key]
 
 
@@ -252,12 +254,13 @@ def maybe_load_from_ipc_with_metrics(
       - rx_decode_time_ms: float
     """
     import time as _time  # local import to avoid overhead at module import
+    from vllm_omni.distributed.connectors.serialization import OmniSerializer
 
     t0 = _time.time()
     if shm_key in container:
         meta = container[shm_key]  # type: ignore[index]
         payload = shm_read_bytes(meta)
-        obj = pickle.loads(payload)
+        obj = OmniSerializer.deserialize(payload)
         try:
             rx_bytes = int(meta.get("size", len(payload)))  # type: ignore[call-arg]
         except Exception:

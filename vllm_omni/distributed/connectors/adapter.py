@@ -42,7 +42,7 @@ def try_send_via_connector(
         }
 
         # Send data via connector
-        success, serialized_size = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
+        success, serialized_size, metadata = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
         
         if success:
             # Send lightweight notification via queue
@@ -54,6 +54,10 @@ def try_send_via_connector(
                 "to_stage": str(next_stage_id),
                 "sent_ts": time.time(),
             }
+            # Merge connector metadata (e.g. shm handle or inline data) into queue payload
+            if metadata:
+                notify_payload["connector_metadata"] = metadata
+
             next_stage_queue_submit_fn(notify_payload)
 
             t1 = time.time()
@@ -110,7 +114,8 @@ def try_recv_via_connector(
             try:
                 # Get data from connector with timeout
                 _t_start = time.time()
-                payload = connector.get(from_stage, to_stage, str(rid))
+                connector_metadata = task.get("connector_metadata")
+                payload = connector.get(from_stage, to_stage, str(rid), metadata=connector_metadata)
                 _t_end = time.time()
                 
                 if payload:
@@ -148,7 +153,20 @@ def try_recv_via_connector(
             )
             return None, None
     else:
-        # Data comes from queue as usual
-        #return maybe_load_from_ipc_with_metrics_fn(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
-        return None, None
+        # Data comes from queue as usual (e.g. seed request for Stage-0)
+        # Since fallback logic is deprecated, we assume this is a direct inputs payload.
+        # We still need to decode it if it used SHM (via legacy stage_utils logic, or new shm_connector format)
+        # For Stage-0 specifically, 'engine_inputs' is often directly in the task dict.
+        
+        # Try to use the new stage_utils which uses OmniSerializer
+        from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc_with_metrics
+        
+        try:
+            ein, metrics = maybe_load_from_ipc_with_metrics(task, "engine_inputs", "engine_inputs_shm")
+            # If metrics are empty or zero, we might want to populate dummy metrics
+            return ein, metrics
+        except Exception:
+            # If engine_inputs is missing, it might be a different kind of payload, but for Stage-0 seed it should be there.
+            # We'll return None to let caller handle error if strictly required.
+            return None, None
 

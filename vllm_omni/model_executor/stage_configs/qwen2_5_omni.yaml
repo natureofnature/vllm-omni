@@ -123,6 +123,12 @@ runtime:
         localbuf: 134217728     # 128MB
         proto: "tcp"
 
+    # Alternative SHM connector with different threshold
+    connector_shm_large:
+      name: SharedMemoryConnector
+      extra:
+        shm_threshold_bytes: 1073741824  # 1MB threshold
+
   edges:
     - from: 0                   # thinker → talker: trigger only after receiving full input (-1)
       to: 1

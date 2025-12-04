@@ -12,7 +12,7 @@ class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
     @abstractmethod
-    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int]:
+    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int, Optional[dict[str, Any]]]:
         """Store Python object, internal serialization handled by connector.
 
         Args:
@@ -22,18 +22,20 @@ class OmniConnectorBase(ABC):
             data: Python object to store
 
         Returns:
-            tuple: (success: bool, serialized_size: int)
+            tuple: (success: bool, serialized_size: int, metadata: Optional[dict])
+                   Metadata may contain transport-specific handles or inline data.
         """
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, request_id: str) -> Optional[tuple[Any, int]]:
+    def get(self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[tuple[Any, int]]:
         """Retrieve Python object and payload size (bytes).
 
         Args:
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
             request_id: Unique request identifier
+            metadata: Optional transport-specific metadata from the put operation
 
         Returns:
             Tuple of (Python object, serialized byte size) if found, None otherwise
@@ -52,19 +54,15 @@ class OmniConnectorBase(ABC):
 
     @staticmethod
     def serialize_obj(obj: Any) -> bytes:
-        """Serialize a Python object to bytes using torch.save (consistent with stage_utils)."""
-        import io
-        import torch
-        buf = io.BytesIO()
-        torch.save(obj, buf)
-        return buf.getvalue()
+        """Serialize a Python object to bytes using centralized serializer."""
+        from vllm_omni.distributed.connectors.serialization import OmniSerializer
+        return OmniSerializer.serialize(obj)
 
     @staticmethod
     def deserialize_obj(data: bytes) -> Any:
-        """Deserialize bytes to Python object using torch.load (consistent with stage_utils)."""
-        import io
-        import torch
-        return torch.load(io.BytesIO(data), map_location="cpu", weights_only=False)
+        """Deserialize bytes to Python object using centralized serializer."""
+        from vllm_omni.distributed.connectors.serialization import OmniSerializer
+        return OmniSerializer.deserialize(data)
 
 
 class InMemoryOmniConnector(OmniConnectorBase):
@@ -81,20 +79,20 @@ class InMemoryOmniConnector(OmniConnectorBase):
     def _make_key(self, from_stage: str, to_stage: str, request_id: str) -> str:
         return f"{from_stage}:{to_stage}:{request_id}"
 
-    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int]:
+    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int, Optional[dict[str, Any]]]:
         try:
             key = self._make_key(from_stage, to_stage, request_id)
             self._storage[key] = data
             serialized_size = len(self.serialize_obj(data))
             self._metrics["puts"] += 1
             logger.debug(f"InMemoryConnector: stored {key}")
-            return True, serialized_size
+            return True, serialized_size, None
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error(f"InMemoryConnector put failed: {e}")
-            return False, 0
+            return False, 0, None
 
-    def get(self, from_stage: str, to_stage: str, request_id: str) -> Optional[tuple[Any, int]]:
+    def get(self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[tuple[Any, int]]:
         try:
             key = self._make_key(from_stage, to_stage, request_id)
             data = self._storage.get(key)

@@ -72,10 +72,10 @@ class MooncakeConnector(OmniConnectorBase):
 
     # Use base class serialization methods for consistency
 
-    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int]:
+    def put(self, from_stage: str, to_stage: str, request_id: str, data: Any) -> tuple[bool, int, Optional[dict[str, Any]]]:
         if not self.store:
             logger.error("Store not initialized")
-            return False, 0
+            return False, 0, None
 
         try:
             serialized_data = self.serialize_obj(data)
@@ -92,14 +92,14 @@ class MooncakeConnector(OmniConnectorBase):
                 to_stage,
                 len(serialized_data),
             )
-            return True, len(serialized_data)
+            return True, len(serialized_data), None
 
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error("MooncakeConnector put failed: %s", e)
-            return False, 0
+            return False, 0, None
 
-    def get(self, from_stage: str, to_stage: str, request_id: str) -> Optional[tuple[Any, int]]:
+    def get(self, from_stage: str, to_stage: str, request_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[tuple[Any, int]]:
         if not self.store:
             logger.error("Store not initialized")
             return None

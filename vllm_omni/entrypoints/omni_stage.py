@@ -514,15 +514,18 @@ def _stage_worker(
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
 
-            # Resolve input data (via Connector or IPC)
+            # Resolve input data strictly via connectors
             ein, _rx_metrics = try_recv_via_connector(
                 task=t,
                 connectors=connectors,
-                stage_id=stage_id
+                stage_id=stage_id,
             )
 
             if ein is None or _rx_metrics is None:
-                ein, _rx_metrics = maybe_load_from_ipc_with_metrics(task, obj_key="engine_inputs", shm_key="engine_inputs_shm")
+                raise RuntimeError(
+                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                    "Ensure connectors are configured for all incoming edges."
+                )
 
             if _rx_metrics:
                 _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
@@ -831,19 +834,15 @@ async def _stage_worker_async(
                 _in_flight_ms_by_rid[rid] = 0.0
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
-        ein = None
-        _rx_metrics = None
-        if connectors:
-            ein, _rx_metrics = try_recv_via_connector(
-                task=task,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
+        ein, _rx_metrics = try_recv_via_connector(
+            task=task,
+            connectors=connectors,
+            stage_id=stage_id,
+        )
         if ein is None or _rx_metrics is None:
-            ein, _rx_metrics = maybe_load_from_ipc_with_metrics(
-                task,
-                obj_key="engine_inputs",
-                shm_key="engine_inputs_shm",
+            raise RuntimeError(
+                f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                "Ensure connectors are configured for all incoming edges."
             )
         _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
         _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
