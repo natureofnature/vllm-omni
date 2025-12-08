@@ -61,6 +61,41 @@ class OmniServeCommand(CLISubcommand):
             help="Path to the stage configs file. If not specified, the stage configs will be loaded from the model.",
         )
         serve_parser.add_argument(
+            "--init-sleep-seconds",
+            type=int,
+            default=30,
+            help="The number of seconds to sleep before initializing the stages.",
+        )
+        serve_parser.add_argument(
+            "--init-timeout",
+            type=int,
+            default=60000,
+            help="The timeout for initializing the stages.",
+        )
+        serve_parser.add_argument(
+            "--shm-threshold-bytes",
+            type=int,
+            default=65536,
+            help="The threshold for the shared memory size.",
+        )
+        serve_parser.add_argument(
+            "--log-stats",
+            action="store_true",
+            help="Enable logging the stats.",
+        )
+        serve_parser.add_argument(
+            "--log-file",
+            type=str,
+            default=None,
+            help="The path to the log file.",
+        )
+        serve_parser.add_argument(
+            "--batch-timeout",
+            type=int,
+            default=10,
+            help="The timeout for the batch.",
+        )
+        serve_parser.add_argument(
             "--worker-backend",
             type=str,
             default="multi_process",
