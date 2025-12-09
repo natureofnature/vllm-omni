@@ -5,7 +5,7 @@ stage_args:
   - stage_id: 0
     runtime:
       process: true            # Run this stage in a separate process
-      devices: "5"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
+      devices: "0"            # Visible devices for this stage (CUDA_VISIBLE_DEVICES/torch.cuda.set_device)
       max_batch_size: 1
     engine_args:
       model_stage: thinker
@@ -30,11 +30,11 @@ stage_args:
       repetition_penalty: 1.1
     # Distributed connector configuration (optional)
     output_connectors:
-      to_stage_1: connector_of_mooncake
+      to_stage_1: mooncake_connector
   - stage_id: 1
     runtime:
       process: true
-      devices: "6"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: talker
@@ -59,13 +59,13 @@ stage_args:
       stop_token_ids: [8294]
     # Distributed connector configuration (optional)
     input_connectors:
-      from_stage_0: connector_of_mooncake
+      from_stage_0: mooncake_connector
     output_connectors:
-      to_stage_2: connector_of_mooncake
+      to_stage_2: mooncake_connector
   - stage_id: 2
     runtime:
       process: true
-      devices: "7"            # Example: use a different GPU than the previous stage; use "0" if single GPU
+      devices: "2"            # Example: use a different GPU than the previous stage; use "0" if single GPU
       max_batch_size: 1
     engine_args:
       model_stage: code2wav
@@ -91,7 +91,7 @@ stage_args:
       repetition_penalty: 1.1
     # Distributed connector configuration (optional)
     input_connectors:
-      from_stage_1: connector_of_mooncake
+      from_stage_1: mooncake_connector
 
 # Top-level runtime config (concise): default windows and stage edges
 runtime:
@@ -104,7 +104,7 @@ runtime:
   # More connectors will be supported in the future.
   connectors:
     # Mooncake connector for cross-node/intra-node communication
-    connector_of_mooncake:
+    mooncake_connector:
       name: MooncakeConnector
       extra:
         host: "127.0.0.1"
@@ -116,7 +116,7 @@ runtime:
 
     # SharedMemory connector for intra-node communication
     #Alternative SHM connector with different threshold
-    connector_of_shared_memory:
+    shared_memory_connector:
       name: SharedMemoryConnector
       extra:
         shm_threshold_bytes: 65536 # 64KB threshold

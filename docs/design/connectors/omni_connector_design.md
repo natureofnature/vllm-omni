@@ -1,4 +1,4 @@
-# VLLM-Omni Distributed Connectors
+# OmniConnector: a unified connector interface of disaggregated inference for omni-modality models
 
 This guide explains how to configure and use distributed connectors (vllm_omni/distributed/connectors) in vllm-omni for multi-stage pipelines.
 
@@ -124,9 +124,22 @@ runtime:
         segment: 512000000          # 512MB segment
         localbuf: 64000000          # 64MB buffer
         proto: "tcp"                # "tcp" or "rdma"
-```
+    ```
 
-**Step 2: Reference in Stages**
+**Mooncake Configuration Parameters:**
+
+*   **host**: The hostname or IP address of the local machine (worker). Mooncake uses this to register itself in the metadata server so other nodes can find it.
+*   **metadata_server**: The URL of the metadata server. This is used for service discovery and connection establishment (e.g., exchanging QP information for RDMA).
+*   **master**: The address of the Mooncake Master Server (e.g., `<MASTER_IP>:50051`). This is used for global state management and control plane operations.
+*   **segment**: The size of the global memory segment in bytes (default: ~512MB). This defines the shared memory region accessible by Mooncake for data transfer.
+*   **localbuf**: The size of the local buffer in bytes (default: ~64MB). Used for local data buffering during transfer operations.
+*   **proto**: The transport protocol to use. Options:
+    *   `tcp`: Standard TCP/IP (easier setup, universal compatibility).
+    *   `rdma`: Remote Direct Memory Access (higher performance, requires RDMA-capable hardware).
+
+For more details, refer to the [Mooncake Repository](https://github.com/kvcache-ai/Mooncake).
+
+    **Step 2: Reference in Stages**
 
 Explicitly link stages using `input_connectors` and `output_connectors`:
 
