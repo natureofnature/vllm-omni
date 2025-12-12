@@ -23,6 +23,7 @@ from vllm_omni.model_executor.model_loader.weight_utils import download_weights_
 
 from .autoencoder import AutoEncoder, AutoEncoderParams, default_ae_params
 from .bagel_core import Bagel, BagelConfig
+from .kv_cache import BagelKVCacheReceiver
 from .qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
 from .utils import BagelGenParams, add_special_tokens
 
@@ -105,6 +106,24 @@ class BagelPipeline(nn.Module):
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
         self.tokenizer, self.new_token_ids, _ = add_special_tokens(self.tokenizer)
 
+        # Optional: cross-stage KV cache receiver (Mooncake/SHM via OmniConnector)
+        self._kv_receiver: BagelKVCacheReceiver | None = None
+        if od_config.kv_cache_connector_name and od_config.kv_cache_connector_config:
+            try:
+                self._kv_receiver = BagelKVCacheReceiver(
+                    od_config,
+                    num_layers=self.bagel.config.llm_config.num_hidden_layers,
+                    device=self.device,
+                )
+                logger.info(
+                    "BagelPipeline KV receiver enabled via %s (%s -> %s)",
+                    od_config.kv_cache_connector_name,
+                    od_config.kv_cache_from_stage,
+                    od_config.kv_cache_to_stage,
+                )
+            except Exception as exc:
+                logger.warning("Failed to init Bagel KV receiver; falling back to local prefill: %s", exc)
+
         # Let vLLM loader download and stream all *.safetensors under model root.
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
@@ -156,7 +175,7 @@ class BagelPipeline(nn.Module):
             timestep_shift=3.0,
         )
 
-        # Context init
+        # Context init (may be overridden by KV receive)
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
@@ -164,6 +183,27 @@ class BagelPipeline(nn.Module):
         }
         cfg_text_context = copy.deepcopy(gen_context)
         cfg_img_context = copy.deepcopy(gen_context)
+
+        if self._kv_receiver is not None:
+            prefill_state = self._kv_receiver.try_recv(req)
+            if prefill_state is not None:
+                gen_context = {
+                    "kv_lens": prefill_state.gen_kv_lens,
+                    "ropes": prefill_state.gen_ropes,
+                    "past_key_values": prefill_state.gen_cache,
+                }
+                cfg_text_context = {
+                    "kv_lens": prefill_state.cfg_text_kv_lens,
+                    "ropes": prefill_state.cfg_text_ropes,
+                    "past_key_values": prefill_state.cfg_text_cache,
+                }
+                cfg_img_context = {
+                    "kv_lens": prefill_state.cfg_img_kv_lens,
+                    "ropes": prefill_state.cfg_img_ropes,
+                    "past_key_values": prefill_state.cfg_img_cache,
+                }
+                # If we got KV from upstream, we assume prompt was already applied there.
+                prompt = ""
 
         # Optional image conditioning: if provided, just treat it as "present image" input.
         # NOTE: Full image-conditioned editing requires prepare_vae_images + cache update; not yet wired here.
@@ -173,26 +213,27 @@ class BagelPipeline(nn.Module):
             # In practice you would encode the image into context here.
             gen_params.cfg_img_scale = 1.0
 
-        # Add text prompt
-        cfg_text_context = copy.deepcopy(gen_context)
-        generation_input, newlens, new_rope = self.bagel.prepare_prompts(
-            curr_kvlens=gen_context["kv_lens"],
-            curr_rope=gen_context["ropes"],
-            prompts=[prompt],
-            tokenizer=self.tokenizer,
-            new_token_ids=self.new_token_ids,
-        )
-        for k, v in generation_input.items():
-            if torch.is_tensor(v):
-                generation_input[k] = v.to(self.device)
-        with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
-            gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
-                gen_context["past_key_values"], **generation_input
+        # Add text prompt (only if we didn't receive prefilled KV from upstream)
+        if prompt:
+            cfg_text_context = copy.deepcopy(gen_context)
+            generation_input, newlens, new_rope = self.bagel.prepare_prompts(
+                curr_kvlens=gen_context["kv_lens"],
+                curr_rope=gen_context["ropes"],
+                prompts=[prompt],
+                tokenizer=self.tokenizer,
+                new_token_ids=self.new_token_ids,
             )
-        gen_context["kv_lens"] = newlens
-        gen_context["ropes"] = new_rope
+            for k, v in generation_input.items():
+                if torch.is_tensor(v):
+                    generation_input[k] = v.to(self.device)
+            with torch.autocast(device_type="cuda", enabled=self.device.type == "cuda", dtype=torch.bfloat16):
+                gen_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                    gen_context["past_key_values"], **generation_input
+                )
+            gen_context["kv_lens"] = newlens
+            gen_context["ropes"] = new_rope
 
-        cfg_img_context = copy.deepcopy(gen_context)
+            cfg_img_context = copy.deepcopy(gen_context)
 
         # Prepare latent query and run flow
         generation_input, newlens, new_rope = self.bagel.prepare_vae_latent(

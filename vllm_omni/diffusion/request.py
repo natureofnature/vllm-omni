@@ -27,6 +27,13 @@ class OmniDiffusionRequest:
 
     request_id: str | None = None
 
+    # === Optional: receive prefill KV cache from another stage/host ===
+    # If provided, BagelPipeline can skip local prefill and directly use received KV.
+    kv_cache_from_connector: bool = False
+    kv_cache_from_stage: str | None = None
+    kv_cache_to_stage: str | None = None
+    kv_cache_connector_metadata: dict[str, Any] | None = None
+
     generator: torch.Generator | list[torch.Generator] | None = None
 
     # Image inputs

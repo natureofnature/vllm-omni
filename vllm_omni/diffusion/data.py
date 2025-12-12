@@ -157,6 +157,18 @@ class OmniDiffusionConfig:
     )
     override_transformer_cls_name: str | None = None
 
+    # === Cross-stage KV cache transfer (e.g. PD / disaggregated deployment) ===
+    # If set, BagelPipeline can fetch prefill KV state via an OmniConnector edge.
+    # Example:
+    #   kv_cache_connector_name="MooncakeConnector"
+    #   kv_cache_connector_config={"host": "...", "metadata_server": "...", "master": "..."}
+    #   kv_cache_from_stage="und"
+    #   kv_cache_to_stage="gen"
+    kv_cache_connector_name: str | None = None
+    kv_cache_connector_config: dict[str, Any] | None = None
+    kv_cache_from_stage: str | None = None
+    kv_cache_to_stage: str | None = None
+
     # # DMD parameters
     # dmd_denoising_steps: List[int] | None = field(default=None)
 
