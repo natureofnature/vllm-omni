@@ -243,14 +243,18 @@ class Bagel(nn.Module):
         cfg_img_packed_key_value_indexes: torch.LongTensor | None = None,
         cfg_type: str = "parallel",
     ):
-        x_t = packed_init_noises
+        # Keep dtype consistent with model parameters. In some environments autocast
+        # may not cover all paths, and BF16 weights + FP32 inputs will error:
+        # "Input type(float) and bias type (c10::BFloat16) should be the same".
+        param_dtype = self.vae2llm.weight.dtype
+        x_t = packed_init_noises.to(dtype=param_dtype)
         timesteps = torch.linspace(1, 0, num_timesteps, device=x_t.device)
         timesteps = timestep_shift * timesteps / (1 + (timestep_shift - 1) * timesteps)
         dts = timesteps[:-1] - timesteps[1:]
         timesteps = timesteps[:-1]
 
         for i, t in enumerate(timesteps):
-            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
+            timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device, dtype=param_dtype)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
                 cfg_img_scale_ = cfg_img_scale

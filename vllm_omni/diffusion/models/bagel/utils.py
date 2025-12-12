@@ -19,28 +19,34 @@ def pil_img2rgb(image: PIL.Image.Image) -> PIL.Image.Image:
 
 
 def add_special_tokens(tokenizer) -> tuple[Any, dict[str, int], int]:
-    """Add Bagel's special tokens if missing; returns (tokenizer, new_token_ids, num_new_tokens)."""
-    all_special_tokens: list[str] = []
-    for _, v in getattr(tokenizer, "special_tokens_map", {}).items():
-        if isinstance(v, str):
-            all_special_tokens.append(v)
-        elif isinstance(v, list):
-            all_special_tokens += v
+    """Resolve Bagel's required special token IDs.
 
-    new_tokens: list[str] = []
-    for tok in ["<|im_start|>", "<|im_end|>", "<|vision_start|>", "<|vision_end|>"]:
-        if tok not in all_special_tokens:
-            new_tokens.append(tok)
+    IMPORTANT: Do not mutate the tokenizer (no add_tokens) during inference.
+    Adding tokens changes token IDs but the checkpoint embedding matrix is not
+    resized/updated, which will cause out-of-bounds embedding lookups on GPU.
+    """
 
-    num_new_tokens = tokenizer.add_tokens(new_tokens)
+    vocab = tokenizer.get_vocab() if hasattr(tokenizer, "get_vocab") else {}
+
+    def _tok_id(tok: str) -> int:
+        if tok in vocab:
+            return int(vocab[tok])
+        tid = tokenizer.convert_tokens_to_ids(tok)
+        # Many tokenizers return unk_token_id for unknown tokens.
+        if tid is None or (hasattr(tokenizer, "unk_token_id") and tid == tokenizer.unk_token_id):
+            raise ValueError(
+                f"Bagel tokenizer is missing required token {tok!r}. "
+                "Please use the tokenizer shipped with the Bagel checkpoint."
+            )
+        return int(tid)
 
     new_token_ids = dict(
-        bos_token_id=tokenizer.convert_tokens_to_ids("<|im_start|>"),
-        eos_token_id=tokenizer.convert_tokens_to_ids("<|im_end|>"),
-        start_of_image=tokenizer.convert_tokens_to_ids("<|vision_start|>"),
-        end_of_image=tokenizer.convert_tokens_to_ids("<|vision_end|>"),
+        bos_token_id=_tok_id("<|im_start|>"),
+        eos_token_id=_tok_id("<|im_end|>"),
+        start_of_image=_tok_id("<|vision_start|>"),
+        end_of_image=_tok_id("<|vision_end|>"),
     )
-    return tokenizer, new_token_ids, num_new_tokens
+    return tokenizer, new_token_ids, 0
 
 
 @dataclass

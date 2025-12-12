@@ -7,6 +7,7 @@ import json
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from math import isqrt
 
 import torch
 from PIL import Image
@@ -81,6 +82,29 @@ class BagelPipeline(nn.Module):
         # Allow overriding from vllm-omni config if user wants MoE/vanilla.
         llm_config.layer_module = od_config.override_transformer_cls_name or "Qwen2MoTDecoderLayer"
 
+        # Tokenizer and special tokens.
+        # Bagel uses a Qwen2 tokenizer variant; prefer trust_remote_code to get the
+        # correct tokenizer implementation from the checkpoint repo when available.
+        self.tokenizer = AutoTokenizer.from_pretrained(
+            model_path,
+            local_files_only=True,
+            trust_remote_code=True,
+        )
+        self.tokenizer, self.new_token_ids, _ = add_special_tokens(self.tokenizer)
+
+        # IMPORTANT: ensure model vocab_size can cover tokenizer ids. Otherwise embedding
+        # lookup will hit CUDA gather OOB during inference.
+        try:
+            tok_len = len(self.tokenizer)
+        except Exception:  # pragma: no cover - very old tokenizers
+            tok_len = getattr(self.tokenizer, "vocab_size", llm_config.vocab_size)
+        required_max_id = max(int(v) for v in self.new_token_ids.values())
+        llm_config.vocab_size = max(
+            int(getattr(llm_config, "vocab_size", tok_len)),
+            int(tok_len),
+            int(required_max_id + 1),
+        )
+
         # Build modules (weights loaded later by DiffusersPipelineLoader/AutoWeightsLoader)
         self.language_model = Qwen2ForCausalLM(llm_config)
 
@@ -100,10 +124,6 @@ class BagelPipeline(nn.Module):
                 timestep_shift=float(bagel_cfg.get("timestep_shift", 1.0)),
             ),
         )
-
-        # Tokenizer and special tokens
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, local_files_only=True, trust_remote_code=False)
-        self.tokenizer, self.new_token_ids, _ = add_special_tokens(self.tokenizer)
 
         # Let vLLM loader download and stream all *.safetensors under model root.
         self.weights_sources = [
@@ -140,9 +160,22 @@ class BagelPipeline(nn.Module):
             # vllm-omni request supports list; Bagel pipeline currently supports first prompt.
             prompt = prompt[0] if prompt else ""
 
-        # Choose target resolution
-        height = int(req.height) if req.height is not None else 1024
-        width = int(req.width) if req.width is not None else 1024
+        # Choose target resolution.
+        # Bagel latent positional embedding supports up to:
+        #   max_hw = max_latent_size * latent_downsample
+        # Exceeding this will cause index-out-of-bounds in latent position embedding (CUDA gather).
+        max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
+        if req.height is None and req.width is None:
+            height = width = max_hw
+        else:
+            height = int(req.height) if req.height is not None else max_hw
+            width = int(req.width) if req.width is not None else max_hw
+        if height > max_hw or width > max_hw:
+            raise ValueError(
+                f"Requested resolution {height}x{width} exceeds Bagel checkpoint limit "
+                f"{max_hw}x{max_hw} (max_latent_size={self.bagel.max_latent_size}, "
+                f"latent_downsample={self.bagel.latent_downsample})."
+            )
         image_shape = (height, width)
 
         # Map request params to Bagel gen params (defaults follow Bagel inferencer)
@@ -156,14 +189,14 @@ class BagelPipeline(nn.Module):
             timestep_shift=3.0,
         )
 
-        # Context init
+        # Context init. Bagel uses per-layer KV cache; keep three contexts for (gen / cfg_text / cfg_img).
+        # NOTE: In Bagel, CFG paths still expect consistent KV cache objects + kv_lens/rope; otherwise
+        # varlen attention merge will fail when past K/V are missing.
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-        cfg_text_context = copy.deepcopy(gen_context)
-        cfg_img_context = copy.deepcopy(gen_context)
 
         # Optional image conditioning: if provided, just treat it as "present image" input.
         # NOTE: Full image-conditioned editing requires prepare_vae_images + cache update; not yet wired here.
@@ -173,8 +206,7 @@ class BagelPipeline(nn.Module):
             # In practice you would encode the image into context here.
             gen_params.cfg_img_scale = 1.0
 
-        # Add text prompt
-        cfg_text_context = copy.deepcopy(gen_context)
+        # Add text prompt (prefill) on gen context.
         generation_input, newlens, new_rope = self.bagel.prepare_prompts(
             curr_kvlens=gen_context["kv_lens"],
             curr_rope=gen_context["ropes"],
@@ -182,6 +214,16 @@ class BagelPipeline(nn.Module):
             tokenizer=self.tokenizer,
             new_token_ids=self.new_token_ids,
         )
+        # Fail fast with a clear error instead of CUDA gather OOB.
+        max_tid = int(generation_input["packed_text_ids"].max().item())
+        emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+        if max_tid >= emb_n:
+            raise ValueError(
+                "Tokenizer/model vocab mismatch: max token id "
+                f"{max_tid} >= embed_tokens size {emb_n}. "
+                "This usually means you're not using the tokenizer shipped with the Bagel checkpoint, "
+                "or llm_config.vocab_size is smaller than the tokenizer vocab."
+            )
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
@@ -192,6 +234,10 @@ class BagelPipeline(nn.Module):
         gen_context["kv_lens"] = newlens
         gen_context["ropes"] = new_rope
 
+        # Initialize cfg contexts from the (now-prefilled) gen context.
+        # This keeps KV/lens/rope consistent and avoids None-KV merge crashes.
+        # TODO: proper unconditional/negative-prompt text CFG should build a separate cfg_text_context.
+        cfg_text_context = copy.deepcopy(gen_context)
         cfg_img_context = copy.deepcopy(gen_context)
 
         # Prepare latent query and run flow
@@ -201,6 +247,28 @@ class BagelPipeline(nn.Module):
             image_sizes=[image_shape],
             new_token_ids=self.new_token_ids,
         )
+        # Fail fast for special tokens used by the image path as well.
+        max_tid_img = int(generation_input["packed_text_ids"].max().item())
+        emb_n = int(self.language_model.model.embed_tokens.weight.shape[0])
+        if max_tid_img >= emb_n:
+            raise ValueError(
+                "Tokenizer/model vocab mismatch (image path): max token id "
+                f"{max_tid_img} >= embed_tokens size {emb_n}. "
+                "This indicates the tokenizer token IDs do not match the checkpoint embeddings."
+            )
+        # Position ids must be non-negative; negative ids can trigger CUDA gather OOB inside RoPE.
+        min_pid = int(generation_input["packed_position_ids"].min().item())
+        if min_pid < 0:
+            raise ValueError(f"Invalid packed_position_ids: min={min_pid} (must be >= 0)")
+        # Latent position embedding bounds check: ids must be < max_latent_size^2.
+        max_lat_pid = int(generation_input["packed_vae_position_ids"].max().item())
+        max_lat_pid_allowed = int(self.bagel.max_latent_size * self.bagel.max_latent_size) - 1
+        if max_lat_pid > max_lat_pid_allowed:
+            raise ValueError(
+                "Invalid packed_vae_position_ids (latent position embedding OOB): "
+                f"max={max_lat_pid} > allowed_max={max_lat_pid_allowed}. "
+                f"Requested image_shape={image_shape}, max_latent_size={self.bagel.max_latent_size}."
+            )
         for k, v in generation_input.items():
             if torch.is_tensor(v):
                 generation_input[k] = v.to(self.device)
@@ -248,5 +316,82 @@ class BagelPipeline(nn.Module):
         return DiffusionOutput(output=img)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        # Bagel checkpoints often include extra modules for "understanding" (e.g.
+        # `connector.*`, vision towers, etc.). This vendored BagelPipeline is a
+        # minimal *generation* pipeline, so those keys won't exist here.
+        #
+        # Some loaders are strict and will error on unexpected keys; filter them.
+        state = self.state_dict()
+        allowed = set(state.keys())
+        shapes = {k: tuple(v.shape) for k, v in state.items()}
+
+        def _normalize_name(name: str) -> str:
+            # Common wrappers/prefixes in checkpoints.
+            for pfx in ("module.", "model."):
+                if name.startswith(pfx):
+                    name = name[len(pfx) :]
+            # Common component renames across repos.
+            if name.startswith("vae_model."):
+                name = "vae." + name[len("vae_model.") :]
+            return name
+
+        def _iter_candidate_names(name: str) -> Iterable[str]:
+            """Yield candidate parameter names in this pipeline for a checkpoint key.
+
+            The upstream Bagel repo typically stores Bagel-core layers (time_embedder,
+            latent_pos_embed, vae2llm, llm2vae, etc.) at the top-level of the model,
+            while this vllm-omni integration nests them under `self.bagel`.
+            """
+            n = _normalize_name(name)
+            yield n
+
+            # Map Bagel core layers from top-level -> `bagel.*` namespace.
+            for pfx in ("time_embedder.", "latent_pos_embed.", "vae2llm.", "llm2vae."):
+                if n.startswith(pfx):
+                    yield "bagel." + n
+                    break
+
+        def _filtered_weights():
+            total = 0
+            kept = 0
+            shape_mismatch = 0
+            for name, tensor in weights:
+                total += 1
+                picked = None
+                for cand in _iter_candidate_names(name):
+                    if cand in allowed:
+                        # Only accept if tensor shape matches target param/buffer shape.
+                        if tuple(tensor.shape) == shapes.get(cand):
+                            picked = cand
+                            break
+                        else:
+                            # Special-case: Bagel checkpoints may have different `max_latent_size`,
+                            # which changes `latent_pos_embed.pos_embed` length (max_latent_size^2).
+                            # If we detect that mismatch, resize the existing parameter *in-place*
+                            # (preserving Parameter identity) so the loader can populate it.
+                            if cand.endswith("bagel.latent_pos_embed.pos_embed") and tensor.ndim == 2:
+                                npos, hdim = tensor.shape
+                                side = isqrt(int(npos))
+                                if side * side == int(npos) and hdim == int(self.bagel.hidden_size):
+                                    param = self.bagel.latent_pos_embed.pos_embed
+                                    # Resize in-place to keep the same Parameter object.
+                                    param.data = param.data.new_empty((npos, hdim))
+                                    # Update model bookkeeping so position-id generation matches.
+                                    self.bagel.max_latent_size = int(side)
+                                    if hasattr(self.bagel, "config"):
+                                        setattr(self.bagel.config, "max_latent_size", int(side))
+                                    if hasattr(self.bagel.latent_pos_embed, "max_num_patch_per_side"):
+                                        self.bagel.latent_pos_embed.max_num_patch_per_side = int(side)
+                                    shapes[cand] = (npos, hdim)
+                                    picked = cand
+                                    break
+                            shape_mismatch += 1
+                            print(f"{name} shape mismatch: {tuple(tensor.shape)} != {shapes.get(cand)}")
+                if picked is not None:
+                    kept += 1
+                    yield picked, tensor
+                # else: ignore extra weights (e.g. connector/vision/und)
+            print(f"BagelPipeline weight filter kept {kept}/{total} tensors (shape mismatches seen: {shape_mismatch})")
+
         loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        return loader.load_weights(_filtered_weights())

@@ -123,8 +123,20 @@ class PackedAttention(Qwen2Attention):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        # Merge with past
-        if past_key_values is not None and key_values_lens is not None and packed_key_value_indexes is not None:
+        # Merge with past (only if past KV actually exists).
+        #
+        # NOTE: For the very first prefill, Bagel passes an allocated NaiveCache
+        # but with empty past (key_values_lens == 0 and/or cache entries None).
+        # In that case we must NOT try to assign `None` into merged tensors.
+        can_merge_past = (
+            past_key_values is not None
+            and key_values_lens is not None
+            and packed_key_value_indexes is not None
+            and packed_key_value_indexes.numel() > 0
+            and past_key_values.key_cache[self.layer_idx] is not None
+            and past_key_values.value_cache[self.layer_idx] is not None
+        )
+        if can_merge_past:
             past_k = past_key_values.key_cache[self.layer_idx]
             past_v = past_key_values.value_cache[self.layer_idx]
             seqlens = int(query_lens.sum().item() + key_values_lens.sum().item())
@@ -267,8 +279,16 @@ class PackedAttentionMoT(Qwen2Attention):
             k_[packed_vae_token_indexes] = self.k_norm_moe_gen(k[packed_vae_token_indexes])
             q, k = q_, k_
 
-        # Merge with past
-        if past_key_values is not None and key_values_lens is not None and packed_key_value_indexes is not None:
+        # Merge with past (only if past KV actually exists).
+        can_merge_past = (
+            past_key_values is not None
+            and key_values_lens is not None
+            and packed_key_value_indexes is not None
+            and packed_key_value_indexes.numel() > 0
+            and past_key_values.key_cache[self.layer_idx] is not None
+            and past_key_values.value_cache[self.layer_idx] is not None
+        )
+        if can_merge_past:
             past_k = past_key_values.key_cache[self.layer_idx]
             past_v = past_key_values.value_cache[self.layer_idx]
             seqlens = int(query_lens.sum().item() + key_values_lens.sum().item())
