@@ -333,6 +333,10 @@ class BagelPipeline(nn.Module):
             # Common component renames across repos.
             if name.startswith("vae_model."):
                 name = "vae." + name[len("vae_model.") :]
+            # Bagel `ae.safetensors` commonly stores AE weights without a top-level prefix.
+            # Map them into this pipeline's `vae.*` namespace.
+            if name.startswith("encoder.") or name.startswith("decoder."):
+                name = "vae." + name
             return name
 
         def _iter_candidate_names(name: str) -> Iterable[str]:
@@ -386,12 +390,17 @@ class BagelPipeline(nn.Module):
                                     picked = cand
                                     break
                             shape_mismatch += 1
-                            print(f"{name} shape mismatch: {tuple(tensor.shape)} != {shapes.get(cand)}")
+                            # Keep this quiet; shape mismatches are expected for ignored modules.
                 if picked is not None:
                     kept += 1
                     yield picked, tensor
                 # else: ignore extra weights (e.g. connector/vision/und)
-            print(f"BagelPipeline weight filter kept {kept}/{total} tensors (shape mismatches seen: {shape_mismatch})")
+            logger.info_once(
+                "BagelPipeline weight filter kept %d/%d tensors (shape mismatches seen: %d)",
+                kept,
+                total,
+                shape_mismatch,
+            )
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(_filtered_weights())
