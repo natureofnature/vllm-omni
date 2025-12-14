@@ -1,0 +1,69 @@
+# Stage config for running Bagel with 3-stage architecture
+# Stage 0: Thinker (AR Model - text understanding/refinement)
+# Stage 1: Gen (Diffusion Model - text to latent)
+# Stage 2: VAE (Decoder - latent to image)
+
+stage_args:
+  - stage_id: 0
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: BagelForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: text
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 32768
+    final_output: false
+    # final_output_type: text
+    # is_comprehension: true
+    default_sampling_params:
+      temperature: 0.7
+      top_p: 0.9
+      max_tokens: 128
+
+  - stage_id: 1
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: gen
+      model_arch: BagelForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: latent
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 32768
+    engine_input_source: [0]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.bagel.thinker2gen
+    final_output: false
+    # default_sampling_params:
+      # Diffusion params ...
+
+  - stage_id: 2
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: vae_decoder
+      model_arch: BagelForConditionalGeneration
+      worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
+      scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: image
+      gpu_memory_utilization: 0.1
+      distributed_executor_backend: "mp"
+      max_num_batched_tokens: 32768
+    engine_input_source: [1]
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.bagel.gen2vae
+    final_output: true
+    final_output_type: image
