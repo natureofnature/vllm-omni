@@ -29,6 +29,7 @@ from vllm.v1.worker.gpu_model_runner import (
 )
 from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
+from vllm_omni.core.sched.omni_ar_scheduler import KVCacheTransferData
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
@@ -263,6 +264,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
             multimodal_outputs,
         )
         self.kv_connector_output = kv_connector_output
+
+        # Check for finished requests that need KV cache transfer
+        self.kv_extracted_req_ids = self._handle_finished_requests_kv_transfer(scheduler_output)
+
         return None
 
     @torch.inference_mode()
@@ -272,6 +277,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
+
+        kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
+        self.kv_extracted_req_ids = None
 
         if self.execute_model_state is None:
             if not kv_connector_output:
@@ -427,6 +435,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
+                kv_extracted_req_ids=kv_extracted_req_ids,
             )
 
         if not self.use_async_scheduling:
@@ -468,5 +477,289 @@ class GPUARModelRunner(OmniGPUModelRunner):
             else:
                 merged[k] = v
         setattr(req_state, "additional_information_cpu", merged)
+
+    def _handle_finished_requests_kv_transfer(self, scheduler_output: SchedulerOutput) -> list[str]:
+        """Handle KV cache transfer for finished requests asynchronously."""
+        # Get finished requests that need KV transfer
+        finished_req_ids = getattr(scheduler_output, "finished_requests_needing_kv_transfer", set())
+        if not finished_req_ids:
+            return []
+
+        logger.debug(f"Processing KV cache transfer for finished requests: {finished_req_ids}")
+
+        extracted_ids = []
+        transfer_data_list = []
+
+        # 1. Sync Phase: Copy from GPU to CPU
+        # Must be done in the current execution window while blocks are valid
+        # because the Scheduler is waiting for our confirmation to free them.
+        for req_id in finished_req_ids:
+            try:
+                # Extract data (GPU -> CPU)
+                kv_data_dict = self._extract_kv_cache_for_requests({req_id})
+
+                if req_id in kv_data_dict:
+                    kv_data = kv_data_dict[req_id]
+                    # Ensure all tensors in kv_data are on CPU
+                    self._move_kv_data_to_cpu(kv_data)
+
+                    transfer_data_list.append(kv_data)
+            except Exception as e:
+                logger.error(f"Failed to extract KV for {req_id}: {e}")
+                import traceback
+
+                traceback.print_exc()
+            finally:
+                # Always mark as extracted so Scheduler can free blocks.
+                # Even if extraction failed, we can't let the block leak.
+                extracted_ids.append(req_id)
+
+        # 2. Async Phase: Network Transfer (CPU -> Remote)
+        if transfer_data_list:
+            import threading
+
+            transfer_thread = threading.Thread(
+                target=self._async_batch_transfer,
+                args=(transfer_data_list,),
+                daemon=True,
+                name=f"kv_transfer_batch_{len(transfer_data_list)}",
+            )
+            transfer_thread.start()
+
+        return extracted_ids
+
+    def _move_kv_data_to_cpu(self, kv_data: KVCacheTransferData) -> None:
+        """Ensure all tensors in KV data are on CPU."""
+        new_layer_blocks = {}
+        for layer_name, blocks in kv_data.layer_blocks.items():
+            if isinstance(blocks, torch.Tensor) and blocks.is_cuda:
+                new_layer_blocks[layer_name] = blocks.detach().cpu().contiguous()
+            else:
+                new_layer_blocks[layer_name] = blocks
+        kv_data.layer_blocks = new_layer_blocks
+
+    def _async_batch_transfer(self, data_list: list[KVCacheTransferData]) -> None:
+        """Worker function for asynchronous KV cache transfer."""
+        for kv_data in data_list:
+            try:
+                # Transfer via OmniConnector
+                self._transfer_kv_cache_via_omni({kv_data.request_id: kv_data})
+            except Exception as e:
+                logger.error(f"Error in async KV transfer for {kv_data.request_id}: {e}")
+
+    def _async_kv_transfer_worker(self, req_ids: set[str]) -> None:
+        # Deprecated, kept for compatibility if needed or removed
+        pass
+
+    def _extract_kv_cache_for_requests(self, req_ids: set[str]) -> dict[str, KVCacheTransferData]:
+        """Extract KV cache data for specific requests."""
+        result = {}
+
+        for req_id in req_ids:
+            if req_id not in self.input_batch.req_id_to_index:
+                logger.warning(f"Request {req_id} not found in input batch, skipping KV transfer")
+                continue
+
+            req_index = self.input_batch.req_id_to_index[req_id]
+            block_ids = self.input_batch.block_table.get_row(req_index)
+
+            if not block_ids:
+                logger.warning(f"Request {req_id} has no block IDs, skipping KV transfer")
+                continue
+
+            # Extract KV cache blocks for this request
+            layer_blocks = {}
+            for layer_name, kv_tensor in self.kv_caches.items():
+                try:
+                    # Extract blocks based on block_ids
+                    blocks_data = self._extract_blocks_from_kv_tensor(kv_tensor, block_ids)
+                    layer_blocks[layer_name] = blocks_data
+                except Exception as e:
+                    logger.error(f"Failed to extract KV blocks for layer {layer_name}, request {req_id}: {e}")
+                    continue
+
+            if layer_blocks:  # Only create data if we have blocks
+                kv_data = KVCacheTransferData(
+                    request_id=req_id,
+                    layer_blocks=layer_blocks,
+                    block_ids=block_ids,
+                    metadata=self._get_kv_cache_metadata(),
+                )
+                result[req_id] = kv_data
+                logger.debug(f"Extracted KV cache data for request {req_id}, {len(layer_blocks)} layers")
+
+        return result
+
+    def _extract_blocks_from_kv_tensor(self, kv_tensor: torch.Tensor, block_ids: list[int]) -> torch.Tensor:
+        """Extract specific blocks from a KV cache tensor."""
+        if kv_tensor.dim() < 2:
+            raise ValueError(f"KV tensor has unexpected shape: {kv_tensor.shape}")
+
+        # Ensure block_ids are valid
+        max_block_id = kv_tensor.shape[0] - 1
+        valid_block_ids = [bid for bid in block_ids if 0 <= bid <= max_block_id]
+
+        if len(valid_block_ids) != len(block_ids):
+            invalid_ids = set(block_ids) - set(valid_block_ids)
+            logger.warning(f"Invalid block IDs found: {invalid_ids}, ignoring them")
+            block_ids = valid_block_ids
+
+        if not block_ids:
+            raise ValueError("No valid block IDs to extract")
+
+        # Select blocks by indices - KV cache shape is [num_blocks, num_kv_heads, head_size, block_size]
+        # or similar depending on the attention backend
+        selected_blocks = kv_tensor[block_ids]  # [num_selected_blocks, ...]
+
+        # Ensure the tensor is contiguous for efficient transfer
+        return selected_blocks.contiguous()
+
+    def _get_kv_cache_metadata(self) -> dict[str, Any]:
+        """Get metadata about the KV cache for transfer."""
+        return {
+            "block_size": self.cache_config.block_size,
+            "num_layers": len(self.kv_caches),
+            "dtype": str(self.cache_config.cache_dtype),
+            "device": str(self.device),
+        }
+
+    def _transfer_kv_cache_via_omni(self, kv_transfer_data: dict[str, KVCacheTransferData]) -> None:
+        """Transfer KV cache data via OmniConnector."""
+        try:
+            # Import here to avoid circular imports
+            from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+
+            # Get connector configuration from system config
+            connector_config = self._get_omni_connector_config()
+            if not connector_config:
+                logger.warning("No OmniConnector config found, skipping KV transfer")
+                return
+
+            connector = OmniConnectorFactory.create_connector(connector_config)
+
+            for req_id, kv_data in kv_transfer_data.items():
+                logger.info(f"Transferring KV cache for request {req_id}")
+
+                # Convert to dict for serialization
+                data_dict = kv_data.to_dict()
+
+                # Detect stages and send via OmniConnector with retry
+                from_stage, to_stage = self._detect_transfer_stages()
+                success, size, metadata = self._transfer_with_retry(
+                    connector, from_stage, to_stage, f"kv_cache_{req_id}", data_dict
+                )
+
+                if success:
+                    logger.info(f"Successfully transferred KV cache for {req_id}, size: {size} bytes")
+                else:
+                    logger.error(f"Failed to transfer KV cache for {req_id} after retries")
+
+        except Exception as e:
+            logger.error(f"Error during KV cache transfer: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    def _get_omni_connector_config(self) -> dict[str, Any] | None:
+        """Get OmniConnector configuration from system config."""
+        try:
+            # Try to get from vLLM config first (if configured for KV transfer)
+            if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
+                kv_config = self.vllm_config.kv_transfer_config
+                if hasattr(kv_config, "omni_connector_config"):
+                    return kv_config.omni_connector_config
+
+            # Fallback: try to get from environment or default config
+            # TODO: Implement proper config loading from stage configuration
+            import os
+
+            if os.getenv("OMNI_CONNECTOR_TYPE"):
+                return {
+                    "type": os.getenv("OMNI_CONNECTOR_TYPE"),
+                    "host": os.getenv("OMNI_CONNECTOR_HOST", "127.0.0.1"),
+                    "metadata_server": os.getenv("OMNI_CONNECTOR_METADATA_SERVER", "http://127.0.0.1:8080/metadata"),
+                    "master": os.getenv("OMNI_CONNECTOR_MASTER", "127.0.0.1:50051"),
+                }
+
+            # Default fallback for testing
+            logger.warning("Using default OmniConnector config for testing")
+            return {
+                "type": "SharedMemoryConnector",  # Use SHM for local testing
+                "shm_threshold_bytes": 65536,
+            }
+
+        except Exception as e:
+            logger.error(f"Error getting OmniConnector config: {e}")
+            return None
+
+    def _detect_transfer_stages(self) -> tuple[str, str]:
+        """Detect the source and target stages for KV transfer."""
+        try:
+            # Try to detect from KV transfer config
+            if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
+                kv_config = self.vllm_config.kv_transfer_config
+                kv_role = getattr(kv_config, "kv_role", None)
+                if kv_role == "kv_producer":
+                    return "prefill", "decode"
+                elif kv_role == "kv_consumer":
+                    return "decode", "prefill"
+                elif kv_role == "kv_both":
+                    # For kv_both, we need to determine direction based on context
+                    # TODO: Implement smarter stage detection
+                    return "prefill", "decode"
+
+            # Fallback based on environment or simple heuristics
+            import os
+
+            from_stage = os.getenv("VLLM_STAGE", "prefill")
+            if from_stage == "prefill":
+                to_stage = "decode"
+            else:
+                to_stage = "prefill"
+
+            return from_stage, to_stage
+
+        except Exception as e:
+            logger.error(f"Error detecting transfer stages: {e}")
+            return "prefill", "decode"  # Default fallback
+
+    def _transfer_with_retry(
+        self,
+        connector: Any,
+        from_stage: str,
+        to_stage: str,
+        request_id: str,
+        data: dict[str, Any],
+        max_retries: int = 3,
+        retry_delay: float = 0.1,
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        """Transfer data with retry mechanism."""
+        import time
+
+        for attempt in range(max_retries):
+            try:
+                success, size, metadata = connector.put(
+                    from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
+                )
+
+                if success:
+                    return success, size, metadata
+                else:
+                    logger.warning(f"Transfer attempt {attempt + 1} failed for {request_id}")
+
+            except Exception as e:
+                logger.warning(f"Transfer attempt {attempt + 1} exception for {request_id}: {e}")
+
+            # Wait before retry (exponential backoff)
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay * (2**attempt))
+
+        return False, 0, None
+
+    # ===== TODO: 需要实现的接收端逻辑 =====
+    # 1. 实现接收端KV cache组装逻辑
+    # 2. 在目标stage的gpu model runner中添加接收处理
+    # 3. 确保KV cache正确放置到目标内存位置
+    # 4. 处理跨节点状态同步
 
     # ===== Helper functions extracted for clarity and reuse =====
