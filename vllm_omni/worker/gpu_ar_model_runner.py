@@ -63,6 +63,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
+        self.omni_connector = None
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -85,6 +86,9 @@ class GPUARModelRunner(OmniGPUModelRunner):
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors | None:
         with record_function_or_nullcontext("Preprocess"):
             with self.synchronize_input_prep():
+                # [Fix] Handle KV transfer BEFORE updating states (which removes finished requests)
+                self.kv_extracted_req_ids = self._handle_finished_requests_kv_transfer(scheduler_output)
+
                 self._update_states(scheduler_output)
                 self._decode_and_store_request_payloads(scheduler_output)
 
@@ -265,9 +269,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
         )
         self.kv_connector_output = kv_connector_output
 
-        # Check for finished requests that need KV cache transfer
-        self.kv_extracted_req_ids = self._handle_finished_requests_kv_transfer(scheduler_output)
-
         return None
 
     @torch.inference_mode()
@@ -435,8 +436,8 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
-                kv_extracted_req_ids=kv_extracted_req_ids,
             )
+            output.kv_extracted_req_ids = kv_extracted_req_ids
 
         if not self.use_async_scheduling:
             return output
@@ -481,11 +482,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
     def _handle_finished_requests_kv_transfer(self, scheduler_output: SchedulerOutput) -> list[str]:
         """Handle KV cache transfer for finished requests asynchronously."""
         # Get finished requests that need KV transfer
-        finished_req_ids = getattr(scheduler_output, "finished_requests_needing_kv_transfer", set())
-        if not finished_req_ids:
+        finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
+        if not finished_reqs:
             return []
 
-        logger.debug(f"Processing KV cache transfer for finished requests: {finished_req_ids}")
+        logger.debug(f"Processing KV cache transfer for finished requests: {finished_reqs.keys()}")
 
         extracted_ids = []
         transfer_data_list = []
@@ -493,10 +494,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # 1. Sync Phase: Copy from GPU to CPU
         # Must be done in the current execution window while blocks are valid
         # because the Scheduler is waiting for our confirmation to free them.
-        for req_id in finished_req_ids:
+        for req_id, data in finished_reqs.items():
             try:
                 # Extract data (GPU -> CPU)
-                kv_data_dict = self._extract_kv_cache_for_requests({req_id})
+                # finished_reqs is now {req_id: {"seq_len": int, "block_ids": list[int]}}
+                kv_data_dict = self._extract_kv_cache_for_requests({req_id: data})
 
                 if req_id in kv_data_dict:
                     kv_data = kv_data_dict[req_id]
@@ -514,17 +516,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 # Even if extraction failed, we can't let the block leak.
                 extracted_ids.append(req_id)
 
-        # 2. Async Phase: Network Transfer (CPU -> Remote)
+        # 2. Transfer Phase: Network Transfer (CPU -> Remote)
+        # Use synchronous transfer to ensure process doesn't exit before transfer completes
         if transfer_data_list:
-            import threading
-
-            transfer_thread = threading.Thread(
-                target=self._async_batch_transfer,
-                args=(transfer_data_list,),
-                daemon=True,
-                name=f"kv_transfer_batch_{len(transfer_data_list)}",
-            )
-            transfer_thread.start()
+            self._async_batch_transfer(transfer_data_list)
 
         return extracted_ids
 
@@ -551,17 +546,17 @@ class GPUARModelRunner(OmniGPUModelRunner):
         # Deprecated, kept for compatibility if needed or removed
         pass
 
-    def _extract_kv_cache_for_requests(self, req_ids: set[str]) -> dict[str, KVCacheTransferData]:
-        """Extract KV cache data for specific requests."""
+    def _extract_kv_cache_for_requests(self, req_data: dict[str, dict]) -> dict[str, any]:
+        """Extract KV cache data for specific requests using provided block IDs."""
         result = {}
 
-        for req_id in req_ids:
-            if req_id not in self.input_batch.req_id_to_index:
-                logger.warning(f"Request {req_id} not found in input batch, skipping KV transfer")
+        for req_id, data in req_data.items():
+            if isinstance(data, int):
+                logger.error(f"Legacy call to _extract_kv_cache_for_requests for {req_id} not supported")
                 continue
 
-            req_index = self.input_batch.req_id_to_index[req_id]
-            block_ids = self.input_batch.block_table.get_row(req_index)
+            seq_len = data.get("seq_len", 0)
+            block_ids = data.get("block_ids", [])
 
             if not block_ids:
                 logger.warning(f"Request {req_id} has no block IDs, skipping KV transfer")
@@ -569,50 +564,90 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
             # Extract KV cache blocks for this request
             layer_blocks = {}
-            for layer_name, kv_tensor in self.kv_caches.items():
+            for layer_idx, kv_cache_item in enumerate(self.kv_caches):
                 try:
-                    # Extract blocks based on block_ids
-                    blocks_data = self._extract_blocks_from_kv_tensor(kv_tensor, block_ids)
-                    layer_blocks[layer_name] = blocks_data
+                    # with shape [2, num_blocks, block size, kv heads, head size]
+                    if isinstance(kv_cache_item, torch.Tensor) and kv_cache_item.dim() == 5:
+                        # return [2, seq_len, n_heads, head_dim]
+                        combined_kv = self._extract_blocks_from_kv_tensor(kv_cache_item, block_ids, seq_len)
+                        layer_blocks[f"{layer_idx}_k"] = combined_kv[0]  # [seq_len, 4, 128]
+                        layer_blocks[f"{layer_idx}_v"] = combined_kv[1]  # [seq_len, 4, 128]
+                    # for kv list (k_cache, v_cache)
+                    elif isinstance(kv_cache_item, (tuple, list)) and len(kv_cache_item) == 2:
+                        k_data = self._extract_blocks_from_kv_tensor(kv_cache_item[0], block_ids, seq_len)
+                        v_data = self._extract_blocks_from_kv_tensor(kv_cache_item[1], block_ids, seq_len)
+                        layer_blocks[f"{layer_idx}_k"] = k_data
+                        layer_blocks[f"{layer_idx}_v"] = v_data
+                    else:
+                        logger.warning(f"Unexpected kv_cache structure at layer {layer_idx}: {type(kv_cache_item)}")
+                        continue
+
                 except Exception as e:
-                    logger.error(f"Failed to extract KV blocks for layer {layer_name}, request {req_id}: {e}")
+                    logger.error(f"Failed to extract KV blocks for layer {layer_idx}, request {req_id}: {e}")
                     continue
 
-            if layer_blocks:  # Only create data if we have blocks
+            if layer_blocks:
+                metadata = self._get_kv_cache_metadata()
+                metadata.update(
+                    {
+                        "kv_lens": [seq_len],
+                        "ropes": [0],
+                        "seq_len": seq_len,
+                    }
+                )
+
                 kv_data = KVCacheTransferData(
                     request_id=req_id,
                     layer_blocks=layer_blocks,
                     block_ids=block_ids,
-                    metadata=self._get_kv_cache_metadata(),
+                    metadata=metadata,
                 )
                 result[req_id] = kv_data
-                logger.debug(f"Extracted KV cache data for request {req_id}, {len(layer_blocks)} layers")
+                logger.debug(f"Extracted KV cache for {req_id}, {len(layer_blocks)} items, len={seq_len}")
 
         return result
 
-    def _extract_blocks_from_kv_tensor(self, kv_tensor: torch.Tensor, block_ids: list[int]) -> torch.Tensor:
-        """Extract specific blocks from a KV cache tensor."""
-        if kv_tensor.dim() < 2:
-            raise ValueError(f"KV tensor has unexpected shape: {kv_tensor.shape}")
+    def _extract_blocks_from_kv_tensor(
+        self, kv_tensor: torch.Tensor, block_ids: list[int], seq_len: int
+    ) -> torch.Tensor:
+        """Extract specific blocks and reconstruct them into a logical sequence."""
 
-        # Ensure block_ids are valid
-        max_block_id = kv_tensor.shape[0] - 1
+        # 5D: [2, num_blocks, block_size, n_heads, head_dim] -> current shape
+        # 4D: [num_blocks, block_size, n_heads, head_dim] ->  single KV
+
+        is_5d = kv_tensor.dim() == 5
+        block_dim = 1 if is_5d else 0
+
+        max_block_id = kv_tensor.shape[block_dim] - 1
         valid_block_ids = [bid for bid in block_ids if 0 <= bid <= max_block_id]
 
-        if len(valid_block_ids) != len(block_ids):
-            invalid_ids = set(block_ids) - set(valid_block_ids)
-            logger.warning(f"Invalid block IDs found: {invalid_ids}, ignoring them")
-            block_ids = valid_block_ids
+        if not valid_block_ids:
+            raise ValueError(f"No valid block IDs. Max ID: {max_block_id}, Requested: {block_ids}")
 
-        if not block_ids:
-            raise ValueError("No valid block IDs to extract")
+        # 1. extract blocks
+        if is_5d:
+            # result shape: [2, len(valid_block_ids), 16, 4, 128]
+            selected = kv_tensor[:, valid_block_ids]
+        else:
+            # result shape: [len(valid_block_ids), 16, 4, 128]
+            selected = kv_tensor[valid_block_ids]
 
-        # Select blocks by indices - KV cache shape is [num_blocks, num_kv_heads, head_size, block_size]
-        # or similar depending on the attention backend
-        selected_blocks = kv_tensor[block_ids]  # [num_selected_blocks, ...]
+        # 2. reshape (Flatten)
+        if is_5d:
+            # [2, n_blocks, 16, 4, 128] -> [2, n_blocks * 16, 4, 128]
+            n_kv, n_blks, blk_sz, n_heads, d_head = selected.shape
+            flat = selected.reshape(n_kv, n_blks * blk_sz, n_heads, d_head)
+            # get actual seq_len
+            if seq_len <= flat.shape[1]:
+                flat = flat[:, :seq_len]
+        else:
+            # [n_blocks, 16, 4, 128] -> [n_blocks * 16, 4, 128]
+            n_blks, blk_sz, n_heads, d_head = selected.shape
+            flat = selected.reshape(n_blks * blk_sz, n_heads, d_head)
+            if seq_len <= flat.shape[0]:
+                flat = flat[:seq_len]
 
-        # Ensure the tensor is contiguous for efficient transfer
-        return selected_blocks.contiguous()
+        return flat.contiguous()
 
     def _get_kv_cache_metadata(self) -> dict[str, Any]:
         """Get metadata about the KV cache for transfer."""
@@ -628,6 +663,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
         try:
             # Import here to avoid circular imports
             from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+            from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
             # Get connector configuration from system config
             connector_config = self._get_omni_connector_config()
@@ -635,7 +671,21 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 logger.warning("No OmniConnector config found, skipping KV transfer")
                 return
 
-            connector = OmniConnectorFactory.create_connector(connector_config)
+            if isinstance(connector_config, dict):
+                c_type = connector_config.get("type")
+                if not c_type:
+                    logger.error("OmniConnector config missing 'type' field")
+                    return
+                c_extra = {k: v for k, v in connector_config.items() if k != "type"}
+                connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
+            else:
+                # Should not happen based on _get_omni_connector_config type hint
+                logger.error(f"Unexpected OmniConnector config type: {type(connector_config)}")
+                return
+
+            connector = (
+                self.omni_connector if self.omni_connector else OmniConnectorFactory.create_connector(connector_spec)
+            )
 
             for req_id, kv_data in kv_transfer_data.items():
                 logger.info(f"Transferring KV cache for request {req_id}")
@@ -684,8 +734,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
             # Default fallback for testing
             logger.warning("Using default OmniConnector config for testing")
             return {
-                "type": "SharedMemoryConnector",  # Use SHM for local testing
-                "shm_threshold_bytes": 65536,
+                "type": "MooncakeConnector",  # Use Mooncake for testing
+                "host": "127.0.0.1",
+                "metadata_server": "http://127.0.0.1:8080/metadata",
+                "master": "127.0.0.1:50051",
             }
 
         except Exception as e:
@@ -741,6 +793,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 success, size, metadata = connector.put(
                     from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
                 )
+                # TODO! if no sleep, data actually not stored
+                import time
+
+                time.sleep(20)
 
                 if success:
                     return success, size, metadata

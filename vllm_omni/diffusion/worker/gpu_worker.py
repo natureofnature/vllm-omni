@@ -44,6 +44,10 @@ class GPUWorker:
         self.rank = rank
         self.od_config = od_config
         self.pipeline = None
+        self.connector = None
+
+        # Initialize OmniConnector early
+        self._init_omni_connector()
 
         self.init_device_and_model()
 
@@ -113,6 +117,10 @@ class GPUWorker:
         # TODO: dealing with first req for now
         req = reqs[0]
 
+        # [Omni] KV Cache Receiving Logic
+        if getattr(req, "need_kv_receive", False) and self.connector is not None:
+            self._receive_kv_cache_for_request(req)
+
         # Refresh cache context if needed
         if self.cache_backend is not None and self.cache_backend.is_enabled():
             self.cache_backend.refresh(self.pipeline, req.num_inference_steps)
@@ -122,6 +130,100 @@ class GPUWorker:
 
     def shutdown(self) -> None:
         destroy_distributed_env()
+
+    def _init_omni_connector(self) -> None:
+        """Initialize OmniConnector for KV cache transfer."""
+        # Only initialize connector if we are in consumer role or have specific config
+        # TODO: Better configuration for roles
+
+        # Check environment variable for KV role
+        # Also check od_config
+        # Note: od_config doesn't standardly have kv_role yet, but we can check extra args if added
+
+        try:
+            from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+            from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+
+            # Use environment variables as fallback, but prefer config if available (future)
+            # Default to MooncakeConnector for testing without manual metadata transfer
+            connector_config = {
+                "type": os.environ.get("OMNI_CONNECTOR_TYPE", "MooncakeConnector"),
+                "shm_threshold_bytes": 65536,
+                "host": os.environ.get("OMNI_CONNECTOR_HOST", "127.0.0.1"),
+                "metadata_server": os.environ.get("OMNI_CONNECTOR_METADATA_SERVER", "http://127.0.0.1:8080/metadata"),
+                "master": os.environ.get("OMNI_CONNECTOR_MASTER", "127.0.0.1:50051"),
+            }
+
+            logger.info(f"Initializing OmniConnector with config: {connector_config}")
+
+            c_type = connector_config.get("type")
+            c_extra = {k: v for k, v in connector_config.items() if k != "type"}
+            connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
+
+            self.connector = OmniConnectorFactory.create_connector(connector_spec)
+
+        except Exception as e:
+            logger.error(f"Failed to initialize OmniConnector: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
+        """Receive KV cache for a request via OmniConnector."""
+        if not req.request_id:
+            logger.warning("Request has no ID, cannot receive KV cache")
+            return
+
+        try:
+            logger.info(f"Attempting to receive KV cache for request {req.request_id}")
+
+            # TODO: Key used for transfer (must match sender side)
+            # key = f"kv_cache_{req.request_id}"
+
+            # Get data from connector
+            # from_stage="prefill", to_stage="decode" (assuming diffusion acts as consumer)
+            # Key must match sender: f"kv_cache_{req.request_id}"
+
+            logger.info(f"Wait for KV cache for request {req.request_id}...")
+            while True:
+                result = self.connector.get(
+                    from_stage="prefill",
+                    to_stage="decode",
+                    request_id=f"kv_cache_{req.request_id}",
+                )
+                if result:
+                    break
+                # loop forever for testing
+                time.sleep(0.5)
+
+            if result:
+                data, size = result
+                logger.info(f"Successfully received KV cache for {req.request_id}")
+
+                # Assume data structure matches KVCacheTransferData.to_dict()
+                if isinstance(data, dict) and "layer_blocks" in data:
+                    # Get layer blocks and ensure they are on the correct device
+                    layer_blocks = data["layer_blocks"]
+
+                    # Move tensors to GPU if needed (OmniSerializer should handle tensor reconstruction)
+                    for k, v in layer_blocks.items():
+                        if isinstance(v, torch.Tensor) and v.device != self.pipeline.device:
+                            layer_blocks[k] = v.to(self.pipeline.device).contiguous()
+
+                    # Store in request for pipeline to use
+                    req.past_key_values = layer_blocks
+
+                if "metadata" in data:
+                    req.kv_metadata = data["metadata"]
+
+            else:
+                logger.warning(f"No KV cache received for {req.request_id} (timeout or empty)")
+
+        except Exception as e:
+            logger.error(f"Error receiving KV cache for {req.request_id}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
 
 class WorkerProc:

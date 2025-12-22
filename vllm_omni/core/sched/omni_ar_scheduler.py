@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from dataclasses import asdict, dataclass
 from time import time
 from typing import Any
 
@@ -18,6 +19,17 @@ from vllm.v1.spec_decode.metrics import SpecDecodingStats
 logger = init_logger(__name__)
 
 
+@dataclass
+class KVCacheTransferData:
+    request_id: str
+    layer_blocks: dict[str, Any]
+    block_ids: list[int]
+    metadata: dict[str, Any]
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
 class OmniARScheduler(VLLMScheduler):
     """
     OmniARScheduler: Scheduler for vLLM-Omni multimodal processing.
@@ -30,7 +42,7 @@ class OmniARScheduler(VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Track requests that need KV cache transfer when finished
-        self.requests_needing_kv_transfer: set[str] = set()
+        self.requests_needing_kv_transfer: dict[str, int] = {}
         # Track requests that have already been processed for KV transfer
         self.processed_kv_transfers: set[str] = set()
         # Track requests waiting for KV transfer (blocks not freed yet)
@@ -73,7 +85,7 @@ class OmniARScheduler(VLLMScheduler):
         except Exception:
             # If anything goes wrong, leave the original output unchanged
             init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
-            scheduler_output.finished_requests_needing_kv_transfer = set()
+            scheduler_output.finished_requests_needing_kv_transfer = {}
 
         return scheduler_output
 
@@ -323,7 +335,8 @@ class OmniARScheduler(VLLMScheduler):
         # 2. Omni Specific: Check if we need to transfer KV
         if self._should_transfer_kv_for_request(request_id):
             self.waiting_for_transfer_free.add(request_id)
-            self._mark_request_for_kv_transfer(request_id)
+            # Store req_id and seq_len
+            self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
             # FORCE delay freeing blocks regardless of connector status
             # We return early so _free_blocks is not called
             return kv_xfer_params
@@ -339,15 +352,26 @@ class OmniARScheduler(VLLMScheduler):
         # VLLMScheduler has _free_blocks
         super()._free_blocks(request)
 
-    def _mark_request_for_kv_transfer(self, req_id: str) -> None:
+    def _mark_request_for_kv_transfer(self, req_id: str, seq_len: int) -> None:
         """Mark a request as needing KV cache transfer when it finishes."""
         # Avoid duplicate marking
         if req_id in self.requests_needing_kv_transfer or req_id in self.processed_kv_transfers:
             return
 
         if self._should_transfer_kv_for_request(req_id):
-            self.requests_needing_kv_transfer.add(req_id)
-            logger.debug(f"Marked request {req_id} for KV cache transfer")
+            # [Omni] Get block IDs from KVCacheManager
+            try:
+                block_ids_tuple = self.kv_cache_manager.get_block_ids(req_id)
+                if block_ids_tuple and len(block_ids_tuple) > 0:
+                    block_ids = block_ids_tuple[0]
+                else:
+                    block_ids = []
+            except Exception as e:
+                init_logger(__name__).warning(f"Failed to get block IDs for {req_id}: {e}")
+                block_ids = []
+
+            self.requests_needing_kv_transfer[req_id] = {"seq_len": seq_len, "block_ids": block_ids}
+            logger.debug(f"Marked request {req_id} for KV cache transfer (len={seq_len}, blocks={len(block_ids)})")
 
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:
         """Determine if a request should trigger KV cache transfer."""
@@ -375,10 +399,32 @@ class OmniARScheduler(VLLMScheduler):
 
         return need_send
 
-    def get_finished_requests_needing_kv_transfer(self) -> set[str]:
-        """Get and clear the list of requests needing KV cache transfer."""
+    def has_requests(self) -> bool:
+        """Check if there are any requests to process, including KV transfers."""
+        # [Omni] Also check for pending KV transfers
+        if self.requests_needing_kv_transfer:
+            return True
+        return super().has_requests()
+
+    def has_finished_requests(self) -> bool:
+        """Check if there are any finished requests (including those needing KV transfer)."""
+        if self.requests_needing_kv_transfer:
+            return True
+        return super().has_finished_requests()
+
+    def has_unfinished_requests(self) -> bool:
+        """Check if there are any unfinished requests (including those needing KV transfer)."""
+        # [Omni] Also check for pending KV transfers to ensure the engine loop continues
+        if self.requests_needing_kv_transfer:
+            return True
+        return super().has_unfinished_requests()
+
+    def get_finished_requests_needing_kv_transfer(self) -> dict[str, dict]:
+        """Get and clear the list of requests needing KV cache transfer.
+        Returns dict: {req_id: {"seq_len": int, "block_ids": list[int]}}
+        """
         requests = self.requests_needing_kv_transfer.copy()
         # Mark these requests as processed to avoid duplicate processing
-        self.processed_kv_transfers.update(requests)
+        self.processed_kv_transfers.update(requests.keys())
         self.requests_needing_kv_transfer.clear()
         return requests
