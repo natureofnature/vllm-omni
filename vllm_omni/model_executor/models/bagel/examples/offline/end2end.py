@@ -27,7 +27,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model",
-        default="../models/BAGEL-7B-MoT",
+        default="/workspace/ByteDance-Seed/BAGEL-7B-MoT",
         help="Path to merged model directory.",
     )
     parser.add_argument("--prompts", nargs="+", default=None, help="Input text prompts.")

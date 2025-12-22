@@ -12,7 +12,6 @@ Architecture:
   processing
 """
 
-# vllm_omni/__init__.py
 import vllm
 from transformers import AutoConfig, Qwen2Config
 from vllm.model_executor.models import ModelRegistry
