@@ -687,7 +687,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 c_type = connector_config.get("type")
                 if not c_type:
                     logger.error("OmniConnector config missing 'type' field")
-                    return
+                    raise ValueError("OmniConnector config missing 'type' field")
                 c_extra = {k: v for k, v in connector_config.items() if k != "type"}
                 connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
             else:
@@ -698,23 +698,49 @@ class GPUARModelRunner(OmniGPUModelRunner):
             connector = (
                 self.omni_connector if self.omni_connector else OmniConnectorFactory.create_connector(connector_spec)
             )
+            if self.omni_connector is None:
+                self.omni_connector = connector
 
             for req_id, kv_data in kv_transfer_data.items():
                 logger.info(f"Transferring KV cache for request {req_id}")
 
+                # [Omni] Try to resolve global request_id for consistency across stages
+                transfer_req_id = req_id
+                # Attempt to find the request state to get additional_information
+                req_state = self.requests.get(req_id)
+                if req_state:
+                    add_info = getattr(req_state, "additional_information_cpu", {})
+                    if add_info and "global_request_id" in add_info:
+                        global_id = add_info["global_request_id"]
+                        # Unwrap list if necessary (since we wrapped it to pass input processor checks)
+                        if isinstance(global_id, list) and len(global_id) > 0:
+                            global_id = global_id[0]
+
+                        # Convert bytes/tensor to string if necessary
+                        if isinstance(global_id, bytes):
+                            transfer_req_id = global_id.decode("utf-8")
+                        else:
+                            transfer_req_id = str(global_id)
+                        logger.debug(f"Resolved global request_id {transfer_req_id} for internal id {req_id}")
+
                 # Convert to dict for serialization
                 data_dict = kv_data.to_dict()
+
+                # Update request_id in the data payload to match the transfer key
+                data_dict["request_id"] = transfer_req_id
 
                 # Detect stages and send via OmniConnector with retry
                 from_stage, to_stage = self._detect_transfer_stages()
                 success, size, metadata = self._transfer_with_retry(
-                    connector, from_stage, to_stage, f"kv_cache_{req_id}", data_dict
+                    connector, from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict
                 )
 
                 if success:
-                    logger.info(f"Successfully transferred KV cache for {req_id}, size: {size} bytes")
+                    logger.info(
+                        f"Successfully transferred KV cache for {transfer_req_id} (int: {req_id}), size: {size} bytes"
+                    )
                 else:
-                    logger.error(f"Failed to transfer KV cache for {req_id} after retries")
+                    logger.error(f"Failed to transfer KV cache for {transfer_req_id} (int: {req_id}) after retries")
 
         except Exception as e:
             logger.error(f"Error during KV cache transfer: {e}")
@@ -723,35 +749,33 @@ class GPUARModelRunner(OmniGPUModelRunner):
             traceback.print_exc()
 
     def _get_omni_connector_config(self) -> dict[str, Any] | None:
-        # TODO(wzliu)! get real connector from yaml file instead of hardcode
-        """Get OmniConnector configuration from system config."""
+        """Get OmniConnector configuration from model config (omni_kv_config)."""
         try:
-            # Try to get from vLLM config first (if configured for KV transfer)
+            # 1. Prefer omni_kv_config (injected from YAML)
+            omni_kv_config = getattr(self.model_config, "omni_kv_config", None)
+            if isinstance(omni_kv_config, dict):
+                connector_config = omni_kv_config.get("connector_config")
+                if isinstance(connector_config, dict) and connector_config:
+                    return connector_config
+
+            # 2. Fallback to kv_transfer_config (backward compatibility)
             if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
                 kv_config = self.vllm_config.kv_transfer_config
-                if hasattr(kv_config, "omni_connector_config"):
-                    return kv_config.omni_connector_config
 
-            # Fallback: try to get from environment or default config
-            # TODO: Implement proper config loading from stage configuration
-            import os
+                # Check direct attribute
+                direct = getattr(kv_config, "omni_connector_config", None)
+                if isinstance(direct, dict) and direct:
+                    return direct
 
-            if os.getenv("OMNI_CONNECTOR_TYPE"):
-                return {
-                    "type": os.getenv("OMNI_CONNECTOR_TYPE"),
-                    "host": os.getenv("OMNI_CONNECTOR_HOST", "127.0.0.1"),
-                    "metadata_server": os.getenv("OMNI_CONNECTOR_METADATA_SERVER", "http://127.0.0.1:8080/metadata"),
-                    "master": os.getenv("OMNI_CONNECTOR_MASTER", "127.0.0.1:50051"),
-                }
+                # Check extra config
+                extra_cfg = getattr(kv_config, "kv_connector_extra_config", None)
+                if isinstance(extra_cfg, dict):
+                    omni_cfg = extra_cfg.get("omni_connector_config")
+                    if isinstance(omni_cfg, dict) and omni_cfg:
+                        return omni_cfg
 
-            # Default fallback for testing
-            logger.warning("Using default OmniConnector config for testing")
-            return {
-                "type": "MooncakeConnector",  # Use Mooncake for testing
-                "host": "127.0.0.1",
-                "metadata_server": "http://127.0.0.1:8080/metadata",
-                "master": "127.0.0.1:50051",
-            }
+            logger.warning("No OmniConnector config found in omni_kv_config or kv_transfer_config")
+            return None
 
         except Exception as e:
             logger.error(f"Error getting OmniConnector config: {e}")
@@ -760,7 +784,15 @@ class GPUARModelRunner(OmniGPUModelRunner):
     def _detect_transfer_stages(self) -> tuple[str, str]:
         """Detect the source and target stages for KV transfer."""
         try:
-            # Try to detect from KV transfer config
+            # 1. Prefer omni_kv_config (injected from YAML)
+            omni_kv_config = getattr(self.model_config, "omni_kv_config", None)
+            if isinstance(omni_kv_config, dict):
+                from_stage = omni_kv_config.get("omni_from_stage")
+                to_stage = omni_kv_config.get("omni_to_stage")
+                if from_stage and to_stage:
+                    return str(from_stage), str(to_stage)
+
+            # 2. Fallback to kv_transfer_config (backward compatibility)
             if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
                 kv_config = self.vllm_config.kv_transfer_config
                 kv_role = getattr(kv_config, "kv_role", None)
@@ -806,10 +838,6 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 success, size, metadata = connector.put(
                     from_stage=from_stage, to_stage=to_stage, request_id=request_id, data=data
                 )
-                # TODO(wzliu)! in offline mode + mooncake connectorif no sleep,
-                # data actually not stored due to the exit of process
-                time.sleep(20)
-
                 if success:
                     return success, size, metadata
                 else:

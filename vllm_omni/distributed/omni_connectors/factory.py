@@ -45,8 +45,9 @@ class OmniConnectorFactory:
             connector = constructor(spec.extra)
             logger.info(f"Created connector: {spec.name}")
             return connector
-        except Exception as e:
-            logger.error(f"Failed to create connector {spec.name}: {e}")
+        except Exception:
+            # Preserve the original exception type and traceback for debugging.
+            logger.exception("Failed to create connector %s", spec.name)
             raise
 
     @classmethod

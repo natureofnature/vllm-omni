@@ -52,6 +52,36 @@ class OmniInputPreprocessor(InputPreprocessor):
 
         return inputs
 
+    def _process_text(
+        self,
+        parsed_content: TextPrompt,
+        tokenization_kwargs: dict[str, Any] | None = None,
+        *,
+        mm_uuids: MultiModalUUIDDict | None = None,
+    ) -> OmniTokenInputs | MultiModalInputs:
+        """Process text prompts while preserving omni-specific fields.
+
+        vLLM's base `_process_text` tokenizes the prompt text but drops any
+        omni-specific metadata. In omni pipelines we may attach
+        `additional_information` (e.g., global request id) to a text prompt,
+        so we explicitly forward it into the resulting token inputs.
+        """
+        additional_information = parsed_content.get("additional_information")
+
+        # Delegate tokenization + multimodal handling to vLLM, then re-attach
+        # omni-specific metadata.
+        inputs = super()._process_text(
+            parsed_content,
+            tokenization_kwargs=tokenization_kwargs,
+            mm_uuids=mm_uuids,
+        )
+
+        if additional_information is not None:
+            # TokenInputs / MultiModalInputs are dict-like containers.
+            inputs["additional_information"] = additional_information  # type: ignore[index]
+
+        return inputs
+
     def _prompt_to_llm_inputs(
         self,
         prompt: SingletonPrompt,

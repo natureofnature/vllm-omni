@@ -48,11 +48,10 @@ class GPUWorker:
         self.connector = None
         self.device = None
 
-        # Initialize OmniConnector early
-        self._init_omni_connector()
-
-        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
         self.init_device_and_model()
+
+        # Initialize OmniConnector after vllm_config is available (via init_device_and_model)
+        self._init_omni_connector()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -227,30 +226,28 @@ class GPUWorker:
     def _init_omni_connector(self) -> None:
         # TODO(wzliu)! get real connector from yaml file instead of hardcode
         """Initialize OmniConnector for KV cache transfer."""
-        # Only initialize connector if we are in consumer role or have specific config
-        # TODO: Better configuration for roles
-
-        # Check environment variable for KV role
-        # Also check od_config
-        # Note: od_config doesn't standardly have kv_role yet, but we can check extra args if added
-
         try:
             from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
             from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
-            # TODO(wzliu)! here hard code using mooncake connector for testing
-            # because shared memory connector requires metadata transfer carried by the queue
-            connector_config = {
-                "type": os.environ.get("OMNI_CONNECTOR_TYPE", "MooncakeConnector"),
-                "shm_threshold_bytes": 65536,
-                "host": os.environ.get("OMNI_CONNECTOR_HOST", "127.0.0.1"),
-                "metadata_server": os.environ.get("OMNI_CONNECTOR_METADATA_SERVER", "http://127.0.0.1:8080/metadata"),
-                "master": os.environ.get("OMNI_CONNECTOR_MASTER", "127.0.0.1:50051"),
-            }
+            connector_config = None
+
+            # 1. Try to get from omni_kv_config (injected from YAML)
+            # Use self.od_config because self.vllm_config is a dummy VllmConfig without model_config
+            if self.od_config.omni_kv_config:
+                connector_config = self.od_config.omni_kv_config.get("connector_config")
+
+            if not connector_config:
+                logger.warning("No OmniConnector config found, skipping initialization")
+                return
 
             logger.info(f"Initializing OmniConnector with config: {connector_config}")
 
             c_type = connector_config.get("type")
+            if not c_type:
+                logger.error("Connector config missing 'type'")
+                return
+
             c_extra = {k: v for k, v in connector_config.items() if k != "type"}
             connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
 
@@ -276,20 +273,37 @@ class GPUWorker:
             # key = f"kv_cache_{req.request_id}"
 
             # Get data from connector
-            # from_stage="prefill", to_stage="decode" (assuming diffusion acts as consumer)
-            # Key must match sender: f"kv_cache_{req.request_id}"
+            # Determine from_stage and to_stage dynamically
+            omni_kv_config = self.od_config.omni_kv_config
+            stage_id = omni_kv_config.get("stage_id")
+            engine_input_source = omni_kv_config.get("engine_input_source", [])
 
-            logger.info(f"Wait for KV cache for request {req.request_id}...")
-            while True:
-                result = self.connector.get(
-                    from_stage="prefill",
-                    to_stage="decode",
-                    request_id=f"kv_cache_{req.request_id}",
-                )
-                if result:
-                    break
-                # loop forever for testing
-                time.sleep(0.5)
+            to_stage = stage_id
+            # Default to stage_id - 1 if input source is not explicit
+            if engine_input_source:
+                from_stage = engine_input_source[0]
+            elif isinstance(stage_id, int):
+                from_stage = stage_id - 1
+            else:
+                raise ValueError("Invalid stage id")
+            logger.info(f"Wait for KV cache for request {req.request_id} from stage {from_stage} to {to_stage}...")
+
+            # Check if we should receive KV cache based on config
+            need_recv_cache = omni_kv_config.get("need_recv_cache", False)
+            if need_recv_cache:
+                while True:
+                    result = self.connector.get(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        request_id=f"kv_cache_{req.request_id}",
+                    )
+                    if result:
+                        break
+                    # loop forever for testing
+                    time.sleep(0.5)
+            else:
+                logger.info(f"Skip receiving KV cache for {req.request_id} (need_recv_cache=False)")
+                result = None
 
             if result:
                 data, size = result

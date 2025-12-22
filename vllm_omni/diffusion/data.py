@@ -357,6 +357,9 @@ class OmniDiffusionConfig:
     # Logging
     log_level: str = "info"
 
+    # Omni configuration (injected from stage config)
+    omni_kv_config: dict[str, Any] = field(default_factory=dict)
+
     def settle_port(self, port: int, port_inc: int = 42, max_attempts: int = 100) -> int:
         """
         Find an available port with retry logic.
