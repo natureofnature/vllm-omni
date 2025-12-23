@@ -18,9 +18,15 @@ from transformers.models.qwen2.modeling_qwen2 import (
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 # Adjust imports to point to the correct location in vllm_omni/diffusion/models/bagel
-from vllm_omni.diffusion.models.bagel.bagel_core import BagelConfig, PositionEmbedding, TimestepEmbedder
-from vllm_omni.diffusion.models.bagel.qwen2_navit import NaiveCache, Qwen2Config
-from vllm_omni.diffusion.models.bagel.utils import get_flattened_position_ids_extrapolate
+# Adjust imports to use local copies in vllm_omni/model_executor/models/bagel
+from .bagel_core import (
+    BagelConfig,
+    PositionEmbedding,
+    TimestepEmbedder,
+    get_flattened_position_ids_extrapolate,
+    prepare_vae_latent,
+)
+from .qwen2_navit import NaiveCache, Qwen2Config
 
 try:
     from vllm.vllm_flash_attn import flash_attn_varlen_func
@@ -385,42 +391,92 @@ class Qwen2ImageGenerator(Qwen2PreTrainedModel):
 
     def forward(
         self,
-        # Inputs from prepare_input/prepare_vae_latent
-        packed_text_ids: torch.LongTensor,
-        packed_text_indexes: torch.LongTensor,
-        packed_init_noises: torch.Tensor,
-        packed_vae_position_ids: torch.LongTensor,
-        packed_vae_token_indexes: torch.LongTensor,
-        packed_seqlens: torch.IntTensor,
-        packed_position_ids: torch.LongTensor,
-        packed_indexes: torch.LongTensor,
-        key_values_lens: torch.IntTensor,
-        packed_key_value_indexes: torch.LongTensor,
-        # KV Cache (handled by runner/worker)
-        past_key_values: NaiveCache | None = None,
-        # Generation Params
-        num_timesteps: int = 24,
-        timestep_shift: float = 1.0,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        past_key_values: torch.Tensor | None = None,
         **kwargs,
     ):
         """
-        Forward method now executing the generation loop.
-        This allows GPUGenerationModelRunner to call model() and get the final result.
+        Forward pass for Bagel DiT.
+        Expects `past_key_values` from AR stage (shape: [2, num_layers, seq_len, num_heads, head_dim]).
+        input_ids/positions are generally ignored/dummy as this is an image generation stage
+        driven by the AR context and configuration.
         """
+        if past_key_values is None:
+            # If strictly required, raise error. But for partial pipeline test, maybe allow?
+            # User objective implies we NEED to handle it.
+            # If passed as None, the generation will likely fail or produce garbage if dependent on it.
+            # Let's verify if we can get it from kwargs just in case.
+            past_key_values = kwargs.get("past_key_values", None)
+
+        if past_key_values is None:
+            raise ValueError("past_key_values (AR KV Cache) is required for Bagel DiT generation.")
+
+        # 1. Wrap AR KV Cache into NaiveCache
+        # Input shape: [2, num_layers, seq_len, num_heads, head_dim]
+        # or maybe [layers, 2, ...] depending on how "someone else" implements it.
+        # Assuming [2, num_layers, seq_len, num_heads, head_dim] as per standard stacking.
+
+        # If the tensor is on CPU, move to device?
+        if past_key_values.device != self.device:
+            past_key_values = past_key_values.to(self.device)
+
+        num_layers = past_key_values.shape[1]
+        seq_len = past_key_values.shape[2]
+
+        ar_cache = NaiveCache(num_layers)
+        for i in range(num_layers):
+            # keys: [seq_len, num_heads, head_dim]
+            ar_cache.key_cache[i] = past_key_values[0, i]
+            # values: [seq_len, num_heads, head_dim]
+            ar_cache.value_cache[i] = past_key_values[1, i]
+
+        curr_kvlens = [seq_len]
+        # Assuming RoPE continues from where text left off
+        curr_rope = [seq_len]
+
+        # 2. Prepare VAE Latent Inputs
+        # Get image size from config or kwargs
+        # Default to configured max size if not specified
+        image_size = kwargs.get(
+            "image_size", (self.max_latent_size * self.latent_downsample, self.max_latent_size * self.latent_downsample)
+        )
+        if isinstance(image_size, int):
+            image_size = (image_size, image_size)
+
+        # We need token IDs for <|vision_start|> etc.
+        # These should align with tokenizer.
+        # Hardcoding standard Bagel special token IDs or extracting if available.
+        new_token_ids = {
+            "start_of_image": self.config.vision_start_token_id
+            if hasattr(self.config, "vision_start_token_id")
+            else 151939,  # Example default, should check
+            "end_of_image": self.config.vision_end_token_id if hasattr(self.config, "vision_end_token_id") else 151940,
+        }
+
+        # Check for user passed new_token_ids
+        if "new_token_ids" in kwargs:
+            new_token_ids.update(kwargs["new_token_ids"])
+
+        generation_input = prepare_vae_latent(
+            curr_kvlens=curr_kvlens,
+            curr_rope=curr_rope,
+            image_sizes=[image_size],  # Batch size 1 assumption
+            new_token_ids=new_token_ids,
+            bagel_config=self.bagel_config,
+        )
+
+        # Move tensors to device
+        for k, v in generation_input.items():
+            if torch.is_tensor(v):
+                generation_input[k] = v.to(self.device)
+
+        # 3. Run Generation Loop
         return self.generate_image(
-            packed_text_ids=packed_text_ids,
-            packed_text_indexes=packed_text_indexes,
-            packed_init_noises=packed_init_noises,
-            packed_vae_position_ids=packed_vae_position_ids,
-            packed_vae_token_indexes=packed_vae_token_indexes,
-            packed_seqlens=packed_seqlens,
-            packed_position_ids=packed_position_ids,
-            packed_indexes=packed_indexes,
-            past_key_values=past_key_values,
-            key_values_lens=key_values_lens,
-            packed_key_value_indexes=packed_key_value_indexes,
-            num_timesteps=num_timesteps,
-            timestep_shift=timestep_shift,
+            past_key_values=ar_cache,
+            **generation_input,
+            num_timesteps=kwargs.get("num_timesteps", 24),
+            timestep_shift=kwargs.get("timestep_shift", getattr(self, "timestep_shift", 1.0)),
         )
 
     @torch.no_grad
