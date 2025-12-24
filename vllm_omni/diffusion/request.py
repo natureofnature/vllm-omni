@@ -66,6 +66,18 @@ class OmniDiffusionRequest:
     seed: int | None = None
     seeds: list[int] | None = None
 
+    # layered info
+    layers: int = 4
+
+    # cfg info
+    cfg_normalize: bool = False
+
+    # caption language
+    use_en_prompt: bool = False
+
+    # different bucket in (640, 1024) to determine the condition and output resolution
+    resolution: int = 640
+
     # Tracking if embeddings are already processed
     is_prompt_processed: bool = False
 
@@ -108,6 +120,11 @@ class OmniDiffusionRequest:
 
     # Other parameters that may be needed by specific schedulers
     extra_step_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    # [Omni] KV Cache Transfer
+    past_key_values: Any | None = None  # Injected KV Cache
+    kv_metadata: dict[str, Any] | None = None  # Metadata for KV Cache (e.g., kv_lens, ropes)
+    need_kv_receive: bool = True  # Flag to indicate if this request expects KV transfer
 
     # Component modules (populated by the pipeline)
     modules: dict[str, Any] = field(default_factory=dict)
