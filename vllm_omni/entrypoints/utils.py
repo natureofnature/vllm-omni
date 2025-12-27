@@ -6,7 +6,8 @@ from typing import Any
 
 from omegaconf import OmegaConf
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import get_config
+from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.utils import detect_device_type, is_rocm
 
@@ -73,6 +74,21 @@ def _maybe_materialize_bagel_config_py(model: str) -> str | None:
     except Exception:
         # Best-effort only; caller will handle the original exception path.
         return None
+def _try_get_class_name_from_diffusers_config(model: str) -> str | None:
+    """Try to get class name from diffusers model configuration files.
+
+    Args:
+        model: Model name or path
+
+    Returns:
+        Model type string if found, None otherwise
+    """
+    model_index = get_hf_file_to_dict("model_index.json", model, revision=None)
+    if model_index and isinstance(model_index, dict) and "_class_name" in model_index:
+        logger.debug(f"Found model_type '{model_index['_class_name']}' in model_index.json")
+        return model_index["_class_name"]
+
+    return None
 
 
 def _convert_dataclasses_to_dict(obj: Any) -> Any:
@@ -138,23 +154,28 @@ def resolve_model_config_path(model: str) -> str:
         String path to the stage configuration file
 
     Raises:
+        ValueError: If model_type cannot be determined
         FileNotFoundError: If no stage config file exists for the model type
     """
+    # Try to get config from standard transformers format first
     try:
         hf_config = get_config(model, trust_remote_code=True)
         model_type = hf_config.model_type
-    except Exception as e:
-        # Keep original behavior, but if Bagel remote-code config file is missing,
-        # materialize a minimal `configuration_bagel.py` and retry.
-        if "configuration_bagel.py" in str(e):
-            patched_dir = _maybe_materialize_bagel_config_py(model)
-            if patched_dir is not None:
-                hf_config = get_config(patched_dir, trust_remote_code=True)
-                model_type = hf_config.model_type
-            else:
-                raise
+    except (ValueError, Exception):
+        # If standard transformers format fails, try diffusers format
+        if file_or_path_exists(model, "model_index.json", revision=None):
+            model_type = _try_get_class_name_from_diffusers_config(model)
+            if model_type is None:
+                raise ValueError(
+                    f"Could not determine model_type for diffusers model: {model}. "
+                    f"Please ensure the model has 'model_type' in transformer/config.json or model_index.json"
+                )
         else:
-            raise
+            raise ValueError(
+                f"Could not determine model_type for model: {model}. "
+                f"Model is not in standard transformers format and does not have model_index.json. "
+                f"Please ensure the model has proper configuration files with 'model_type' field"
+            )
     device_type = detect_device_type()
 
     # Try device-specific config first
@@ -170,7 +191,7 @@ def resolve_model_config_path(model: str) -> str:
     stage_config_file = f"vllm_omni/model_executor/stage_configs/{model_type}.yaml"
     stage_config_path = PROJECT_ROOT / stage_config_file
     if not os.path.exists(stage_config_path):
-        raise FileNotFoundError(f"Stage config file {stage_config_path} not found")
+        return None
     return str(stage_config_path)
 
 
@@ -193,6 +214,8 @@ def load_stage_configs_from_model(model: str, base_engine_args: dict | None = No
     if base_engine_args is None:
         base_engine_args = {}
     stage_config_path = resolve_model_config_path(model)
+    if stage_config_path is None:
+        return []
     stage_configs = load_stage_configs_from_yaml(config_path=stage_config_path, base_engine_args=base_engine_args)
     return stage_configs
 
