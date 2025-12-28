@@ -62,6 +62,11 @@ _OMNI_MODELS = {
         "qwen2_bagel",
         "Qwen2ForCausalLM",
     ),
+    "Qwen2ImageGenerator": (
+        "bagel",
+        "bagel_dit",
+        "Qwen2ImageGenerator",
+    ),
 }
 
 ## Register omni models to vLLM registry
