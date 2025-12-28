@@ -83,6 +83,8 @@ def main():
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
         stage_configs_path=args.stage_configs_path,
+        model_arch="BagelForConditionalGeneration",
+        enforce_eager=True,
     )
     sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=20, stop=["<|im_end|>"])
 

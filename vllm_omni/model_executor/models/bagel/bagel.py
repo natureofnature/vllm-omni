@@ -8,13 +8,14 @@ For vLLM, we focus on the image understanding (vision-to-text) capabilities.
 """
 
 from collections.abc import Iterable, Mapping, Sequence
-from typing import Any, Literal, Optional, TypeAlias, Union
+
+# from pydantic.dataclasses import dataclass
+from dataclasses import dataclass
+from typing import Any, Literal, TypeAlias
 
 import torch
 import torch.nn as nn
 from pydantic import Field
-#from pydantic.dataclasses import dataclass
-from dataclasses import dataclass
 from vllm.config import VllmConfig
 
 # from vllm.config.multimodal import BaseDummyOptions
@@ -90,13 +91,19 @@ class BagelModelOutput:
     Must contain multimodal_outputs and act like a Tensor/Tuple.
     """
 
-    logits: Union[torch.Tensor, IntermediateTensors]
-    multimodal_outputs: Optional[Any] = None
+    logits: torch.Tensor | IntermediateTensors
+    multimodal_outputs: Any | None = None
 
     def __getitem__(self, item):
-        if item == 0:
-            return self.logits
-        return None
+        if isinstance(item, torch.Tensor):
+            return self.logits[item]
+        if isinstance(item, int):
+            if item == 0:
+                return self.logits
+            if item == 1:
+                return self.multimodal_outputs
+            return None
+        return self.logits[item]
 
     def __getattr__(self, name):
         # Forward attribute access to the internal logits tensor
