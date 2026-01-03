@@ -273,72 +273,60 @@ def enable_cache_for_flux(pipeline: Any, cache_config: Any) -> Callable[[int], N
     raise NotImplementedError("cache-dit is not implemented for Flux pipeline.")
 
 
-def enable_cache_for_bagel(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
-    """Enable cache-dit for Bagel model.
-
-    Bagel uses a Qwen2ForCausalLM as the backend. Since Qwen2Model is not
-    natively supported by cache-dit, we use BlockAdapter to manually adapt it.
+def enable_cache_for_sd3(pipeline: Any, cache_config: Any) -> Callable[[int], None]:
+    """Enable cache-dit for StableDiffusion3Pipeline.
 
     Args:
-        pipeline: The BagelPipeline instance.
+        pipeline: The StableDiffusion3 pipeline instance.
         cache_config: DiffusionCacheConfig instance with cache configuration.
-
-    Returns:
-        A refresh function that can be called to update cache context with new num_inference_steps.
     """
-    # Build DBCacheConfig with optional SCM support
+    # Build DBCacheConfig for transformer
     db_cache_config = _build_db_cache_config(cache_config)
 
-    # Build calibrator config if TaylorSeer is enabled
-    calibrator_config = None
+    calibrator = None
     if cache_config.enable_taylorseer:
         taylorseer_order = cache_config.taylorseer_order
-        calibrator_config = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
+        calibrator = TaylorSeerCalibratorConfig(taylorseer_order=taylorseer_order)
         logger.info(f"TaylorSeer enabled with order={taylorseer_order}")
 
-    # Build ParamsModifier
+    # Build ParamsModifier for transformer
     modifier = ParamsModifier(
         cache_config=db_cache_config,
-        calibrator_config=calibrator_config,
+        calibrator_config=calibrator,
     )
 
     logger.info(
-        f"Enabling cache-dit on Bagel transformer with BlockAdapter: "
+        f"Enabling cache-dit on StableDiffusion3 transformer with BlockAdapter: "
         f"Fn={db_cache_config.Fn_compute_blocks}, "
         f"Bn={db_cache_config.Bn_compute_blocks}, "
         f"W={db_cache_config.max_warmup_steps}, "
     )
 
-    transformer = pipeline.language_model.model
-    # Alias layers to blocks for consistent access in refresh function if needed
-    if not hasattr(transformer, "blocks"):
-        transformer.blocks = transformer.layers
-
-    # Enable cache-dit using BlockAdapter
-    # We use ForwardPattern.Pattern_1 for standard single-transformer execution
+    # Enable cache-dit using BlockAdapter for transformer
     cache_dit.enable_cache(
-        BlockAdapter(
-            transformer=[transformer],
-            blocks=[transformer.layers],
-            forward_pattern=[ForwardPattern.Pattern_1],
-            params_modifiers=[modifier],
-            has_separate_cfg=True,
+        (
+            BlockAdapter(
+                transformer=pipeline.transformer,
+                blocks=pipeline.transformer.transformer_blocks,
+                forward_pattern=ForwardPattern.Pattern_1,
+                params_modifiers=[modifier],
+            )
         ),
+        cache_config=db_cache_config,
     )
 
     def refresh_cache_context(pipeline: Any, num_inference_steps: int, verbose: bool = True) -> None:
         """Refresh cache context for the transformer with new num_inference_steps.
 
         Args:
-            pipeline: The BagelPipeline instance.
+            pipeline: The LongCatImage pipeline instance.
             num_inference_steps: New number of inference steps.
         """
-        transformer = pipeline.language_model.model
         if cache_config.scm_steps_mask_policy is None:
-            cache_dit.refresh_context(transformer, num_inference_steps=num_inference_steps, verbose=verbose)
+            cache_dit.refresh_context(pipeline.transformer, num_inference_steps=num_inference_steps, verbose=verbose)
         else:
             cache_dit.refresh_context(
-                transformer,
+                pipeline.transformer,
                 cache_config=DBCacheConfig().reset(
                     num_inference_steps=num_inference_steps,
                     steps_computation_mask=cache_dit.steps_mask(
@@ -421,6 +409,7 @@ CUSTOM_DIT_ENABLERS.update(
         "BagelPipeline": enable_cache_for_bagel,
         "LongcatImagePipeline": enable_cache_for_longcat_image,
         "LongcatImageEditPipeline": enable_cache_for_longcat_image,
+        "StableDiffusion3Pipeline": enable_cache_for_sd3,
     }
 )
 
