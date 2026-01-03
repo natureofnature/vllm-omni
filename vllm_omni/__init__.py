@@ -18,7 +18,6 @@ from transformers import AutoConfig, Qwen2Config
 from vllm.model_executor.models import ModelRegistry
 
 from vllm_omni.model_executor.models.bagel.bagel import BagelForConditionalGeneration
-from vllm_omni.model_executor.models.bagel.bagel_dit import Qwen2ImageGenerator
 from vllm_omni.model_executor.models.bagel.configuration_bagel import BagelConfig
 from vllm_omni.model_executor.models.bagel.qwen2_bagel import Qwen2ForCausalLM
 
@@ -74,7 +73,6 @@ vllm.config.VllmConfig.with_hf_config = _patched_with_hf_config
 
 ModelRegistry.register_model("BagelForConditionalGeneration", BagelForConditionalGeneration)
 ModelRegistry.register_model("Qwen2ForCausalLM", Qwen2ForCausalLM)
-ModelRegistry.register_model("Qwen2ImageGenerator", Qwen2ImageGenerator)
 
 print(" vLLM-Omni 初始化完成")
 
