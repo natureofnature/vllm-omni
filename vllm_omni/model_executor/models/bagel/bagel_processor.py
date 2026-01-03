@@ -3,11 +3,10 @@
 # Copyright 2025 Bytedance Ltd. and/or its affiliates.
 """BAGEL processor for image and text inputs."""
 
-from transformers import AutoProcessor
+from transformers import AutoProcessor, BatchFeature
 from transformers.image_utils import ImageInput
 from transformers.processing_utils import ProcessorMixin
 from transformers.tokenization_utils_base import PreTokenizedInput, TextInput
-from transformers import BatchFeature
 
 
 class BagelProcessor(ProcessorMixin):
