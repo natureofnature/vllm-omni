@@ -13,7 +13,6 @@ from dataclasses import dataclass
 
 import torch
 from einops import rearrange
-from safetensors.torch import load_file as load_sft
 from torch import Tensor, nn
 
 
@@ -323,38 +322,3 @@ class AutoEncoder(nn.Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return self.decode(self.encode(x))
-
-
-def print_load_warning(missing: list[str], unexpected: list[str]) -> None:
-    if len(missing) > 0 and len(unexpected) > 0:
-        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
-        print("\n" + "-" * 79 + "\n")
-        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
-    elif len(missing) > 0:
-        print(f"Got {len(missing)} missing keys:\n\t" + "\n\t".join(missing))
-    elif len(unexpected) > 0:
-        print(f"Got {len(unexpected)} unexpected keys:\n\t" + "\n\t".join(unexpected))
-
-
-def load_ae(local_path: str) -> AutoEncoder:
-    ae_params = AutoEncoderParams(
-        resolution=256,
-        in_channels=3,
-        downsample=8,
-        ch=128,
-        out_ch=3,
-        ch_mult=[1, 2, 4, 4],
-        num_res_blocks=2,
-        z_channels=16,
-        scale_factor=0.3611,
-        shift_factor=0.1159,
-    )
-
-    # Loading the autoencoder
-    ae = AutoEncoder(ae_params)
-
-    if local_path is not None:
-        sd = load_sft(local_path)
-        missing, unexpected = ae.load_state_dict(sd, strict=False, assign=True)
-        print_load_warning(missing, unexpected)
-    return ae, ae_params

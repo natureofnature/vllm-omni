@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """
-BagelPipeline implementation for vLLM Omni.
+BagelPipeline implementation for vLLM-Omni.
 """
 
 from __future__ import annotations
@@ -25,11 +26,53 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.model_executor.model_loader.weight_utils import download_weights_from_hf_specific
 
 from .autoencoder import AutoEncoder, AutoEncoderParams
-from .bagel_core import Bagel, BagelConfig
-from .qwen2_navit import NaiveCache, Qwen2Config, Qwen2ForCausalLM
-from .utils import BagelGenParams, add_special_tokens
+from .bagel_transformer import Bagel, BagelConfig, NaiveCache, Qwen2MoTConfig, Qwen2MoTForCausalLM
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class BagelGenParams:
+    num_timesteps: int = 50
+    timestep_shift: float = 1.0
+
+
+def add_special_tokens(tokenizer):
+    all_special_tokens = []
+    for k, v in tokenizer.special_tokens_map.items():
+        if isinstance(v, str):
+            all_special_tokens.append(v)
+        elif isinstance(v, list):
+            all_special_tokens += v
+
+    new_tokens = []
+
+    if "<|im_start|>" not in all_special_tokens:
+        new_tokens.append("<|im_start|>")
+
+    if "<|im_end|>" not in all_special_tokens:
+        new_tokens.append("<|im_end|>")
+
+    if "<|vision_start|>" not in all_special_tokens:
+        new_tokens.append("<|vision_start|>")
+
+    if "<|vision_end|>" not in all_special_tokens:
+        new_tokens.append("<|vision_end|>")
+
+    num_new_tokens = tokenizer.add_tokens(new_tokens)
+    bos_token_id = tokenizer.convert_tokens_to_ids("<|im_start|>")
+    eos_token_id = tokenizer.convert_tokens_to_ids("<|im_end|>")
+    start_of_image = tokenizer.convert_tokens_to_ids("<|vision_start|>")
+    end_of_image = tokenizer.convert_tokens_to_ids("<|vision_end|>")
+
+    new_token_ids = dict(
+        bos_token_id=bos_token_id,
+        eos_token_id=eos_token_id,
+        start_of_image=start_of_image,
+        end_of_image=end_of_image,
+    )
+
+    return tokenizer, new_token_ids, num_new_tokens
 
 
 def get_bagel_post_process_func(od_config: OmniDiffusionConfig):
@@ -93,7 +136,7 @@ class BagelPipeline(nn.Module):
 
         # LLM config: Bagel MoT requires explicitly setting layer_module
         llm_cfg_path = os.path.join(model_path, "llm_config.json")
-        llm_config = Qwen2Config.from_json_file(llm_cfg_path)
+        llm_config = Qwen2MoTConfig.from_json_file(llm_cfg_path)
         llm_config.qk_norm = True
         llm_config.tie_word_embeddings = False
         # Allow overriding from vllm-omni config if user wants MoE/vanilla.
@@ -109,8 +152,6 @@ class BagelPipeline(nn.Module):
         )
         self.tokenizer, self.new_token_ids, _ = add_special_tokens(self.tokenizer)
 
-        # IMPORTANT: ensure model vocab_size can cover tokenizer ids. Otherwise embedding
-        # lookup will hit CUDA gather OOB during inference.
         try:
             tok_len = len(self.tokenizer)
         except Exception:  # pragma: no cover - very old tokenizers
@@ -122,11 +163,7 @@ class BagelPipeline(nn.Module):
             int(required_max_id + 1),
         )
 
-        # Build modules (weights loaded later by DiffusersPipelineLoader/AutoWeightsLoader)
-        self.language_model = Qwen2ForCausalLM(llm_config)
-
-        # AutoEncoder architecture is fixed for Bagel release; weights come from `ae.safetensors`.
-        # Keep params compatible with original.
+        self.language_model = Qwen2MoTForCausalLM(llm_config)
         ae_params: AutoEncoderParams = default_ae_params()
         self.vae = AutoEncoder(ae_params)
 
@@ -180,11 +217,6 @@ class BagelPipeline(nn.Module):
         if isinstance(prompt, list):
             # vllm-omni request supports list; Bagel pipeline currently supports first prompt.
             prompt = prompt[0] if prompt else ""
-
-        # Choose target resolution.
-        # Bagel latent positional embedding supports up to:
-        #   max_hw = max_latent_size * latent_downsample
-        # Exceeding this will cause index-out-of-bounds in latent position embedding (CUDA gather).
         max_hw = int(self.bagel.max_latent_size * self.bagel.latent_downsample)
         if req.height is None and req.width is None:
             height = width = max_hw
@@ -205,26 +237,11 @@ class BagelPipeline(nn.Module):
             timestep_shift=3.0,
         )
 
-        # Context init. Bagel uses per-layer KV cache; keep three contexts for (gen / cfg_text / cfg_img).
-        # NOTE: In Bagel, CFG paths still expect consistent KV cache objects + kv_lens/rope; otherwise
-        # varlen attention merge will fail when past K/V are missing.
         gen_context = {
             "kv_lens": [0],
             "ropes": [0],
             "past_key_values": NaiveCache(self.bagel.config.llm_config.num_hidden_layers),
         }
-
-        # Optional image conditioning: if provided, just treat it as "present image" input.
-        # NOTE: Full image-conditioned editing requires prepare_vae_images + cache update; not yet wired here.
-        if req.pil_image is not None:
-            # Keep prompt consistent; for now we only use it to set output size.
-            _ = req.pil_image  # reserved
-            # In practice you would encode the image into context here.
-            # gen_params.cfg_img_scale = 1.0 # No longer supported
-            pass
-
-        # Initialize cfg_text_context REMOVED
-        # cfg_text_context = copy.deepcopy(gen_context)
 
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
@@ -264,9 +281,6 @@ class BagelPipeline(nn.Module):
                     except Exception as e:
                         logger.warning(f"Failed to load injected KV part {key_name}: {e}")
 
-            # Sync metadata (kv_lens and ropes) from the source
-            # We assume injected_metadata contains 'kv_lens' and 'ropes'
-            # Be defensive about types (convert to int/list as needed)
             if "kv_lens" in injected_metadata:
                 val = injected_metadata["kv_lens"]
                 if isinstance(val, (int, float)):
@@ -361,11 +375,6 @@ class BagelPipeline(nn.Module):
         return DiffusionOutput(output=img)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        # Bagel checkpoints often include extra modules for "understanding" (e.g.
-        # `connector.*`, vision towers, etc.). This vendored BagelPipeline is a
-        # minimal *generation* pipeline, so those keys won't exist here.
-        #
-        # Some loaders are strict and will error on unexpected keys; filter them.
         state = self.state_dict()
         allowed = set(state.keys())
         shapes = {k: tuple(v.shape) for k, v in state.items()}
@@ -414,10 +423,6 @@ class BagelPipeline(nn.Module):
                             picked = cand
                             break
                         else:
-                            # Special-case: Bagel checkpoints may have different `max_latent_size`,
-                            # which changes `latent_pos_embed.pos_embed` length (max_latent_size^2).
-                            # If we detect that mismatch, resize the existing parameter *in-place*
-                            # (preserving Parameter identity) so the loader can populate it.
                             if cand.endswith("bagel.latent_pos_embed.pos_embed") and tensor.ndim == 2:
                                 npos, hdim = tensor.shape
                                 side = isqrt(int(npos))
