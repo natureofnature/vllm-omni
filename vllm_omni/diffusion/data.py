@@ -239,6 +239,7 @@ class OmniDiffusionConfig:
     model: str | None = None
 
     model_class_name: str | None = None
+    model_arch: str | None = None
 
     dtype: torch.dtype = torch.bfloat16
 
@@ -452,7 +453,12 @@ class OmniDiffusionConfig:
         if "cache_backend" not in kwargs:
             cache_backend = os.environ.get("DIFFUSION_CACHE_BACKEND") or os.environ.get("DIFFUSION_CACHE_ADAPTER")
             kwargs["cache_backend"] = cache_backend.lower() if cache_backend else "none"
-        return cls(**kwargs)
+
+        # Filter kwargs to only include valid fields
+        valid_fields = {f.name for f in fields(cls)}
+        filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
+
+        return cls(**filtered_kwargs)
 
 
 _current_omni_diffusion_config: OmniDiffusionConfig | None = None

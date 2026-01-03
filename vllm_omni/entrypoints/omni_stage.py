@@ -590,7 +590,7 @@ def _stage_worker(
     try:
         if stage_type == "diffusion":
             engine_args.pop("model_stage")
-            stage_engine = OmniDiffusion(**engine_args)
+            stage_engine = OmniDiffusion(model=model, **engine_args)
         else:
             # Default to LLM engine
             stage_engine = OmniLLM(model=model, **engine_args)
