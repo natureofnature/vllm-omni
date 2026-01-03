@@ -246,54 +246,16 @@ class BagelPipeline(nn.Module):
         # Add text prompt (prefill) on gen context.
         # [Omni] Check for injected KV Cache from remote transfer
         injected_kv = getattr(req, "past_key_values", None)
-        injected_metadata = getattr(req, "kv_metadata", None)
 
-        if injected_kv is not None and injected_metadata is not None:
-            logger.info("Using injected KV Cache from remote transfer")
+        if injected_kv is not None:
+            logger.info("Using injected KV Cache (direct)")
+            gen_context["past_key_values"] = injected_kv
 
-            # [Fix] Reconstruct NaiveCache if injected_kv is a dict of tensors
-            current_cache = gen_context["past_key_values"]
-            if isinstance(current_cache, NaiveCache) and isinstance(injected_kv, dict):
-                # injected_kv keys are like "0_k", "0_v", "1_k", ...
-                for key_name, tensor in injected_kv.items():
-                    try:
-                        # Parse layer index and type
-                        parts = key_name.split("_")
-                        if len(parts) < 2:
-                            continue
-
-                        layer_idx = int(parts[0])
-                        cache_type = parts[1]  # 'k' or 'v'
-
-                        # Ensure tensor is on correct device
-                        if tensor.device != self.device:
-                            tensor = tensor.to(self.device)
-
-                        if layer_idx in current_cache.key_cache:
-                            if cache_type == "k":
-                                current_cache.key_cache[layer_idx] = tensor
-                            elif cache_type == "v":
-                                current_cache.value_cache[layer_idx] = tensor
-                            elif cache_type == "kv":
-                                # Fallback if sender sent mixed/packed (less ideal)
-                                current_cache.key_cache[layer_idx] = tensor
-                                current_cache.value_cache[layer_idx] = tensor
-                    except Exception as e:
-                        logger.warning(f"Failed to load injected KV part {key_name}: {e}")
-
-            if "kv_lens" in injected_metadata:
-                val = injected_metadata["kv_lens"]
-                if isinstance(val, (int, float)):
-                    gen_context["kv_lens"] = [int(val)]
-                else:
-                    gen_context["kv_lens"] = list(val)
-
-            if "ropes" in injected_metadata:
-                val = injected_metadata["ropes"]
-                if isinstance(val, (int, float)):
-                    gen_context["ropes"] = [int(val)]
-                else:
-                    gen_context["ropes"] = list(val)
+            # User requested: kv_lens and ropes set to [gen_context["past_key_values"].key_cache[0].shape[0]]
+            # Assuming injected_kv is compatible and has key_cache[0]
+            seq_len = injected_kv.key_cache[0].shape[0]
+            gen_context["kv_lens"] = [seq_len]
+            gen_context["ropes"] = [seq_len]
 
         else:
             # Standard local prefill path

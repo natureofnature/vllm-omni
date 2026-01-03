@@ -5,9 +5,6 @@ import time
 
 import numpy as np
 import torch
-from vllm.sampling_params import SamplingParams
-
-from vllm_omni.entrypoints.omni_llm import OmniLLM
 
 SEED = 42
 # Set all random seeds
@@ -72,30 +69,73 @@ def main():
 
     if args.prompts is None:
         # Default prompt for text2img test if none provided
-        args.prompts = ["<|im_start|>user\ndraw a cat<|im_end|>\n<|im_start|>assistant\n"]
+        args.prompts = ["A cute cat"]
         print(f"[Info] No prompts provided, using default: {args.prompts}")
 
-    omni_llm = OmniLLM(
-        model=model_name,
-        log_stats=args.enable_stats,
-        init_sleep_seconds=args.init_sleep_seconds,
-        batch_timeout=args.batch_timeout,
-        init_timeout=args.init_timeout,
-        shm_threshold_bytes=args.shm_threshold_bytes,
-        stage_configs_path=args.stage_configs_path,
-        model_arch="BagelForConditionalGeneration",
-        enforce_eager=True,
-    )
-    sampling_params = SamplingParams(temperature=0.7, top_p=0.9, max_tokens=20, stop=["<|im_end|>"])
+    # Load stage configs explicitly to get engine args (optional, Omni handles it)
+    # But checking paths is good.
+    from vllm_omni.entrypoints.omni import Omni
 
-    sampling_params_list = [sampling_params] * len(args.prompts)
+    # We allow Omni to load configs and manage stages.
+    # We don't need to manually extract engine args for OmniLLM anymore.
+
+    omni_kwargs = {}
+    if args.stage_configs_path:
+        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+
+    # Update with script args
+    omni_kwargs.update(
+        {
+            "log_stats": args.enable_stats,
+            "init_sleep_seconds": args.init_sleep_seconds,
+            "batch_timeout": args.batch_timeout,
+            "init_timeout": args.init_timeout,
+            "shm_threshold_bytes": args.shm_threshold_bytes,
+            "worker_backend": args.worker_backend,
+            "ray_address": args.ray_address,
+        }
+    )
+
+    omni = Omni(model=model_name, **omni_kwargs)
 
     t1 = time.time()
-    # Format prompts as required by OmniLLM (list of dicts)
+    # Format prompts
     formatted_prompts = [{"prompt": p} for p in args.prompts]
-    omni_outputs = omni_llm.generate(formatted_prompts, sampling_params_list)
+
+    # Omni.generate handles sampling params internally from config if not provided
+    # or we can pass overrides. Current end2end.py used hardcoded params for text.
+    # But for multi-stage (AR->Diffusion), we rely on YAML defaults or pass explicit list.
+    # Let's rely on YAML defaults + kwargs overrides if any.
+    # Passing prompt is enough.
+
+    # Only RequestOutput generator is returned? Omni.generate yields.
+    # We consume it.
+    omni_outputs = list(omni.generate(prompts=formatted_prompts))
+
     t2 = time.time()
     print(f"==========> time:{t2 - t1}")
+    print(f"==========> time:{t2 - t1}")
+
+    # Save images if present
+    for i, req_output in enumerate(omni_outputs):
+        # req_output is OmniRequestOutput
+        print(f"Request {i}: finished={req_output.finished}")
+        # Check top-level images
+        if req_output.images:
+            for j, img in enumerate(req_output.images):
+                save_path = f"output_{i}_{j}.png"
+                img.save(save_path)
+                print(f"[Info] Saved image to {save_path}")
+
+        # Check stage-specific outputs if needed (though top-level should aggregate final output)
+        if req_output.request_output:
+            for stage_out in req_output.request_output:
+                if hasattr(stage_out, "images") and stage_out.images:
+                    for k, img in enumerate(stage_out.images):
+                        save_path = f"output_{i}_stage_{stage_out.stage_id}_{k}.png"
+                        img.save(save_path)
+                        print(f"[Info] Saved stage output image to {save_path}")
+
     print(omni_outputs)
 
 

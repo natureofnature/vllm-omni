@@ -35,20 +35,26 @@ def ar2dit(
 
     for req_output in source_outputs:
         # req_output is RequestOutput
-        # For Bagel AR, we expect generated text.
         if hasattr(req_output, "outputs") and len(req_output.outputs) > 0:
             generated_text = req_output.outputs[0].text
-            # Create input for DiT
-            # For now, we just pass the generated text as the prompt for DiT
-            # Logic from test.py: output = image_generator.generate(...)
-            # The prompt for DiT is implicit or same as AR?
-            # In test.py: kv_cache = encode_text(prompt) -> kv_cache passed.
-            # The DiT prompts are usually the same or conditioned.
-            # But here we treat the AR output as the "context" potentially.
-            # If ar2dit is strict, we need to know what Stage 1 expects.
-            # Qwen2ImageGenerator expects prompts?
 
-            # We assume Stage 1 needs a prompt.
-            engine_inputs.append({"prompt": generated_text, "request_id": req_output.request_id})
+            # Create input for DiT
+            input_dict = {
+                "prompt": generated_text,
+                "request_id": req_output.request_id,
+            }
+
+            # Check for KV cache in additional_information
+            # This relies on the AR stage (Runner/Scheduler) attaching the extracted KV to the output
+            # or the OmniLLM flow preserving it.
+            add_info = getattr(req_output, "additional_information", None) or {}
+
+            if "past_key_values" in add_info:
+                input_dict["past_key_values"] = add_info["past_key_values"]
+
+            if "kv_metadata" in add_info:
+                input_dict["kv_metadata"] = add_info["kv_metadata"]
+
+            engine_inputs.append(input_dict)
 
     return engine_inputs

@@ -11,7 +11,7 @@ stage_args:
       model_arch: BagelForConditionalGeneration
       worker_cls: vllm_omni.worker.gpu_ar_worker.GPUARWorker
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.3
+      gpu_memory_utilization: 0.4
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: text
@@ -19,6 +19,8 @@ stage_args:
       enable_prefix_caching: false
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
+      omni_config:
+        need_send_cache: true
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -32,16 +34,19 @@ stage_args:
       repetition_penalty: 1.05
 
   - stage_id: 1
-    stage_type: diffusion  # DiT models use diffusion stage type
+    stage_type: diffusion
     runtime:
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      model_arch: Qwen2ImageGenerator
+      model_arch: BagelForConditionalGeneration # Using the same model class wrapper or pipeline
+      # Need to check what class vllm_omni expects.
+      # Looking at test.py, it uses OmniDiffusion (pipeline wrapper).
+      # The worker for diffusion usually wraps a pipeline.
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.4
       enforce_eager: true
       trust_remote_code: true
       engine_output_type: image
@@ -50,6 +55,10 @@ stage_args:
       max_num_batched_tokens: 32768
       tensor_parallel_size: 1
     engine_input_source: [0]
+    # We need a custom transformer to convert AR output (KV) to Diffusion input (Request)
+    # The user says "pass KV cache... directly... skipping logic".
+    # vllm-omni usually has a `stage_input_processors` module.
+    # We need to ensure the processor passes `past_key_values` in the request.
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.bagel.ar2dit
     final_output: true
     final_output_type: image
