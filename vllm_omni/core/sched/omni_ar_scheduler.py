@@ -340,6 +340,19 @@ class OmniARScheduler(VLLMScheduler):
             self._mark_request_for_kv_transfer(request_id, request.num_computed_tokens)
             # FORCE delay freeing blocks regardless of connector status
             # We return early so _free_blocks is not called
+
+            # [Omni] Return KV transfer metadata so it propagates to RequestOutput
+            if request_id in self.requests_needing_kv_transfer:
+                transfer_data = self.requests_needing_kv_transfer[request_id]
+                kv_xfer_params = {
+                    "past_key_values": transfer_data["block_ids"],
+                    "kv_metadata": {"seq_len": transfer_data["seq_len"], "block_ids": transfer_data["block_ids"]},
+                }
+                # Also update request.additional_information for good measure
+                if not hasattr(request, "additional_information") or request.additional_information is None:
+                    request.additional_information = {}
+                request.additional_information.update(kv_xfer_params)
+
             return kv_xfer_params
 
         # 3. Standard Freeing
@@ -381,7 +394,7 @@ class OmniARScheduler(VLLMScheduler):
 
         # 1. Try to read from vLLM Config (where YAML config is typically loaded)
         # Check for omni_config attribute
-        omni_config = getattr(self.vllm_config, "omni_config", None)
+        omni_config = getattr(self.vllm_config.model_config, "omni_config", None)
         if omni_config:
             # omni_config could be an object or a dict
             if isinstance(omni_config, dict):
