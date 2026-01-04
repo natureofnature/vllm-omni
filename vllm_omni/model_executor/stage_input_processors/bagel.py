@@ -36,6 +36,10 @@ def ar2dit(
 
         # Not finished! Now I can only get length and block ids
         # TODO: Extract past_key_values from block ids
+        # past_key_values data structure is:
+        # {key_cache: [layer_nums, seq_lens, head_nums, hidden_size],
+        # value_cache: [layer_nums, seq_lens, head_nums, hidden_size]}
+
         # kv_info = getattr(req_output, "kv_transfer_params", {}) or {}
         # past_key_values = kv_info.get("past_key_values")
         past_key_values = None
