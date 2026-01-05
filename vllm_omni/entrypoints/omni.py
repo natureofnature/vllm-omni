@@ -272,6 +272,49 @@ class OmniBase:
                 stage_id,
             )
 
+            # Inject connector spec for manual KV transfer (AR runner) WITHOUT using env.
+            # We serialize it into KVTransferConfig.kv_connector_extra_config so the stage
+            # can reconstruct the connector config locally.
+            try:
+                transfer_cfg = self.omni_transfer_config
+                if transfer_cfg is not None:
+                    # Find a deterministic outgoing edge from this stage.
+                    outgoing = sorted(
+                        [
+                            (to_s, spec)
+                            for (from_s, to_s), spec in transfer_cfg.connectors.items()
+                            if str(from_s) == str(stage_id)
+                        ],
+                        key=lambda x: int(x[0]) if str(x[0]).isdigit() else str(x[0]),
+                    )
+                    if outgoing:
+                        to_stage, spec = outgoing[0]
+                        omni_connector_cfg = {"type": spec.name, **(spec.extra or {})}
+
+                        # Stage engine args is OmegaConf; set via attribute/dict interface.
+                        kv_transfer_cfg = {
+                            "kv_connector_extra_config": {
+                                "omni_connector_config": omni_connector_cfg,
+                                "from_stage": str(stage_id),
+                                "to_stage": str(to_stage),
+                            }
+                        }
+                        try:
+                            stage.engine_args["kv_transfer_config"] = kv_transfer_cfg  # type: ignore[index]
+                        except Exception:
+                            setattr(stage.engine_args, "kv_transfer_config", kv_transfer_cfg)
+
+                        # Enable send-cache behavior in OmniARScheduler without env.
+                        omni_cfg = {"need_send_cache": True}
+                        try:
+                            stage.engine_args["omni_config"] = omni_cfg  # type: ignore[index]
+                        except Exception:
+                            setattr(stage.engine_args, "omni_config", omni_cfg)
+            except Exception as exc:
+                logger.warning(
+                    "[Orchestrator] Failed to inject KV transfer connector config for stage-%s: %s", stage_id, exc
+                )
+
             stage.init_stage_worker(
                 model,
                 is_async=self.is_async,

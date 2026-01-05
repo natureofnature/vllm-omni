@@ -377,7 +377,6 @@ class OmniARScheduler(VLLMScheduler):
     def _should_transfer_kv_for_request(self, req_id: str) -> bool:
         """Determine if a request should trigger KV cache transfer."""
         need_send = False
-        import os
 
         # 1. Try to read from vLLM Config (where YAML config is typically loaded)
         # Check for omni_config attribute
@@ -389,13 +388,10 @@ class OmniARScheduler(VLLMScheduler):
             else:
                 need_send = getattr(omni_config, "need_send_cache", False)
 
-        # 2. Environment variable as override/fallback
-        if os.getenv("OMNI_NEED_SEND_CACHE"):
-            need_send = os.getenv("OMNI_NEED_SEND_CACHE", "false").lower() == "true"
-
-        # 3. Compatibility check
-        kv_role = os.getenv("VLLM_KV_ROLE", "")
-        if kv_role == "kv_producer":
+        # 2. If KVTransferConfig.extra includes omni connector config, treat as enabled.
+        kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+        extra = getattr(kv_cfg, "kv_connector_extra_config", None) if kv_cfg is not None else None
+        if isinstance(extra, dict) and isinstance(extra.get("omni_connector_config"), dict):
             need_send = True
 
         return need_send

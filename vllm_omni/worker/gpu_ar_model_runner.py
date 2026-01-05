@@ -696,7 +696,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
                 # Detect stages and send via OmniConnector with retry
                 from_stage, to_stage = self._detect_transfer_stages()
-                success, size, metadata = self._transfer_with_retry(
+                success, size, _metadata = self._transfer_with_retry(
                     connector, from_stage, to_stage, f"kv_cache_{req_id}", data_dict
                 )
 
@@ -712,17 +712,24 @@ class GPUARModelRunner(OmniGPUModelRunner):
             traceback.print_exc()
 
     def _get_omni_connector_config(self) -> dict[str, Any] | None:
-        # TODO(wzliu)! get real connector from yaml file instead of hardcode
-        """Get OmniConnector configuration from system config."""
+        """Get OmniConnector configuration.
+
+        Preference order:
+        1) `vllm_config.kv_transfer_config.kv_connector_extra_config["omni_connector_config"]`
+           (passed from orchestrator / stage YAML)
+        2) Environment variables (legacy)
+        3) Hardcoded MooncakeConnector defaults (testing fallback)
+        """
         try:
-            # Try to get from vLLM config first (if configured for KV transfer)
-            if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
-                kv_config = self.vllm_config.kv_transfer_config
-                if hasattr(kv_config, "omni_connector_config"):
-                    return kv_config.omni_connector_config
+            # Preferred: get from KVTransferConfig.extra (no env needed).
+            kv_config = getattr(self.vllm_config, "kv_transfer_config", None)
+            extra = getattr(kv_config, "kv_connector_extra_config", None) if kv_config is not None else None
+            if isinstance(extra, dict):
+                omni_cfg = extra.get("omni_connector_config")
+                if isinstance(omni_cfg, dict) and omni_cfg.get("type"):
+                    return omni_cfg
 
             # Fallback: try to get from environment or default config
-            # TODO: Implement proper config loading from stage configuration
             import os
 
             if os.getenv("OMNI_CONNECTOR_TYPE"):
@@ -749,18 +756,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
     def _detect_transfer_stages(self) -> tuple[str, str]:
         """Detect the source and target stages for KV transfer."""
         try:
-            # Try to detect from KV transfer config
-            if hasattr(self.vllm_config, "kv_transfer_config") and self.vllm_config.kv_transfer_config:
-                kv_config = self.vllm_config.kv_transfer_config
-                kv_role = getattr(kv_config, "kv_role", None)
-                if kv_role == "kv_producer":
-                    return "prefill", "decode"
-                elif kv_role == "kv_consumer":
-                    return "decode", "prefill"
-                elif kv_role == "kv_both":
-                    # For kv_both, we need to determine direction based on context
-                    # TODO: Implement smarter stage detection
-                    return "prefill", "decode"
+            # Preferred: if orchestrator provided explicit stage ids in kv_transfer_config.extra.
+            kv_config = getattr(self.vllm_config, "kv_transfer_config", None)
+            extra = getattr(kv_config, "kv_connector_extra_config", None) if kv_config is not None else None
+            if isinstance(extra, dict):
+                from_stage = extra.get("from_stage")
+                to_stage = extra.get("to_stage")
+                if from_stage is not None and to_stage is not None:
+                    return str(from_stage), str(to_stage)
 
             # Fallback based on environment or simple heuristics
             import os
