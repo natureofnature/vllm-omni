@@ -82,11 +82,24 @@ class SharedMemoryConnector(OmniConnectorBase):
         if not metadata:
             # Try to infer metadata from request_id for KV cache transfer scenarios
             # where metadata is not passed out-of-band.
-            logger.debug(
-                f"SharedMemoryConnector get called without metadata for req {request_id}, trying deterministic name"
-            )
             shm_name = f"omni_{request_id}"
-            metadata = {"shm": {"name": shm_name}, "is_fallback": True}
+
+            # We need the size to read from SHM using stage_utils.shm_read_bytes
+            try:
+                # Use local import to avoid potential scope issues if _shm isn't available
+                from multiprocessing import shared_memory as shm_pkg
+
+                temp_shm = shm_pkg.SharedMemory(name=shm_name)
+                size = temp_shm.size
+                temp_shm.close()
+
+                metadata = {"shm": {"name": shm_name, "size": size}, "is_fallback": True}
+                logger.debug(f"SharedMemoryConnector inferred metadata for {request_id}: {metadata}")
+            except Exception as e:
+                # If file not found or other error, standard path will likely fail too, but we let it try or return None
+                logger.debug(f"SharedMemoryConnector failed to infer metadata for {request_id} (fallback): {e}")
+                # We can't proceed without size if we rely on shm_read_bytes
+                return None
 
         try:
             obj = None
