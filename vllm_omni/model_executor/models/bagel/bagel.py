@@ -27,6 +27,7 @@ from vllm.model_executor.layers.linear import (
     RowParallelLinear,
 )
 from vllm.model_executor.layers.quantization import QuantizationConfig
+from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.models.interfaces import (
     MultiModalEmbeddings,
     SupportsLoRA,
@@ -67,9 +68,7 @@ from vllm.multimodal.profiling import BaseDummyInputsBuilder
 from vllm.sequence import IntermediateTensors
 from vllm.utils.tensor_schema import TensorSchema
 
-# from vllm.transformers_utils.processors.bagel import BagelProcessor
 from .bagel_processor import BagelProcessor
-from .rope import get_rope
 
 logger = init_logger(__name__)
 
@@ -379,6 +378,7 @@ class Qwen2BagelAttention(VllmQwen2Attention):
         # Override rotary embedding to use custom rope
         self.rotary_emb = get_rope(
             self.head_dim,
+            rotary_dim=self.head_dim,
             max_position=max_position,
             rope_parameters=rope_parameters,
             dual_chunk_attention_config=dual_chunk_attention_config,
