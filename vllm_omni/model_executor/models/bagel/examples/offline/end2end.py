@@ -69,7 +69,7 @@ def main():
 
     if args.prompts is None:
         # Default prompt for text2img test if none provided
-        args.prompts = ["A cute cat"]
+        args.prompts = ["<|im_start|>A cute cat<|im_end|>"]
         print(f"[Info] No prompts provided, using default: {args.prompts}")
 
     # Load stage configs explicitly to get engine args (optional, Omni handles it)
