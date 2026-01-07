@@ -1,26 +1,5 @@
 import argparse
 import os
-import random
-import time
-
-import numpy as np
-import torch
-
-SEED = 42
-# Set all random seeds
-random.seed(SEED)
-np.random.seed(SEED)
-torch.manual_seed(SEED)
-torch.cuda.manual_seed(SEED)
-torch.cuda.manual_seed_all(SEED)
-
-# Make PyTorch deterministic
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-# Set environment variables for deterministic behavior
-os.environ["PYTHONHASHSEED"] = str(SEED)
-os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 
 def parse_args():
@@ -38,6 +17,20 @@ def parse_args():
         help="Path to a .txt file with one prompt per line (preferred).",
     )
     parser.add_argument("--prompt_type", default="text", choices=["text"])
+
+    parser.add_argument(
+        "--modality",
+        default="text2img",
+        choices=["text2img", "img2img", "img2text", "text2text"],
+        help="Modality mode to control stage execution.",
+    )
+
+    parser.add_argument(
+        "--image-path",
+        type=str,
+        default=None,
+        help="Path to input image for img2img.",
+    )
 
     # OmniLLM init args
     parser.add_argument("--enable-stats", action="store_true", default=False)
@@ -71,68 +64,106 @@ def main():
         # Default prompt for text2img test if none provided
         args.prompts = ["<|im_start|>A cute cat<|im_end|>"]
         print(f"[Info] No prompts provided, using default: {args.prompts}")
+    omni_outputs = []
 
-    # Load stage configs explicitly to get engine args (optional, Omni handles it)
-    # But checking paths is good.
-    from vllm_omni.entrypoints.omni import Omni
+    from PIL import Image
 
-    # We allow Omni to load configs and manage stages.
-    # We don't need to manually extract engine args for OmniLLM anymore.
+    if args.modality == "img2img":
+        from PIL import Image
 
-    omni_kwargs = {}
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
+        from vllm_omni.entrypoints.omni_diffusion import OmniDiffusion
 
-    # Update with script args
-    omni_kwargs.update(
-        {
-            "log_stats": args.enable_stats,
-            "init_sleep_seconds": args.init_sleep_seconds,
-            "batch_timeout": args.batch_timeout,
-            "init_timeout": args.init_timeout,
-            "shm_threshold_bytes": args.shm_threshold_bytes,
-            "worker_backend": args.worker_backend,
-            "ray_address": args.ray_address,
+        print("[Info] Running in img2img mode (Stage 1 only)")
+        client = OmniDiffusion(model=model_name)
+
+        generate_kwargs = {
+            "prompt": args.prompts,
+            "seed": 52,
+            "need_kv_receive": False,
         }
-    )
 
-    omni = Omni(model=model_name, **omni_kwargs)
+        if args.image_path:
+            if os.path.exists(args.image_path):
+                loaded_image = Image.open(args.image_path).convert("RGB")
+                generate_kwargs["pil_image"] = loaded_image
+            else:
+                print(f"[Warning] Image path {args.image_path} does not exist.")
 
-    t1 = time.time()
-    # Format prompts
-    formatted_prompts = [{"prompt": p} for p in args.prompts]
+        result = client.generate(**generate_kwargs)
 
-    # Omni.generate handles sampling params internally from config if not provided
-    # or we can pass overrides. Current end2end.py used hardcoded params for text.
-    # But for multi-stage (AR->Diffusion), we rely on YAML defaults or pass explicit list.
-    # Let's rely on YAML defaults + kwargs overrides if any.
-    # Passing prompt is enough.
+        # Ensure result is a list for iteration
+        if not isinstance(result, list):
+            omni_outputs = [result]
+        else:
+            omni_outputs = result
 
-    # Only RequestOutput generator is returned? Omni.generate yields.
-    # We consume it.
-    omni_outputs = list(omni.generate(prompts=formatted_prompts))
+    else:
+        import copy
 
-    t2 = time.time()
-    print(f"==========> time:{t2 - t1}")
-    print(f"==========> time:{t2 - t1}")
+        from vllm_omni.entrypoints.omni import Omni
 
-    # Save images if present
+        omni_kwargs = {}
+        if args.stage_configs_path:
+            omni_kwargs["stage_configs_path"] = args.stage_configs_path
+
+        omni_kwargs.update(
+            {
+                "log_stats": args.enable_stats,
+                "init_sleep_seconds": args.init_sleep_seconds,
+                "batch_timeout": args.batch_timeout,
+                "init_timeout": args.init_timeout,
+                "shm_threshold_bytes": args.shm_threshold_bytes,
+                "worker_backend": args.worker_backend,
+                "ray_address": args.ray_address,
+            }
+        )
+
+        omni = Omni(model=model_name, **omni_kwargs)
+
+        formatted_prompts = []
+        for p in args.prompts:
+            if args.modality == "img2text":
+                if args.image_path:
+                    loaded_image = Image.open(args.image_path).convert("RGB")
+                    final_prompt_text = f"<|im_start|>user\n<|image_pad|>\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                    prompt_dict = {
+                        "prompt": final_prompt_text,
+                        "multi_modal_data": {"image": loaded_image},
+                        "modalities": ["text"],
+                    }
+                    formatted_prompts.append(prompt_dict)
+            elif args.modality == "text2text":
+                final_prompt_text = f"<|im_start|>user\n{p}<|im_end|>\n<|im_start|>assistant\n"
+                prompt_dict = {"prompt": final_prompt_text, "modalities": ["text"]}
+                formatted_prompts.append(prompt_dict)
+            else:
+                # text2img
+                final_prompt_text = f"<|im_start|>{p}<|im_end|>"
+                prompt_dict = {"prompt": final_prompt_text, "modalities": ["image"]}
+                formatted_prompts.append(prompt_dict)
+
+        params_list = copy.deepcopy(omni.default_sampling_params_list)
+        if args.modality == "text2img":
+            params_list[0]["max_tokens"] = 1
+        omni_outputs = list(omni.generate(prompts=formatted_prompts, sampling_params_list=params_list))
+
     for i, req_output in enumerate(omni_outputs):
-        # req_output is OmniRequestOutput
-        print(f"Request {i}: finished={req_output.finished}")
-        # Check top-level images
-        if req_output.images:
-            for j, img in enumerate(req_output.images):
-                save_path = f"output_{i}_{j}.png"
-                img.save(save_path)
-                print(f"[Info] Saved image to {save_path}")
+        images = getattr(req_output, "images", None)
+        if not images and hasattr(req_output, "output"):
+            if isinstance(req_output.output, list):
+                images = req_output.output
+            else:
+                images = [req_output.output]
 
-        # Check stage-specific outputs if needed (though top-level should aggregate final output)
-        if req_output.request_output:
+        if images:
+            for j, img in enumerate(images):
+                img.save(f"output_{i}_{j}.png")
+
+        if hasattr(req_output, "request_output") and req_output.request_output:
             for stage_out in req_output.request_output:
                 if hasattr(stage_out, "images") and stage_out.images:
                     for k, img in enumerate(stage_out.images):
-                        save_path = f"output_{i}_stage_{stage_out.stage_id}_{k}.png"
+                        save_path = f"output_{i}_stage_{getattr(stage_out, 'stage_id', '?')}_{k}.png"
                         img.save(save_path)
                         print(f"[Info] Saved stage output image to {save_path}")
 
