@@ -379,20 +379,6 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
             # Fix vit_config: checkpoint has 26 layers (0-25) but config says 27
             # Also disable head as it's not in checkpoint
             vit_config = config.vit_config
-            # if isinstance(vit_config, dict):
-            #    from types import SimpleNamespace
-            #    # 将字典转为对象，这样就能用 .num_hidden_layers 访问了
-            #    print(f"⚠️ [Bagel] 检测到 vit_config 是字典，正在转换为对象...")
-            #    vit_config = SimpleNamespace(**vit_config)
-
-            # if not hasattr(vit_config, "attention_dropout"):
-            #    vit_config.attention_dropout = 0.0  # 推理时通常设为 0
-
-            # if not hasattr(vit_config, "layer_norm_eps"):
-            #    vit_config.layer_norm_eps = 1e-6    # 常见的默认值
-
-            # if not hasattr(vit_config, "hidden_act"):
-            #     vit_config.hidden_act = "gelu_pytorch_tanh" # Siglip 常见激活函数
 
             if vit_config.num_hidden_layers == 27:
                 logger.warning(
@@ -503,17 +489,9 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
     def get_language_model(self) -> nn.Module:
         return self.language_model
 
-    # 修改签名，增加 **kwargs 以吞掉 multimodal_embeddings 等多余参数
     def get_input_embeddings(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
-        """
-        vLLM Runner 需要调用此方法来获取文本的 Embedding。
-        kwargs 会捕获 'multimodal_embeddings' 等 Runner 传入但我们不需要的参数。
-        """
-        # 尝试直接调用内部 LLM 的 get_input_embeddings
         if hasattr(self.language_model, "get_input_embeddings"):
             return self.language_model.get_input_embeddings(input_ids)
-
-        # 如果内部 LLM 没这个方法，直接访问 embedding 层
         return self.language_model.model.embed_tokens(input_ids)
 
     def forward(
@@ -559,13 +537,6 @@ class BagelForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsLoRA,
         if self.vit_model is None:
             skip_prefixes.extend(["vit_model.", "connector.", "vit_pos_embed"])
 
-        # Skip generation-related weights since we only support text2text and image2text
-        # Filter out all image generation components:
-        # - 'moe_gen': MoE generation weights
-        # - 'latent_pos_embed': Latent position embeddings for VAE
-        # - 'llm2vae', 'vae2llm': LLM-VAE projections
-        # - 'time_embedder': Timestep embeddings for diffusion
-        # - VAE encoder/decoder: Use specific prefixes to avoid matching vision encoder
         generation_keywords = [
             "moe_gen",
             "latent_pos_embed",
