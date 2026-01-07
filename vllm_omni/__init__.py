@@ -17,8 +17,8 @@ import vllm
 from transformers import AutoConfig, Qwen2Config
 from vllm.model_executor.models import ModelRegistry
 
+from vllm_omni.diffusion.models.bagel.bagel_transformer import BagelConfig
 from vllm_omni.model_executor.models.bagel.bagel import BagelForConditionalGeneration
-from vllm_omni.model_executor.models.bagel.configuration_bagel import BagelConfig
 
 from .config import OmniModelConfig
 from .entrypoints.async_omni import AsyncOmni

@@ -237,7 +237,6 @@ class OmniDiffusionConfig:
     model: str | None = None
 
     model_class_name: str | None = None
-    model_arch: str | None = None
 
     dtype: torch.dtype = torch.bfloat16
 

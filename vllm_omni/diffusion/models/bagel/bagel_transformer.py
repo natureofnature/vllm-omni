@@ -15,8 +15,8 @@ import numpy as np
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import flex_attention
-from transformers.configuration_utils import PretrainedConfig
-from transformers.models.qwen2.configuration_qwen2 import Qwen2Config as _Qwen2Config
+from transformers import PretrainedConfig, SiglipVisionConfig
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2MLP,
@@ -71,7 +71,7 @@ torch._dynamo.config.accumulated_cache_size_limit = 4096
 flex_attention = torch.compile(flex_attention)
 
 
-class Qwen2MoTConfig(_Qwen2Config):
+class Qwen2MoTConfig(Qwen2Config):
     """Configuration for Qwen2MoT (Mixture of Tokens) model.
 
     This is fundamentally different from Qwen2, hence the distinct name.
@@ -635,33 +635,52 @@ def get_flattened_position_ids_extrapolate(img_h, img_w, patch_size, max_num_pat
 
 
 class BagelConfig(PretrainedConfig):
+    """Configuration class for BAGEL model."""
+
+    model_type = "bagel"
+
     def __init__(
         self,
-        visual_gen=True,
-        visual_und=True,
-        llm_config=None,
-        vit_config=None,
-        vae_config=None,
-        latent_patch_size=2,
-        max_latent_size=32,
-        vit_max_num_patch_per_side=70,
-        connector_act="gelu_pytorch_tanh",
-        interpolate_pos=False,
-        timestep_shift=1.0,
+        visual_gen: bool = True,
+        visual_und: bool = True,
+        llm_config: dict | Qwen2Config | None = None,
+        vit_config: dict | SiglipVisionConfig | None = None,
+        vae_config: dict | None = None,
+        latent_patch_size: int = 2,
+        max_latent_size: int = 32,
+        vit_max_num_patch_per_side: int = 70,
+        connector_act: str = "gelu_pytorch_tanh",
+        interpolate_pos: bool = False,
+        timestep_shift: float = 1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.visual_gen = visual_gen
         self.visual_und = visual_und
-        self.llm_config = llm_config
-        self.vit_config = vit_config
-        self.vae_config = vae_config
+
+        # Convert dict configs to proper config objects
+        if isinstance(llm_config, dict):
+            self.llm_config = Qwen2Config(**llm_config)
+        else:
+            self.llm_config = llm_config or Qwen2Config()
+
+        if isinstance(vit_config, dict):
+            self.vit_config = SiglipVisionConfig(**vit_config)
+        else:
+            self.vit_config = vit_config or SiglipVisionConfig()
+
+        self.vae_config = vae_config or {"z_channels": 16, "downsample": 8}
         self.latent_patch_size = latent_patch_size
         self.max_latent_size = max_latent_size
         self.vit_max_num_patch_per_side = vit_max_num_patch_per_side
         self.connector_act = connector_act
         self.interpolate_pos = interpolate_pos
         self.timestep_shift = timestep_shift
+
+    @property
+    def hidden_size(self) -> int:
+        """Return the hidden size of the language model."""
+        return self.llm_config.hidden_size
 
 
 class Bagel(torch.nn.Module):

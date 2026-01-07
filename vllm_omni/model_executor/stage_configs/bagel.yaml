@@ -40,7 +40,6 @@ stage_args:
       max_batch_size: 1
     engine_args:
       model_stage: dit
-      model_arch: BagelForConditionalGeneration # Using the same model class wrapper or pipeline
       worker_cls: vllm_omni.worker.gpu_generation_worker.GPUGenerationWorker
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler
       gpu_memory_utilization: 0.4
