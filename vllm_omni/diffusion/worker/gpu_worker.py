@@ -45,9 +45,13 @@ class GPUWorker:
         self.rank = rank
         self.od_config = od_config
         self.pipeline = None
+        self.connector = None
         self.device = None
-        self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+
         self.init_device_and_model()
+
+        # Initialize OmniConnector after vllm_config is available (via init_device_and_model)
+        self._init_omni_connector()
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -128,6 +132,10 @@ class GPUWorker:
             raise ValueError("Cannot execute model with empty request list")
         # TODO: dealing with first req for now
         req = reqs[0]
+
+        # [Omni] KV Cache Receiving Logic
+        if getattr(req, "need_kv_receive", False) and self.connector is not None:
+            self._receive_kv_cache_for_request(req)
 
         if req.generator is None and req.seed is not None:
             req.generator = torch.Generator(device=self.device).manual_seed(req.seed)
@@ -214,6 +222,118 @@ class GPUWorker:
 
     def shutdown(self) -> None:
         destroy_distributed_env()
+
+    def _init_omni_connector(self) -> None:
+        # TODO(wzliu)! get real connector from yaml file instead of hardcode
+        """Initialize OmniConnector for KV cache transfer."""
+        try:
+            from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
+            from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+
+            connector_config = None
+
+            # 1. Try to get from omni_kv_config (injected from YAML)
+            # Use self.od_config because self.vllm_config is a dummy VllmConfig without model_config
+            if self.od_config.omni_kv_config:
+                connector_config = self.od_config.omni_kv_config.get("connector_config")
+
+            if not connector_config:
+                logger.warning("No OmniConnector config found, skipping initialization")
+                return
+
+            logger.info(f"Initializing OmniConnector with config: {connector_config}")
+
+            c_type = connector_config.get("type")
+            if not c_type:
+                logger.error("Connector config missing 'type'")
+                return
+
+            c_extra = {k: v for k, v in connector_config.items() if k != "type"}
+            connector_spec = ConnectorSpec(name=c_type, extra=c_extra)
+
+            self.connector = OmniConnectorFactory.create_connector(connector_spec)
+
+        except Exception as e:
+            logger.error(f"Failed to initialize OmniConnector: {e}")
+            import traceback
+
+            traceback.print_exc()
+
+    def _receive_kv_cache_for_request(self, req: OmniDiffusionRequest) -> None:
+        """Receive KV cache for a request via OmniConnector."""
+        # TODO(wzliu)! must get control info from stage queue instead of hardcode
+        if not req.request_id:
+            logger.warning("Request has no ID, cannot receive KV cache")
+            return
+
+        try:
+            logger.info(f"Attempting to receive KV cache for request {req.request_id}")
+
+            # TODO: Key used for transfer (must match sender side)
+            # key = f"kv_cache_{req.request_id}"
+
+            # Get data from connector
+            # Determine from_stage and to_stage dynamically
+            omni_kv_config = self.od_config.omni_kv_config
+            stage_id = omni_kv_config.get("stage_id")
+            engine_input_source = omni_kv_config.get("engine_input_source", [])
+
+            to_stage = stage_id
+            # Default to stage_id - 1 if input source is not explicit
+            if engine_input_source:
+                from_stage = engine_input_source[0]
+            elif isinstance(stage_id, int):
+                from_stage = stage_id - 1
+            else:
+                raise ValueError("Invalid stage id")
+            logger.info(f"Wait for KV cache for request {req.request_id} from stage {from_stage} to {to_stage}...")
+
+            # Check if we should receive KV cache based on config
+            need_recv_cache = omni_kv_config.get("need_recv_cache", False)
+            if need_recv_cache:
+                while True:
+                    result = self.connector.get(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        request_id=f"kv_cache_{req.request_id}",
+                    )
+                    if result:
+                        break
+                    # loop forever for testing
+                    time.sleep(0.5)
+            else:
+                logger.info(f"Skip receiving KV cache for {req.request_id} (need_recv_cache=False)")
+                result = None
+
+            if result:
+                data, size = result
+                logger.info(f"Successfully received KV cache for {req.request_id}")
+
+                # Assume data structure matches KVCacheTransferData.to_dict()
+                if isinstance(data, dict) and "layer_blocks" in data:
+                    # Get layer blocks and ensure they are on the correct device
+                    layer_blocks = data["layer_blocks"]
+
+                    # Move tensors to GPU if needed (OmniSerializer should handle tensor reconstruction)
+                    for cache_list in [layer_blocks["key_cache"], layer_blocks["value_cache"]]:
+                        for i, tensor in enumerate(cache_list):
+                            if isinstance(tensor, torch.Tensor) and tensor.device != self.pipeline.device:
+                                cache_list[i] = tensor.to(self.pipeline.device).contiguous()
+                    from types import SimpleNamespace
+
+                    req.past_key_values = SimpleNamespace(**layer_blocks)
+
+                if "metadata" in data:
+                    req.kv_metadata = data["metadata"]
+
+            else:
+                logger.warning(f"No KV cache received for {req.request_id} (timeout or empty)")
+
+        except Exception as e:
+            logger.error(f"Error receiving KV cache for {req.request_id}: {e}")
+            import traceback
+
+            traceback.print_exc()
 
 
 class WorkerProc:
