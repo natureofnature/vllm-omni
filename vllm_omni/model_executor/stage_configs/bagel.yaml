@@ -1,4 +1,3 @@
-# Stage config for running Bagel (AR only)
 # Stage 0: Thinker (multimodal understanding + text generation)
 
 stage_args:
