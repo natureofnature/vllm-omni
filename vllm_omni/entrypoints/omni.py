@@ -33,6 +33,7 @@ from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
 from vllm_omni.entrypoints.utils import (
+    configure_stage_devices,
     get_final_stage_id_for_e2e,
     load_stage_configs_from_model,
     load_stage_configs_from_yaml,
@@ -217,6 +218,11 @@ class OmniBase:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path, base_engine_args=base_engine_args)
 
+        # ----------------------------------------------------------------------
+        # Device Allocation Logic
+        # ----------------------------------------------------------------------
+        configure_stage_devices(self.stage_configs, worker_backend=worker_backend)
+
         # Initialize connectors
         self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
             self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
@@ -261,11 +267,15 @@ class OmniBase:
         """Start all stage processes."""
         if self.worker_backend == "ray":
             # Initialize Ray Cluster
-            self._ray_pg = create_placement_group(
-                number_of_stages=len(self.stage_list), address=self.ray_address, strategy="PACK"
-            )
+            bundles = []
+            for stage_cfg in self.stage_configs:
+                runtime_cfg = getattr(stage_cfg, "runtime", {})
+                num_gpus = runtime_cfg.get("num_gpus", 1)
+                bundles.append({"GPU": float(num_gpus), "CPU": 1.0})
 
-        for stage_id, stage in enumerate[OmniStage](self.stage_list):
+            self._ray_pg = create_placement_group(bundles=bundles, address=self.ray_address, strategy="PACK")
+
+        for stage_id, stage in enumerate(self.stage_list):
             in_q = self._queue_cls()
             out_q = self._queue_cls()
             self._stage_in_queues.append(in_q)
