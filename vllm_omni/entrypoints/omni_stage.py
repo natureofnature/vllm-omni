@@ -267,6 +267,8 @@ class OmniStage:
             new_env = f"[Stage-{self.stage_id}] {'' if old_env is None else old_env}"
             os.environ["VLLM_LOGGING_PREFIX"] = new_env
             if worker_backend == "ray":
+                # Get num_gpus from runtime config for Ray actor
+                num_gpus = int(runtime_cfg.get("num_gpus", 1))
                 if is_async:
                     self._ray_actor = start_ray_actor(
                         _stage_worker_async_entry,
@@ -277,6 +279,7 @@ class OmniStage:
                         stage_payload=stage_payload,
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
+                        num_gpus=num_gpus,
                     )
                 else:
                     self._ray_actor = start_ray_actor(
@@ -289,6 +292,7 @@ class OmniStage:
                         out_q=self._out_q,
                         batch_timeout=batch_timeout,
                         stage_init_timeout=self._stage_init_timeout,
+                        num_gpus=num_gpus,
                     )
             else:
                 if is_async:

@@ -247,3 +247,127 @@ def get_final_stage_id_for_e2e(
         final_stage_id_for_e2e = last_stage_id
 
     return final_stage_id_for_e2e
+
+
+def calculate_gpus_needed(engine_args: dict[str, Any]) -> int:
+    """Calculate total GPUs needed based on parallelism config."""
+    # Check parallel_config first
+    parallel_config = engine_args.get("parallel_config", {})
+
+    # Handle dataclass objects (convert to dict)
+    if is_dataclass(parallel_config):
+        parallel_config = asdict(parallel_config)
+    # Handle DictConfig (OmegaConf) or dict; both have .get()
+    elif not hasattr(parallel_config, "get"):
+        parallel_config = {}
+
+    def get_param(key: str, default: int = 1) -> int:
+        # 1. Try parallel_config
+        val = parallel_config.get(key)
+        if val is not None:
+            return int(val)
+        # 2. Try root engine_args
+        val = engine_args.get(key)
+        if val is not None:
+            return int(val)
+        return default
+
+    tp = get_param("tensor_parallel_size", 1)
+    pp = get_param("pipeline_parallel_size", 1)
+    dp = get_param("data_parallel_size", 1)
+
+    # Sequence Parallelism (Ulysses / Ring)
+    # In vLLM/Diffusion, sequence_parallel_size = ulysses_degree * ring_degree
+    sp = get_param("sequence_parallel_size", 1)
+    ulysses = get_param("ulysses_degree", 1)
+    ring = get_param("ring_degree", 1)
+
+    if ulysses * ring > 1:
+        if sp == 1:
+            sp = ulysses * ring
+        else:
+            # If both are set, they should be consistent, but we take the product
+            # logic from DiffusionParallelConfig which says sp = ulysses * ring.
+            # If user set sp explicitly to something else, we respect the higher value
+            # to be safe, or just trust ulysses*ring as the source of truth for SP.
+            sp = max(sp, ulysses * ring)
+
+    # Classifier Free Guidance Parallelism (Diffusion)
+    cfg = get_param("cfg_parallel_size", 1)
+
+    # Expert Parallelism (MoE) - typically part of TP in standard vLLM,
+    # but if using external libraries or future EP support:
+    ep = get_param("expert_parallel_size", 1)
+
+    # Prefill Context Parallelism
+    pcp = get_param("prefill_context_parallel_size", 1)
+
+    total = tp * pp * dp * sp * cfg * ep * pcp
+    return total
+
+
+def configure_stage_devices(stage_configs: list[Any], worker_backend: str = "multi_process") -> None:
+    """Configure device allocation for all stages based on backend and parallelism requirements.
+
+    This function iterates through stage configurations and assigns devices either automatically
+    (based on parallelism config) or respects manual 'devices' configuration if applicable.
+
+    Args:
+        stage_configs: List of stage configuration objects (usually OmegaConf or dict-like).
+        worker_backend: The worker backend being used ("ray" or "multi_process").
+    """
+    # Maintain a running counter of GPU indices for sequential allocation in MP mode
+    current_gpu_offset = 0
+
+    for stage_cfg in stage_configs:
+        runtime_cfg = getattr(stage_cfg, "runtime", {})
+
+        # Policy:
+        # 1. In Ray backend, ALWAYS use auto-allocation (relative indices).
+        #    We ignore YAML 'devices' because physical IDs are meaningless/dangerous in Ray actors.
+        # 2. In MP backend, RESPECT manual 'devices' if present (for resource reuse).
+        #    Fallback to auto-allocation (global physical indices) if not present.
+
+        use_manual_config = False
+        if worker_backend != "ray":
+            if "devices" in runtime_cfg and runtime_cfg["devices"] is not None:
+                use_manual_config = True
+
+        if use_manual_config:
+            # Manual override (MP only)
+            try:
+                devs = str(runtime_cfg["devices"])
+                # Count commas+1 or non-empty parts to get num_gpus
+                num_gpus = len([x for x in devs.split(",") if x.strip()])
+                stage_cfg.runtime["num_gpus"] = num_gpus
+            except Exception:
+                stage_cfg.runtime["num_gpus"] = 1
+            # Do NOT update current_gpu_offset when manually overriding,
+            # as the user is managing the placement.
+        else:
+            # Auto allocation (Ray OR MP-without-config)
+            engine_args = getattr(stage_cfg, "engine_args", {})
+            gpus_needed = calculate_gpus_needed(engine_args)
+
+            # Determine device string based on backend
+            if worker_backend == "ray":
+                # Ray Backend:
+                # Devices should be relative logical indices [0, 1, ..., N-1]
+                # because Ray isolates the physical GPUs for the actor.
+                device_ids = list(range(gpus_needed))
+            else:
+                # Multi-Process Backend:
+                # Devices must be global physical indices (or aligned with CUDA_VISIBLE_DEVICES)
+                # [offset, offset + N-1]
+                device_ids = list(range(current_gpu_offset, current_gpu_offset + gpus_needed))
+                current_gpu_offset += gpus_needed
+
+            devices_str = ",".join(map(str, device_ids))
+
+            # Inject back into config (ensure runtime dict exists)
+            if not hasattr(stage_cfg, "runtime"):
+                stage_cfg.runtime = {}
+
+            stage_cfg.runtime["devices"] = devices_str
+            # Also store num_gpus for Ray backend usage
+            stage_cfg.runtime["num_gpus"] = gpus_needed

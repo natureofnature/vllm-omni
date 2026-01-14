@@ -75,8 +75,8 @@ class OmniLLM(LLM):
     ):
         """LLM constructor with omni-specific configuration loading."""
         # Store stage management parameters (used by Omni class)
-        self.worker_backend = kwargs.get("worker_backend", "multi_process")
-        self.ray_address = kwargs.get("ray_address", None)
+        self.worker_backend = kwargs.pop("worker_backend", "multi_process")
+        self.ray_address = kwargs.pop("ray_address", None)
         self.batch_timeout = batch_timeout
         self._enable_stats: bool = bool(log_stats)
 

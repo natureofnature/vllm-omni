@@ -107,11 +107,17 @@ def initialize_ray_cluster(address: str | None = None):
         ray.init(address=address, ignore_reinit_error=True, runtime_env=runtime_env)
 
 
-def create_placement_group(number_of_stages: int, address: str | None = None, strategy: str = "PACK") -> PlacementGroup:
+def create_placement_group(
+    number_of_stages: int | None = None,
+    address: str | None = None,
+    strategy: str = "PACK",
+    bundles: list[dict[str, float]] | None = None,
+) -> PlacementGroup:
     """Create a placement group for the given number of stages.
     Args:
         number_of_stages: The number of stages to create the placement group for.
         strategy: The strategy to use for the placement group.
+        bundles: Optional list of resource bundles. If provided, overrides number_of_stages.
     Returns:
         The placement group.
     """
@@ -123,10 +129,15 @@ def create_placement_group(number_of_stages: int, address: str | None = None, st
         logger.warning("[Orchestrator] Ray is not initialized. Initializing with default settings.")
         initialize_ray_cluster(address)
 
-    bundles = [{"GPU": 1.0, "CPU": 1.0} for _ in range(number_of_stages)]
+    if bundles is None:
+        # use default bundles, 1 GPU and 1 CPU per stage
+        if number_of_stages is None:
+            raise ValueError("Must provide either number_of_stages or bundles")
+        bundles = [{"GPU": 1.0, "CPU": 1.0} for _ in range(number_of_stages)]
+
     pg = ray.util.placement_group(bundles, strategy=strategy)
     ray.get(pg.ready())
-    logger.info("[Orchestrator] Ray Placement Group created")
+    logger.info("[Orchestrator] Ray Placement Group created with %d bundles", len(bundles))
     return pg
 
 
@@ -159,12 +170,13 @@ def start_ray_actor(
     placement_group,
     placement_group_bundle_index: int,
     *args,
+    num_gpus: int = 1,
     **kwargs,
 ):
     if not RAY_AVAILABLE:
         raise ImportError("ray is required for starting ray actor")
 
-    @ray.remote(num_gpus=1)
+    @ray.remote(num_gpus=num_gpus)
     class OmniStageRayWorker:
         def run(self, func, *args, **kwargs):
             return func(*args, **kwargs)

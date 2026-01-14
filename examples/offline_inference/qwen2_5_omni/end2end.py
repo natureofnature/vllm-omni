@@ -327,6 +327,8 @@ def main(args):
         batch_timeout=args.batch_timeout,
         init_timeout=args.init_timeout,
         shm_threshold_bytes=args.shm_threshold_bytes,
+        worker_backend=args.worker_backend,
+        ray_address=args.ray_address,
     )
     thinker_sampling_params = SamplingParams(
         temperature=0.0,  # Deterministic - no randomness
