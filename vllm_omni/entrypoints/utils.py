@@ -337,13 +337,20 @@ def configure_stage_devices(stage_configs: list[Any], worker_backend: str = "mul
             # Manual override (MP only)
             try:
                 devs = str(runtime_cfg["devices"])
-                # Count commas+1 or non-empty parts to get num_gpus
-                num_gpus = len([x for x in devs.split(",") if x.strip()])
+                device_parts = [x.strip() for x in devs.split(",") if x.strip()]
+                # Count non-empty parts to get num_gpus
+                num_gpus = len(device_parts)
                 stage_cfg.runtime["num_gpus"] = num_gpus
             except Exception:
                 stage_cfg.runtime["num_gpus"] = 1
-            # Do NOT update current_gpu_offset when manually overriding,
-            # as the user is managing the placement.
+            # Advance auto allocator past any manually specified devices.
+            # This avoids collisions when manual and auto configs are mixed.
+            try:
+                max_manual = max(int(x) for x in device_parts)
+                current_gpu_offset = max(current_gpu_offset, max_manual + 1)
+            except Exception:
+                # If parsing fails, keep existing offset.
+                pass
         else:
             # Auto allocation (Ray OR MP-without-config)
             engine_args = getattr(stage_cfg, "engine_args", {})
