@@ -14,36 +14,40 @@ class DiffusionExecutor(ABC):
 
     @staticmethod
     def get_class(od_config: OmniDiffusionConfig) -> type["DiffusionExecutor"]:
-        backend = od_config.distributed_executor_backend
-        if isinstance(backend, type):
-            if not issubclass(backend, DiffusionExecutor):
-                raise TypeError(f"distributed_executor_backend must be a subclass of DiffusionExecutor. Got {backend}.")
-            return backend
+        executor_class: type[DiffusionExecutor]
+        distributed_executor_backend = od_config.distributed_executor_backend
 
-        if isinstance(backend, str):
-            if backend == "mp":
-                from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
+        if isinstance(distributed_executor_backend, type):
+            if not issubclass(distributed_executor_backend, DiffusionExecutor):
+                raise TypeError(
+                    "distributed_executor_backend must be a subclass of "
+                    f"DiffusionExecutor. Got {distributed_executor_backend}."
+                )
+            executor_class = distributed_executor_backend
+        elif distributed_executor_backend == "ray":
+            raise NotImplementedError("ray backend is not yet supported.")
+        elif distributed_executor_backend == "mp":
+            from vllm_omni.diffusion.executor.multiproc_executor import MultiprocDiffusionExecutor
 
-                return MultiprocDiffusionExecutor
-
+            executor_class = MultiprocDiffusionExecutor
+        elif distributed_executor_backend == "external_launcher":
+            raise NotImplementedError("external_launcher backend is not yet supported.")
+        elif isinstance(distributed_executor_backend, str):
             try:
-                executor_class = resolve_obj_by_qualname(backend)
+                executor_class = resolve_obj_by_qualname(distributed_executor_backend)
             except (ImportError, ValueError) as e:
-                # If backend is not a valid python path, raise error
                 raise ValueError(
-                    f"Failed to load executor backend '{backend}'. "
-                    f"Ensure it is a valid python path, 'mp', or a DiffusionExecutor subclass. Error: {e}"
+                    f"Failed to load executor backend '{distributed_executor_backend}'. "
+                    f"Ensure it is a valid python path. Error: {e}"
                 ) from e
 
             if not issubclass(executor_class, DiffusionExecutor):
                 raise TypeError(
                     f"distributed_executor_backend must be a subclass of DiffusionExecutor. Got {executor_class}."
                 )
-            return executor_class
-
-        raise TypeError(
-            f"distributed_executor_backend must be a string or a subclass of DiffusionExecutor. Got {type(backend)}."
-        )
+        else:
+            raise ValueError(f"Unknown distributed executor backend: {distributed_executor_backend}")
+        return executor_class
 
     def __init__(self, od_config: OmniDiffusionConfig):
         self.od_config = od_config
