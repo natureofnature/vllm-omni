@@ -185,6 +185,11 @@ class AsyncOmni(OmniBase):
         is_tracing_enabled = result.get("is_tracing_enabled")
         if is_tracing_enabled is not None:
             stage.set_is_tracing_enabled(is_tracing_enabled)
+        # Store node_ip for cross-node RDMA configuration
+        node_ip = result.get("node_ip")
+        if node_ip is not None:
+            stage.set_node_ip(node_ip)
+            logger.info(f"[{self._name}] Stage-{stage_id} node IP: {node_ip}")
         super()._process_stage_ready(stage, stage_id, result)
 
     def _wait_for_stages_ready(self, timeout: int = 120) -> None:
@@ -391,11 +396,15 @@ class AsyncOmni(OmniBase):
                     engine_input = copy.deepcopy(prompt)
                     engine_input["prompt_token_ids"] = [0] * compute_talker_prompt_ids_length(prompt_token_ids)
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
+                    # Build kv_sender_info using deterministic port calculation (like vLLM native)
+                    # sender listens on zmq_port (from config), each TP rank uses zmq_port + tp_rank
+                    kv_sender_info = self._build_kv_sender_info(sender_stage_id=0)
                     for i in range(1, len(self.stage_list)):
                         task = {
                             "request_id": request_id,
                             "engine_inputs": engine_input,
                             "sampling_params": sampling_params_list[i],
+                            "kv_sender_info": kv_sender_info,  # Pass sender info for RDMA
                         }
                         self.stage_list[i].submit(task)
                         metrics.stage_first_ts[i] = time.time()
@@ -442,6 +451,8 @@ class AsyncOmni(OmniBase):
 
                 sent_via_connector = False
                 if connector:
+                    # Build kv_sender_info using deterministic port (like vLLM native)
+                    kv_sender_info = self._build_kv_sender_info(sender_stage_id=0)
                     sent_via_connector = try_send_via_connector(
                         connector=connector,
                         stage_id=stage_id,
@@ -452,6 +463,7 @@ class AsyncOmni(OmniBase):
                         original_prompt=prompt,
                         next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                         metrics=metrics,
+                        kv_sender_info=kv_sender_info,
                     )
 
                 if not sent_via_connector:

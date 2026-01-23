@@ -1,4 +1,5 @@
 # Stage 0: Thinker (multimodal understanding + text generation)
+# This configuration uses RDMA for KV cache transfer between stages.
 
 stage_args:
   - stage_id: 0
@@ -23,6 +24,8 @@ stage_args:
         need_send_cache: true
         kv_transfer_criteria:
           type: prefill_finished #or special token generated
+    output_connectors:
+      to_stage_1: rdma_connector #mooncake_connector #rdma_connector
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -53,6 +56,8 @@ stage_args:
       omni_kv_config:
         need_recv_cache: true
     engine_input_source: [0]
+    input_connectors:
+      from_stage_0: rdma_connector #mooncake_connector #rdma_connector
 
     final_output: true
     final_output_type: image
@@ -67,14 +72,35 @@ runtime:
     window_size: -1
     max_inflight: 1
 
-  # Distributed connectors configuration (optional)
-  # More connectors will be supported in the future.
+  # RDMA connectors configuration
+  # Note: Update host/port settings according to your environment
   connectors:
-    shared_memory_connector:
-      name: SharedMemoryConnector
+    # Unified RDMA connector configuration
+    # Role is auto-detected based on context:
+    #   - When used for sending (need_send_cache=true): acts as sender
+    #   - When used for receiving (need_recv_cache=true): acts as receiver
+    rdma_connector:
+      name: MooncakeRDMAConnector
       extra:
-        shm_threshold_bytes: 65536 # 64KB threshold
+        role: "auto"                # Auto-detect role based on context (sender/receiver)
+        host: "auto"                # Auto-detect local IP for RDMA (each node uses its own IP)
+        zmq_port: 50051             # Base ZMQ port for sender listener
+        sender_host: "auto"         # To be resolved dynamically from orchestrator
+        sender_zmq_port: 50051      # Sender's ZMQ port (same as zmq_port for request_forwarding)
+        protocol: "rdma"
+        device_name: ""             # RDMA device name (e.g., "mlx5_0"), empty for auto-detect
+        memory_pool_size: 2147483648  # 2GB memory pool
+        memory_pool_device: "cpu"  # "cuda" for GPUDirect RDMA, "cpu" for pinned memory
 
+    mooncake_connector:
+      name: MooncakeConnector
+      extra:
+        host: "auto"  # Auto-detect local IP
+        metadata_server: "http://10.248.12.106:8280/metadata"  # Metadata server on head node
+        master: "10.248.12.106:52051"
+        segment: 512000000    # 512MB
+        localbuf: 512000000   # 512MB
+        proto: "tcp"
 
   edges:
     - from: 0

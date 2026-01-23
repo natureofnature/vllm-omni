@@ -55,6 +55,58 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _ensure_sitecustomize_on_path() -> None:
+    """Ensure repo root is on PYTHONPATH for spawned workers."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    existing = os.environ.get("PYTHONPATH", "")
+    existing_paths = [p for p in existing.split(os.pathsep) if p]
+    if repo_root not in existing_paths:
+        os.environ["PYTHONPATH"] = repo_root + (os.pathsep + existing if existing else "")
+
+
+def _patch_bagel_processor() -> None:
+    """Filter invalid kwargs for Bagel image processor (e.g., truncation)."""
+    try:
+        from transformers.feature_extraction_utils import BatchFeature
+        from vllm.transformers_utils.processors.bagel import BagelProcessor
+
+        def _patched_call(self, text=None, images=None, **kwargs):
+            if images is not None:
+                image_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k
+                    not in (
+                        "use_fast",
+                        "truncation",
+                        "padding",
+                        "max_length",
+                        "add_special_tokens",
+                    )
+                }
+                if "return_tensors" not in image_kwargs:
+                    image_kwargs["return_tensors"] = "pt"
+                pixel_values = self.image_processor(images, **image_kwargs)
+            else:
+                pixel_values = None
+            text_inputs = self.tokenizer(text, **kwargs) if text is not None else None
+            if pixel_values is not None and text_inputs is not None:
+                combined = dict(text_inputs)
+                combined["pixel_values"] = pixel_values["pixel_values"]
+                return BatchFeature(combined)
+            if pixel_values is not None:
+                return pixel_values
+            if text_inputs is not None:
+                return BatchFeature(dict(text_inputs))
+            return BatchFeature({})
+
+        BagelProcessor.__call__ = _patched_call
+    except ImportError:
+        pass
+
+
 def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     worker_type = engine_args.pop("worker_type", None)
     if not worker_type:
@@ -105,6 +157,7 @@ class OmniStage:
         self.tokenizer = None
         self.input_preprocessor = None
         self.is_tracing_enabled = False
+        self.node_ip = None  # Node IP for cross-node RDMA
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
@@ -182,6 +235,14 @@ class OmniStage:
             input_preprocessor: InputPreprocessor instance received from worker process
         """
         self.input_preprocessor = input_preprocessor
+
+    def set_node_ip(self, node_ip: str) -> None:
+        """Set the node IP for this stage (for cross-node RDMA).
+
+        Args:
+            node_ip: IP address of the node running this stage
+        """
+        self.node_ip = node_ip
 
     def set_is_tracing_enabled(self, is_tracing_enabled: bool) -> None:
         """Set whether tracing is enabled for this stage.
@@ -501,7 +562,9 @@ def _stage_worker(
 
     from vllm_omni.plugins import load_omni_general_plugins
 
+    _ensure_sitecustomize_on_path()
     load_omni_general_plugins()
+    _patch_bagel_processor()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -698,7 +761,9 @@ def _stage_worker(
             )
         else:
             # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
+            # skip_connector_init=True: Stage processes manage connectors separately
+            # via build_stage_connectors, not through OmniLLM initialization
+            stage_engine = OmniLLM(model=model, skip_connector_init=True, **engine_args)
     finally:
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
@@ -894,9 +959,14 @@ def _stage_worker(
             if stage_type == "diffusion":
                 stage_engine = cast(OmniDiffusion, stage_engine)
                 batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
+                # Extract kv_sender_info from first task (all tasks in batch should have same sender)
+                kv_sender_info = batch_tasks[0].get("kv_sender_info") if batch_tasks else None
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(
-                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                    batch_engine_inputs,
+                    batch_engine_sampling_params,
+                    batch_request_ids,
+                    kv_sender_info=kv_sender_info,
                 )
                 gen_outputs.extend(diffusion_results)
                 # Assign request_ids if not present
@@ -955,33 +1025,24 @@ def _stage_worker(
                     _metrics.stage_stats = None
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                    result_payload = {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "metrics": _metrics,
+                    }
                     if use_shm:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs_shm": payload,
-                                "metrics": _metrics,
-                            }
-                        )
+                        result_payload["engine_outputs_shm"] = payload
                     else:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs": payload,
-                                "metrics": _metrics,
-                            }
-                        )
+                        result_payload["engine_outputs"] = payload
+                    out_q.put(result_payload)
                 except Exception:
-                    out_q.put(
-                        {
-                            "request_id": rid,
-                            "stage_id": stage_id,
-                            "engine_outputs": r_outputs,
-                            "metrics": _metrics,
-                        }
-                    )
+                    result_payload = {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "engine_outputs": r_outputs,
+                        "metrics": _metrics,
+                    }
+                    out_q.put(result_payload)
                 logger.debug(
                     "Enqueued result for request %s to downstream",
                     rid,
@@ -1025,7 +1086,9 @@ async def _stage_worker_async(
 
     from vllm_omni.plugins import load_omni_general_plugins
 
+    _ensure_sitecustomize_on_path()
     load_omni_general_plugins()
+    _patch_bagel_processor()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
@@ -1335,6 +1398,22 @@ async def _stage_worker_async(
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
             stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+
+        # Report this stage's node IP for cross-node RDMA configuration
+        try:
+            import socket
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                node_ip = s.getsockname()[0]
+            finally:
+                s.close()
+            stage_ready_payload["node_ip"] = node_ip
+            logger.info(f"[Stage-{stage_id}] Reporting node IP: {node_ip}")
+        except Exception as ip_e:
+            logger.warning(f"[Stage-{stage_id}] Failed to get node IP: {ip_e}")
+
         out_q.put(stage_ready_payload)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
@@ -1381,8 +1460,11 @@ async def _stage_worker_async(
 
             if stage_type == "diffusion":
                 diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
+                kv_sender_info = task.get("kv_sender_info")
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(
+                    ein, diffusion_sampling_params, rid, kv_sender_info=kv_sender_info
+                )
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))

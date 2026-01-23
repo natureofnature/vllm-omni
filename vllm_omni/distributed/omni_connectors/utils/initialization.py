@@ -21,10 +21,22 @@ logger = get_connector_logger(__name__)
 
 
 def initialize_connectors_from_config(
-    config_path: str | Path | None = None, default_shm_threshold: int = 65536
+    config_path: str | Path | None = None,
+    default_shm_threshold: int = 65536,
+    purpose: str = "request_forwarding",
+    caller_stage_id: int | str | None = None,
+    is_sender: bool | None = None,
 ) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """
     Initialize connectors from configuration file.
+
+    Args:
+        config_path: Path to the configuration file.
+        default_shm_threshold: Default shared memory threshold.
+        purpose: Purpose of the connector ("request_forwarding" or "kv_transfer").
+            Different purposes use different port offsets to avoid conflicts.
+        caller_stage_id: The stage ID of the caller (for role determination).
+        is_sender: Explicit role override. If None, auto-detect based on edge direction.
 
     Returns:
         tuple: (OmniTransferConfig, dict of {(from, to): connector_instance})
@@ -36,28 +48,113 @@ def initialize_connectors_from_config(
         return None, {}
 
     # create connectors from config
-    connectors = create_connectors_from_config(transfer_config.connectors)
+    connectors = create_connectors_from_config(
+        transfer_config.connectors,
+        purpose=purpose,
+        caller_stage_id=caller_stage_id,
+        is_sender=is_sender,
+    )
     return transfer_config, connectors
 
 
 def create_connectors_from_config(
     connectors_config: dict[tuple[str, str], ConnectorSpec],
+    purpose: str = "request_forwarding",
+    caller_stage_id: int | str | None = None,
+    is_sender: bool | None = None,
 ) -> dict[tuple[str, str], OmniConnectorBase]:
     """
     Create connectors from config.
 
     Args:
         connectors_config: A dictionary of connector configurations.
+        purpose: Purpose of the connector ("request_forwarding" or "kv_transfer").
+            Different purposes use different port offsets:
+            - request_forwarding: port_offset = 0
+            - kv_transfer: port_offset = 100
+        caller_stage_id: The stage ID of the caller process (for role determination).
+        is_sender: Explicit role override. If None, auto-detect based on edge direction.
 
     Returns:
         A dictionary of connectors.
     """
+    # Purpose-based port offset to avoid conflicts between different types of connections
+    PURPOSE_PORT_OFFSETS = {
+        "request_forwarding": 0,
+        "kv_transfer": 100,
+    }
+    port_offset = PURPOSE_PORT_OFFSETS.get(purpose, 0)
+
+    # Orchestrator uses a different port offset to avoid conflicts with stage workers
+    # This is important for Ray mode where Orchestrator and Stage 0 may be on the same node
+    ORCHESTRATOR_PORT_OFFSET = 200
+
     connectors = {}
     for edge_key, connector_spec in connectors_config.items():
+        from_stage, to_stage = edge_key
         try:
+            # For RDMA connector, adjust port and role based on purpose and caller
+            if connector_spec.name == "MooncakeRDMAConnector":
+                # Deep copy extra to avoid modifying original
+                extra = dict(connector_spec.extra) if connector_spec.extra else {}
+
+                # Calculate port based on purpose, caller and from_stage
+                base_port = extra.get("zmq_port", 50051)
+                try:
+                    stage_offset = int(from_stage)
+                except (ValueError, TypeError):
+                    stage_offset = 0
+
+                # Orchestrator uses separate port offset to avoid conflicts with stage workers
+                if str(caller_stage_id) == "orchestrator":
+                    adjusted_port = base_port + ORCHESTRATOR_PORT_OFFSET + stage_offset
+                else:
+                    adjusted_port = base_port + port_offset + stage_offset
+                extra["zmq_port"] = adjusted_port
+
+                # Determine role based on caller_stage_id and edge direction
+                if is_sender is not None:
+                    # Explicit override
+                    extra["role"] = "sender" if is_sender else "receiver"
+                    if not is_sender:
+                        # Receiver needs sender connection info
+                        extra["sender_host"] = extra.get("host", "127.0.0.1")
+                        extra["sender_zmq_port"] = adjusted_port
+                elif caller_stage_id is not None:
+                    caller_str = str(caller_stage_id)
+                    if caller_str == from_stage:
+                        extra["role"] = "sender"
+                    elif caller_str == to_stage:
+                        extra["role"] = "receiver"
+                        # Set sender connection info
+                        extra["sender_host"] = extra.get("host", "127.0.0.1")
+                        extra["sender_zmq_port"] = adjusted_port
+                    else:
+                        # Orchestrator (caller_stage_id might be "orchestrator" or -1)
+                        # For orchestrator, use sender role for output edges
+                        extra["role"] = "sender"
+                else:
+                    # Fallback to auto
+                    extra["role"] = extra.get("role", "auto")
+
+                # Create modified connector spec
+                modified_spec = ConnectorSpec(name=connector_spec.name, extra=extra)
+                connector = OmniConnectorFactory.create_connector(modified_spec)
+                connectors[edge_key] = connector
+                logger.info(
+                    f"Created {connector_spec.name} for edge {from_stage} -> {to_stage}:\n"
+                    f"  caller={caller_stage_id}, purpose={purpose}\n"
+                    f"  local: host={extra.get('host')}, zmq_port={adjusted_port}\n"
+                    f"  remote: sender_host={extra.get('sender_host')}, "
+                    f"sender_zmq_port={extra.get('sender_zmq_port')}\n"
+                    f"  role={extra.get('role')}"
+                )
+                continue
+
+            # Non-RDMA connectors: create as-is
             connector = OmniConnectorFactory.create_connector(connector_spec)
             connectors[edge_key] = connector
-            logger.info(f"Created connector for {edge_key[0]} -> {edge_key[1]}: {type(connector).__name__}")
+            logger.info(f"Created connector for {from_stage} -> {to_stage}: {type(connector).__name__}")
         except Exception as e:
             raise RuntimeError(f"Failed to initialize connector for edge {edge_key}: {e}") from e
 
@@ -242,6 +339,12 @@ def initialize_orchestrator_connectors(
     config_path: str | None, worker_backend: str | None = "multi_process", shm_threshold_bytes: int = 65536
 ) -> tuple[OmniTransferConfig | None, dict[tuple[str, str], OmniConnectorBase]]:
     """Initialize connectors shared at orchestrator level.
+
+    The orchestrator uses connectors for request forwarding to stages.
+    For MooncakeRDMAConnector, separate ports are used for request_forwarding
+    and kv_transfer to allow both orchestrator and workers to have their own
+    RDMA connections.
+
     Args:
         config_path: The path to the configuration file.
         worker_backend: The backend to use for the worker.
@@ -252,8 +355,14 @@ def initialize_orchestrator_connectors(
         default_shm_threshold = sys.maxsize
     else:
         default_shm_threshold = max(0, shm_threshold_bytes)
+
+    # Orchestrator uses request_forwarding purpose with sender role
     transfer_config, connectors = initialize_connectors_from_config(
-        config_path, default_shm_threshold=default_shm_threshold
+        config_path,
+        default_shm_threshold=default_shm_threshold,
+        purpose="request_forwarding",
+        caller_stage_id="orchestrator",
+        is_sender=True,
     )
     return transfer_config, connectors
 
@@ -280,27 +389,36 @@ def get_stage_connector_config(
 def build_stage_connectors(
     stage_id: int,
     connectors_config: dict[str, Any],
+    purpose: str = "request_forwarding",
 ) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config."""
+    """Instantiate OmniConnectors for a stage based on config.
+
+    Args:
+        stage_id: The ID of this stage.
+        connectors_config: Connector configuration dictionary.
+        purpose: Purpose of the connector ("request_forwarding" or "kv_transfer").
+    """
     if not connectors_config:
         return {}
 
     logger.info(
-        "[Stage-%s] Initializing OmniConnectors with config keys: %s",
+        "[Stage-%s] Initializing OmniConnectors (purpose=%s) with config keys: %s",
         stage_id,
+        purpose,
         list(connectors_config.keys()),
     )
 
     from .config import ConnectorSpec
 
     connectors: dict[tuple[str, str], Any] = {}
-    # Convert dictionary-formatted config to ConnectorSpec objects
-    stage_connector_specs = {}
-    for input_key, config in connectors_config.items():
-        if not input_key.startswith("from_stage_"):
+
+    # Process input connectors (from_stage_X) - this stage is receiver
+    input_specs = {}
+    for key, config in connectors_config.items():
+        if not key.startswith("from_stage_"):
             continue
 
-        from_stage = input_key.replace("from_stage_", "")
+        from_stage = key.replace("from_stage_", "")
         spec_dict = config.get("spec", {})
         if not spec_dict:
             continue
@@ -309,15 +427,50 @@ def build_stage_connectors(
             name=spec_dict.get("name", "SharedMemoryConnector"),
             extra=spec_dict.get("extra", {}),
         )
-        stage_connector_specs[(str(from_stage), str(stage_id))] = connector_spec
+        input_specs[(str(from_stage), str(stage_id))] = connector_spec
 
-    try:
-        # Use unified connector creation logic
-        connectors = create_connectors_from_config(stage_connector_specs)
-    except Exception as exc:  # pragma: no cover - defensive logging
-        # Fail fast so the stage does not start with missing connectors.
-        logger.exception("[Stage-%s] Failed to initialize connectors: %s", stage_id, exc)
-        raise
+    if input_specs:
+        try:
+            input_connectors = create_connectors_from_config(
+                input_specs,
+                purpose=purpose,
+                caller_stage_id=stage_id,
+                is_sender=False,  # This stage is receiver for input connectors
+            )
+            connectors.update(input_connectors)
+        except Exception as exc:
+            logger.exception("[Stage-%s] Failed to initialize input connectors: %s", stage_id, exc)
+            raise
+
+    # Process output connectors (to_stage_X) - this stage is sender
+    output_specs = {}
+    for key, config in connectors_config.items():
+        if not key.startswith("to_stage_"):
+            continue
+
+        to_stage = key.replace("to_stage_", "")
+        spec_dict = config.get("spec", {})
+        if not spec_dict:
+            continue
+
+        connector_spec = ConnectorSpec(
+            name=spec_dict.get("name", "SharedMemoryConnector"),
+            extra=spec_dict.get("extra", {}),
+        )
+        output_specs[(str(stage_id), str(to_stage))] = connector_spec
+
+    if output_specs:
+        try:
+            output_connectors = create_connectors_from_config(
+                output_specs,
+                purpose=purpose,
+                caller_stage_id=stage_id,
+                is_sender=True,  # This stage is sender for output connectors
+            )
+            connectors.update(output_connectors)
+        except Exception as exc:
+            logger.exception("[Stage-%s] Failed to initialize output connectors: %s", stage_id, exc)
+            raise
 
     return connectors
 

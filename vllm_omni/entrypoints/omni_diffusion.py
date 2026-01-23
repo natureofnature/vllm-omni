@@ -90,6 +90,7 @@ class OmniDiffusion:
         prompts: OmniPromptType | Sequence[OmniPromptType],
         sampling_params: OmniDiffusionSamplingParams,
         request_ids: list[str] = [],
+        kv_sender_info: dict | None = None,
     ) -> list[OmniRequestOutput]:
         if isinstance(prompts, (str, dict)):
             prompts = [prompts]
@@ -100,7 +101,7 @@ class OmniDiffusion:
         if len(request_ids) < len(prompts):
             request_ids.extend(f"{i + len(request_ids)}_{uuid.uuid4()}" for i in range(len(prompts) - len(request_ids)))
 
-        request = OmniDiffusionRequest(prompts, sampling_params, request_ids)
+        request = OmniDiffusionRequest(prompts, sampling_params, request_ids, kv_sender_info=kv_sender_info)
         return self._run_engine(request)
 
     def _run_engine(self, request: OmniDiffusionRequest) -> list[OmniRequestOutput]:

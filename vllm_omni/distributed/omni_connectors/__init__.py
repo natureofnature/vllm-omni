@@ -3,6 +3,7 @@
 
 from .connectors.base import OmniConnectorBase
 from .connectors.mooncake_connector import MooncakeConnector
+from .connectors.mooncake_rdma_connector import MooncakeRDMAConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 from .factory import OmniConnectorFactory
@@ -26,6 +27,7 @@ __all__ = [
     "OmniConnectorFactory",
     # Specific implementations
     "MooncakeConnector",
+    "MooncakeRDMAConnector",
     "SharedMemoryConnector",
     "YuanrongConnector",
     # Utilities

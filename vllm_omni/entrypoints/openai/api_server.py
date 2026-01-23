@@ -930,8 +930,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         )
 
     try:
-        # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        # Build prompt for Bagel-style text2img
+        # Align with offline inference formatting to ensure conditioning.
+        final_prompt_text = f"<|im_start|>{request.prompt}<|im_end|>"
+        prompt: OmniTextPrompt = {"prompt": final_prompt_text, "modalities": ["image"]}
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
 
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
@@ -1025,17 +1027,24 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
                     sampling_params_list.append(gen_params)
                 else:
                     base_params = default_params_list[idx]
+                    # For text2img, keep the LLM stage short like offline flow.
+                    if hasattr(base_params, "max_tokens"):
+                        base_params.max_tokens = 1
                     sampling_params_list.append(base_params)
 
             async for output in engine_client.generate(
                 prompt=prompt,
                 request_id=request_id,
                 sampling_params_list=sampling_params_list,
+                output_modalities=["image"],
             ):
                 result = output
         else:
             result = await engine_client.generate(
-                prompt=prompt, request_id=request_id, sampling_params_list=[gen_params]
+                prompt=prompt,
+                request_id=request_id,
+                sampling_params_list=[gen_params],
+                output_modalities=["image"],
             )
 
         if result is None:
