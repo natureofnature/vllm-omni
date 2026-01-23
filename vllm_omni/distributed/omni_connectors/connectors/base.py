@@ -12,6 +12,11 @@ logger = get_connector_logger(__name__)
 class OmniConnectorBase(ABC):
     """Base class for all OmniConnectors."""
 
+    # Whether the connector can handle raw bytes/torch.Tensor natively
+    # without going through OmniSerializer.  Connectors that copy raw
+    # payloads directly (e.g. RDMA) should override this to True.
+    supports_raw_data: bool = False
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.

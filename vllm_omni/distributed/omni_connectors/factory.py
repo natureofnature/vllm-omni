@@ -56,17 +56,17 @@ class OmniConnectorFactory:
 
 
 # Register built-in connectors with lazy imports
-def _create_mooncake_connector(config: dict[str, Any]) -> OmniConnectorBase:
+def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
-        from .connectors.mooncake_connector import MooncakeConnector
+        from .connectors.mooncake_store_connector import MooncakeStoreConnector
     except ImportError:
         # Fallback import
         import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors.mooncake_connector import MooncakeConnector
-    return MooncakeConnector(config)
+        from omni_connectors.connectors.mooncake_store_connector import MooncakeStoreConnector
+    return MooncakeStoreConnector(config)
 
 
 def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
@@ -94,7 +94,22 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return YuanrongConnector(config)
 
 
+def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
+    return MooncakeTransferEngineConnector(config)
+
+
 # Register connectors
-OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
+OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
+OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
+# Backward-compatible aliases – will be removed in the future
+OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_store_connector)
