@@ -94,7 +94,20 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     return YuanrongConnector(config)
 
 
+def _create_mooncake_rdma_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    try:
+        from .connectors.mooncake_rdma_connector import MooncakeRDMAConnector
+    except ImportError:
+        import os
+        import sys
+
+        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+        from omni_connectors.connectors.mooncake_rdma_connector import MooncakeRDMAConnector
+    return MooncakeRDMAConnector(config)
+
+
 # Register connectors
 OmniConnectorFactory.register_connector("MooncakeConnector", _create_mooncake_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
+OmniConnectorFactory.register_connector("MooncakeRDMAConnector", _create_mooncake_rdma_connector)

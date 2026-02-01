@@ -38,7 +38,7 @@ stage_args:
   - stage_id: 1
     stage_type: diffusion
     runtime:
-      devices: "0"
+      devices: "1"
       max_batch_size: 1
     engine_args:
       model_stage: dit

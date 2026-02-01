@@ -74,9 +74,15 @@ class OmniLLM(LLM):
         shm_threshold_bytes: int = 65536,
         batch_timeout: int = 10,
         init_timeout: int = 300,
+        skip_connector_init: bool = False,
         **kwargs: Any,
     ):
-        """LLM constructor with omni-specific configuration loading."""
+        """LLM constructor with omni-specific configuration loading.
+
+        Args:
+            skip_connector_init: If True, skip connector initialization. Used when OmniLLM
+                is created within a Stage process where connectors are managed separately.
+        """
         # Store stage management parameters (used by Omni class)
         self.worker_backend = kwargs.get("worker_backend", "multi_process")
         self.ray_address = kwargs.get("ray_address", None)
@@ -91,10 +97,14 @@ class OmniLLM(LLM):
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
-        )
+        # Initialize connectors (skip when running inside a Stage process)
+        if skip_connector_init:
+            self.omni_transfer_config = None
+            self.connectors = {}
+        else:
+            self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
+                self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+            )
 
         # Initialize LLM engine
         if "disable_log_stats" not in kwargs:

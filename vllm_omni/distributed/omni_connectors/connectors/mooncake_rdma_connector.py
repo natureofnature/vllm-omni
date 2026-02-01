@@ -28,6 +28,25 @@ except ImportError:
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
 TRANS_ERROR = b"trans_error"
+QUERY_INFO = b"query_info"
+INFO_NOT_FOUND = b"info_not_found"
+
+
+@dataclass
+class QueryRequest:
+    """Request to query metadata for a specific key."""
+
+    request_id: str
+
+
+@dataclass
+class QueryResponse:
+    """Response containing metadata for a request."""
+
+    request_id: str
+    data_size: int
+    is_fast_path: bool
+    is_bytes: bool
 
 
 @dataclass
@@ -222,6 +241,22 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB
         self.pool_device = config.get("memory_pool_device", "cpu")
 
+        # --- Sender Configuration (for receiver to query without metadata) ---
+        # When receiver doesn't have metadata, it uses these to connect to sender
+        self.sender_host = config.get("sender_host", None)
+        self.sender_zmq_port = config.get("sender_zmq_port", None)
+
+        # --- Role Configuration ---
+        # "sender": Exposes data for RDMA pull, starts ZMQ listener
+        # "receiver": Pulls data from sender, does NOT start ZMQ listener
+        # "auto": Auto-detect based on sender_host/sender_zmq_port presence
+        role = config.get("role", "auto")
+        if role == "auto":
+            # If sender_host is configured, this is likely a receiver
+            self.is_sender = self.sender_host is None
+        else:
+            self.is_sender = role == "sender"
+
         self.engine_id = str(uuid.uuid4())
 
         # --- Mooncake Engine Init ---
@@ -268,12 +303,31 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         # --- Background Threads ---
         self._sender_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mooncake-sender")
         self._stop_event = threading.Event()
-        self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
-        self._listener_thread.start()
+        self._listener_thread = None
+        self._listener_ready = threading.Event()  # Signals when listener successfully binds
 
-    def put(
-        self, from_stage: str, to_stage: str, request_id: str, data: Any
-    ) -> tuple[bool, int, dict[str, Any] | None]:
+        # Only sender needs ZMQ listener to handle pull requests
+        if self.is_sender:
+            self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
+            self._listener_thread.start()
+            # Wait briefly for listener to bind (or fail)
+            self._listener_ready.wait(timeout=1.0)
+            # Check if listener failed and switched to receiver mode
+            if self.is_sender:
+                logger.info(f"MooncakeRDMAConnector started as SENDER (ZMQ listener on {self.host}:{self.zmq_port})")
+            else:
+                # Listener failed to bind, switched to receiver mode
+                logger.info(
+                    f"MooncakeRDMAConnector: port in use, falling back to RECEIVER mode "
+                    f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
+                )
+        else:
+            logger.info(
+                f"MooncakeRDMAConnector started as RECEIVER "
+                f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
+            )
+
+    def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
         Producer Side.
         Exposes data for RDMA transfer.
@@ -299,7 +353,7 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                     # Fallback to copy path if buffer is from a different pool/device context
                     logger.warning("ManagedBuffer from different pool detected. Falling back to copy path.")
                     # Ensure contiguous before fallback put
-                    return self.put(from_stage, to_stage, request_id, data.tensor.contiguous())
+                    return self.put(from_stage, to_stage, put_key, data.tensor.contiguous())
 
                 src_addr = self.base_ptr + data.offset
                 size = data.size
@@ -377,13 +431,27 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                 serialized = OmniSerializer.serialize(data)
                 # Recursively call put with bytes data
                 # We need to manually handle the recursive return to set is_fast_path correctly in metadata
-                success, size, meta = self.put(from_stage, to_stage, request_id, serialized)
+                success, size, meta = self.put(from_stage, to_stage, put_key, serialized)
                 if success and meta:
                     meta["is_fast_path"] = False  # Override to indicate deserialization needed
+                    # Also update _local_buffers to reflect correct is_fast_path
+                    # This is needed for metadata query from receiver
+                    with self._local_buffers_lock:
+                        if put_key in self._local_buffers:
+                            src_addrs, lengths, holder, should_release, _, is_bytes = self._local_buffers[put_key]
+                            self._local_buffers[put_key] = (src_addrs, lengths, holder, should_release, False, is_bytes)
                 return success, size, meta
 
             with self._local_buffers_lock:
-                self._local_buffers[request_id] = ([src_addr], [size], holder, should_release_holder)
+                # Store: (src_addrs, lengths, holder, should_release, is_fast_path, is_bytes)
+                self._local_buffers[put_key] = (
+                    [src_addr],
+                    [size],
+                    holder,
+                    should_release_holder,
+                    is_fast_path,
+                    is_bytes_payload,
+                )
 
             # Metadata for Consumer
             metadata = {
@@ -397,19 +465,57 @@ class MooncakeRDMAConnector(OmniConnectorBase):
             return True, size, metadata
 
         except Exception as e:
-            logger.error(f"RDMA Put failed for {request_id}: {e}", exc_info=True)
+            logger.error(f"RDMA Put failed for {put_key}: {e}", exc_info=True)
             return False, 0, None
+
+    def _query_metadata_from_sender(self, get_key: str) -> dict[str, Any] | None:
+        """Query metadata from sender using configured sender_host/sender_zmq_port."""
+        if not self.sender_host or not self.sender_zmq_port:
+            logger.warning("No sender_host/sender_zmq_port configured, cannot query metadata")
+            return None
+
+        zmq_addr = f"tcp://{self.sender_host}:{self.sender_zmq_port}"
+        req_socket = self.zmq_ctx.socket(zmq.REQ)
+        req_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5s timeout for query
+        req_socket.connect(zmq_addr)
+
+        try:
+            # Send query request
+            query = QueryRequest(request_id=get_key)
+            req_socket.send(QUERY_INFO + msgspec.msgpack.encode(query))
+            resp = req_socket.recv()
+
+            if resp == INFO_NOT_FOUND:
+                return None
+
+            # Parse response
+            query_resp = msgspec.msgpack.decode(resp, type=QueryResponse)
+            return {
+                "source_host": self.sender_host,
+                "source_port": self.sender_zmq_port,
+                "data_size": query_resp.data_size,
+                "is_fast_path": query_resp.is_fast_path,
+                "is_bytes": query_resp.is_bytes,
+            }
+        except Exception as e:
+            logger.debug(f"Failed to query metadata for {get_key}: {e}")
+            return None
+        finally:
+            req_socket.close()
 
     def get(
         self,
         from_stage: str,
         to_stage: str,
-        request_id: str,
+        get_key: str,
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         """
         Consumer Side.
         Allocates from local pool and pulls data via RDMA.
+
+        If metadata is not provided, will attempt to query it from sender
+        using configured sender_host/sender_zmq_port.
 
         Returns:
             Tuple[Any, int] | None:
@@ -420,8 +526,11 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         if getattr(self, "_closed", False):
             raise RuntimeError("Cannot get data: MooncakeRDMAConnector is closed")
 
+        # If no metadata provided, try to query from sender
         if not metadata:
-            return None
+            metadata = self._query_metadata_from_sender(get_key)
+            if not metadata:
+                return None
 
         src_host = metadata.get("source_host")
         src_port = metadata.get("source_port")
@@ -445,7 +554,7 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         agent_meta = MooncakeAgentMetadata(
             remote_hostname=self.host,
             remote_port=self.rpc_port,
-            request_id=request_id,
+            request_id=get_key,
             dst_addrs=[dst_ptr],
             lengths=[data_size],
         )
@@ -507,8 +616,8 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         with self._local_buffers_lock:
             item = self._local_buffers.pop(request_id, None)
             if item:
-                # item is (src_addrs, lengths, holder, should_release)
-                _, _, holder, should_release = item
+                # item is (src_addrs, lengths, holder, should_release, is_fast_path, is_bytes)
+                _, _, holder, should_release, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     # We own this buffer (created internally), so we must release it.
                     holder.release()
@@ -539,8 +648,8 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         # 1. Signal listener thread to stop
         self._stop_event.set()
 
-        # 2. Wait for listener thread to finish
-        if self._listener_thread.is_alive():
+        # 2. Wait for listener thread to finish (only if sender mode)
+        if self._listener_thread is not None and self._listener_thread.is_alive():
             self._listener_thread.join(timeout=2.0)
             if self._listener_thread.is_alive():
                 logger.warning("Listener thread did not stop gracefully")
@@ -551,7 +660,7 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         # 4. Release all pending buffers
         with self._local_buffers_lock:
             for req_id, item in list(self._local_buffers.items()):
-                _, _, holder, should_release = item
+                _, _, holder, should_release, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
             self._local_buffers.clear()
@@ -594,8 +703,20 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         try:
             socket.bind(f"tcp://{self.host}:{self.zmq_port}")
         except zmq.ZMQError:
-            logger.error(f"Failed to bind ZMQ listener on {self.host}:{self.zmq_port}")
+            # Port already in use - another sender is already running
+            # This instance should switch to receiver mode silently
+            logger.debug(f"ZMQ port {self.host}:{self.zmq_port} already in use, another sender is running")
+            self.is_sender = False
+            # Set sender_host/sender_zmq_port for querying if not already set
+            if not self.sender_host:
+                self.sender_host = self.host
+            if not self.sender_zmq_port:
+                self.sender_zmq_port = self.zmq_port
+            self._listener_ready.set()  # Signal that we've determined our role
             return
+
+        # Successfully bound - signal ready
+        self._listener_ready.set()
 
         # Create inproc socket pair for worker thread notifications
         # This allows workers to wake up the listener immediately when done
@@ -655,14 +776,18 @@ class MooncakeRDMAConnector(OmniConnectorBase):
             except Exception:
                 pass
 
-    def _handle_pull_request(
-        self, response_queue: queue.Queue, notify_addr: str, identity, payload
-    ):
+    def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
         """
-        Handle pull request in worker thread.
+        Handle pull request or query request in worker thread.
         Results are put into response_queue and listener is notified via inproc.
         """
         try:
+            # Check if this is a query request
+            if payload.startswith(QUERY_INFO):
+                self._handle_query_request(response_queue, notify_addr, identity, payload[len(QUERY_INFO) :])
+                return
+
+            # Normal RDMA transfer request
             meta = msgspec.msgpack.decode(payload, type=MooncakeAgentMetadata)
 
             with self._local_buffers_lock:
@@ -673,13 +798,11 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                 self._notify_listener(notify_addr)
                 return
 
-            src_addrs, src_lengths, _, _ = item
+            src_addrs, src_lengths, _, _, _, _ = item
             remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
 
             # RDMA Write
-            ret = self.engine.batch_transfer_sync_write(
-                remote_session, src_addrs, meta.dst_addrs, src_lengths
-            )
+            ret = self.engine.batch_transfer_sync_write(remote_session, src_addrs, meta.dst_addrs, src_lengths)
 
             if ret == 0:
                 self.cleanup(meta.request_id)
@@ -692,6 +815,33 @@ class MooncakeRDMAConnector(OmniConnectorBase):
             response_queue.put((identity, TRANS_ERROR))
 
         # Notify listener thread that response is ready
+        self._notify_listener(notify_addr)
+
+    def _handle_query_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
+        """Handle metadata query request."""
+        try:
+            query = msgspec.msgpack.decode(payload, type=QueryRequest)
+
+            with self._local_buffers_lock:
+                item = self._local_buffers.get(query.request_id)
+
+            if not item:
+                response_queue.put((identity, INFO_NOT_FOUND))
+            else:
+                src_addrs, src_lengths, _, _, is_fast_path, is_bytes = item
+
+                resp = QueryResponse(
+                    request_id=query.request_id,
+                    data_size=src_lengths[0] if src_lengths else 0,
+                    is_fast_path=is_fast_path,
+                    is_bytes=is_bytes,
+                )
+                response_queue.put((identity, msgspec.msgpack.encode(resp)))
+
+        except Exception as e:
+            logger.error(f"Query request failed: {e}")
+            response_queue.put((identity, INFO_NOT_FOUND))
+
         self._notify_listener(notify_addr)
 
     def _notify_listener(self, notify_addr: str):

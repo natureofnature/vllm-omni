@@ -137,8 +137,49 @@ class OmniKVTransferManager:
             cfg = self.config.connector_config
             if cfg and (c_type := cfg.get("type")):
                 try:
-                    logger.info(f"Initializing OmniConnector with config: {cfg}")
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
+
+                    # Auto-set role and port based on need_send_cache/need_recv_cache for RDMA connector
+                    # Port offset strategy:
+                    #   - request_forwarding: base_port + 0 + from_stage_id
+                    #   - kv_transfer: base_port + 100 + from_stage_id
+                    # This allows orchestrator/stage main processes and workers to each have
+                    # their own RDMA connections without port conflicts.
+                    KV_TRANSFER_PORT_OFFSET = 100
+
+                    if c_type == "MooncakeRDMAConnector" and c_extra.get("role") == "auto":
+                        base_port = c_extra.get("zmq_port", 50051)
+
+                        if self.config.need_send_cache:
+                            c_extra["role"] = "sender"
+                            # Sender port = base_port + KV_TRANSFER_PORT_OFFSET + from_stage_id
+                            from_stage = self.config.from_stage
+                            if from_stage is not None:
+                                try:
+                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                                except (ValueError, TypeError):
+                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET
+
+                        elif self.config.need_recv_cache:
+                            c_extra["role"] = "receiver"
+                            # Receiver connects to sender's port = base_port + KV_TRANSFER_PORT_OFFSET + from_stage_id
+                            from_stage = self.config.from_stage
+                            sender_port = base_port + KV_TRANSFER_PORT_OFFSET
+                            if from_stage is not None:
+                                try:
+                                    sender_port = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
+                                except (ValueError, TypeError):
+                                    pass
+
+                            if "sender_host" not in c_extra:
+                                c_extra["sender_host"] = c_extra.get("host", "127.0.0.1")
+                            if "sender_zmq_port" not in c_extra:
+                                c_extra["sender_zmq_port"] = sender_port
+
+                    logger.info(
+                        f"Initializing OmniConnector (purpose=kv_transfer) "
+                        f"with config: {cfg}, role: {c_extra.get('role', 'N/A')}"
+                    )
                     self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
                 except Exception as e:
                     logger.error(f"Failed to initialize OmniConnector: {e}")

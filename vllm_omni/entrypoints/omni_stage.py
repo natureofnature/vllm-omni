@@ -698,7 +698,9 @@ def _stage_worker(
             )
         else:
             # Default to LLM engine
-            stage_engine = OmniLLM(model=model, **engine_args)
+            # skip_connector_init=True: Stage processes manage connectors separately
+            # via build_stage_connectors, not through OmniLLM initialization
+            stage_engine = OmniLLM(model=model, skip_connector_init=True, **engine_args)
     finally:
         # Release all locks by closing file descriptors
         # Locks are automatically released when file descriptors are closed
