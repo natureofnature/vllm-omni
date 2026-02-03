@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 import queue
 import threading
 import uuid
@@ -236,6 +237,11 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         # Example: "mlx5_0,mlx5_1" to use only specific NICs.
         # This is important for environments with mixed InfiniBand/RoCE NICs.
         self.device_name = config.get("device_name", "")
+        if not self.device_name:
+            env_device = os.environ.get("RDMA_DEVICE_NAME", "")
+            if env_device:
+                self.device_name = env_device
+                logger.info(f"Using RDMA_DEVICE_NAME from env: {self.device_name}")
 
         # --- Memory Pool Configuration ---
         self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB

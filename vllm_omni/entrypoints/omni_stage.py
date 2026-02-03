@@ -55,6 +55,58 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 
+def _ensure_sitecustomize_on_path() -> None:
+    """Ensure repo root is on PYTHONPATH for spawned workers."""
+    repo_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    existing = os.environ.get("PYTHONPATH", "")
+    existing_paths = [p for p in existing.split(os.pathsep) if p]
+    if repo_root not in existing_paths:
+        os.environ["PYTHONPATH"] = repo_root + (os.pathsep + existing if existing else "")
+
+
+def _patch_bagel_processor() -> None:
+    """Filter invalid kwargs for Bagel image processor (e.g., truncation)."""
+    try:
+        from transformers.feature_extraction_utils import BatchFeature
+        from vllm.transformers_utils.processors.bagel import BagelProcessor
+
+        def _patched_call(self, text=None, images=None, **kwargs):
+            if images is not None:
+                image_kwargs = {
+                    k: v
+                    for k, v in kwargs.items()
+                    if k
+                    not in (
+                        "use_fast",
+                        "truncation",
+                        "padding",
+                        "max_length",
+                        "add_special_tokens",
+                    )
+                }
+                if "return_tensors" not in image_kwargs:
+                    image_kwargs["return_tensors"] = "pt"
+                pixel_values = self.image_processor(images, **image_kwargs)
+            else:
+                pixel_values = None
+            text_inputs = self.tokenizer(text, **kwargs) if text is not None else None
+            if pixel_values is not None and text_inputs is not None:
+                combined = dict(text_inputs)
+                combined["pixel_values"] = pixel_values["pixel_values"]
+                return BatchFeature(combined)
+            if pixel_values is not None:
+                return pixel_values
+            if text_inputs is not None:
+                return BatchFeature(dict(text_inputs))
+            return BatchFeature({})
+
+        BagelProcessor.__call__ = _patched_call
+    except ImportError:
+        pass
+
+
 def _resolve_worker_cls(engine_args: dict[str, Any]) -> None:
     worker_type = engine_args.pop("worker_type", None)
     if not worker_type:
@@ -501,7 +553,9 @@ def _stage_worker(
 
     from vllm_omni.plugins import load_omni_general_plugins
 
+    _ensure_sitecustomize_on_path()
     load_omni_general_plugins()
+    _patch_bagel_processor()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     # Mooncake / gRPC / RDMA and CUDA/NCCL can deadlock under fork-with-threads.
@@ -1027,7 +1081,9 @@ async def _stage_worker_async(
 
     from vllm_omni.plugins import load_omni_general_plugins
 
+    _ensure_sitecustomize_on_path()
     load_omni_general_plugins()
+    _patch_bagel_processor()
     # IMPORTANT: Ensure vLLM's internal multiprocessing workers (e.g., GPUARWorker /
     # GPUARModelRunner) are spawned with a fork-safe method.
     if _os.environ.get("VLLM_WORKER_MULTIPROC_METHOD") != "spawn":
