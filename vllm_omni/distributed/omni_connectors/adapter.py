@@ -31,6 +31,7 @@ def try_send_via_connector(
     original_prompt: Any,
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: Any,
+    kv_sender_info: dict[int, dict[str, Any]] | None = None,
 ) -> bool:
     """
     Attempts to send data via OmniConnector.
@@ -55,6 +56,12 @@ def try_send_via_connector(
         # Send data via connector
         success, serialized_size, metadata = connector.put(str(stage_id), str(next_stage_id), str(req_id), payload_data)
 
+        logger.info(
+            f"[Connector PUT] req={req_id}, edge={stage_id}->{next_stage_id}, "
+            f"success={success}, size={serialized_size}, "
+            f"metadata={metadata}"
+        )
+
         if success:
             # Send lightweight notification via queue
             notify_payload = {
@@ -69,6 +76,9 @@ def try_send_via_connector(
             # Merge connector metadata (e.g. shm handle or inline data) into queue payload
             if metadata:
                 notify_payload["connector_metadata"] = metadata
+            # Pass kv_sender_info for cross-node RDMA
+            if kv_sender_info:
+                notify_payload["kv_sender_info"] = kv_sender_info
 
             next_stage_queue_submit_fn(notify_payload)
 
@@ -127,6 +137,9 @@ def try_recv_via_connector(
                 # Get data from connector with timeout
                 _t_start = time.time()
                 connector_metadata = task.get("connector_metadata")
+                logger.info(
+                    f"[Connector GET] req={rid}, edge={from_stage}->{to_stage}, connector_metadata={connector_metadata}"
+                )
                 payload = connector.get(from_stage, to_stage, str(rid), metadata=connector_metadata)
                 _t_end = time.time()
 

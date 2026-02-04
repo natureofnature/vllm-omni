@@ -85,6 +85,10 @@ def create_connectors_from_config(
     }
     port_offset = PURPOSE_PORT_OFFSETS.get(purpose, 0)
 
+    # Orchestrator uses a different port offset to avoid conflicts with stage workers
+    # This is important for Ray mode where Orchestrator and Stage 0 may be on the same node
+    ORCHESTRATOR_PORT_OFFSET = 200
+
     connectors = {}
     for edge_key, connector_spec in connectors_config.items():
         from_stage, to_stage = edge_key
@@ -94,13 +98,18 @@ def create_connectors_from_config(
                 # Deep copy extra to avoid modifying original
                 extra = dict(connector_spec.extra) if connector_spec.extra else {}
 
-                # Calculate port based on purpose and from_stage
+                # Calculate port based on purpose, caller and from_stage
                 base_port = extra.get("zmq_port", 50051)
                 try:
                     stage_offset = int(from_stage)
                 except (ValueError, TypeError):
                     stage_offset = 0
-                adjusted_port = base_port + port_offset + stage_offset
+
+                # Orchestrator uses separate port offset to avoid conflicts with stage workers
+                if str(caller_stage_id) == "orchestrator":
+                    adjusted_port = base_port + ORCHESTRATOR_PORT_OFFSET + stage_offset
+                else:
+                    adjusted_port = base_port + port_offset + stage_offset
                 extra["zmq_port"] = adjusted_port
 
                 # Determine role based on caller_stage_id and edge direction
@@ -133,8 +142,12 @@ def create_connectors_from_config(
                 connector = OmniConnectorFactory.create_connector(modified_spec)
                 connectors[edge_key] = connector
                 logger.info(
-                    f"Created {connector_spec.name} for {from_stage} -> {to_stage} "
-                    f"(purpose={purpose}, port={adjusted_port}, role={extra.get('role')})"
+                    f"Created {connector_spec.name} for edge {from_stage} -> {to_stage}:\n"
+                    f"  caller={caller_stage_id}, purpose={purpose}\n"
+                    f"  local: host={extra.get('host')}, zmq_port={adjusted_port}\n"
+                    f"  remote: sender_host={extra.get('sender_host')}, "
+                    f"sender_zmq_port={extra.get('sender_zmq_port')}\n"
+                    f"  role={extra.get('role')}"
                 )
                 continue
 

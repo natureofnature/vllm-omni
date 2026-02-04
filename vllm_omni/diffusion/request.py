@@ -26,6 +26,10 @@ class OmniDiffusionRequest:
 
     request_ids: list[str] = field(default_factory=list)
 
+    # KV cache sender connection info (for cross-node RDMA transfer)
+    # Set by orchestrator when forwarding request to receiver stage
+    kv_sender_info: dict | None = None
+
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""
         # Set do_classifier_free_guidance based on guidance scale and negative prompt

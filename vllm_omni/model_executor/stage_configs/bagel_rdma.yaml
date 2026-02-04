@@ -1,0 +1,108 @@
+# Stage 0: Thinker (multimodal understanding + text generation)
+# This configuration uses RDMA for KV cache transfer between stages.
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      devices: "0"
+      max_batch_size: 1
+    engine_args:
+      model_stage: thinker
+      model_arch: BagelForConditionalGeneration
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: text
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      omni_kv_config:
+        need_send_cache: true
+        kv_transfer_criteria:
+          type: prefill_finished #or special token generated
+    output_connectors:
+      to_stage_1: rdma_connector
+    final_output: true
+    final_output_type: text
+    is_comprehension: true
+    default_sampling_params:
+      temperature: 0.4
+      top_p: 0.9
+      top_k: 1
+      max_tokens: 2048
+      seed: 52
+      detokenize: True
+      repetition_penalty: 1.05
+
+  - stage_id: 1
+    stage_type: diffusion
+    runtime:
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      model_stage: dit
+      gpu_memory_utilization: 0.4
+      enforce_eager: true
+      trust_remote_code: true
+      engine_output_type: image
+      distributed_executor_backend: "mp"
+      enable_prefix_caching: false
+      max_num_batched_tokens: 32768
+      tensor_parallel_size: 1
+      omni_kv_config:
+        need_recv_cache: true
+    engine_input_source: [0]
+    input_connectors:
+      from_stage_0: rdma_connector
+
+    final_output: true
+    final_output_type: image
+    is_comprehension: false
+    default_sampling_params:
+      seed: 52
+
+# Runtime edges
+runtime:
+  enabled: true
+  defaults:
+    window_size: -1
+    max_inflight: 1
+
+  # RDMA connectors configuration
+  # Note: Update host/port settings according to your environment
+  connectors:
+    # Unified RDMA connector configuration
+    # Role is auto-detected based on context:
+    #   - When used for sending (need_send_cache=true): acts as sender
+    #   - When used for receiving (need_recv_cache=true): acts as receiver
+    rdma_connector:
+      name: MooncakeRDMAConnector
+      extra:
+        role: "auto"                # Auto-detect role based on context (sender/receiver)
+        host: "auto"                # Auto-detect local IP for RDMA (each node uses its own IP)
+        zmq_port: 50051             # Base ZMQ port for sender listener
+        sender_host: "auto"         # To be resolved dynamically from orchestrator
+        sender_zmq_port: 50051      # Sender's ZMQ port (same as zmq_port for request_forwarding)
+        protocol: "rdma"
+        device_name: ""             # RDMA device name (e.g., "mlx5_0"), empty for auto-detect
+        memory_pool_size: 2147483648  # 2GB memory pool
+        memory_pool_device: "cpu"   # "cpu" for pinned memory, or "cuda:0" for GPU
+
+    mooncake_connector:
+      name: MooncakeConnector
+      extra:
+        host: "auto"  # Auto-detect local IP
+        metadata_server: "http://10.248.12.106:8280/metadata"  # Metadata server on head node
+        master: "10.248.12.106:52051"
+        segment: 512000000    # 512MB
+        localbuf: 512000000   # 512MB
+        proto: "tcp"
+
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1

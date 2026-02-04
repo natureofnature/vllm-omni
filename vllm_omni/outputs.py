@@ -24,6 +24,9 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    # KV sender connector info for cross-node RDMA transfer
+    # Contains {rank_id: {"host": ip, "zmq_port": port, "rpc_port": port}}
+    kv_sender_info: dict[int, dict[str, Any]] | None = None
 
 
 @dataclass

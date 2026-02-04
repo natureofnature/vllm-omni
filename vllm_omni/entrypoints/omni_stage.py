@@ -157,6 +157,7 @@ class OmniStage:
         self.tokenizer = None
         self.input_preprocessor = None
         self.is_tracing_enabled = False
+        self.node_ip = None  # Node IP for cross-node RDMA
         self.stage_id = stage_config.stage_id
         self.engine_args = stage_config.engine_args
         self.model_stage = stage_config.engine_args.model_stage
@@ -234,6 +235,14 @@ class OmniStage:
             input_preprocessor: InputPreprocessor instance received from worker process
         """
         self.input_preprocessor = input_preprocessor
+
+    def set_node_ip(self, node_ip: str) -> None:
+        """Set the node IP for this stage (for cross-node RDMA).
+
+        Args:
+            node_ip: IP address of the node running this stage
+        """
+        self.node_ip = node_ip
 
     def set_is_tracing_enabled(self, is_tracing_enabled: bool) -> None:
         """Set whether tracing is enabled for this stage.
@@ -950,9 +959,14 @@ def _stage_worker(
             if stage_type == "diffusion":
                 stage_engine = cast(OmniDiffusion, stage_engine)
                 batch_engine_sampling_params = cast(OmniDiffusionSamplingParams, batch_engine_sampling_params)
+                # Extract kv_sender_info from first task (all tasks in batch should have same sender)
+                kv_sender_info = batch_tasks[0].get("kv_sender_info") if batch_tasks else None
                 # Diffusion generate returns results directly, not an iterator
                 diffusion_results = stage_engine.generate(
-                    batch_engine_inputs, batch_engine_sampling_params, batch_request_ids
+                    batch_engine_inputs,
+                    batch_engine_sampling_params,
+                    batch_request_ids,
+                    kv_sender_info=kv_sender_info,
                 )
                 gen_outputs.extend(diffusion_results)
                 # Assign request_ids if not present
@@ -1011,33 +1025,24 @@ def _stage_worker(
                     _metrics.stage_stats = None
                 try:
                     use_shm, payload = maybe_dump_to_shm(r_outputs, shm_threshold_bytes)
+                    result_payload = {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "metrics": _metrics,
+                    }
                     if use_shm:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs_shm": payload,
-                                "metrics": _metrics,
-                            }
-                        )
+                        result_payload["engine_outputs_shm"] = payload
                     else:
-                        out_q.put(
-                            {
-                                "request_id": rid,
-                                "stage_id": stage_id,
-                                "engine_outputs": payload,
-                                "metrics": _metrics,
-                            }
-                        )
+                        result_payload["engine_outputs"] = payload
+                    out_q.put(result_payload)
                 except Exception:
-                    out_q.put(
-                        {
-                            "request_id": rid,
-                            "stage_id": stage_id,
-                            "engine_outputs": r_outputs,
-                            "metrics": _metrics,
-                        }
-                    )
+                    result_payload = {
+                        "request_id": rid,
+                        "stage_id": stage_id,
+                        "engine_outputs": r_outputs,
+                        "metrics": _metrics,
+                    }
+                    out_q.put(result_payload)
                 logger.debug(
                     "Enqueued result for request %s to downstream",
                     rid,
@@ -1393,6 +1398,22 @@ async def _stage_worker_async(
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
             stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+
+        # Report this stage's node IP for cross-node RDMA configuration
+        try:
+            import socket
+
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                s.connect(("8.8.8.8", 80))
+                node_ip = s.getsockname()[0]
+            finally:
+                s.close()
+            stage_ready_payload["node_ip"] = node_ip
+            logger.info(f"[Stage-{stage_id}] Reporting node IP: {node_ip}")
+        except Exception as ip_e:
+            logger.warning(f"[Stage-{stage_id}] Failed to get node IP: {ip_e}")
+
         out_q.put(stage_ready_payload)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
@@ -1439,8 +1460,11 @@ async def _stage_worker_async(
 
             if stage_type == "diffusion":
                 diffusion_sampling_params = cast(OmniDiffusionSamplingParams, task["sampling_params"])
+                kv_sender_info = task.get("kv_sender_info")
                 # AsyncOmniDiffusion.generate returns a single result, not an async generator
-                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(ein, diffusion_sampling_params, rid)
+                gen_output = await cast(AsyncOmniDiffusion, stage_engine).generate(
+                    ein, diffusion_sampling_params, rid, kv_sender_info=kv_sender_info
+                )
                 _gen_t1 = _time.time()
                 _gen_ms = (_gen_t1 - _gen_t0) * 1000.0
                 await generation_out_q.put((rid, gen_output, _gen_ms))

@@ -3,6 +3,7 @@
 
 import os
 import queue
+import socket
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -228,7 +229,13 @@ class MooncakeRDMAConnector(OmniConnectorBase):
             raise ImportError("Mooncake not available")
 
         self.config = config
-        self.host = config.get("host", "127.0.0.1")
+        host_config = config.get("host", "127.0.0.1")
+        # Support "auto" to auto-detect local IP address
+        if host_config.lower() == "auto":
+            self.host = self._get_local_ip()
+            logger.info(f"Auto-detected local IP for RDMA: {self.host}")
+        else:
+            self.host = host_config
         self.zmq_port = config.get("zmq_port", 50051)
         self.protocol = config.get("protocol", "rdma")
 
@@ -312,6 +319,14 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         self._listener_thread = None
         self._listener_ready = threading.Event()  # Signals when listener successfully binds
 
+        # Log complete connector configuration for debugging
+        logger.info(
+            f"MooncakeRDMAConnector config summary:\n"
+            f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
+            f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
+            f"  Role: is_sender={self.is_sender}, configured_role={config.get('role', 'auto')}"
+        )
+
         # Only sender needs ZMQ listener to handle pull requests
         if self.is_sender:
             self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
@@ -328,10 +343,55 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                     f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
                 )
         else:
-            logger.info(
-                f"MooncakeRDMAConnector started as RECEIVER "
-                f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
-            )
+            # Receiver mode - sender_host and sender_zmq_port may be configured later
+            # via update_sender_info() when task arrives from orchestrator
+            if not self.sender_host or self.sender_host.lower() == "auto":
+                logger.info(
+                    "MooncakeRDMAConnector receiver: sender_host='auto', "
+                    "awaiting sender info via task from orchestrator."
+                )
+            else:
+                logger.info(
+                    f"MooncakeRDMAConnector started as RECEIVER "
+                    f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
+                )
+
+    def get_connection_info(self) -> dict[str, Any]:
+        """Get connection info for this connector (useful for sender to share with receivers)."""
+        return {
+            "host": self.host,
+            "zmq_port": self.zmq_port,
+            "rpc_port": self.rpc_port,
+            "is_sender": self.is_sender,
+        }
+
+    def _get_local_ip(self) -> str:
+        """
+        Auto-detect the local IP address that can be used for RDMA communication.
+        This tries to get the IP that would be used to communicate externally,
+        not the loopback address.
+        """
+        try:
+            # Create a socket to determine the local IP used for external communication
+            # We don't actually connect, just use the socket to get routing info
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                # Use Google's DNS as a target (doesn't actually connect)
+                s.connect(("8.8.8.8", 80))
+                local_ip = s.getsockname()[0]
+            finally:
+                s.close()
+            return local_ip
+        except Exception as e:
+            logger.warning(f"Failed to auto-detect local IP: {e}, falling back to hostname lookup")
+            try:
+                # Fallback: use hostname resolution
+                hostname = socket.gethostname()
+                local_ip = socket.gethostbyname(hostname)
+                return local_ip
+            except Exception as e2:
+                logger.error(f"Failed to get local IP via hostname: {e2}, using 127.0.0.1")
+                return "127.0.0.1"
 
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
@@ -532,11 +592,18 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         if getattr(self, "_closed", False):
             raise RuntimeError("Cannot get data: MooncakeRDMAConnector is closed")
 
+        import time as _time
+
+        _t0 = _time.perf_counter()
+
         # If no metadata provided, try to query from sender
         if not metadata:
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
                 return None
+
+        _t1 = _time.perf_counter()
+        _query_ms = (_t1 - _t0) * 1000
 
         src_host = metadata.get("source_host")
         src_port = metadata.get("source_port")
@@ -555,6 +622,9 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         except MemoryError:
             logger.error(f"Failed to allocate {data_size} bytes in receive pool")
             return None
+
+        _t2 = _time.perf_counter()
+        _alloc_ms = (_t2 - _t1) * 1000
 
         # 2. Prepare Handshake
         agent_meta = MooncakeAgentMetadata(
@@ -575,6 +645,9 @@ class MooncakeRDMAConnector(OmniConnectorBase):
             req_socket.send(msgspec.msgpack.encode(agent_meta))
             resp = req_socket.recv()
 
+            _t3 = _time.perf_counter()
+            _rdma_ms = (_t3 - _t2) * 1000
+
             if resp == TRANS_DONE:
                 # Success
                 # Ensure data is visible on GPU
@@ -586,23 +659,60 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                     with torch.cuda.device(self.pool.device):
                         torch.cuda.current_stream().synchronize()
 
+                _t4 = _time.perf_counter()
+                _sync_ms = (_t4 - _t3) * 1000
+
                 if is_fast_path:
                     if is_bytes:
                         # Return as bytes (copy) and release buffer
                         try:
-                            return recv_buffer.to_bytes(), data_size
+                            result = recv_buffer.to_bytes(), data_size
+                            _t5 = _time.perf_counter()
+                            _copy_ms = (_t5 - _t4) * 1000
+                            _total_ms = (_t5 - _t0) * 1000
+                            _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                            logger.info(
+                                f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
+                                f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, copy={_copy_ms:.1f}ms, "
+                                f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s"
+                            )
+                            return result
                         finally:
                             recv_buffer.release()
                     else:
                         # If sender said it was a raw transfer (ManagedBuffer or
                         # Tensor), return the ManagedBuffer directly.
+                        _t5 = _time.perf_counter()
+                        _total_ms = (_t5 - _t0) * 1000
+                        _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                        logger.info(
+                            f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
+                            f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, "
+                            f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s (fast_path)"
+                        )
                         return recv_buffer, data_size
                 else:
                     # If it was a serialized object or generic bytes, we assume standard Omni behavior:
                     # Deserialize and return object. This requires a copy (to_bytes).
                     # We MUST release the buffer after deserialization.
                     try:
-                        val = OmniSerializer.deserialize(recv_buffer.to_bytes())
+                        _t_copy_start = _time.perf_counter()
+                        raw_bytes = recv_buffer.to_bytes()
+                        _t_copy_end = _time.perf_counter()
+                        _copy_ms = (_t_copy_end - _t_copy_start) * 1000
+
+                        _t_deser_start = _time.perf_counter()
+                        val = OmniSerializer.deserialize(raw_bytes)
+                        _t_deser_end = _time.perf_counter()
+                        _deser_ms = (_t_deser_end - _t_deser_start) * 1000
+
+                        _total_ms = (_t_deser_end - _t0) * 1000
+                        _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                        logger.info(
+                            f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
+                            f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, copy={_copy_ms:.1f}ms, "
+                            f"deser={_deser_ms:.1f}ms, total={_total_ms:.1f}ms, {_mbps:.1f} MB/s"
+                        )
                         return val, data_size
                     finally:
                         recv_buffer.release()

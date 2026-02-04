@@ -76,6 +76,15 @@ class OmniKVTransferManager:
             else (None, None)
         )
 
+        # For sender mode, eagerly initialize connector so sender info is available early
+        # This allows the info to be passed to receiver before it needs to connect
+        if config.need_send_cache and config.connector_config:
+            try:
+                _ = self.connector  # Trigger lazy init
+                logger.info("Sender connector eagerly initialized")
+            except Exception as e:
+                logger.warning(f"Failed to eagerly initialize sender connector: {e}")
+
     @classmethod
     def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
@@ -150,6 +159,12 @@ class OmniKVTransferManager:
                     if c_type == "MooncakeRDMAConnector" and c_extra.get("role") == "auto":
                         base_port = c_extra.get("zmq_port", 50051)
 
+                        # Pass stage info for dynamic sender discovery
+                        c_extra["from_stage"] = (
+                            str(self.config.from_stage) if self.config.from_stage is not None else "0"
+                        )
+                        c_extra["to_stage"] = str(self.config.to_stage) if self.config.to_stage is not None else "1"
+
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"
                             # Sender port = base_port + KV_TRANSFER_PORT_OFFSET + from_stage_id
@@ -194,6 +209,66 @@ class OmniKVTransferManager:
     def get_connector(self):
         """Get connector (compatibility wrapper for existing code)."""
         return self.connector
+
+    def get_sender_connection_info(self) -> dict[str, Any] | None:
+        """Get sender connector's connection info for passing to receiver.
+
+        Returns:
+            Dict with 'host', 'zmq_port', 'rpc_port' if sender connector is initialized,
+            None otherwise.
+        """
+        if not self.config.need_send_cache:
+            return None
+        conn = self.connector
+        if conn and hasattr(conn, "get_connection_info"):
+            return conn.get_connection_info()
+        return None
+
+    def update_sender_info(self, sender_info: dict[str, Any]) -> None:
+        """Update sender connection info for receiver connector.
+
+        This should be called before receive_kv_cache() when sender info
+        is dynamically provided (e.g., via task from orchestrator).
+
+        Args:
+            sender_info: Dict with 'host' and 'zmq_port' keys, or
+                         Dict mapping rank_id to {"host": ..., "zmq_port": ...}
+        """
+        if not self.config.need_recv_cache:
+            return
+
+        # Handle nested format: {rank_id: {"host": ..., "zmq_port": ...}}
+        # For TP=1, rank_id=0; for TP>1, use matching rank or first available
+        actual_info = sender_info
+        if sender_info and "host" not in sender_info:
+            # It's the nested format, extract the first rank's info
+            # TODO: For TP>1, match receiver rank to sender rank
+            for rank_id, info in sender_info.items():
+                if isinstance(info, dict) and "host" in info:
+                    actual_info = info
+                    logger.debug(f"Extracted sender info for rank {rank_id}: {info}")
+                    break
+
+        if not actual_info or "host" not in actual_info:
+            logger.warning(f"Invalid sender_info format: {sender_info}")
+            return
+
+        # Update connector config so new connector uses correct sender info
+        if self.config.connector_config:
+            self.config.connector_config["sender_host"] = actual_info.get("host")
+            self.config.connector_config["sender_zmq_port"] = actual_info.get("zmq_port")
+            logger.info(
+                f"Updated sender info in config: host={actual_info.get('host')}, zmq_port={actual_info.get('zmq_port')}"
+            )
+
+        # If connector already exists, try to update its sender info
+        if self._connector and hasattr(self._connector, "sender_host"):
+            self._connector.sender_host = actual_info.get("host")
+            self._connector.sender_zmq_port = actual_info.get("zmq_port")
+            logger.info(
+                f"Updated existing connector's sender info: host={actual_info.get('host')}, "
+                f"zmq_port={actual_info.get('zmq_port')}"
+            )
 
     def handle_finished_requests_kv_transfer(
         self,
@@ -331,10 +406,15 @@ class OmniKVTransferManager:
         data_dict = kv_data.to_dict()
         data_dict["request_id"] = transfer_req_id
 
+        import time as _time
+
+        _start = _time.perf_counter()
         success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict)
+        _elapsed = _time.perf_counter() - _start
 
         if success:
-            logger.info(f"KV transfer OK: {transfer_req_id}, {size} bytes")
+            _mbps = (size / 1024 / 1024) / _elapsed if _elapsed > 0 else 0
+            logger.info(f"KV transfer OK: {transfer_req_id}, {size} bytes, {_elapsed:.3f}s, {_mbps:.1f} MB/s")
         else:
             logger.error(f"KV transfer FAILED: {transfer_req_id}")
 
@@ -423,7 +503,8 @@ class OmniKVTransferManager:
                 )
                 if result:
                     data, size = result
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes")
+                    _elapsed = time.time() - start_time
+                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes, wait={_elapsed:.3f}s")
 
                     # Move tensors to target device if specified
                     if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
@@ -442,7 +523,7 @@ class OmniKVTransferManager:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
                     return None, 0
 
-                time.sleep(0.5)
+                time.sleep(0.01)  # 10ms polling interval
 
         except Exception as e:
             logger.error(f"Error receiving KV cache for {request_id}: {e}")
@@ -484,6 +565,11 @@ class OmniKVTransferManager:
         Returns:
             True if successful, False otherwise
         """
+        # Check if request has sender info (for cross-node RDMA)
+        kv_sender_info = getattr(req, "kv_sender_info", None)
+        if kv_sender_info:
+            self.update_sender_info(kv_sender_info)
+
         request_id = getattr(req, "request_id", None)
         if not request_id and hasattr(req, "request_ids") and req.request_ids:
             # Adaptation for new OmniDiffusionRequest which has list of prompts/ids

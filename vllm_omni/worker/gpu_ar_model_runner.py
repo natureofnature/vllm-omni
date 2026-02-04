@@ -562,6 +562,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            # Attach sender connector info for cross-node RDMA
+            sender_info = self.kv_transfer_manager.get_sender_connection_info()
+            if sender_info:
+                # Include rank_id for TP>1 scenarios
+                rank_id = getattr(self, "rank", 0)
+                output.kv_sender_info = {rank_id: sender_info}
 
         if not self.use_async_scheduling:
             return output

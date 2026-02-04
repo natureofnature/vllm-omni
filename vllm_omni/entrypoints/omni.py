@@ -149,6 +149,48 @@ class OmniBase:
             cache_config = self._get_default_cache_config(cache_backend)
         return cache_config
 
+    def _build_kv_sender_info(self, sender_stage_id: int = 0) -> dict[int, dict[str, Any]] | None:
+        """Build kv_sender_info using deterministic port calculation.
+
+        Similar to vLLM's native approach: sender info is computed from
+        node_ip (collected at stage_ready) + deterministic zmq_port.
+
+        Note: KV cache transfer uses purpose="kv_transfer" with port_offset=100,
+        so the port is base_port + 100 = 50151 (not the orchestrator's port).
+
+        Args:
+            sender_stage_id: The stage ID of the sender (default: 0)
+
+        Returns:
+            Dict mapping rank_id to sender connection info, or None if unavailable.
+        """
+        if sender_stage_id >= len(self.stage_list):
+            return None
+
+        sender_stage = self.stage_list[sender_stage_id]
+        sender_node_ip = getattr(sender_stage, "node_ip", None)
+        if not sender_node_ip:
+            logger.warning(f"[{self._name}] Sender stage {sender_stage_id} has no node_ip")
+            return None
+
+        # KV cache transfer uses purpose="kv_transfer" with port_offset=100
+        # So the port is base_port (50051) + kv_transfer_offset (100) = 50151
+        # This is different from orchestrator's request_forwarding port (50251)
+        base_port = 50051  # Default base port from config
+        kv_transfer_port_offset = 100  # From initialization.py PURPOSE_PORT_OFFSETS
+        zmq_port = base_port + kv_transfer_port_offset  # = 50151
+
+        # For TP=1, rank 0 uses zmq_port directly
+        # For TP>1, each rank uses zmq_port + tp_rank (handled by receiver)
+        kv_sender_info = {
+            0: {  # rank 0
+                "host": sender_node_ip,
+                "zmq_port": zmq_port,
+            }
+        }
+        logger.info(f"[{self._name}] Built kv_sender_info: {kv_sender_info}")
+        return kv_sender_info
+
     def _create_default_diffusion_stage_cfg(self, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Create default diffusion stage configuration."""
         # We temporally create a default config for diffusion stage.
@@ -816,6 +858,8 @@ class Omni(OmniBase):
                     connector = self.connectors.get(connector_key)
                     sent_via_connector = False
                     if connector:
+                        # Build kv_sender_info using deterministic port (like vLLM native)
+                        kv_sender_info = self._build_kv_sender_info(sender_stage_id=0)
                         sent_via_connector = try_send_via_connector(
                             connector=connector,
                             stage_id=stage_id,
@@ -826,6 +870,7 @@ class Omni(OmniBase):
                             original_prompt=request_id_to_prompt[req_id],
                             next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                             metrics=metrics,
+                            kv_sender_info=kv_sender_info,
                         )
 
                     if not sent_via_connector:
