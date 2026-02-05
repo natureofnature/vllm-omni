@@ -27,8 +27,18 @@ response = requests.post(
     },
 )
 
-# Decode and save
-img_data = response.json()["data"][0]["b64_json"]
-img_bytes = base64.b64decode(img_data)
-img = Image.open(io.BytesIO(img_bytes))
-img.save("cat.png")
+# Check response and decode
+resp_json = response.json()
+if response.status_code != 200:
+    print(f"Error: HTTP {response.status_code}")
+    print(resp_json)
+elif "error" in resp_json:
+    print(f"API Error: {resp_json['error']}")
+elif "data" not in resp_json:
+    print(f"Unexpected response format: {resp_json}")
+else:
+    img_data = resp_json["data"][0]["b64_json"]
+    img_bytes = base64.b64decode(img_data)
+    img = Image.open(io.BytesIO(img_bytes))
+    img.save("cat.png")
+    print("Image saved to cat.png")
