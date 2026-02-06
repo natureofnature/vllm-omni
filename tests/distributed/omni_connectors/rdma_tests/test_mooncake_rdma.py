@@ -388,9 +388,15 @@ class TestMooncakeRDMAEndToEnd(unittest.TestCase):
             self.assertIsNotNone(result, "RDMA transfer failed")
 
             recv_data, recv_size = result
-            # is_bytes=True means we get bytes back directly
-            self.assertIsInstance(recv_data, bytes)
-            self.assertEqual(recv_data, original_data)
+            # fast_path returns ManagedBuffer for zero-copy access;
+            # convert to bytes for comparison, then release the buffer.
+            if hasattr(recv_data, "tensor") and hasattr(recv_data, "release"):
+                recv_bytes = recv_data.to_bytes()
+                recv_data.release()
+            else:
+                recv_bytes = recv_data
+            self.assertIsInstance(recv_bytes, bytes)
+            self.assertEqual(recv_bytes, original_data)
 
             print(f"\n[PASS] E2E bytes transfer of {recv_size} bytes successful.")
 

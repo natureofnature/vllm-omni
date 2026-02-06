@@ -689,20 +689,30 @@ class OmniKVTransferManager:
                             f"{size} bytes, wait={_elapsed:.3f}s, link={_link_ms:.1f}ms (dict)"
                         )
 
-                    # Move tensors to target device if specified
-                    if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
-                        layer_blocks = data["layer_blocks"]
-                        for cache_list in [
-                            layer_blocks.get("key_cache", []),
-                            layer_blocks.get("value_cache", []),
-                        ]:
-                            for i, tensor in enumerate(cache_list):
-                                if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
-                                    cache_list[i] = tensor.to(target_device).contiguous()
-
-                    # Release RDMA buffer AFTER tensors are safely on GPU
-                    if managed_buffer is not None:
-                        managed_buffer.release()
+                    # Move tensors to target device (or clone if no target)
+                    # IMPORTANT: When using ManagedBuffer zero-copy path, tensors
+                    # are views into the RDMA pool.  We MUST ensure all tensor data
+                    # is copied out of the pool BEFORE releasing the buffer.
+                    try:
+                        if isinstance(data, dict) and "layer_blocks" in data:
+                            layer_blocks = data["layer_blocks"]
+                            for cache_list in [
+                                layer_blocks.get("key_cache", []),
+                                layer_blocks.get("value_cache", []),
+                            ]:
+                                for i, tensor in enumerate(cache_list):
+                                    if not isinstance(tensor, torch.Tensor):
+                                        continue
+                                    if target_device is not None and tensor.device != target_device:
+                                        cache_list[i] = tensor.to(target_device).contiguous()
+                                    elif managed_buffer is not None:
+                                        # No target device but tensor is a view into
+                                        # the RDMA pool – must clone before release
+                                        cache_list[i] = tensor.clone()
+                    finally:
+                        # Always release RDMA buffer, even if GPU transfer fails
+                        if managed_buffer is not None:
+                            managed_buffer.release()
 
                     return data, size
 

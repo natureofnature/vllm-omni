@@ -500,15 +500,24 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                 success, size, meta = self.put(from_stage, to_stage, put_key, serialized)
                 if success and meta:
                     meta["is_fast_path"] = False  # Override to indicate deserialization needed
-                    # Also update _local_buffers to reflect correct is_fast_path
+                    meta["is_bytes"] = False  # This is a serialized object, not raw bytes
+                    # Also update _local_buffers to reflect correct is_fast_path and is_bytes
                     # This is needed for metadata query from receiver
                     with self._local_buffers_lock:
                         if put_key in self._local_buffers:
-                            src_addrs, lengths, holder, should_release, _, is_bytes = self._local_buffers[put_key]
-                            self._local_buffers[put_key] = (src_addrs, lengths, holder, should_release, False, is_bytes)
+                            src_addrs, lengths, holder, should_release, _, _ = self._local_buffers[put_key]
+                            self._local_buffers[put_key] = (src_addrs, lengths, holder, should_release, False, False)
                 return success, size, meta
 
             with self._local_buffers_lock:
+                # Release old buffer if put_key already exists (prevents pool leak)
+                old_item = self._local_buffers.pop(put_key, None)
+                if old_item:
+                    _, _, old_holder, old_should_release, _, _ = old_item
+                    if old_should_release and isinstance(old_holder, ManagedBuffer):
+                        old_holder.release()
+                        logger.warning(f"Released old buffer for duplicate put_key: {put_key}")
+
                 # Store: (src_addrs, lengths, holder, should_release, is_fast_path, is_bytes)
                 self._local_buffers[put_key] = (
                     [src_addr],
@@ -585,9 +594,11 @@ class MooncakeRDMAConnector(OmniConnectorBase):
 
         Returns:
             Tuple[Any, int] | None:
-            - If metadata['is_fast_path'] is True and not bytes: Returns (ManagedBuffer, size).
-              **CALLER MUST RELEASE ManagedBuffer**.
-            - Otherwise: Returns (DeserializedObject|bytes, size). Buffer auto-released.
+            - If metadata['is_fast_path'] is True: Returns (ManagedBuffer, size).
+              **CALLER MUST call ManagedBuffer.release() after consuming the data.**
+              Use buf.tensor.numpy() for zero-copy access, or buf.to_bytes() for a copy.
+            - If metadata['is_fast_path'] is False: Returns (DeserializedObject, size).
+              Buffer is auto-released internally after deserialization.
         """
         if getattr(self, "_closed", False):
             raise RuntimeError("Cannot get data: MooncakeRDMAConnector is closed")
@@ -662,9 +673,15 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                 _sync_ms = (_t4 - _t3) * 1000
 
                 if is_fast_path:
-                    # Return ManagedBuffer directly – caller is responsible
-                    # for releasing it after consuming the data.
+                    # Return ManagedBuffer directly for ALL fast_path data
+                    # (both bytes and tensor payloads).  Caller is responsible
+                    # for consuming the data and calling release() afterwards.
                     # This avoids the expensive to_bytes() copy (~54ms for 115MB).
+                    #
+                    # Usage patterns for callers:
+                    #   - Zero-copy read: mv = memoryview(buf.tensor.numpy())
+                    #   - Copy to GPU:    buf.tensor.to(device); buf.release()
+                    #   - Fallback:       data = buf.to_bytes(); buf.release()
                     _t5 = _time.perf_counter()
                     _total_ms = (_t5 - _t0) * 1000
                     _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
