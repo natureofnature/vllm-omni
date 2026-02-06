@@ -609,7 +609,6 @@ class MooncakeRDMAConnector(OmniConnectorBase):
         src_port = metadata.get("source_port")
         data_size = metadata.get("data_size", 0)
         is_fast_path = metadata.get("is_fast_path", False)
-        is_bytes = metadata.get("is_bytes", False)
 
         if data_size == 0:
             return None, 0
@@ -663,34 +662,18 @@ class MooncakeRDMAConnector(OmniConnectorBase):
                 _sync_ms = (_t4 - _t3) * 1000
 
                 if is_fast_path:
-                    if is_bytes:
-                        # Return as bytes (copy) and release buffer
-                        try:
-                            result = recv_buffer.to_bytes(), data_size
-                            _t5 = _time.perf_counter()
-                            _copy_ms = (_t5 - _t4) * 1000
-                            _total_ms = (_t5 - _t0) * 1000
-                            _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
-                            logger.info(
-                                f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
-                                f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, copy={_copy_ms:.1f}ms, "
-                                f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s"
-                            )
-                            return result
-                        finally:
-                            recv_buffer.release()
-                    else:
-                        # If sender said it was a raw transfer (ManagedBuffer or
-                        # Tensor), return the ManagedBuffer directly.
-                        _t5 = _time.perf_counter()
-                        _total_ms = (_t5 - _t0) * 1000
-                        _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
-                        logger.info(
-                            f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
-                            f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, "
-                            f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s (fast_path)"
-                        )
-                        return recv_buffer, data_size
+                    # Return ManagedBuffer directly – caller is responsible
+                    # for releasing it after consuming the data.
+                    # This avoids the expensive to_bytes() copy (~54ms for 115MB).
+                    _t5 = _time.perf_counter()
+                    _total_ms = (_t5 - _t0) * 1000
+                    _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
+                    logger.info(
+                        f"[RDMA GET] {get_key}: query={_query_ms:.1f}ms, alloc={_alloc_ms:.1f}ms, "
+                        f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, "
+                        f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s (fast_path, zero-copy)"
+                    )
+                    return recv_buffer, data_size
                 else:
                     # If it was a serialized object or generic bytes, we assume standard Omni behavior:
                     # Deserialize and return object. This requires a copy (to_bytes).

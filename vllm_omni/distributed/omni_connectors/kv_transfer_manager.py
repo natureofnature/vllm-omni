@@ -72,7 +72,6 @@ class KVCacheTransferData:
                 shape = list(t.shape)
 
                 # View as uint8 then use numpy tobytes for reliable byte extraction
-                # This handles all dtypes including bfloat16
                 raw = t.view(torch.uint8).numpy().tobytes()
 
                 tensors_desc.append(
@@ -629,6 +628,7 @@ class OmniKVTransferManager:
             while True:
                 # Build the full key for connector
                 full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
+                _link_start = time.perf_counter()
                 result = self.connector.get(
                     from_stage=from_stage,
                     to_stage=to_stage,
@@ -636,10 +636,35 @@ class OmniKVTransferManager:
                 )
                 if result:
                     raw_data, size = result
+                    _link_ms = (time.perf_counter() - _link_start) * 1000
                     _elapsed = time.time() - start_time
+                    managed_buffer = None  # Track RDMA buffer for deferred release
 
-                    # Handle bytes (fast_path) or dict (legacy)
-                    if isinstance(raw_data, (bytes, bytearray)):
+                    # Handle ManagedBuffer (RDMA zero-copy), bytes (fast_path), or dict (legacy)
+                    if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
+                        # ManagedBuffer from RDMA connector – zero-copy path
+                        # Parse directly from the RDMA pool memory, no copy needed
+                        import time as _time
+
+                        managed_buffer = raw_data
+                        _deser_start = _time.perf_counter()
+                        try:
+                            np_view = raw_data.tensor.numpy()
+                            data = KVCacheTransferData.from_bytes(memoryview(np_view))
+                        except Exception as e:
+                            logger.error(f"Failed to deserialize KV cache from ManagedBuffer: {e}")
+                            import traceback
+
+                            traceback.print_exc()
+                            raw_data.release()
+                            return None, 0
+                        _deser_ms = (_time.perf_counter() - _deser_start) * 1000
+                        logger.info(
+                            f"Successfully received KV cache for {request_id}, "
+                            f"{size} bytes, wait={_elapsed:.3f}s, link={_link_ms:.1f}ms, "
+                            f"deser={_deser_ms:.1f}ms (rdma zero-copy)"
+                        )
+                    elif isinstance(raw_data, (bytes, bytearray)):
                         import time as _time
 
                         _deser_start = _time.perf_counter()
@@ -654,13 +679,14 @@ class OmniKVTransferManager:
                         _deser_ms = (_time.perf_counter() - _deser_start) * 1000
                         logger.info(
                             f"Successfully received KV cache for {request_id}, "
-                            f"{size} bytes, wait={_elapsed:.3f}s, deser={_deser_ms:.1f}ms (fast_path)"
+                            f"{size} bytes, wait={_elapsed:.3f}s, link={_link_ms:.1f}ms, "
+                            f"deser={_deser_ms:.1f}ms (fast_path)"
                         )
                     else:
                         data = raw_data
                         logger.info(
                             f"Successfully received KV cache for {request_id}, "
-                            f"{size} bytes, wait={_elapsed:.3f}s (dict)"
+                            f"{size} bytes, wait={_elapsed:.3f}s, link={_link_ms:.1f}ms (dict)"
                         )
 
                     # Move tensors to target device if specified
@@ -673,6 +699,10 @@ class OmniKVTransferManager:
                             for i, tensor in enumerate(cache_list):
                                 if isinstance(tensor, torch.Tensor) and tensor.device != target_device:
                                     cache_list[i] = tensor.to(target_device).contiguous()
+
+                    # Release RDMA buffer AFTER tensors are safely on GPU
+                    if managed_buffer is not None:
+                        managed_buffer.release()
 
                     return data, size
 
