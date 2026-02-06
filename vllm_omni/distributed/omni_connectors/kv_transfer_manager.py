@@ -43,6 +43,125 @@ class KVCacheTransferData:
         """Convert to dictionary for serialization."""
         return asdict(self)
 
+    def to_bytes(self) -> bytes:
+        """Convert to compact binary format for fast transfer.
+
+        Format: [4-byte header_length][JSON header][tensor data]
+
+        The header contains metadata and tensor layout descriptors.
+        Tensor data is a flat concatenation of raw tensor bytes.
+        On the receiver side, tensors can be reconstructed with
+        torch.frombuffer() for near-zero-copy deserialization.
+        """
+        import json
+        import struct
+
+        tensors_desc: list[dict[str, Any]] = []
+        tensor_bufs: list[bytes] = []
+        data_offset = 0
+
+        for cache_name in ("key_cache", "value_cache"):
+            cache_list = self.layer_blocks.get(cache_name, [])
+            for layer_idx, tensor in enumerate(cache_list):
+                if tensor is None:
+                    tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
+                    continue
+
+                t = tensor.detach().cpu().contiguous()
+                dtype_str = str(t.dtype).removeprefix("torch.")
+                shape = list(t.shape)
+
+                # View as uint8 then use numpy tobytes for reliable byte extraction
+                # This handles all dtypes including bfloat16
+                raw = t.view(torch.uint8).numpy().tobytes()
+
+                tensors_desc.append(
+                    {
+                        "n": f"{cache_name}_{layer_idx}",
+                        "d": dtype_str,
+                        "s": shape,
+                        "o": data_offset,
+                        "b": len(raw),
+                    }
+                )
+                tensor_bufs.append(raw)
+                data_offset += len(raw)
+
+        header = json.dumps(
+            {
+                "rid": self.request_id,
+                "bids": self.block_ids,
+                "meta": self.metadata,
+                "td": tensors_desc,
+                "nl": len(self.layer_blocks.get("key_cache", [])),
+            },
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+        # Assemble: [4-byte header_length][JSON header][tensor data...]
+        return b"".join([struct.pack(">I", len(header)), header] + tensor_bufs)
+
+    @staticmethod
+    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
+        """Reconstruct KV cache data dict from compact binary format.
+
+        Uses memoryview + torch.frombuffer for true zero-copy tensor
+        reconstruction.  The returned tensors are read-only views into
+        the original *raw* buffer – no large memory copies are made.
+        Since the tensors are typically moved to GPU immediately after
+        this call, the read-only restriction is harmless.
+        """
+        import json
+        import struct
+
+        # 1. Wrap in memoryview for zero-copy slicing
+        raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
+
+        # 2. Parse header (tiny copy for JSON string only)
+        header_len = struct.unpack(">I", raw_mv[:4])[0]
+        header = json.loads(bytes(raw_mv[4 : 4 + header_len]))
+        data_start = 4 + header_len
+
+        # 3. Zero-copy view into the tensor data region
+        #    No bytearray() copy – tensors will be non-writable but that is
+        #    fine because they are moved to GPU via .to(device) right after.
+        tensor_data_mv = raw_mv[data_start:]
+
+        # 4. Reconstruct tensors via zero-copy views into the shared buffer
+        num_layers = header["nl"]
+        key_cache: list[torch.Tensor | None] = [None] * num_layers
+        value_cache: list[torch.Tensor | None] = [None] * num_layers
+
+        for info in header["td"]:
+            if info.get("x"):
+                continue
+
+            name: str = info["n"]
+            dtype_str: str = info["d"]
+            shape: list[int] = info["s"]
+            offset: int = info["o"]
+            nbytes: int = info["b"]
+
+            torch_dtype = getattr(torch, dtype_str)
+
+            # True zero-copy: frombuffer from memoryview (no data copied)
+            t = torch.frombuffer(tensor_data_mv, dtype=torch.uint8, offset=offset, count=nbytes)
+            t = t.view(torch_dtype).reshape(shape)
+
+            # Parse layer index from name (e.g. "key_cache_3" -> 3)
+            layer_idx = int(name.split("_")[-1])
+            if name.startswith("key_cache_"):
+                key_cache[layer_idx] = t
+            elif name.startswith("value_cache_"):
+                value_cache[layer_idx] = t
+
+        return {
+            "request_id": header["rid"],
+            "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
+            "block_ids": header["bids"],
+            "metadata": header["meta"],
+        }
+
 
 class OmniKVTransferManager:
     """Unified management for OmniConnector and KV cache transfer.
@@ -402,14 +521,28 @@ class OmniKVTransferManager:
         if not from_stage or not to_stage:
             raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
 
-        # Prepare data and transfer with retry
-        data_dict = kv_data.to_dict()
-        data_dict["request_id"] = transfer_req_id
-
         import time as _time
 
+        # Try fast binary serialization first (skips OmniSerializer overhead)
+        _set_start = _time.perf_counter()
+        try:
+            kv_data.request_id = transfer_req_id
+            transfer_data: bytes | dict[str, Any] = kv_data.to_bytes()
+            _set_ms = (_time.perf_counter() - _set_start) * 1000
+            logger.info(f"KV cache serialized: {len(transfer_data)} bytes, {_set_ms:.1f}ms (fast_path)")
+        except Exception as e:
+            logger.warning(f"Fast serialization failed, falling back to dict: {e}")
+            import traceback
+
+            traceback.print_exc()
+            data_dict = kv_data.to_dict()
+            data_dict["request_id"] = transfer_req_id
+            transfer_data = data_dict
+            _set_ms = (_time.perf_counter() - _set_start) * 1000
+            logger.info(f"KV cache serialized: {_set_ms:.1f}ms (dict fallback)")
+
         _start = _time.perf_counter()
-        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict)
+        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", transfer_data)
         _elapsed = _time.perf_counter() - _start
 
         if success:
@@ -423,7 +556,7 @@ class OmniKVTransferManager:
         from_stage: str,
         to_stage: str,
         request_id: str,
-        data: dict[str, Any],
+        data: "dict[str, Any] | bytes",
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         """Transfer data with retry and exponential backoff.
@@ -502,9 +635,33 @@ class OmniKVTransferManager:
                     get_key=full_request_id,
                 )
                 if result:
-                    data, size = result
+                    raw_data, size = result
                     _elapsed = time.time() - start_time
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes, wait={_elapsed:.3f}s")
+
+                    # Handle bytes (fast_path) or dict (legacy)
+                    if isinstance(raw_data, (bytes, bytearray)):
+                        import time as _time
+
+                        _deser_start = _time.perf_counter()
+                        try:
+                            data = KVCacheTransferData.from_bytes(raw_data)
+                        except Exception as e:
+                            logger.error(f"Failed to deserialize KV cache bytes: {e}")
+                            import traceback
+
+                            traceback.print_exc()
+                            return None, 0
+                        _deser_ms = (_time.perf_counter() - _deser_start) * 1000
+                        logger.info(
+                            f"Successfully received KV cache for {request_id}, "
+                            f"{size} bytes, wait={_elapsed:.3f}s, deser={_deser_ms:.1f}ms (fast_path)"
+                        )
+                    else:
+                        data = raw_data
+                        logger.info(
+                            f"Successfully received KV cache for {request_id}, "
+                            f"{size} bytes, wait={_elapsed:.3f}s (dict)"
+                        )
 
                     # Move tensors to target device if specified
                     if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
