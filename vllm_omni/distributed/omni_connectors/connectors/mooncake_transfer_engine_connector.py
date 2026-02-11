@@ -224,6 +224,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     """
     OmniConnector implementation using Mooncake Transfer Engine with a managed memory pool.
     Supports both CPU (Pinned) and GPU memory pools, and both RDMA and TCP protocols.
+
+    Topology limitations (current implementation):
+        - **1 sender → 1 receiver per key**: After a successful RDMA write the
+          sender immediately cleans up the buffer (``cleanup()``), so only the
+          first receiver to pull a given key will succeed.  Broadcast / multicast
+          (1 sender → N receivers sharing the same data) is not yet supported.
+        - **1 receiver → 1 sender**: ``update_sender_info()`` stores a single
+          ``(sender_host, sender_zmq_port)`` pair, so a receiver can only query
+          metadata from one sender at a time.
+
+    Future work:
+        - Support 1 sender → N receivers (e.g. reference-counted buffers, or
+          explicit ``retain()`` / ``release()`` semantics so the buffer survives
+          multiple pulls).
+        - Support 1 receiver → N senders (e.g. a sender registry mapping
+          ``get_key`` prefixes to different sender endpoints).
     """
 
     # RDMA connector copies raw bytes/tensor directly to the memory pool
@@ -237,6 +253,21 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         self._closed = False
         self._bind_error: Exception | None = None  # fatal ZMQ bind error from listener thread
+
+        # --- Early init of all teardown-related fields ---
+        # If __init__ fails later (engine init, pool alloc, etc.), __del__ → close()
+        # must not crash on missing attributes.  Safe defaults here ensure close()
+        # can always run without AttributeError.
+        self._stop_event = threading.Event()
+        self._sender_executor: ThreadPoolExecutor | None = None
+        self._listener_thread: threading.Thread | None = None
+        self._listener_ready = threading.Event()
+        self._local_buffers: dict[str, Any] = {}
+        self._local_buffers_lock = threading.Lock()
+        self._req_local = threading.local()
+        self._worker_local = threading.local()
+        self._last_ttl_check: float = _time_mod.monotonic()
+
         self.config = config
         host_config = config.get("host", "127.0.0.1")
         # Support "auto" to auto-detect local IP address
@@ -268,18 +299,17 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.sender_host = config.get("sender_host", None)
         self.sender_zmq_port = config.get("sender_zmq_port", None)
 
-        # --- Role Detection ---
-        # Default ("auto"): every instance tries to bind the ZMQ listener.
-        #   - First to bind succeeds → sender (can_put=True)
-        #   - EADDRINUSE → automatic fallback to receiver (can_put=False)
-        # "receiver": skip the bind attempt, go straight to receiver mode.
-        role = str(config.get("role", "auto")).lower()
-        if role not in {"sender", "receiver", "auto"}:
+        # --- Role ---
+        # "sender": bind ZMQ listener, accept put() calls.
+        # "receiver": skip ZMQ bind, only accept get() calls.
+        # The orchestration layer (get_connectors_config_for_stage /
+        # kv_transfer_manager) is responsible for injecting the correct role.
+        role = str(config.get("role", "sender")).lower()
+        if role not in {"sender", "receiver"}:
             raise ValueError(
-                f"Invalid role={role!r} for MooncakeTransferEngineConnector. "
-                "Expected one of: 'sender', 'receiver', 'auto'."
+                f"Invalid role={role!r} for MooncakeTransferEngineConnector. Expected 'sender' or 'receiver'."
             )
-        self.can_put = role != "receiver"
+        self.can_put = role == "sender"
 
         self.engine_id = str(uuid.uuid4())
 
@@ -346,7 +376,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"MooncakeTransferEngineConnector config summary:\n"
             f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
             f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
-            f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'auto')}"
+            f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}"
         )
 
         # Only sender needs ZMQ listener to handle pull requests
@@ -355,23 +385,15 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             self._listener_thread.start()
             # Wait briefly for listener to bind (or fail)
             self._listener_ready.wait(timeout=1.0)
-            # Propagate fatal bind errors (non-EADDRINUSE) to the caller
+            # Propagate any bind error to the caller — sender must bind successfully.
             if self._bind_error is not None:
                 raise RuntimeError(
                     f"MooncakeTransferEngineConnector failed to bind ZMQ on "
                     f"{self.host}:{self.zmq_port}: {self._bind_error}"
                 ) from self._bind_error
-            # Check if listener failed and switched to receiver mode
-            if self.can_put:
-                logger.info(
-                    f"MooncakeTransferEngineConnector started as SENDER (ZMQ listener on {self.host}:{self.zmq_port})"
-                )
-            else:
-                # Listener failed to bind, switched to receiver mode
-                logger.info(
-                    f"MooncakeTransferEngineConnector: port in use, falling back to RECEIVER mode "
-                    f"(will query sender at {self.sender_host}:{self.sender_zmq_port})"
-                )
+            logger.info(
+                f"MooncakeTransferEngineConnector started as SENDER (ZMQ listener on {self.host}:{self.zmq_port})"
+            )
         else:
             # Receiver mode — sender address is provided per-request via
             # metadata from put() through the queue, not pre-configured.
@@ -396,22 +418,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         }
 
     def update_sender_info(self, sender_host: str, sender_zmq_port: int) -> None:
-        """Set the sender's ZMQ endpoint on a receiver connector.
-
-        When the caller does **not** pass ``metadata`` to :meth:`get`
-        (e.g. the KV-cache transfer path that polls via
-        ``_query_metadata_from_sender``), the receiver needs to know the
-        sender's address beforehand.  Call this method after the sender
-        has started and its address is known.
-
-        Typical usage (orchestrator layer)::
-
-            sender_info = sender_manager.get_sender_connection_info()
-            receiver_connector.update_sender_info(
-                sender_info["host"], sender_info["zmq_port"])
-
-        After this call, ``get(metadata=None)`` will query the sender
-        via ZMQ to obtain ``data_size`` / ``is_fast_path`` automatically.
+        """
+        Inject the sender's ZMQ endpoint into the receiver connector.
+        Used for NO METADATA GET calls.(E.g: KV-cache transfer path)
+        Must be called before using get() without metadata!
+        Otherwise, get() will raise an error.
         """
         self.sender_host = sender_host
         self.sender_zmq_port = sender_zmq_port
@@ -686,13 +697,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         Support the two paths in case that the orchestrator pushes the request info
         to different stages at the same time knowing metadata or not.
         """
-        if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
-            raise RuntimeError(
-                f"get(metadata=None) requires sender info to be resolved, "
-                f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
-                f"Call update_sender_info(host, port) before using get() without metadata."
-            )
-
         zmq_addr = f"tcp://{self.sender_host}:{self.sender_zmq_port}"
         req_socket = self._get_req_socket(zmq_addr, timeout_ms=5000)
 
@@ -752,17 +756,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         get_key = self._make_key(get_key, from_stage, to_stage)
 
-        import time as _time
-
-        _t0 = _time.perf_counter()
+        _t0 = _time_mod.perf_counter()
 
         # If no metadata provided, try to query from sender
         if not metadata:
+            # Must insert sender info before using get() without metadata.
+            if not self.sender_host or not self.sender_zmq_port or str(self.sender_host).lower() == "auto":
+                raise RuntimeError(
+                    f"get(metadata=None) requires sender info to be resolved, "
+                    f"but sender_host={self.sender_host!r}, sender_zmq_port={self.sender_zmq_port!r}. "
+                    f"Call update_sender_info(host, port) before using get() without metadata."
+                )
             metadata = self._query_metadata_from_sender(get_key)
             if not metadata:
                 return None
 
-        _t1 = _time.perf_counter()
+        _t1 = _time_mod.perf_counter()
         _query_ms = (_t1 - _t0) * 1000
 
         src_host = metadata.get("source_host")
@@ -790,7 +799,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             logger.error(f"Failed to allocate {data_size} bytes in receive pool")
             return None
 
-        _t2 = _time.perf_counter()
+        _t2 = _time_mod.perf_counter()
         _alloc_ms = (_t2 - _t1) * 1000
 
         # 2. Prepare Handshake
@@ -817,7 +826,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             req_socket.send(msgspec.msgpack.encode(agent_meta))
             resp = req_socket.recv()
 
-            _t3 = _time.perf_counter()
+            _t3 = _time_mod.perf_counter()
             _rdma_ms = (_t3 - _t2) * 1000
 
             if resp == TRANS_DONE:
@@ -831,7 +840,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     with torch.cuda.device(self.pool.device):
                         torch.cuda.current_stream().synchronize()
 
-                _t4 = _time.perf_counter()
+                _t4 = _time_mod.perf_counter()
                 _sync_ms = (_t4 - _t3) * 1000
 
                 if is_fast_path:
@@ -844,7 +853,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     #   - Zero-copy read: mv = memoryview(buf.tensor.numpy())
                     #   - Copy to GPU:    buf.tensor.to(device); buf.release()
                     #   - Fallback:       data = buf.to_bytes(); buf.release()
-                    _t5 = _time.perf_counter()
+                    _t5 = _time_mod.perf_counter()
                     _total_ms = (_t5 - _t0) * 1000
                     _mbps = (data_size / 1024 / 1024) / (_total_ms / 1000) if _total_ms > 0 else 0
                     logger.info(
@@ -858,14 +867,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                     # Deserialize and return object. This requires a copy (to_bytes).
                     # We MUST release the buffer after deserialization.
                     try:
-                        _t_copy_start = _time.perf_counter()
+                        _t_copy_start = _time_mod.perf_counter()
                         raw_bytes = recv_buffer.to_bytes()
-                        _t_copy_end = _time.perf_counter()
+                        _t_copy_end = _time_mod.perf_counter()
                         _copy_ms = (_t_copy_end - _t_copy_start) * 1000
 
-                        _t_deser_start = _time.perf_counter()
+                        _t_deser_start = _time_mod.perf_counter()
                         val = OmniSerializer.deserialize(raw_bytes)
-                        _t_deser_end = _time.perf_counter()
+                        _t_deser_end = _time_mod.perf_counter()
                         _deser_ms = (_t_deser_end - _t_deser_start) * 1000
 
                         _total_ms = (_t_deser_end - _t0) * 1000
@@ -951,8 +960,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             if self._listener_thread.is_alive():
                 logger.warning("Listener thread did not stop gracefully")
 
-        # 3. Shutdown sender executor
-        self._sender_executor.shutdown(wait=True, cancel_futures=False)
+        # 3. Shutdown sender executor (may be None if __init__ failed early)
+        if self._sender_executor is not None:
+            self._sender_executor.shutdown(wait=True, cancel_futures=False)
 
         # 4. Release all pending buffers
         with self._local_buffers_lock:
@@ -1031,27 +1041,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         try:
             socket.bind(f"tcp://{self.host}:{self.zmq_port}")
         except zmq.ZMQError as exc:
-            import errno as _errno
-
-            # Only EADDRINUSE means another sender already owns this port;
-            # silently fall back to receiver mode in that case.
-            if exc.errno == _errno.EADDRINUSE:
-                logger.debug(
-                    f"ZMQ port {self.host}:{self.zmq_port} already in use, "
-                    f"another sender is running — switching to receiver mode"
-                )
-                self.can_put = False
-                # Set sender_host/sender_zmq_port for querying if not already set
-                if not self.sender_host:
-                    self.sender_host = self.host
-                if not self.sender_zmq_port:
-                    self.sender_zmq_port = self.zmq_port
-                self._listener_ready.set()  # Signal that we've determined our role
-                return
-
-            # Any other ZMQ error (EADDRNOTAVAIL, EACCES, etc.) is a fatal
-            # misconfiguration — fail fast so the user sees the real cause.
-            logger.error(f"Fatal ZMQ bind error on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})")
+            # Any bind failure (EADDRINUSE, EADDRNOTAVAIL, EACCES, etc.)
+            # is fatal for a sender — fail fast so __init__ propagates the error.
+            # There is no silent receiver fallback; roles are explicitly assigned.
+            logger.error(f"ZMQ bind failed on {self.host}:{self.zmq_port}: {exc} (errno={exc.errno})")
             self.can_put = False
             self._bind_error = exc
             self._listener_ready.set()

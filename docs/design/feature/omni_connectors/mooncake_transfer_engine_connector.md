@@ -29,11 +29,8 @@ runtime:
     rdma_connector:
       name: MooncakeTransferEngineConnector
       extra:
-        role: "auto"                  # Auto-detect role based on context (sender/receiver)
         host: "auto"                  # Auto-detect local RDMA IP
-        zmq_port: 50051               # Base ZMQ port for sender listener
-        sender_host: "auto"           # Resolved dynamically from orchestrator
-        sender_zmq_port: 50051        # Sender's ZMQ port
+        zmq_port: 50051               # ZMQ base port (see "Port Offset Scheme" below)
         protocol: "rdma"              # "rdma" or "tcp"
         device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
         memory_pool_size: 2147483648  # 2GB memory pool
@@ -59,7 +56,7 @@ stage_args:
 
 | Parameter | Description |
 |---|---|
-| `role` | `"auto"` (recommended) or `"receiver"`. Auto-injected by the initialization layer based on `output_connectors` (sender) / `input_connectors` (receiver). Manual override is rarely needed. |
+| `role` | **Internal, do not set manually.** Auto-injected by the orchestration layer (`"sender"` for `output_connectors`, `"receiver"` for `input_connectors`). Defaults to `"sender"` if omitted. |
 | `host` | Local IP address for RDMA. `"auto"` detects from network interfaces. |
 | `protocol` | Transport protocol: `"rdma"` (InfiniBand/RoCE) or `"tcp"`. |
 
@@ -74,10 +71,39 @@ stage_args:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `zmq_port` | 50051 | Base ZMQ port for the sender's metadata listener. |
-| `sender_host` | `"auto"` | Sender's IP, resolved from orchestrator. |
-| `sender_zmq_port` | 50051 | Sender's ZMQ port. |
+| `zmq_port` | 50051 | ZMQ **base** port. The orchestration layer computes the actual port as `base + purpose_offset + stage_offset` (see table below). Users only set this base value. |
+| `sender_host` | `None` | **Internal.** Receiver-side only — dynamically resolved via `update_sender_info()`. Not needed in YAML. |
+| `sender_zmq_port` | `None` | **Internal.** Receiver-side only — defaults to the sender's adjusted port. Not needed in YAML. |
 | `device_name` | `""` | RDMA device name (e.g., `"mlx5_0"`). Empty for auto-detect. Can also be set via `RDMA_DEVICE_NAME` env var. |
+
+#### ZMQ Port Offset Scheme
+
+To avoid port conflicts when multiple edges, purposes, DP replicas, or TP ranks share the same node, the actual ZMQ port is computed as:
+
+```
+side_channel_port = zmq_port + purpose_offset + stage_offset + dp_index * tp_size
+sender_listen     = side_channel_port + tp_rank
+receiver_connect  = remote_side_channel_port + tp_rank
+```
+
+| Component | Value | Description |
+|---|---|---|
+| `zmq_port` | 50051 (default) | Base port from YAML config |
+| `purpose_offset` | `request_forwarding` = 0, `kv_transfer` = 100 | Separates control-plane vs KV-cache connections |
+| `stage_offset` | `int(from_stage)` (0, 1, 2...) | Separates edges from different source stages |
+| `dp_index * tp_size` | e.g., DP1 × TP2 = 2 | Each DP replica reserves a port range of size `tp_size` (following vLLM convention: `VLLM_MOONCAKE_BOOTSTRAP_PORT + dp_index * tp_size`) |
+| `tp_rank` | 0, 1, 2... | Each TP rank within a DP replica uses its own port |
+| orchestrator | +200 | Extra offset when caller is the orchestrator (avoids collision with stage workers on the same node) |
+
+**Example** (base=50051, stage 0→1, DP=2, TP=2, kv_transfer):
+
+| Caller | DP | TP rank | Port |
+|---|---|---|---|
+| Stage worker | DP0 | rank 0 | `50051 + 100 + 0 + 0×2 + 0 = 50151` |
+| Stage worker | DP0 | rank 1 | `50051 + 100 + 0 + 0×2 + 1 = 50152` |
+| Stage worker | DP1 | rank 0 | `50051 + 100 + 0 + 1×2 + 0 = 50153` |
+| Stage worker | DP1 | rank 1 | `50051 + 100 + 0 + 1×2 + 1 = 50154` |
+| Orchestrator | — | — | `50051 + 200 + 0 = 50251` |
 
 ## Memory Pool Modes
 
@@ -174,7 +200,7 @@ Then configure the connector:
 device_name: "mlx5_2"  # or set RDMA_DEVICE_NAME=mlx5_2
 ```
 
-See the [RDMA Test README](../../../../tests/distributed/omni_connectors/README.md)
+See the [RDMA Test README](../../../tests/distributed/omni_connectors/README.md)
 for test-specific setup instructions.
 
 For more details on the underlying engine, refer to the
