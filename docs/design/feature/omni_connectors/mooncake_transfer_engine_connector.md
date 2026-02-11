@@ -200,7 +200,7 @@ Then configure the connector:
 device_name: "mlx5_2"  # or set RDMA_DEVICE_NAME=mlx5_2
 ```
 
-See the [RDMA Test README](../../../tests/distributed/omni_connectors/README.md)
+See the RDMA Test README in tests/distributed/omni_connectors/README.md
 for test-specific setup instructions.
 
 For more details on the underlying engine, refer to the

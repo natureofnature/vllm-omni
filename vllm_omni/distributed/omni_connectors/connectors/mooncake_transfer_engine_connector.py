@@ -1022,9 +1022,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
     def _cleanup_stale_buffers(self) -> None:
         """Reclaim buffers older than ``_BUFFER_TTL_SECONDS``.
-
         Prevents permanent memory leaks when a receiver crashes or times out
         without ever pulling the data.
+        TODO(wzliu): In extreme rare case, long transfer time, there might exist
+        TTL cleanup vs in-flight transfer conflict, which will be handled in the next PR.
         """
         now = _time_mod.monotonic()
         with self._local_buffers_lock:
