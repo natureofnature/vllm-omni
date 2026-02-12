@@ -51,15 +51,6 @@ class MooncakeStoreConnector(OmniConnectorBase):
 
         self._init_store()
 
-    @staticmethod
-    def _make_key(key: str, from_stage: str, to_stage: str) -> str:
-        """Generate store key with stage routing info.
-
-        Format: ``{key}@{from_stage}_{to_stage}``
-        Example: ``abc123@0_1`` (request abc123, stage 0 → 1)
-        """
-        return f"{key}@{from_stage}_{to_stage}"
-
     def _init_store(self):
         """Initialize Mooncake store."""
         try:
@@ -173,6 +164,9 @@ class MooncakeStoreConnector(OmniConnectorBase):
             "host": self.host,
             "metadata_server": self.metadata,
             "master": self.master,
+            "protocol": None,
+            "pool_device": None,
+            "pool_size": 0,
             **self._metrics,
         }
 

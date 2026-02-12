@@ -356,7 +356,8 @@ class Producer(CrossNodeTester):
 
             if self.config.benchmark:
                 print(
-                    f"[BENCHMARK] Running {self.config.num_transfers} transfers of {self.config.tensor_size_mb} MB each..."
+                    f"[BENCHMARK] Running {self.config.num_transfers} "
+                    f"transfers of {self.config.tensor_size_mb} MB each..."
                 )
 
             start_time = time.time()
@@ -522,7 +523,8 @@ class Consumer(CrossNodeTester):
 
             if self.config.benchmark:
                 print(
-                    f"[BENCHMARK] Running {self.config.num_transfers} transfers of {self.config.tensor_size_mb} MB each..."
+                    f"[BENCHMARK] Running {self.config.num_transfers} "
+                    f"transfers of {self.config.tensor_size_mb} MB each..."
                 )
 
             start_time = time.time()

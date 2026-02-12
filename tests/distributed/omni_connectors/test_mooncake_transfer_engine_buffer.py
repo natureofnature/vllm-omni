@@ -17,7 +17,11 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     ManagedBuffer,
 )
 
+# All tests in this file are pure-CPU unit tests for the memory allocator.
+pytestmark = [pytest.mark.cpu, pytest.mark.parallel]
 
+
+@pytest.mark.core_model
 class TestBufferAllocator(unittest.TestCase):
     """Unit tests for BufferAllocator."""
 
@@ -181,6 +185,7 @@ class TestAllocatorInvariants(unittest.TestCase):
         self.assertEqual(offset, 0)
 
 
+@pytest.mark.core_model
 class TestManagedBuffer(unittest.TestCase):
     """Unit tests for ManagedBuffer."""
 

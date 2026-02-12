@@ -24,6 +24,9 @@ from vllm_omni.distributed.omni_connectors.connectors.mooncake_transfer_engine_c
     TransferEngine,
 )
 
+# All tests in this file require Mooncake TransferEngine and an RDMA environment.
+pytestmark = [pytest.mark.parallel, pytest.mark.gpu]
+
 # ---------------------------------------------------------------------------
 # Shared helpers
 # ---------------------------------------------------------------------------
@@ -489,6 +492,7 @@ class TestLifecycle(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.cuda
 @unittest.skipIf(TransferEngine is None, "Mooncake TransferEngine not available")
 @unittest.skipIf(not torch.cuda.is_available(), "CUDA not available")
 class TestGPUPool(unittest.TestCase):

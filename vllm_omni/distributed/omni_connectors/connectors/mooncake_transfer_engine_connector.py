@@ -224,8 +224,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     """
     OmniConnector implementation using Mooncake Transfer Engine with a managed memory pool.
     Supports both CPU (Pinned) and GPU memory pools, and both RDMA and TCP protocols.
-
     Topology limitations (current implementation):
+        Current design focuses on peer-to-peer communication between stages.
         - **1 sender → 1 receiver per key**: After a successful RDMA write the
           sender immediately cleans up the buffer (``cleanup()``), so only the
           first receiver to pull a given key will succeed.  Broadcast / multicast
@@ -267,6 +267,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self._req_local = threading.local()
         self._worker_local = threading.local()
         self._last_ttl_check: float = _time_mod.monotonic()
+
+        self._metrics = {
+            "puts": 0,
+            "gets": 0,
+            "bytes_transferred": 0,
+            "errors": 0,
+            "timeouts": 0,
+        }
 
         self.config = config
         host_config = config.get("host", "127.0.0.1")
@@ -497,15 +505,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             except Exception:
                 pass
 
-    @staticmethod
-    def _make_key(key: str, from_stage: str, to_stage: str) -> str:
-        """Generate internal key with stage routing info.
-
-        Format: ``{key}@{from_stage}_{to_stage}``
-        Example: ``kv_cache_abc123@0_1`` (request abc123, stage 0 → 1)
-        """
-        return f"{key}@{from_stage}_{to_stage}"
-
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
         Producer Side.
@@ -668,9 +667,13 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 "is_fast_path": is_fast_path,  # Hint: True = return ManagedBuffer, False = deserialize
             }
 
+            self._metrics["puts"] += 1
+            self._metrics["bytes_transferred"] += size
+
             return True, size, metadata
 
         except Exception as e:
+            self._metrics["errors"] += 1
             logger.error(f"RDMA Put failed for {put_key}: {e}", exc_info=True)
             return False, 0, None
 
@@ -742,14 +745,14 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             ``(data, size)`` on success, ``None`` on failure.
 
             - **is_fast_path=True** (tensor *or* bytes payload):
-              Returns ``(ManagedBuffer, size)``.
-              **CALLER MUST call ``ManagedBuffer.release()`` after consuming.**
-              Note: even if the producer ``put()`` raw ``bytes``, the consumer
-              receives a ``ManagedBuffer`` — use ``buf.to_bytes()`` to obtain
-              a ``bytes`` copy, or ``buf.tensor`` for zero-copy access.
+                Returns ``(ManagedBuffer, size)``.
+                **CALLER MUST call ``ManagedBuffer.release()`` after consuming.**
+                Note: even if the producer ``put()`` raw ``bytes``, the consumer
+                receives a ``ManagedBuffer`` — use ``buf.to_bytes()`` to obtain
+                a ``bytes`` copy, or ``buf.tensor`` for zero-copy access.
             - **is_fast_path=False** (serialized Python object):
-              Returns ``(DeserializedObject, size)``.
-              Buffer is auto-released internally after deserialization.
+                Returns ``(DeserializedObject, size)``.
+                Buffer is auto-released internally after deserialization.
         """
         if self._closed:
             raise RuntimeError("Cannot get data: MooncakeTransferEngineConnector is closed")
@@ -861,6 +864,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                         f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, "
                         f"total={_total_ms:.1f}ms, {_mbps:.1f} MB/s (fast_path, zero-copy)"
                     )
+                    self._metrics["gets"] += 1
+                    self._metrics["bytes_transferred"] += data_size
                     return recv_buffer, data_size
                 else:
                     # If it was a serialized object or generic bytes, we assume standard Omni behavior:
@@ -884,16 +889,20 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                             f"rdma={_rdma_ms:.1f}ms, sync={_sync_ms:.1f}ms, copy={_copy_ms:.1f}ms, "
                             f"deser={_deser_ms:.1f}ms, total={_total_ms:.1f}ms, {_mbps:.1f} MB/s"
                         )
+                        self._metrics["gets"] += 1
+                        self._metrics["bytes_transferred"] += data_size
                         return val, data_size
                     finally:
                         recv_buffer.release()
             else:
+                self._metrics["errors"] += 1
                 logger.error(f"RDMA Get failed: received {resp} instead of TRANS_DONE")
                 recv_buffer.release()
                 return None
         except Exception as e:
             # Socket may be stuck after timeout; discard it
             self._invalidate_req_socket(zmq_addr)
+            self._metrics["timeouts"] += 1
             logger.error(f"RDMA Get error: {e}", exc_info=True)
             recv_buffer.release()
             return None
@@ -930,11 +939,18 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 # If holder was something else (e.g. Tensor), GC handles it.
 
     def health(self) -> dict[str, Any]:
+        if self._closed:
+            return {"status": "unhealthy", "error": "Connector is closed"}
+
         return {
             "status": "healthy",
+            "host": self.host,
+            "metadata_server": None,
+            "master": None,
             "protocol": self.protocol,
             "pool_device": self.pool_device,
             "pool_size": self.pool_size,
+            **self._metrics,
         }
 
     def close(self) -> None:
@@ -1006,15 +1022,6 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.pool = None
 
         logger.info("MooncakeTransferEngineConnector closed.")
-
-    def __del__(self):
-        self.close()
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.close()
 
     # -------------------------------------------------------
     # Listener Logic
