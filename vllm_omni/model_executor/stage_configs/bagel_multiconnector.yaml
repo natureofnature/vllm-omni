@@ -87,6 +87,24 @@ runtime:
         localbuf: 64000000     # 64MB
         proto: "tcp"
 
+    # PR1 (#1019) note:
+    # - Keep this transfer-engine connector config as a ready-to-use template.
+    # - Bagel does NOT consume this connector in PR1(#1019).
+    # - output_connectors/input_connectors above still point to mooncake_connector.
+    # - We will switch Bagel to this connector in the next PR.
+    rdma_connector:
+      name: MooncakeTransferEngineConnector
+      extra:
+        # NOTE:
+        # - role/sender_host/sender_zmq_port are internal fields resolved by
+        #   orchestration logic and should not be set in user YAML.
+        host: "auto"                  # Auto-detect local IP for RDMA
+        zmq_port: 50051               # ZMQ base port (actual port uses runtime offsets)
+        protocol: "rdma"
+        device_name: ""               # e.g. "mlx5_0"; empty for auto-detect
+        memory_pool_size: 2147483648  # 2GB
+        memory_pool_device: "cpu"     # "cuda" for GPUDirect RDMA, "cpu" for pinned memory
+
 
   edges:
     - from: 0
