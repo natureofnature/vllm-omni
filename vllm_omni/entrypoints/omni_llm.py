@@ -15,8 +15,6 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
-from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
-
 # Internal imports (our code)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.input_processor import OmniInputProcessor
@@ -90,11 +88,6 @@ class OmniLLM(LLM):
         else:
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
-
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
-        )
 
         # Initialize LLM engine
         if "disable_log_stats" not in kwargs:
