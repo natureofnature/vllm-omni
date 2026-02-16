@@ -218,7 +218,7 @@ The `cross_node_mooncake_transfer_engine.py` script enables testing RDMA transfe
 **On Machine A (Producer) — start first:**
 
 ```bash
-cd tests/distributed/omni_connectors
+cd benchmarks/distributed/omni_connectors/
 
 # Optional: specify device if multiple exist
 export RDMA_DEVICE_NAME='mlx5_0'
@@ -234,7 +234,7 @@ python cross_node_mooncake_transfer_engine.py \
 **On Machine B (Consumer) — start after producer:**
 
 ```bash
-cd tests/distributed/omni_connectors
+cd benchmarks/distributed/omni_connectors/
 
 export RDMA_DEVICE_NAME='mlx5_0'
 
@@ -318,7 +318,10 @@ export RDMA_DEVICE_NAME='mlx5_0'
 python -c "from mooncake.engine import TransferEngine; print('OK')"
 
 # Reinstall if needed
-pip install mooncake
+pip install mooncake-transfer-engine
+# Or using uv
+uv pip install mooncake-transfer-engine
+
 ```
 
 ### 3. "Permission denied" accessing /dev/infiniband

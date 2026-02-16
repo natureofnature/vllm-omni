@@ -353,31 +353,11 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         self.allocator = BufferAllocator(self.pool_size, alignment=4096)  # 4KB alignment for safety
 
-        # --- State Management ---
+        # --- State Management & Background Threads ---
+        # Most fields already initialized at the top of __init__ for teardown
+        # safety.  Only create the real ZMQ context and thread pool here.
         self.zmq_ctx = zmq.Context()
-
-        # Producer buffers: {req_id: (src_addrs, lengths, holder, should_release, is_fast_path, created_at)}
-        # 'holder' keeps the object alive (ManagedBuffer or original Tensor)
-        # 'created_at' is monotonic timestamp for TTL-based cleanup
-        self._local_buffers: dict[str, Any] = {}
-        self._local_buffers_lock = threading.Lock()
-
-        # Per-thread ZMQ REQ socket cache (thread-local storage).
-        # Each thread gets its own {zmq_addr: socket} dict, avoiding both
-        # TCP reconnection overhead AND the concurrency hazard of sharing
-        # a REQ socket across threads (ZMQ REQ enforces strict send→recv
-        # ordering that cannot be interleaved).
-        self._req_local = threading.local()
-
-        # --- Background Threads ---
         self._sender_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="mooncake-sender")
-        self._stop_event = threading.Event()
-        # Per-worker-thread cached PUSH socket for _notify_listener
-        self._worker_local = threading.local()
-        # TTL tracking: last time we scanned for stale buffers
-        self._last_ttl_check: float = _time_mod.monotonic()
-        self._listener_thread = None
-        self._listener_ready = threading.Event()  # Signals when listener successfully binds
 
         # Log complete connector configuration for debugging
         logger.info(
@@ -389,6 +369,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
 
         # Only sender needs ZMQ listener to handle pull requests
         if self.can_put:
+            self._last_ttl_check = _time_mod.monotonic()  # reset after slow init
             self._listener_thread = threading.Thread(target=self._zmq_listener_loop, daemon=True)
             self._listener_thread.start()
             # Wait briefly for listener to bind (or fail)
@@ -445,13 +426,10 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         try:
             # Create a socket to determine the local IP used for external communication
             # We don't actually connect, just use the socket to get routing info
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 # Use Google's DNS as a target (doesn't actually connect)
                 s.connect(("8.8.8.8", 80))
                 local_ip = s.getsockname()[0]
-            finally:
-                s.close()
             return local_ip
         except Exception as e:
             logger.warning(f"Failed to auto-detect local IP: {e}, falling back to hostname lookup")
@@ -503,7 +481,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             try:
                 sock.close(linger=0)
             except Exception:
-                pass
+                pass  # Best-effort; zmq_ctx.term() will reclaim if needed
 
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """
@@ -999,7 +977,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 try:
                     sock.close(linger=0)
                 except Exception:
-                    pass
+                    pass  # Best-effort; zmq_ctx.term() below will reclaim
             cache.clear()
 
         # 6. Unregister memory from engine (if supported)
@@ -1017,7 +995,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         except Exception as e:
             logger.warning(f"Failed to terminate ZMQ context: {e}")
 
-        # 7. Release pool tensor reference (let GC handle actual deallocation)
+        # 8. Release pool tensor reference (let GC handle actual deallocation)
         # Note: We set to None instead of del to avoid AttributeError on repeated access
         self.pool = None
 
@@ -1123,7 +1101,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
                 notify_recv.close(linger=0)
                 socket.close(linger=0)
             except Exception:
-                pass
+                pass  # Best-effort cleanup during listener shutdown
 
     def _handle_pull_request(self, response_queue: queue.Queue, notify_addr: str, identity, payload):
         """

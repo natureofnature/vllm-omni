@@ -12,20 +12,20 @@ Supports three transfer modes:
 
 Usage:
     # On Machine A (Producer) - start first:
-    python test_cross_node.py --role producer --local-host hostname_A --remote-host hostname_B
+    python cross_node_mooncake_transfer_engine.py --role producer --local-host hostname_A --remote-host hostname_B
 
     # On Machine B (Consumer) - start after producer:
-    python test_cross_node.py --role consumer --local-host hostname_B --remote-host hostname_A
+    python cross_node_mooncake_transfer_engine.py --role consumer --local-host hostname_B --remote-host hostname_A
 
     # Zero-copy mode:
-    python test_cross_node.py --role producer ... --mode zerocopy
+    python cross_node_mooncake_transfer_engine.py --role producer ... --mode zerocopy
 
     # GPU mode (requires GPUDirect RDMA support):
-    python test_cross_node.py --role producer ... --mode gpu --gpu-id 0
+    python cross_node_mooncake_transfer_engine.py --role producer ... --mode gpu --gpu-id 0
 
     # Benchmark mode (skip random data generation and MD5 verification,
     # measures pure RDMA throughput):
-    python test_cross_node.py --role producer ... --benchmark
+    python cross_node_mooncake_transfer_engine.py --role producer ... --benchmark
 
 Environment Variables:
     RDMA_DEVICE_NAME:              Specify RDMA device (e.g., mlx5_0)
@@ -560,19 +560,23 @@ Transfer Modes:
 
 Examples:
   # Copy mode (default):
-  python test_cross_node.py --role producer --local-host hostA --remote-host hostB
+  python cross_node_mooncake_transfer_engine.py --role producer \
+  --local-host hostA --remote-host hostB
 
   # Zero-copy mode:
-  python test_cross_node.py --role producer --local-host hostA --remote-host hostB --mode zerocopy
+  python cross_node_mooncake_transfer_engine.py --role producer \
+  --local-host hostA --remote-host hostB --mode zerocopy
 
   # GPU mode:
-  python test_cross_node.py --role producer --local-host hostA --remote-host hostB --mode gpu --gpu-id 0
+  python cross_node_mooncake_transfer_engine.py --role producer \
+  --local-host hostA --remote-host hostB --mode gpu --gpu-id 0
 
   # Benchmark mode (skip MD5, measure pure RDMA performance):
-  python test_cross_node.py --role producer --local-host hostA --remote-host hostB --benchmark
+  python cross_node_mooncake_transfer_engine.py --role producer \
+  --local-host hostA --remote-host hostB --benchmark
 
   # With specific RDMA device:
-  RDMA_DEVICE_NAME=mlx5_0 python test_cross_node.py --role producer ...
+  RDMA_DEVICE_NAME=mlx5_0 python cross_node_mooncake_transfer_engine.py --role producer ...
         """,
     )
 

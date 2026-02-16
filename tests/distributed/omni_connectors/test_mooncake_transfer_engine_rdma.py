@@ -68,7 +68,7 @@ def get_rdma_host() -> str:
         if host_ip and not host_ip.startswith("127."):
             return host_ip
     except Exception:
-        pass
+        pass  # Hostname resolution failed; fall back to loopback below
     return "127.0.0.1"
 
 
@@ -95,8 +95,6 @@ def _detect_rdma_device() -> str:
     # 2. ibdev2netdev: most reliable, no Mooncake dependency
     #    Prefer RoCE (Ethernet-backed) over IB for loopback reliability.
     try:
-        import subprocess
-
         result = subprocess.run(["ibdev2netdev"], capture_output=True, text=True, timeout=5)
         if result.returncode == 0:
             up_lines = [ln.strip() for ln in result.stdout.strip().splitlines() if "(Up)" in ln]
@@ -203,21 +201,17 @@ class TestBasicConnector(unittest.TestCase):
 
     def test_initialization(self):
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port, pool_size=1024 * 1024))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=1024 * 1024)) as c:
             self.assertNotEqual(c.rpc_port, 0)
             self.assertEqual(c.pool_size, 1024 * 1024)
             self.assertTrue(c.pool.is_pinned())
             health = c.health()
             self.assertEqual(health["status"], "healthy")
-        finally:
-            c.close()
 
     def test_put_tensor_bytes_object(self):
         """Put tensor / bytes / dict and verify metadata."""
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             ok, sz, meta = c.put("s0", "s1", "t", torch.randn(100))
             self.assertTrue(ok)
             self.assertTrue(meta["is_fast_path"])
@@ -229,26 +223,20 @@ class TestBasicConnector(unittest.TestCase):
             ok, sz, meta = c.put("s0", "s1", "d", {"k": [1, 2, 3]})
             self.assertTrue(ok)
             self.assertFalse(meta["is_fast_path"])
-        finally:
-            c.close()
 
     def test_cleanup_releases_buffer(self):
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port)) as c:
             c.put("s0", "s1", "r1", torch.randn(100))
             key = MooncakeTransferEngineConnector._make_key("r1", "s0", "s1")
             self.assertIn(key, c._local_buffers)
             c.cleanup("r1", from_stage="s0", to_stage="s1")
             self.assertNotIn(key, c._local_buffers)
-        finally:
-            c.close()
 
     def test_pool_exhaustion_and_recovery(self):
         """Fill pool, verify failure, free, verify recovery."""
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=64 * 1024)) as c:
             ids = []
             for i in range(10):
                 ok, _, _ = c.put("s", "s", f"f{i}", torch.randn(1000))
@@ -260,8 +248,6 @@ class TestBasicConnector(unittest.TestCase):
                 c.cleanup(rid, from_stage="s", to_stage="s")
             ok, _, _ = c.put("s", "s", "recovery", torch.randn(1000))
             self.assertTrue(ok, "Pool recovery failed after cleanup")
-        finally:
-            c.close()
 
 
 # ---------------------------------------------------------------------------
@@ -426,7 +412,7 @@ class TestEndToEnd(unittest.TestCase):
                 with lock:
                     errors.append(f"{rid}: {e}")
 
-        try:
+        with conn:
             threads = []
             for i in range(10):
                 t = threading.Thread(target=worker, args=(f"r{i}", torch.randn(256, 256)))
@@ -435,8 +421,6 @@ class TestEndToEnd(unittest.TestCase):
             for t in threads:
                 t.join()
             self.assertEqual(len(errors), 0, f"errors: {errors}")
-        finally:
-            conn.close()
 
     def test_auto_cleanup(self):
         """Producer buffer should be released after consumer get."""
@@ -503,16 +487,12 @@ class TestGPUPool(unittest.TestCase):
         return _connector_config(port, pool_size, pool_device="cuda:0")
 
     def test_gpu_pool_init(self):
-        c = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
-        try:
+        with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
             self.assertEqual(c.pool_device, "cuda:0")
             self.assertTrue(c.pool.is_cuda)
-        finally:
-            c.close()
 
     def test_gpu_pool_put_cpu_and_gpu_tensor(self):
-        c = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
-        try:
+        with MooncakeTransferEngineConnector(self._gpu_cfg(_free_port())) as c:
             ok, _, meta = c.put("s0", "s1", "h2d", torch.randn(256, 256))
             self.assertTrue(ok)
             self.assertTrue(meta["is_fast_path"])
@@ -520,8 +500,6 @@ class TestGPUPool(unittest.TestCase):
             ok, _, meta = c.put("s0", "s1", "d2d", torch.randn(256, 256, device="cuda:0"))
             self.assertTrue(ok)
             self.assertTrue(meta["is_fast_path"])
-        finally:
-            c.close()
 
     def test_gpu_e2e_transfer(self):
         p = MooncakeTransferEngineConnector(self._gpu_cfg(_free_port()))
@@ -738,12 +716,9 @@ class TestStressCorrectness(unittest.TestCase):
     def test_empty_bytes_rejected(self):
         """Connector should gracefully reject empty bytes payload."""
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
             ok, sz, meta = c.put("s0", "s1", "empty_b", b"")
             self.assertFalse(ok, "Empty bytes should be rejected by connector")
-        finally:
-            c.close()
 
     # -- Large payload stress (500 MB) --
 
@@ -773,8 +748,7 @@ class TestStressCorrectness(unittest.TestCase):
     def test_rapid_alloc_free_cycle(self):
         """Put + cleanup in tight loop to stress allocator under real connector."""
         port = _free_port()
-        c = MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024))
-        try:
+        with MooncakeTransferEngineConnector(_connector_config(port, pool_size=8 * 1024 * 1024)) as c:
             for i in range(50):
                 rid = f"cycle_{i}"
                 ok, _, _ = c.put("s0", "s1", rid, torch.randn(256, 256))
@@ -783,8 +757,6 @@ class TestStressCorrectness(unittest.TestCase):
             # After all cycles, pool should be fully recovered
             ok, _, _ = c.put("s0", "s1", "final", torch.randn(1024, 1024))
             self.assertTrue(ok, "Pool not fully recovered after rapid cycles")
-        finally:
-            c.close()
 
 
 if __name__ == "__main__":

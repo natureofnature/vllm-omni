@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from collections.abc import Callable
 from typing import Any
 
@@ -11,7 +12,6 @@ try:
     from .utils.config import ConnectorSpec
 except ImportError:
     # Fallback for direct execution
-    import os
     import sys
 
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -61,7 +61,6 @@ def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBas
         from .connectors.mooncake_store_connector import MooncakeStoreConnector
     except ImportError:
         # Fallback import
-        import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -74,7 +73,6 @@ def _create_shm_connector(config: dict[str, Any]) -> OmniConnectorBase:
         from .connectors.shm_connector import SharedMemoryConnector
     except ImportError:
         # Fallback import
-        import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -86,7 +84,6 @@ def _create_yuanrong_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.yuanrong_connector import YuanrongConnector
     except ImportError:
-        import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
@@ -98,7 +95,6 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
     try:
         from .connectors.mooncake_transfer_engine_connector import MooncakeTransferEngineConnector
     except ImportError:
-        import os
         import sys
 
         sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
