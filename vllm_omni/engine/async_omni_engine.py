@@ -32,7 +32,15 @@ from vllm.logger import init_logger
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
-from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+
+try:
+    from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
+
+    _LAUNCH_CORE_ENGINES_NEEDS_ADDRESSES = True
+except ImportError:
+    from vllm.v1.engine.utils import launch_core_engines
+
+    _LAUNCH_CORE_ENGINES_NEEDS_ADDRESSES = False
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -334,13 +342,20 @@ class AsyncOmniEngine:
                         engine_args_dict,
                         stage_init_timeout,
                     )
-                    addresses = get_engine_zmq_addresses(vllm_config)
-                    launch_cm = launch_core_engines(
-                        vllm_config=vllm_config,
-                        executor_class=executor_class,
-                        log_stats=False,
-                        addresses=addresses,
-                    )
+                    if _LAUNCH_CORE_ENGINES_NEEDS_ADDRESSES:
+                        addresses = get_engine_zmq_addresses(vllm_config)
+                        launch_cm = launch_core_engines(
+                            vllm_config=vllm_config,
+                            executor_class=executor_class,
+                            log_stats=False,
+                            addresses=addresses,
+                        )
+                    else:
+                        launch_cm = launch_core_engines(
+                            vllm_config=vllm_config,
+                            executor_class=executor_class,
+                            log_stats=False,
+                        )
                     engine_manager, coordinator, addresses = launch_cm.__enter__()
                     started_stage = StartedLlmStage(
                         stage_id=metadata.stage_id,
@@ -351,15 +366,15 @@ class AsyncOmniEngine:
                         coordinator=coordinator,
                         addresses=addresses,
                     )
+                    logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
+                    launch_cm.__exit__(None, None, None)
+                    logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                 finally:
                     if previous_visible_devices is None:
                         current_omni_platform.unset_device_control_env_var()
                     else:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
-            logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-            launch_cm.__exit__(None, None, None)
-            logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
         except Exception:
@@ -375,6 +390,7 @@ class AsyncOmniEngine:
         started: StartedLlmStage,
     ) -> tuple[Any, Any, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
+        from vllm_omni.platforms import current_omni_platform
 
         client_addresses = {
             "input_address": started.addresses.inputs[0],
@@ -383,7 +399,10 @@ class AsyncOmniEngine:
         if started.addresses.frontend_stats_publish_address is not None:
             client_addresses["stats_update_address"] = started.addresses.frontend_stats_publish_address
 
+        device_control_env = current_omni_platform.device_control_env_var
+        previous_visible_devices = os.environ.get(device_control_env)
         try:
+            setup_stage_devices(started.stage_id, started.metadata.runtime_cfg)
             stage_client = StageEngineCoreClient(
                 vllm_config=started.vllm_config,
                 executor_class=started.executor_class,
@@ -397,6 +416,11 @@ class AsyncOmniEngine:
         except Exception:
             close_started_llm_stage(started)
             raise
+        finally:
+            if previous_visible_devices is None:
+                current_omni_platform.unset_device_control_env_var()
+            else:
+                current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
         try:
             if started.vllm_config.model_config.skip_tokenizer_init:
@@ -493,16 +517,16 @@ class AsyncOmniEngine:
                                     metadata,
                                     batch_size=self.diffusion_batch_size,
                                 )
-                                logger.info(
-                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
-                                    stage_id,
-                                    self.diffusion_batch_size,
-                                )
                             finally:
                                 if previous_visible_devices is None:
                                     current_omni_platform.unset_device_control_env_var()
                                 else:
                                     current_omni_platform.set_device_control_env_var(previous_visible_devices)
+                        logger.info(
+                            "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                            stage_id,
+                            self.diffusion_batch_size,
+                        )
                         continue
 
                     llm_stage_ids.append(stage_id)

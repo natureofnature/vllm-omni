@@ -2,8 +2,10 @@ import time
 from types import SimpleNamespace
 
 import pytest
+from vllm import SamplingParams
 
 from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -112,3 +114,57 @@ def test_companion_lifecycle_timeout(tracker):
 
     # Should be removed from pending
     assert tracker.pop_pending_parent("req1") is None
+
+
+class _CfgStage:
+    def __init__(self, stage_id, stage_type):
+        self.stage_id = stage_id
+        self.stage_type = stage_type
+        self.submitted = []
+
+    def submit(self, task):
+        self.submitted.append(task)
+
+
+class _FakeMetrics:
+    def __init__(self, num_stages):
+        self.stage_first_ts = [None] * num_stages
+
+
+def test_forward_parent_with_cfg_seeds_downstream_diffusion_request():
+    tracker = CfgCompanionTracker(prompt_expand_func=None, stage0_sampling_params=SamplingParams())
+    tracker._companion_map["req-1"] = {"cfg_text": "req-1__cfg_text"}
+
+    stage_list = [_CfgStage(0, "llm"), _CfgStage(1, "diffusion")]
+    sampling_params_list = [SamplingParams(), OmniDiffusionSamplingParams()]
+    request_id_to_prompt = {"req-1": {"prompt": "city", "modalities": ["image"]}}
+    final_stage_id_to_prompt = {"req-1": 1}
+    metrics = _FakeMetrics(num_stages=2)
+    remaining_by_stage = [0, 0]
+
+    forwarded = tracker.forward_parent_with_cfg(
+        req_id="req-1",
+        parent_result={
+            "stage_id": 0,
+            "engine_outputs": [type("Out", (), {"prompt_token_ids": [1, 2, 3]})()],
+        },
+        stage_list=stage_list,
+        sampling_params_list=sampling_params_list,
+        request_id_to_prompt=request_id_to_prompt,
+        final_stage_id_to_prompt=final_stage_id_to_prompt,
+        metrics=metrics,
+        remaining_by_stage=remaining_by_stage,
+    )
+
+    assert forwarded is True
+    assert remaining_by_stage == [0, 1]
+    assert metrics.stage_first_ts[1] is not None
+    assert len(stage_list[1].submitted) == 1
+
+    task = stage_list[1].submitted[0]
+    assert task["request_id"] == "req-1"
+    assert task["from_connector"] is False
+    assert task["engine_inputs"]["prompt_token_ids"]
+    assert task["engine_inputs"]["multi_modal_data"] is None
+    assert isinstance(task["sampling_params"], OmniDiffusionSamplingParams)
+    assert task["sampling_params"].cfg_kv_request_ids == {"cfg_text": "req-1__cfg_text"}

@@ -365,8 +365,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         generators: list[AsyncGenerator[RequestOutput, None]] = []
         try:
             for i, engine_prompt in enumerate(engine_prompts):
-                if hasattr(request, "sampling_params_list"):
-                    sampling_params_list = self._to_sampling_params_list(request.sampling_params_list)
+                raw_sampling_params_list = getattr(request, "sampling_params_list", None)
+                if raw_sampling_params_list is not None:
+                    sampling_params_list = self._to_sampling_params_list(raw_sampling_params_list)
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)

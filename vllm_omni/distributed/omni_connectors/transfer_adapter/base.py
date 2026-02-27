@@ -29,8 +29,6 @@ class OmniTransferAdapterBase:
 
         # Requests that are waiting to be saved
         self._pending_save_reqs = deque()
-        # Requests that have successfully saved data
-        self._finished_save_reqs = set()
 
         self.stop_event = threading.Event()
         self._recv_cond = threading.Condition()

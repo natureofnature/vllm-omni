@@ -1,3 +1,4 @@
+import importlib
 import os
 import types
 from collections import Counter
@@ -288,7 +289,7 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
     # Convert any nested dataclass objects to dicts before creating DictConfig
     base_engine_args = _convert_dataclasses_to_dict(base_engine_args)
     base_engine_args = create_config(base_engine_args)
-    for stage_arg in stage_args:
+    for idx, stage_arg in enumerate(stage_args):
         base_engine_args_tmp = base_engine_args.copy()
         # Update base_engine_args with stage-specific engine_args if they exist
         if hasattr(stage_arg, "engine_args") and stage_arg.engine_args is not None:
@@ -296,6 +297,32 @@ def load_stage_configs_from_yaml(config_path: str, base_engine_args: dict | None
         stage_type = getattr(stage_arg, "stage_type", "llm")
         if hasattr(stage_arg, "runtime") and stage_arg.runtime is not None and stage_type != "diffusion":
             base_engine_args_tmp.async_chunk = global_async_chunk
+        if (
+            stage_type != "diffusion"
+            and not getattr(base_engine_args_tmp, "async_chunk", False)
+            and not getattr(base_engine_args_tmp, "custom_process_next_stage_input_func", None)
+            and idx + 1 < len(stage_args)
+        ):
+            next_stage_input_func = getattr(stage_args[idx + 1], "custom_process_input_func", None)
+            if isinstance(next_stage_input_func, str) and next_stage_input_func:
+                try:
+                    module_path, func_name = next_stage_input_func.rsplit(".", 1)
+                    if func_name.endswith("_full_payload") or func_name.endswith("_batch"):
+                        candidate_names = [func_name]
+                    else:
+                        candidate_names = [f"{func_name}_full_payload", f"{func_name}_batch"]
+                    derived_func_name = candidate_names[0]
+                    try:
+                        module = importlib.import_module(module_path)
+                        for candidate_name in candidate_names:
+                            if callable(getattr(module, candidate_name, None)):
+                                derived_func_name = candidate_name
+                                break
+                    except Exception:
+                        pass
+                    base_engine_args_tmp.custom_process_next_stage_input_func = f"{module_path}.{derived_func_name}"
+                except ValueError:
+                    pass
         stage_arg.engine_args = base_engine_args_tmp
     return stage_args
 

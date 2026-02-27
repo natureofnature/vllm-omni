@@ -1071,3 +1071,17 @@ def test_image_edit_with_seed_zero_single_stage(test_client):
         f"Expected seed=0, but got seed={captured_sampling_params.seed}. "
         "This indicates the bug where seed=0 is treated as falsy."
     )
+
+
+def test_generate_images_async_omni_preserves_image_modality(async_omni_test_client):
+    response = async_omni_test_client.post(
+        "/v1/images/generations",
+        json={
+            "prompt": "a cat",
+            "n": 1,
+            "size": "256x256",
+        },
+    )
+    assert response.status_code == 200
+    engine = async_omni_test_client.app.state.engine_client
+    assert engine.captured_prompt == {"prompt": "a cat", "modalities": ["image"]}

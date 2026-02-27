@@ -227,7 +227,7 @@ class TestQwen3TTSAPIEndpoints:
 
 @pytest.fixture(scope="class")
 def omni_server_no_async_chunk():
-    """Start vLLM-Omni server with non-async-chunk config."""
+    """Start vLLM-Omni server with full_payload_mode config."""
     stage_config_path = get_stage_config("qwen3_tts_no_async_chunk.yaml")
 
     with OmniServer(
@@ -246,13 +246,13 @@ def omni_server_no_async_chunk():
 
 
 class TestQwen3TTSNoAsyncChunk:
-    """E2E tests for Qwen3-TTS in non-async-chunk (full decode) mode."""
+    """E2E tests for Qwen3-TTS in full_payload_mode (async_chunk=false)."""
 
     @pytest.mark.core_model
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_english(self, omni_server_no_async_chunk) -> None:
-        """Test English TTS with non-async-chunk pipeline."""
+        """Test English TTS with the full_payload_mode pipeline."""
         response = make_speech_request(
             host=omni_server_no_async_chunk.host,
             port=omni_server_no_async_chunk.port,
@@ -270,7 +270,7 @@ class TestQwen3TTSNoAsyncChunk:
     @pytest.mark.omni
     @hardware_test(res={"cuda": "L4"}, num_cards=4)
     def test_speech_chinese(self, omni_server_no_async_chunk) -> None:
-        """Test Chinese TTS with non-async-chunk pipeline."""
+        """Test Chinese TTS with the full_payload_mode pipeline."""
         response = make_speech_request(
             host=omni_server_no_async_chunk.host,
             port=omni_server_no_async_chunk.port,

@@ -40,6 +40,7 @@ from vllm_ascend.utils import enable_sp, global_stream
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 
 
 class ExecuteModelState(NamedTuple):
@@ -103,10 +104,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
-            if hasattr(self.model, "_clear_warmup_state"):
-                self.model._clear_warmup_state()
+            model = getattr(self, "model", None)
+            if model is not None and hasattr(model, "_clear_warmup_state"):
+                model._clear_warmup_state()
 
-        # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
@@ -118,13 +119,22 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         data["custom_metadata"] = existing
                 except Exception as e:
                     logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
-        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
+        for req_id, kv_meta in finished_reqs.items():
+            self.mark_kv_transfer(
+                req_id,
+                seq_len=kv_meta.get("seq_len", 0),
+                block_ids=kv_meta.get("block_ids", []),
+                custom_metadata=kv_meta.get("custom_metadata"),
+            )
+        self.kv_extracted_req_ids = self.send_kv_cache(
+            finished_reqs=self.drain_pending_kv_transfers(),
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
-            request_id_resolver=self._resolve_global_request_id,
+            request_id_resolver=self._resolve_transfer_request_id,
         )
+        if self.kv_extracted_req_ids:
+            self.ack_kv_transfers(self.kv_extracted_req_ids)
         #  -------------------------------------- Omni-new -------------------------------------------------
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
@@ -356,8 +366,10 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
             ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output, defer_finalize=not clear_kv_metadata
+            maybe_get_kv_connector_output_compat(
+                self,
+                scheduler_output,
+                clear_metadata=clear_kv_metadata,
             ) as kv_connector_output,
         ):
             hidden_states = self._model_forward(
@@ -620,7 +632,7 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 dtype=np.int32,
             )
 
-        self._process_additional_information_updates(
+        self._process_model_intermediate_buffer_updates(
             hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
@@ -730,18 +742,12 @@ class NPUARModelRunner(OmniNPUModelRunner):
             vocab_size=self.input_batch.vocab_size,
         )
 
-    def _resolve_global_request_id(self, req_id: str) -> str:
-        """Resolve global request ID from request state."""
+    def _resolve_transfer_request_id(self, req_id: str) -> str:
+        """Resolve cross-stage request ID from request state."""
         req_state = self.requests.get(req_id)
-        if not req_state:
+        if req_state is None:
             return req_id
-
-        add_info = self.model_intermediate_buffer.get(req_id, {})
-        global_id = add_info.get("global_request_id")
-        if global_id:
-            if isinstance(global_id, list) and global_id:
-                global_id = global_id[0]
-            if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
+        external_req_id = getattr(req_state, "external_req_id", None)
+        if external_req_id is not None:
+            return str(external_req_id)
         return req_id

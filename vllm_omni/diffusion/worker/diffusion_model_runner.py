@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -35,11 +36,12 @@ from vllm_omni.diffusion.sched.interface import DiffusionSchedulerOutput
 from vllm_omni.diffusion.worker.utils import DiffusionRequestState, RunnerOutput
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner:
+class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -72,8 +74,43 @@ class DiffusionModelRunner:
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Diffusion may use the mixin's KV receive helpers before the
+        # full connector bootstrap path runs, so seed the delegated KV manager
+        # on both the diffusion runner and the mixin-facing attribute.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self._kv_transfer_manager = self.kv_transfer_manager
+        self._bootstrap_kv_receive_routing()
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        model_config = getattr(od_config, "model_config", None) or getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            self.init_omni_connectors(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
+
+    def _bootstrap_kv_receive_routing(self) -> None:
+        """Seed KV key builders from diffusion config."""
+        omni_kv_cfg = getattr(self.od_config, "omni_kv_config", {}) or {}
+        connector_cfg = omni_kv_cfg.get("connector_config", {}) if isinstance(omni_kv_cfg, dict) else {}
+        if not isinstance(connector_cfg, dict):
+            connector_cfg = {}
+        rank_mapping = connector_cfg.get("rank_mapping", {})
+        if not isinstance(rank_mapping, dict):
+            rank_mapping = {}
+
+        to_tp = getattr(getattr(self.od_config, "parallel_config", None), "tensor_parallel_size", 1) or 1
+        self._from_tp = int(rank_mapping.get("from_tp", 1))
+        self._to_tp = int(rank_mapping.get("to_tp", to_tp))
+        try:
+            self._local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except (TypeError, ValueError):
+            self._local_rank = 0
+
+        self.kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
+        self.kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
+        self.kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
+        self.kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -190,33 +227,6 @@ class DiffusionModelRunner:
         """Load weights into the pipeline."""
         return self.pipeline.load_weights(weights)
 
-    def _record_peak_memory(self, output: DiffusionOutput) -> None:
-        """Record peak GPU memory for the current forward pass into output.
-
-        Must be called immediately after pipeline.forward(), with
-        reset_peak_memory_stats() called just before it, so the measurement
-        reflects this request only and not the global historical maximum.
-
-        Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
-        max_memory_allocated so that allocator fragmentation is also visible.
-        See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
-        """
-        peak_reserved_bytes = current_omni_platform.max_memory_reserved()
-        peak_allocated_bytes = current_omni_platform.max_memory_allocated()
-
-        output.peak_memory_mb = peak_reserved_bytes / (1024**2)
-        peak_reserved_gb = peak_reserved_bytes / (1024**3)
-        peak_allocated_gb = peak_allocated_bytes / (1024**3)
-        pool_overhead_gb = peak_reserved_gb - peak_allocated_gb
-
-        logger.info(
-            "Peak GPU memory (this request): %.2f GB reserved, %.2f GB allocated, %.2f GB pool overhead (%.1f%%)",
-            peak_reserved_gb,
-            peak_allocated_gb,
-            pool_overhead_gb,
-            pool_overhead_gb / peak_reserved_gb * 100 if peak_reserved_gb > 0 else 0.0,
-        )
-
     def execute_model(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         """
         Execute a forward pass for the given requests.
@@ -241,8 +251,8 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
+            # The mixin owns the runner-facing KV receive entrypoint.
+            self.receive_multi_kv_cache(
                 req,
                 cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                 target_device=getattr(self.pipeline, "device", None),
@@ -266,16 +276,9 @@ class DiffusionModelRunner:
             ):
                 self.cache_backend.refresh(self.pipeline, req.sampling_params.num_inference_steps)
 
-            is_primary = not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-            if is_primary:
-                current_omni_platform.reset_peak_memory_stats()
-
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 with record_function("pipeline_forward"):
                     output = self.pipeline.forward(req)
-
-            if is_primary:
-                self._record_peak_memory(output)
 
             # NOTE:
             if (
@@ -296,30 +299,24 @@ class DiffusionModelRunner:
         """Return whether current pipeline supports step execution."""
         return self.pipeline is not None and supports_step_execution(self.pipeline)
 
-    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> tuple[DiffusionRequestState, bool]:
+    def _update_states(self, scheduler_output: DiffusionSchedulerOutput) -> DiffusionRequestState:
         """Step-before update: cleanup finished requests and get/create one running state."""
         for req_id in scheduler_output.finished_req_ids:
             self.state_cache.pop(req_id, None)
 
-        if scheduler_output.num_scheduled_reqs != 1:
-            raise ValueError(
-                "Step mode currently supports batch_size=1, "
-                f"but got {scheduler_output.num_scheduled_reqs} scheduled requests."
-            )
+        req_states = scheduler_output.req_states
+        if len(req_states) != 1:
+            raise ValueError(f"Step mode currently supports batch_size=1, but got {len(req_states)} req_states.")
 
-        if scheduler_output.scheduled_new_reqs:
-            new_req_data = scheduler_output.scheduled_new_reqs[0]
-            req_id = new_req_data.sched_req_id
-            req = new_req_data.req
-            if req_id in self.state_cache:
-                raise ValueError(f"Received duplicate new-request payload for cached request {req_id}.")
-        else:
-            req_id = scheduler_output.scheduled_cached_reqs.sched_req_ids[0]
-            state = self.state_cache.get(req_id)
-            if state is None:
-                raise ValueError(f"Missing cached state for request {req_id}.")
-            return state, False
+        # TODO: remove req state from SchedulerOutput
+        # Stepwise mode currently trusts runner-owned cached state more than
+        # re-validating scheduler-provided request content on every step.
+        sched_req_state = req_states[0]
+        req_id = sched_req_state.sched_req_id
+        if req_id in self.state_cache:
+            return self.state_cache[req_id]
 
+        req = sched_req_state.req
         request_ids = req.request_ids or [req_id]
         if len(request_ids) != len(req.prompts):
             raise ValueError(
@@ -332,7 +329,7 @@ class DiffusionModelRunner:
             prompts=req.prompts,
         )
         self.state_cache[req_id] = state
-        return state, True
+        return state
 
     def _update_states_after(self, state: DiffusionRequestState, finished: bool) -> None:
         """Step-after update: clear cached state for completed request."""
@@ -353,9 +350,9 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            state, is_new_request = self._update_states(scheduler_output)
+            state = self._update_states(scheduler_output)
 
-            if is_new_request:
+            if state.new_request:
                 # TODO: support kv manager recv
                 # TODO: support cache backend
                 if state.sampling.generator is None and state.sampling.seed is not None:
@@ -369,7 +366,7 @@ class DiffusionModelRunner:
 
             with set_forward_context(vllm_config=self.vllm_config, omni_diffusion_config=self.od_config):
                 # step0/new request: encode
-                if is_new_request:
+                if state.new_request:
                     self.pipeline.prepare_encode(state)
 
                 noise_pred = self.pipeline.denoise_step(state)
