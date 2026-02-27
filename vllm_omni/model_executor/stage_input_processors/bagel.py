@@ -79,32 +79,27 @@ def expand_cfg_prompts(
 
 def collect_cfg_kv_caches(
     request_id: str,
-    cfg_request_ids: dict[str, str],
-    kv_transfer_manager: Any,
-    target_device: Any | None = None,
+    cfg_role_payloads: dict[str, tuple[dict[str, Any] | None, int]],
 ) -> dict[str, Any]:
-    """Collect KV caches for all CFG roles from the KV transfer manager.
+    """Convert already-fetched CFG companion KV payloads into Bagel attrs.
 
-    Called by the diffusion model runner after receiving the primary KV cache.
-    Uses the kv_transfer_manager to fetch companion KV caches by their
-    request IDs.
+    Called after the transport layer has already fetched companion payloads.
+    This function stays model-specific: it transforms role-keyed raw payloads
+    into the sampling-params fields Bagel expects.
 
     Args:
         request_id: The original (parent) request ID.
-        cfg_request_ids: Mapping of role -> companion request ID,
-            e.g. {"cfg_text": "req_0__cfg_text"}.
-        kv_transfer_manager: The OmniKVTransferManager instance.
-        target_device: Device to move tensors to.
+        cfg_role_payloads: Mapping of role -> ``(payload, size)`` returned by
+            the KV transport layer.
 
     Returns:
-        Dict with keys like "cfg_text_past_key_values",
-        "cfg_text_kv_metadata", etc.
+        Dict with keys like ``cfg_text_past_key_values`` and
+        ``cfg_text_kv_metadata``.
     """
     result: dict[str, Any] = {}
 
-    for role, companion_rid in cfg_request_ids.items():
+    for role, (data, size) in cfg_role_payloads.items():
         try:
-            data, size = kv_transfer_manager.receive_kv_cache_for_request(companion_rid, target_device)
             if data and "layer_blocks" in data:
                 layer_blocks = data["layer_blocks"]
                 kv_obj = SimpleNamespace(**layer_blocks)
@@ -112,22 +107,22 @@ def collect_cfg_kv_caches(
                 if "metadata" in data:
                     result[f"{role}_kv_metadata"] = data["metadata"]
                 logger.info(
-                    "Collected CFG KV cache for role=%s, rid=%s, size=%d bytes",
+                    "Collected CFG KV cache for request=%s role=%s size=%d bytes",
+                    request_id,
                     role,
-                    companion_rid,
                     size,
                 )
             else:
                 logger.warning(
-                    "Failed to collect CFG KV cache for role=%s, rid=%s",
+                    "Failed to collect CFG KV cache for request=%s role=%s",
+                    request_id,
                     role,
-                    companion_rid,
                 )
         except Exception as e:
             logger.exception(
-                "Error collecting CFG KV cache for role=%s, rid=%s: %s",
+                "Error collecting CFG KV cache for request=%s role=%s: %s",
+                request_id,
                 role,
-                companion_rid,
                 e,
             )
 

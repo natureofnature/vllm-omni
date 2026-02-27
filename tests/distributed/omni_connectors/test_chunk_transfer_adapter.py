@@ -4,10 +4,10 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-from pytest_mock import MockerFixture
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -40,9 +40,9 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 
 @pytest.fixture
-def build_adapter(monkeypatch, mocker: MockerFixture):
+def build_adapter(monkeypatch):
     def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
-        connector = mocker.MagicMock()
+        connector = MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
         connector.put.return_value = (True, 1, {})
@@ -110,7 +110,8 @@ def test_load_poll(build_adapter):
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
-    assert request.additional_information == payload
+    assert request.additional_information is None
+    assert adapter.request_payload["external-1"] == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
@@ -169,13 +170,9 @@ def test_postprocess_scheduler_output(build_adapter):
         scheduled_new_reqs=[SimpleNamespace(req_id="new-ready")],
         scheduled_cached_reqs=SimpleNamespace(req_ids=["cached-ready", "missing"]),
     )
-    requests = {"cached-ready": SimpleNamespace(additional_information={"k": "v"})}
 
-    adapter.postprocess_scheduler_output(scheduler_output, requests)
+    adapter.postprocess_scheduler_output(scheduler_output, requests={})
 
-    cached_info = scheduler_output.scheduled_cached_reqs.additional_information
-    assert cached_info["cached-ready"] == {"k": "v"}
-    assert cached_info["missing"] is None
     assert adapter.requests_with_ready_chunks == {"leftover"}
 
 
@@ -331,28 +328,28 @@ class _HashableRequest(SimpleNamespace):
         return getattr(other, "request_id", None) == self.request_id
 
 
-def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: MockerFixture):
+def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch):
     """OmniGenerationScheduler must call adapter.cleanup when request finishes."""
     cleanup_calls = []
 
-    adapter_mock = mocker.MagicMock()
+    adapter_mock = MagicMock()
     adapter_mock.finished_requests = {"req-s1"}
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
 
     from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 
-    scheduler = mocker.MagicMock()
+    scheduler = MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
     scheduler.connector = None
     scheduler.ec_connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False
     scheduler.recompute_kv_load_failures = False
-    scheduler.structured_output_manager = mocker.MagicMock()
+    scheduler.structured_output_manager = MagicMock()
     scheduler.structured_output_manager.should_advance.return_value = False
     scheduler.finished_req_ids_dict = {}
     scheduler.kv_cache_manager.take_events.return_value = None
-    scheduler.kv_event_publisher = mocker.MagicMock()
+    scheduler.kv_event_publisher = MagicMock()
 
     request = _HashableRequest(
         request_id="req-s1",
@@ -376,13 +373,13 @@ def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: Moc
     )
     scheduler.requests = {"req-s1": request}
 
-    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
-    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
+    scheduler._handle_stopped_request = MagicMock(return_value=True)
+    scheduler._free_request = MagicMock(return_value=None)
+    scheduler._get_routed_experts = MagicMock(return_value=None)
     scheduler.running = [request]
-    scheduler.waiting = mocker.MagicMock()
-    scheduler.waiting.remove_requests = mocker.MagicMock()
-    scheduler.make_stats = mocker.MagicMock(return_value=None)
+    scheduler.waiting = MagicMock()
+    scheduler.waiting.remove_requests = MagicMock()
+    scheduler.make_stats = MagicMock(return_value=None)
 
     scheduler_output = SimpleNamespace(
         num_scheduled_tokens={"req-s1": 10},

@@ -33,7 +33,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         self.have_multimodal_outputs = True
         self.has_preprocess = False
         self.has_postprocess = False
-        self.enable_update_additional_information = True
         self.requires_raw_input_tokens = True
 
         self._speech_tokenizer: Qwen3TTSTokenizer | None = None
@@ -170,7 +169,6 @@ class Qwen3TTSCode2Wav(nn.Module):
         positions: torch.Tensor | None = None,
         intermediate_tensors: Any = None,
         inputs_embeds: torch.Tensor | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ) -> OmniOutput:
         """Decode codec codes into audio waveform.
@@ -208,8 +206,9 @@ class Qwen3TTSCode2Wav(nn.Module):
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
-        if runtime_additional_information is not None:
-            for i, info in enumerate(runtime_additional_information):
+        model_intermediate_buffer = kwargs.get("model_intermediate_buffer")
+        if isinstance(model_intermediate_buffer, list):
+            for i, info in enumerate(model_intermediate_buffer):
                 if i >= len(left_context_size):
                     break
                 if "left_context_size" in info:

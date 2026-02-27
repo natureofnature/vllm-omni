@@ -17,18 +17,19 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
+from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
 from vllm_omni.entrypoints.omni import OmniBase
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
+from vllm_omni.entrypoints.talker_prompt_utils import compute_talker_prompt_ids_length
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
 )
-from vllm_omni.inputs.data import OmniPromptType, OmniSamplingParams
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 
 # Internal imports (our code)
 from vllm_omni.lora.request import LoRARequest
@@ -335,12 +336,33 @@ class AsyncOmni(OmniBase):
             req_state.metrics = metrics
             self.request_states[request_id] = req_state
             sp0: SamplingParams = sampling_params_list[0]  # type: ignore[index]
+            has_diffusion_stage = any(
+                stage.stage_type == "diffusion" for stage in self.stage_list[1 : final_stage_id_for_e2e + 1]
+            )
+            cfg = CfgCompanionTracker(
+                prompt_expand_func=getattr(self.stage_list[0], "prompt_expand_func", None),
+                stage0_sampling_params=sp0,
+            )
+            if has_diffusion_stage:
+                expanded_companions = []
+                cfg_request_ids = {}
+            else:
+                expanded_companions = cfg.expand_prompts({request_id: prompt})
+                cfg_request_ids = cfg.get_companion_request_ids(request_id)
             task = {
                 "request_id": request_id,
                 "engine_inputs": prompt,
                 "sampling_params": sp0,
             }
             self.stage_list[0].submit(task)
+            if cfg.is_active:
+                for companion_id, companion_prompt in expanded_companions:
+                    companion_task = {
+                        "request_id": companion_id,
+                        "engine_inputs": companion_prompt,
+                        "sampling_params": cfg.stage0_sampling_params,
+                    }
+                    self.stage_list[0].submit(companion_task)
             metrics.stage_first_ts[0] = metrics.stage_first_ts[0] or time.time()
             _req_start_ts[request_id] = time.time()
             logger.info(
@@ -353,6 +375,7 @@ class AsyncOmni(OmniBase):
                     request_id,
                     prompt,
                     sampling_params_list,
+                    cfg_request_ids,
                     req_state,
                     metrics,
                     final_stage_id_for_e2e,
@@ -366,6 +389,7 @@ class AsyncOmni(OmniBase):
                     final_stage_id_for_e2e,
                     sampling_params_list,
                     prompt,
+                    cfg_request_ids,
                 ):
                     yield output
 
@@ -395,6 +419,7 @@ class AsyncOmni(OmniBase):
         request_id: str,
         prompt: Any,
         sampling_params_list: list[SamplingParams],
+        cfg_request_ids: dict[str, str],
         req_state: ClientRequestState,
         metrics: OrchestratorAggregator,
         final_stage_id_for_e2e: int,
@@ -419,15 +444,22 @@ class AsyncOmni(OmniBase):
                 if submit_flag and stage_id == 0:
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
-                    engine_input = copy.deepcopy(prompt)
+                    engine_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
                     next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
                     engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
-                    for i in range(1, len(self.stage_list)):
+                    for i in range(1, final_stage_id_for_e2e + 1):
+                        sampling_params = self._prepare_downstream_sampling_params(
+                            request_id=request_id,
+                            stage_id=i,
+                            sampling_params=sampling_params_list[i],
+                            cfg_request_ids=cfg_request_ids,
+                        )
                         task = {
                             "request_id": request_id,
+                            "external_req_id": request_id,
                             "engine_inputs": engine_input,
-                            "sampling_params": sampling_params_list[i],
+                            "sampling_params": sampling_params,
                         }
                         self.stage_list[i].submit(task)
                         metrics.stage_first_ts[i] = time.time()
@@ -444,6 +476,7 @@ class AsyncOmni(OmniBase):
         final_stage_id_for_e2e: int,
         sampling_params_list: list[SamplingParams],
         prompt: Any,
+        cfg_request_ids: dict[str, str],
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
             finished = False
@@ -461,47 +494,57 @@ class AsyncOmni(OmniBase):
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
             stage.set_engine_outputs(engine_outputs)
-            # Forward to next stage if there is one
+            # Forward to next stage using seed-request pattern
             next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
-                next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
-
-                # Check if we have a connector for this edge
-                connector_key = (str(stage_id), str(next_stage_id))
-                connector = self.connectors.get(connector_key)
-
-                sent_via_connector = False
-                if connector:
-                    sent_via_connector = try_send_via_connector(
-                        connector=connector,
-                        stage_id=stage_id,
-                        next_stage_id=next_stage_id,
-                        req_id=request_id,
-                        next_inputs=next_inputs,
-                        sampling_params=sp_next,
-                        original_prompt=prompt,
-                        next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                        metrics=metrics,
+            if next_stage_id <= final_stage_id_for_e2e and stage_id == 0:
+                primary_output = engine_outputs[0]
+                prompt_token_ids = primary_output.prompt_token_ids
+                seed_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
+                next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                seed_input["prompt_token_ids"] = [0] * next_prompt_len
+                seed_input["multi_modal_data"] = seed_input["mm_processor_kwargs"] = None
+                for ds_stage_id in range(1, final_stage_id_for_e2e + 1):
+                    sp_ds = self._prepare_downstream_sampling_params(
+                        request_id=request_id,
+                        stage_id=ds_stage_id,
+                        sampling_params=sampling_params_list[ds_stage_id],
+                        cfg_request_ids=cfg_request_ids,
                     )
-
-                if not sent_via_connector:
-                    # Fallback logic removed as we now enforce connector usage.
-                    # If no connector is found or send fails, we log an error and raise,
-                    # because continuing would cause the request to be silently dropped
-                    # and the orchestrator to hang waiting for completion.
-                    error_msg = (
-                        f"[{self._name}] Failed to send request {request_id} to stage-{next_stage_id} via connector. "
-                        "Configure a connector for this edge or inspect connector logs for details."
-                    )
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
-            else:
+                    seed_task = {
+                        "request_id": request_id,
+                        "external_req_id": request_id,
+                        "engine_inputs": seed_input,
+                        "sampling_params": sp_ds,
+                        "from_connector": False,
+                    }
+                    self.stage_list[ds_stage_id].submit(seed_task)
+                    metrics.stage_first_ts[ds_stage_id] = metrics.stage_first_ts[ds_stage_id] or time.time()
+                logger.debug(f"[{self._name}] Seeded downstream stages for request {request_id}")
+            elif next_stage_id > final_stage_id_for_e2e:
                 logger.debug(f"[{self._name}] Request {request_id} fully completed")
+
+    def _prepare_downstream_sampling_params(
+        self,
+        request_id: str,
+        stage_id: int,
+        sampling_params: OmniSamplingParams,
+        cfg_request_ids: dict[str, str],
+    ) -> OmniSamplingParams:
+        prepared_params = copy.deepcopy(sampling_params)
+        if (
+            cfg_request_ids
+            and stage_id < len(self.stage_list)
+            and self.stage_list[stage_id].stage_type == "diffusion"
+            and isinstance(prepared_params, OmniDiffusionSamplingParams)
+        ):
+            prepared_params.cfg_kv_request_ids = dict(cfg_request_ids)
+            logger.info(
+                "Attaching cfg_kv_request_ids=%s to request %s for stage-%d",
+                prepared_params.cfg_kv_request_ids,
+                request_id,
+                stage_id,
+            )
+        return prepared_params
 
     def _process_single_result(
         self,

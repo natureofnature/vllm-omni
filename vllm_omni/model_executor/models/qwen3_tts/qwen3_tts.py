@@ -157,7 +157,7 @@ class Qwen3TTSModelForGeneration(nn.Module):
         Returns:
             OmniOutput: Contains multimodal outputs with audio tensors
         """
-        runtime_info_list = kwargs.get("runtime_additional_information", [{}])
+        runtime_info_list = kwargs.get("model_intermediate_buffer", [{}])
         if not isinstance(runtime_info_list, list):
             runtime_info_list = [runtime_info_list]
 

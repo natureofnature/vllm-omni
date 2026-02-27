@@ -1,3 +1,4 @@
+import sys
 from collections.abc import Callable
 from typing import Any
 
@@ -15,7 +16,7 @@ from vllm.usage.usage_lib import UsageContext
 from vllm.utils.counter import Counter
 from vllm.v1.engine.llm_engine import LLMEngine
 
-from vllm_omni.distributed.omni_connectors import initialize_orchestrator_connectors
+from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
 
 # Internal imports (our code)
 from vllm_omni.engine.arg_utils import OmniEngineArgs
@@ -92,9 +93,11 @@ class OmniLLM(LLM):
             self.config_path = stage_configs_path
             self.stage_configs = load_stage_configs_from_yaml(stage_configs_path)
 
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=self.worker_backend, shm_threshold_bytes=shm_threshold_bytes
+        # Orchestrator keeps only the serialized transfer config; stage workers own live connectors.
+        default_shm_threshold = sys.maxsize if self.worker_backend == "ray" else max(0, shm_threshold_bytes)
+        self.omni_transfer_config = load_omni_transfer_config(
+            self.config_path,
+            default_shm_threshold=default_shm_threshold,
         )
 
         # Initialize LLM engine

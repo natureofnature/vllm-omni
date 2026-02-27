@@ -21,7 +21,6 @@ from dataclasses import fields
 from typing import Any, Literal, cast
 
 from vllm import PromptType, RequestOutput
-from vllm.inputs import TextPrompt
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
@@ -32,9 +31,6 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
-from vllm_omni.distributed.omni_connectors import build_stage_connectors
-from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector
-from vllm_omni.distributed.omni_connectors.connectors.base import OmniConnectorBase
 from vllm_omni.distributed.ray_utils.utils import kill_ray_actor, start_ray_actor
 from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs, OmniEngineArgs
 from vllm_omni.entrypoints.async_omni_diffusion import AsyncOmniDiffusion
@@ -56,7 +52,7 @@ from vllm_omni.entrypoints.zmq_utils import (
     ZmqQueue,
     create_zmq_queue,
 )
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams, OmniTokensPrompt
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType, OmniSamplingParams
 from vllm_omni.metrics import count_tokens_from_outputs
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -573,36 +569,6 @@ class OmniStage:
                 sampling_params, etc.)
         """
         assert self._in_q is not None
-
-        # [Omni] Inject global request_id into additional_information for cross-stage ID consistency
-        # This allows workers (like GPUARModelRunner) to use the global ID for side-channel
-        # operations like KV transfer, even if they use internal IDs for execution.
-        if "request_id" in payload and "engine_inputs" in payload:
-            req_id = payload["request_id"]
-            ein = payload["engine_inputs"]
-
-            # Helper to inject into additional_information
-            def _inject_global_id(target_ein):
-                # OmniTokensPrompt is a TypedDict at runtime, so we treat it as a dict
-                if isinstance(target_ein, dict):
-                    if "additional_information" not in target_ein:
-                        target_ein["additional_information"] = {}
-
-                    # Ensure additional_information is a dict before assignment
-                    # (in case it was somehow initialized as None or other type)
-                    if target_ein["additional_information"] is None:
-                        target_ein["additional_information"] = {}
-
-                    if isinstance(target_ein["additional_information"], dict):
-                        # Wrap in list because OmniInputProcessor requires Tensor or list values
-                        target_ein["additional_information"]["global_request_id"] = [str(req_id)]
-
-            if isinstance(ein, list):
-                for item in ein:
-                    _inject_global_id(item)
-            else:
-                _inject_global_id(ein)
-
         self._in_q.put(payload)
 
     def try_collect(self) -> dict[str, Any] | None:
@@ -617,78 +583,6 @@ class OmniStage:
             return self._out_q.get_nowait()
         except Exception:
             return None
-
-    def process_engine_inputs(
-        self,
-        stage_list: list[Any],
-        prompt: OmniTokensPrompt | TextPrompt = None,
-        *,
-        source_outputs_override: Any = None,
-    ) -> list[OmniTokensPrompt | TextPrompt]:
-        """Process engine inputs for this stage from upstream stage outputs.
-
-        Derives inputs for this stage from outputs of upstream stages.
-        Uses engine_input_source configuration to determine which upstream
-        stage outputs to use. Supports custom processing functions.
-
-        Args:
-            stage_list: List of all stages in the pipeline
-            prompt: Optional original prompt (for multimodal data preservation)
-            source_outputs_override: Use these outputs instead of reading from
-                the source stage's ``engine_outputs`` (for deferred CFG requests).
-
-        Returns:
-            List of processed engine inputs ready for this stage
-
-        Raises:
-            ValueError: If engine_input_source is empty or invalid
-        """
-        if self.custom_process_input_func is None:
-            engine_inputs = []
-            if len(self.engine_input_source) == 0:
-                raise ValueError("engine_input_source is empty")
-            source_stage_id = self.engine_input_source[0]
-            source_outputs = (
-                source_outputs_override
-                if source_outputs_override is not None
-                else stage_list[source_stage_id].engine_outputs
-            )
-            if not isinstance(prompt, list):
-                prompt = [prompt]
-            multi_modal_data = {
-                source_output.request_id: p.get("multi_modal_data", None)
-                for source_output, p in zip(source_outputs, prompt)
-            }
-
-            for source_output in source_outputs:
-                engine_input = OmniTokensPrompt(
-                    prompt_token_ids=source_output.outputs[0].token_ids,
-                    multi_modal_data=(
-                        multi_modal_data[source_output.request_id]
-                        if self.requires_multimodal_data and multi_modal_data
-                        else None
-                    ),
-                )
-                engine_inputs.append(engine_input)
-            return engine_inputs
-
-        else:
-            engine_input_source = self.engine_input_source
-            if source_outputs_override is not None and engine_input_source:
-                # Temporarily swap engine_outputs so custom_process_input_func
-                # (which reads stage_list directly) sees the correct data.
-                _source_id = engine_input_source[0]
-                _orig_outputs = stage_list[_source_id].engine_outputs
-                stage_list[_source_id].engine_outputs = source_outputs_override
-                try:
-                    return self.custom_process_input_func(
-                        stage_list, engine_input_source, prompt, self.requires_multimodal_data
-                    )
-                finally:
-                    stage_list[_source_id].engine_outputs = _orig_outputs
-            return self.custom_process_input_func(
-                stage_list, engine_input_source, prompt, self.requires_multimodal_data
-            )
 
 
 def _stage_worker(
@@ -802,15 +696,6 @@ def _stage_worker(
             stage_engine = OmniLLM(model=model, **engine_args)
 
     logger.debug("Engine initialized")
-    # Initialize OmniConnectors if configured
-    connectors: dict[tuple[str, str], OmniConnectorBase] | None = {}
-    if connectors_config:
-        connectors = build_stage_connectors(
-            stage_id=stage_id,
-            connectors_config=connectors_config,
-        )
-        if connectors is None:
-            return
 
     # Signal readiness to orchestrator
     try:
@@ -944,25 +829,15 @@ def _stage_worker(
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
 
-            # Resolve input data strictly via connectors if payload
-            # is larger than shm_threshold_bytes or using other connectors
-            ein, _rx_metrics = try_recv_via_connector(
-                task=t,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
-
-            if ein is None or _rx_metrics is None:
+            if t.get("from_connector"):
                 raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
+                    f"[Stage-{stage_id}] Legacy connector queue notifications "
+                    f"are no longer supported for request {rid}. "
+                    "Use seed requests plus model-runner recv_stage_inputs()."
                 )
-
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, t.get("engine_inputs"))
+            _rx_decode_ms_by_rid[rid] = 0.0
+            _rx_bytes_by_rid[rid] = 0
 
             batch_request_ids.append(rid)
 
@@ -1180,17 +1055,6 @@ async def _stage_worker_async(
     except Exception as e:
         logger.warning("Device setup failed: %s", e)
 
-    # Initialize OmniConnectors if configured to match sync worker behavior
-    connectors: dict[Any, Any] = {}
-    if connectors_config:
-        built_connectors = build_stage_connectors(
-            stage_id=stage_id,
-            connectors_config=connectors_config,
-        )
-        if built_connectors is None:
-            return
-        connectors = built_connectors
-
     # Use sequential init locks only when NVML is unavailable
     with _sequential_init_lock(engine_args, stage_init_timeout):
         # Init engine based on stage_type
@@ -1340,22 +1204,15 @@ async def _stage_worker_async(
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
         try:
-            ein, _rx_metrics = try_recv_via_connector(
-                task=task,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
-
-            if ein is None or _rx_metrics is None:
+            if task.get("from_connector"):
                 raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
+                    f"[Stage-{stage_id}] Legacy connector queue notifications "
+                    f"are no longer supported for request {rid}. "
+                    "Use seed requests plus model-runner recv_stage_inputs()."
                 )
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, task.get("engine_inputs"))
+            _rx_decode_ms_by_rid[rid] = 0.0
+            _rx_bytes_by_rid[rid] = 0
 
             logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()

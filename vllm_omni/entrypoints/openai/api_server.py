@@ -41,10 +41,7 @@ try:
     from vllm.entrypoints.serve.instrumentator.basic import base
 except ModuleNotFoundError:
     from vllm.entrypoints.openai.basic.api_router import base
-from vllm.entrypoints.openai.chat_completion.protocol import (
-    ChatCompletionRequest,
-    ChatCompletionResponse,
-)
+from vllm.entrypoints.openai.chat_completion.protocol import ChatCompletionResponse
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -88,6 +85,7 @@ from vllm_omni.entrypoints.openai.image_api_utils import (
     parse_size,
 )
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionRequest
 from vllm_omni.entrypoints.openai.protocol.images import (
     ImageData,
     ImageGenerationRequest,
@@ -768,7 +766,7 @@ def Omnispeech(request: Request) -> OmniOpenAIServingSpeech | None:
 )
 @with_cancellation
 @load_aware_call
-async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
+async def create_chat_completion(request: OmniChatCompletionRequest, raw_request: Request):
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
     if handler is None:
@@ -1006,7 +1004,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
     try:
         # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)

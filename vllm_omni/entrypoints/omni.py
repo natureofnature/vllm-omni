@@ -3,6 +3,7 @@
 import json
 import multiprocessing as mp
 import os
+import sys
 import threading
 import time
 import uuid
@@ -24,9 +25,8 @@ from vllm.v1.utils import get_engine_client_zmq_addr
 
 from vllm_omni.distributed.omni_connectors import (
     get_stage_connector_config,
-    initialize_orchestrator_connectors,
+    load_omni_transfer_config,
 )
-from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
     resolve_omni_kv_config_for_stage,
 )
@@ -39,6 +39,7 @@ from vllm_omni.entrypoints.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.entrypoints.omni_stage import OmniStage
 from vllm_omni.entrypoints.stage_utils import SHUTDOWN_TASK, OmniStageTaskType
 from vllm_omni.entrypoints.stage_utils import maybe_load_from_ipc as _load
+from vllm_omni.entrypoints.talker_prompt_utils import compute_talker_prompt_ids_length
 from vllm_omni.entrypoints.utils import (
     get_final_stage_id_for_e2e,
     inject_omni_kv_config,
@@ -321,9 +322,11 @@ class OmniBase:
         # Resolve stage configs shared by orchestrator/headless paths.
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
-        # Initialize connectors
-        self.omni_transfer_config, self.connectors = initialize_orchestrator_connectors(
-            self.config_path, worker_backend=worker_backend, shm_threshold_bytes=shm_threshold_bytes
+        # Orchestrator keeps only the serialized transfer config; stage workers own live connectors.
+        default_shm_threshold = sys.maxsize if worker_backend == "ray" else max(0, shm_threshold_bytes)
+        self.omni_transfer_config = load_omni_transfer_config(
+            self.config_path,
+            default_shm_threshold=default_shm_threshold,
         )
 
         # Initialize stats paths
@@ -1014,6 +1017,7 @@ class Omni(OmniBase):
         remaining_by_stage: list[int] = [len(request_prompts) + cfg.num_companions] + [0] * (num_stages - 1)
         completed_requests = 0
         total_requests = len(request_prompts)
+        seeded_downstream_reqs: set[str] = set()
 
         logger.debug(
             f"[{self._name}] Entering scheduling loop: total_requests={total_requests}, stages={num_stages}",
@@ -1055,7 +1059,6 @@ class Omni(OmniBase):
                             ready_parent,
                             cfg.pop_pending_parent(ready_parent),
                             self.stage_list,
-                            self.connectors,
                             sampling_params_list,
                             request_id_to_prompt,
                             final_stage_id_to_prompt,
@@ -1176,7 +1179,6 @@ class Omni(OmniBase):
                                 req_id,
                                 {"engine_outputs": engine_outputs, "stage_id": stage_id},
                                 self.stage_list,
-                                self.connectors,
                                 sampling_params_list,
                                 request_id_to_prompt,
                                 final_stage_id_to_prompt,
@@ -1194,49 +1196,43 @@ class Omni(OmniBase):
                             cfg.defer_parent(req_id, engine_outputs, stage_id)
                         continue
 
-                    next_stage: OmniStage = self.stage_list[next_stage_id]
-                    try:
-                        # Derive inputs for the next stage, record preprocess time
-                        with metrics.stage_postprocess_timer(stage_id, req_id):
-                            next_inputs = next_stage.process_engine_inputs(
-                                self.stage_list, [request_id_to_prompt[req_id]]
+                    if req_id not in seeded_downstream_reqs and stage_id == 0:
+                        seeded_downstream_reqs.add(req_id)
+                        prompt_token_ids = getattr(engine_outputs, "prompt_token_ids", None)
+                        if prompt_token_ids is None and isinstance(engine_outputs, list) and engine_outputs:
+                            prompt_token_ids = getattr(engine_outputs[0], "prompt_token_ids", None)
+                        try:
+                            next_prompt_len = (
+                                max(1, compute_talker_prompt_ids_length(prompt_token_ids)) if prompt_token_ids else 1
                             )
-                    except Exception as e:
-                        completed_requests += 1
-                        logger.exception(
-                            f"[{self._name}] Process engine inputs error for req {req_id}"
-                            f" at stage {next_stage_id}: {e} ({completed_requests}/{total_requests})",
-                        )
-                        continue
-                    sp_next = sampling_params_list[next_stage_id]  # type: ignore[index]
-
-                    # Check if we have a connector for this edge
-                    connector_key = (str(stage_id), str(next_stage_id))
-                    connector = self.connectors.get(connector_key)
-                    sent_via_connector = False
-                    if connector:
-                        sent_via_connector = try_send_via_connector(
-                            connector=connector,
-                            stage_id=stage_id,
-                            next_stage_id=next_stage_id,
-                            req_id=req_id,
-                            next_inputs=next_inputs,
-                            sampling_params=sp_next,
-                            original_prompt=request_id_to_prompt[req_id],
-                            next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                            metrics=metrics,
-                        )
-
-                    if not sent_via_connector:
-                        raise RuntimeError(
-                            f"[{self._name}] Failed to send request {req_id} to stage-{next_stage_id} via connector. "
-                            "Configure a connector for this edge or inspect connector logs for details."
-                        )
-
-                    logger.debug(
-                        f"[{self._name}] Forwarded request {req_id} to stage-{next_stage_id}",
-                    )
-                    remaining_by_stage[next_stage_id] += 1
+                        except Exception:
+                            logger.warning(
+                                "compute_talker_prompt_ids_length failed, falling back to len()",
+                                exc_info=True,
+                            )
+                            next_prompt_len = max(1, len(prompt_token_ids)) if prompt_token_ids else 1
+                        seed_input = {
+                            "prompt_token_ids": [0] * next_prompt_len,
+                            "multi_modal_data": None,
+                            "mm_processor_kwargs": None,
+                        }
+                        for ds_stage_id in range(1, final_stage_id_to_prompt[req_id] + 1):
+                            sp_ds = sampling_params_list[ds_stage_id]
+                            seed_task = {
+                                "request_id": req_id,
+                                "external_req_id": req_id,
+                                "engine_inputs": seed_input,
+                                "sampling_params": sp_ds,
+                                "from_connector": False,
+                            }
+                            self.stage_list[ds_stage_id].submit(seed_task)
+                            metrics.stage_first_ts[ds_stage_id] = metrics.stage_first_ts[ds_stage_id] or time.time()
+                            remaining_by_stage[ds_stage_id] += 1
+                            logger.debug(
+                                f"[{self._name}] Seeded stage-{ds_stage_id} for request {req_id}",
+                            )
+                    elif stage_id != 0:
+                        remaining_by_stage[next_stage_id] += 1
                 else:
                     completed_requests += 1
                     if pbar:

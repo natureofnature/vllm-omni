@@ -1025,9 +1025,9 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             else _default_query_start_loc
         )
 
-        runtime_additional_information = kwargs.get("runtime_additional_information", [])
-        if runtime_additional_information:
-            request_ids = [info.get("req_id", str(i)) for i, info in enumerate(runtime_additional_information)]
+        model_intermediate_buffer = kwargs.get("model_intermediate_buffer", [])
+        if model_intermediate_buffer:
+            request_ids = [info.get("req_id", str(i)) for i, info in enumerate(model_intermediate_buffer)]
         else:
             request_ids = [str(i) for i in range(len(query_start_loc[1:]))] if query_start_loc is not None else []
         num_reqs = len(request_ids)

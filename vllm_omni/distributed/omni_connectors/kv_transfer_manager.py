@@ -143,10 +143,7 @@ class OmniKVTransferManager:
                     c_extra = {k: v for k, v in cfg.items() if k != "type"}
                     self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
                 except Exception as e:
-                    logger.error(f"Failed to initialize OmniConnector: {e}")
-                    import traceback
-
-                    traceback.print_exc()
+                    logger.exception("Failed to initialize OmniConnector: %s", e)
                     # Cache failure sentinel to avoid repeated initialization attempts in hot paths.
                     self._connector = False
 
@@ -340,25 +337,53 @@ class OmniKVTransferManager:
 
         return key_blocks, value_blocks
 
-    def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
-        """Transfer KV cache data to downstream stage via OmniConnector.
+    def _build_rank_aware_send_keys(self, request_id: str, from_stage: str, to_stage: str) -> list[str]:
+        key_builder = getattr(self, "kv_send_key_builder", None)
+        if callable(key_builder):
+            keys = list(key_builder(request_id, from_stage, to_stage))
+            if keys:
+                return keys
+        return [f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"]
 
-        Args:
-            kv_data: The extracted KV cache data
-            transfer_req_id: The request ID to use for transfer
-        """
+    def _build_rank_aware_recv_keys(self, request_id: str, from_stage: str, to_stage: str) -> list[str]:
+        key_builder = getattr(self, "kv_recv_key_builder", None)
+        if callable(key_builder):
+            keys = list(key_builder(request_id, from_stage, to_stage))
+            if keys:
+                return keys
+        return [f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"]
+
+    def _merge_received_rank_shards(self, payloads: list[dict[str, Any]]) -> dict[str, Any] | None:
+        merger = getattr(self, "kv_payload_merger", None)
+        if callable(merger):
+            return merger(payloads)
+        return payloads[0] if payloads else None
+
+    def _slice_received_rank_shard(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        slicer = getattr(self, "kv_payload_slicer", None)
+        if callable(slicer):
+            return slicer(payload)
+        return payload
+
+    def _transfer_kv_cache(self, kv_data: KVCacheTransferData, transfer_req_id: str) -> None:
+        """Transfer KV cache data to downstream stage via OmniConnector."""
         from_stage, to_stage = self.send_stages
         if not from_stage or not to_stage:
             raise ValueError("Transfer stages (omni_from_stage, omni_to_stage) not configured")
 
-        # Prepare data and transfer with retry
         data_dict = kv_data.to_dict()
         data_dict["request_id"] = transfer_req_id
+        send_keys = self._build_rank_aware_send_keys(transfer_req_id, from_stage, to_stage)
 
-        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", data_dict)
+        total_size = 0
+        all_succeeded = True
+        for put_key in send_keys:
+            success, size, _ = self._transfer_with_retry(from_stage, to_stage, put_key, data_dict)
+            total_size += size
+            all_succeeded = all_succeeded and success
 
-        if success:
-            logger.info(f"KV transfer OK: {transfer_req_id}, {size} bytes")
+        if all_succeeded:
+            logger.info(f"KV transfer OK: {transfer_req_id}, {total_size} bytes across {len(send_keys)} key(s)")
         else:
             logger.error(f"KV transfer FAILED: {transfer_req_id}")
 
@@ -366,34 +391,21 @@ class OmniKVTransferManager:
         self,
         from_stage: str,
         to_stage: str,
-        request_id: str,
+        put_key: str,
         data: dict[str, Any],
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
-        """Transfer data with retry and exponential backoff.
-
-        Args:
-            from_stage: Source stage identifier
-            to_stage: Target stage identifier
-            request_id: Request identifier for the key
-            data: Data to transfer
-            max_retries: Maximum number of retry attempts
-
-        Returns:
-            Tuple of (success, size, metadata)
-        """
+        """Transfer data with retry and exponential backoff."""
         for attempt in range(max_retries):
             try:
-                # Build the full key for connector
-                full_request_id = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 success, size, metadata = self.connector.put(
-                    from_stage=from_stage, to_stage=to_stage, put_key=full_request_id, data=data
+                    from_stage=from_stage, to_stage=to_stage, put_key=put_key, data=data
                 )
                 if success:
                     return success, size, metadata
-                logger.warning(f"Transfer attempt {attempt + 1} failed for {request_id}")
+                logger.warning(f"Transfer attempt {attempt + 1} failed for {put_key}")
             except Exception as e:
-                logger.warning(f"Transfer attempt {attempt + 1} exception: {e}")
+                logger.warning(f"Transfer attempt {attempt + 1} exception for {put_key}: {e}")
 
             if attempt < max_retries - 1:
                 time.sleep(0.1 * (2**attempt))
@@ -433,23 +445,44 @@ class OmniKVTransferManager:
 
         timeout = self.config.recv_timeout
         start_time = time.time()
+        recv_keys = self._build_rank_aware_recv_keys(request_id, from_stage, to_stage)
+        pending_keys = list(recv_keys)
+        received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
 
-        logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
+        logger.info(
+            "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
+            request_id,
+            from_stage,
+            to_stage,
+            len(recv_keys),
+        )
 
         try:
             while True:
-                # Build the full key for connector
-                full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
-                result = self.connector.get(
-                    from_stage=from_stage,
-                    to_stage=to_stage,
-                    get_key=full_request_id,
-                )
-                if result:
+                for get_key in list(pending_keys):
+                    result = self.connector.get(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        get_key=get_key,
+                    )
+                    if not result:
+                        continue
                     data, size = result
-                    logger.info(f"Successfully received KV cache for {request_id}, {size} bytes")
+                    received_payloads[get_key] = (data, size)
+                    pending_keys.remove(get_key)
 
-                    # Move tensors to target device if specified
+                if not pending_keys and received_payloads:
+                    ordered_payloads = [received_payloads[key][0] for key in recv_keys if key in received_payloads]
+                    data = self._merge_received_rank_shards(ordered_payloads)
+                    data = self._slice_received_rank_shard(data)
+                    size = sum(received_payloads[key][1] for key in recv_keys if key in received_payloads)
+                    logger.info(
+                        "Successfully received KV cache for %s, %s bytes across %s key(s)",
+                        request_id,
+                        size,
+                        len(ordered_payloads),
+                    )
+
                     if target_device is not None and isinstance(data, dict) and "layer_blocks" in data:
                         layer_blocks = data["layer_blocks"]
                         for cache_list in [
@@ -463,16 +496,18 @@ class OmniKVTransferManager:
                     return data, size
 
                 if time.time() - start_time > timeout:
-                    logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
+                    logger.error(
+                        "Timeout waiting for KV cache for request %s after %ss; missing keys=%s",
+                        request_id,
+                        timeout,
+                        pending_keys,
+                    )
                     return None, 0
 
                 time.sleep(0.5)
 
         except Exception as e:
-            logger.error(f"Error receiving KV cache for {request_id}: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.exception("Error receiving KV cache for %s: %s", request_id, e)
             return None, 0
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
@@ -496,76 +531,3 @@ class OmniKVTransferManager:
 
         if "metadata" in data:
             req.kv_metadata = data["metadata"]
-
-    # Legacy compatibility method
-    def receive_kv_cache(self, req: Any, target_device: torch.device | None = None) -> bool:
-        """Receive KV cache and populate request object (legacy interface).
-
-        Args:
-            req: Request object with request_id attribute
-            target_device: Optional device to move tensors to
-
-        Returns:
-            True if successful, False otherwise
-        """
-        request_id = getattr(req, "request_id", None)
-        if not request_id and hasattr(req, "request_ids") and req.request_ids:
-            # Adaptation for new OmniDiffusionRequest which has list of prompts/ids
-            request_id = req.request_ids[0]
-
-        if not request_id:
-            logger.warning("Request has no ID, cannot receive KV cache")
-            return False
-
-        data, size = self.receive_kv_cache_for_request(request_id, target_device)
-        if data:
-            self.apply_kv_cache_to_request(req, data)
-            return True
-        return False
-
-    def receive_multi_kv_cache(
-        self,
-        req: Any,
-        cfg_kv_collect_func: Callable | None = None,
-        target_device: torch.device | None = None,
-    ) -> bool:
-        """Receive primary KV cache and optional CFG companion KV caches.
-
-        First receives the primary KV cache (existing logic). Then, if the
-        request carries cfg_kv_request_ids and a model-specific
-        cfg_kv_collect_func is provided, calls it to fetch and attach the
-        companion KV caches to sampling_params.
-
-        Args:
-            req: Request object with request_id and sampling_params.
-            cfg_kv_collect_func: Model-specific function for collecting
-                CFG KV caches. Signature:
-                (request_id, cfg_request_ids, kv_transfer_manager, target_device)
-                -> dict[str, Any]
-            target_device: Device to move tensors to.
-
-        Returns:
-            True if primary KV cache was received successfully.
-        """
-        primary_ok = self.receive_kv_cache(req, target_device)
-
-        cfg_ids = getattr(getattr(req, "sampling_params", None), "cfg_kv_request_ids", None)
-        if cfg_ids and cfg_kv_collect_func:
-            request_id = getattr(req, "request_id", None) or (
-                req.request_ids[0] if hasattr(req, "request_ids") and req.request_ids else None
-            )
-            try:
-                cfg_kvs = cfg_kv_collect_func(
-                    request_id,
-                    cfg_ids,
-                    self,
-                    target_device,
-                )
-                if cfg_kvs and hasattr(req, "sampling_params") and req.sampling_params is not None:
-                    for key, value in cfg_kvs.items():
-                        setattr(req.sampling_params, key, value)
-                    logger.info("Applied CFG KV caches: %s", list(cfg_kvs.keys()))
-            except Exception:
-                logger.exception("Failed to collect CFG KV caches for %s", request_id)
-
-        return primary_ok

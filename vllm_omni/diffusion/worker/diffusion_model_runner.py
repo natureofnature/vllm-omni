@@ -31,11 +31,12 @@ from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner:
+class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -65,8 +66,19 @@ class DiffusionModelRunner:
         self.cache_backend = None
         self.offload_backend = None
 
-        # Initialize KV cache manager for connector management
+        # Diffusion may use the mixin's KV receive helpers before the
+        # full connector bootstrap path runs, so seed the delegated KV manager
+        # on both the diffusion runner and the mixin-facing attribute.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self._kv_transfer_manager = self.kv_transfer_manager
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        model_config = getattr(od_config, "model_config", None) or getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            self.init_omni_connectors(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -199,8 +211,8 @@ class DiffusionModelRunner:
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache(
+            # The mixin owns the runner-facing KV receive entrypoint.
+            self.receive_multi_kv_cache(
                 req,
                 cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
                 target_device=getattr(self.pipeline, "device", None),
