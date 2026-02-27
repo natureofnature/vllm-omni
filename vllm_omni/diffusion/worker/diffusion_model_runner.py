@@ -31,11 +31,12 @@ from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.platforms import current_omni_platform
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
 
-class DiffusionModelRunner:
+class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
     """
     Model runner that handles model loading and execution for diffusion models.
 
@@ -67,6 +68,14 @@ class DiffusionModelRunner:
 
         # Initialize KV cache manager for connector management
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        model_config = getattr(od_config, "model_config", None) or getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            self.init_omni_connectors(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
 
     def load_model(
         self,

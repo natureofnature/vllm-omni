@@ -141,6 +141,43 @@ def thinker2talker_async_chunk(
     return talker_additional_info
 
 
+def thinker2talker_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Batch-mode thinker->talker processor (async-style signature).
+
+    Unlike ``thinker2talker_async_chunk`` which is called per-step,
+    this is called once when the thinker finishes processing a request.
+    It packs the complete thinker outputs into a single payload with
+    ``finished=True``.
+    """
+    embeddings = pooling_output.get("0")
+    hidden_states = pooling_output.get("24")
+    tts_bos = pooling_output.get("tts_bos_embed")
+    tts_eos = pooling_output.get("tts_eos_embed")
+    tts_pad = pooling_output.get("tts_pad_embed")
+    if any(v is None for v in (embeddings, hidden_states, tts_bos, tts_eos, tts_pad)):
+        return None
+
+    all_token_ids = request.all_token_ids
+    prompt_token_ids = request.prompt_token_ids
+    all_token_ids = _ensure_list(all_token_ids)
+    prompt_token_ids = _ensure_list(prompt_token_ids)
+
+    return {
+        "thinker_embeddings": embeddings.detach().cpu(),
+        "thinker_hidden_states": hidden_states.detach().cpu(),
+        "thinker_sequences": all_token_ids,
+        "thinker_input_ids": prompt_token_ids,
+        "tts_bos_embed": tts_bos.detach().cpu(),
+        "tts_eos_embed": tts_eos.detach().cpu(),
+        "tts_pad_embed": tts_pad.detach().cpu(),
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+
+
 def thinker2talker(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -260,6 +297,39 @@ def talker2code2wav_async_chunk(
         "finished": torch.tensor(request.is_finished(), dtype=torch.bool),
     }
     return info
+
+
+def talker2code2wav_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Batch-mode talker->code2wav processor (async-style signature).
+
+    Called once when the talker finishes processing a request.
+    Extracts codec codes from pooling_output and sends the complete
+    set with ``finished=True``.
+    """
+    if "code_predictor_codes" not in pooling_output:
+        return None
+
+    code_predictor_codes = pooling_output["code_predictor_codes"]
+    if code_predictor_codes is None:
+        return None
+    if isinstance(code_predictor_codes, torch.Tensor):
+        if code_predictor_codes.numel() == 0 or not code_predictor_codes.any():
+            return None
+    elif hasattr(code_predictor_codes, "__len__") and len(code_predictor_codes) == 0:
+        return None
+
+    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
+    if sum(codec_codes) == 0:
+        return None
+
+    return {
+        "code_predictor_codes": codec_codes,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 def talker2code2wav(

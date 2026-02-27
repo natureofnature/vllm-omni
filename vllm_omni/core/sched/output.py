@@ -78,3 +78,9 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
+    # Requests that need to be registered for chunk recv by the Model Runner's
+    # background thread. Populated by ChunkSchedulingCoordinator.
+    pending_chunk_registrations: list = field(default_factory=list)
+    # Requests that need to be registered for batch input recv by the
+    # Model Runner's background thread. Populated by OmniSchedulingCoordinator.
+    pending_input_registrations: list = field(default_factory=list)

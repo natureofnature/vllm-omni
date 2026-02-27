@@ -37,17 +37,25 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
 
 
-class GPUGenerationModelRunner(OmniGPUModelRunner):
+class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
     """Generation model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.
     - Executes generation process and returns tensors via `pooler_output`.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.init_omni_connectors(
+            vllm_config=self.vllm_config,
+            model_config=self.model_config,
+        )
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -85,6 +93,13 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        # [Omni] Register requests that need chunk/input recv
+        for request in getattr(scheduler_output, "pending_chunk_registrations", []):
+            self.register_chunk_recv(request)
+        for request in getattr(scheduler_output, "pending_input_registrations", []):
+            self.register_chunk_recv(request)
+        self.recv_stage_inputs(scheduler_output)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -104,7 +119,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 self._update_request_states(scheduler_output)
             self._update_states(scheduler_output)
             if not scheduler_output.total_num_scheduled_tokens:
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self._empty_output_with_connector_signals()
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -127,10 +142,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._empty_output_with_connector_signals()
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                if result is not None and hasattr(result, "omni_connector_output"):
+                    result.omni_connector_output = self.get_omni_connector_output()
+                return result
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -394,6 +410,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
+        output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output

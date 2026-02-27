@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# DEPRECATED: OmniChunkTransferAdapter is superseded by:
+#   - OmniConnectorModelRunnerMixin (transport side)
+#   - ChunkSchedulingCoordinator (scheduling side)
+# This module is preserved for backward compatibility and will be removed
+# once all callers migrate.
 
 import importlib
 from collections import defaultdict, deque

@@ -18,10 +18,9 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import ChunkSchedulingCoordinator
 from vllm_omni.core.sched.output import OmniSchedulerOutput
-from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
-    OmniChunkTransferAdapter,
-)
+from vllm_omni.outputs import OmniConnectorOutput
 
 logger = init_logger(__name__)
 
@@ -64,9 +63,17 @@ class OmniARScheduler(VLLMScheduler):
         # Track requests that have already triggered prefill transfer to avoid duplicates
         self.transfer_triggered_requests: set[str] = set()
         model_config = self.vllm_config.model_config
-        self.chunk_transfer_adapter = None
-        if getattr(model_config, "async_chunk", False):
-            self.chunk_transfer_adapter = OmniChunkTransferAdapter(self.vllm_config)
+        self.chunk_coordinator: ChunkSchedulingCoordinator | None = None
+        self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        stage_id = getattr(model_config, "stage_id", 0)
+        is_async_chunk = getattr(model_config, "async_chunk", False)
+        needs_coordinator = is_async_chunk or stage_id > 0
+        if needs_coordinator:
+            self.chunk_coordinator = ChunkSchedulingCoordinator(
+                scheduler_max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+                stage_id=stage_id,
+                async_chunk=is_async_chunk,
+            )
 
     def _get_kv_transfer_criteria(self) -> dict | None:
         # Note: vllm_config is available in Scheduler after super().__init__
@@ -136,15 +143,25 @@ class OmniARScheduler(VLLMScheduler):
         return False
 
     def schedule(self) -> SchedulerOutput:  # type: ignore[override]
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
+        if self.chunk_coordinator:
+            oco = self._latest_omni_connector_output
+            self.chunk_coordinator.process_pending_chunks(
+                self.waiting,
+                self.running,
+                chunk_ready_req_ids=oco.chunk_ready_req_ids if oco else set(),
+                chunk_finished_req_ids=oco.chunk_finished_req_ids if oco else set(),
+            )
+            self.chunk_coordinator.process_pending_batch_inputs(
+                self.waiting,
+                self.running,
+                stage_recv_req_ids=oco.stage_recv_req_ids if oco else set(),
+            )
 
         try:
             scheduler_output = super().schedule()
         finally:
-            if self.chunk_transfer_adapter:
-                # Add request waiting for chunk to the waiting and running queue
-                self.chunk_transfer_adapter.restore_queues(self.waiting, self.running)
+            if self.chunk_coordinator:
+                self.chunk_coordinator.restore_queues(self.waiting, self.running)
         try:
             # Late import to avoid circulars in some launch modes
             from .output import OmniNewRequestData
@@ -173,8 +190,8 @@ class OmniARScheduler(VLLMScheduler):
                 new_list.append(omni_nr)
 
             scheduler_output.scheduled_new_reqs = new_list  # type: ignore[assignment]
-            if self.chunk_transfer_adapter:
-                self.chunk_transfer_adapter.postprocess_scheduler_output(scheduler_output, self.requests)
+            if self.chunk_coordinator:
+                self.chunk_coordinator.postprocess_scheduler_output(scheduler_output, self.requests)
             # Add information about requests needing KV cache transfer
             finished_reqs = self.get_finished_requests_needing_kv_transfer()
         except Exception:
@@ -185,9 +202,13 @@ class OmniARScheduler(VLLMScheduler):
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
         base_data = {name: getattr(scheduler_output, name) for name in base_fields}
+        chunk_regs = self.chunk_coordinator.pending_chunk_registrations if self.chunk_coordinator else []
+        input_regs = self.chunk_coordinator.pending_input_registrations if self.chunk_coordinator else []
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_reqs,
+            pending_chunk_registrations=chunk_regs,
+            pending_input_registrations=input_regs,
         )
 
     def update_from_output(
@@ -352,8 +373,7 @@ class OmniARScheduler(VLLMScheduler):
                         num_nans_in_logits=request.num_nans_in_logits,
                     )
                 )
-                if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(pooler_output, request)
+                # Chunk sending is now handled by Model Runner mixin; no-op here.
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
@@ -468,6 +488,20 @@ class OmniARScheduler(VLLMScheduler):
         except Exception:
             init_logger(__name__).exception("Failed to process finished transfer requests")
 
+        # Consume OmniConnectorOutput from mixin (stores for next schedule())
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        if omni_output is not None:
+            self._latest_omni_connector_output = omni_output
+            if self.chunk_coordinator and omni_output.chunk_data:
+                self.chunk_coordinator.update_request_data(
+                    self.requests,
+                    omni_output.chunk_data,
+                    model_mode="ar",
+                )
+            # WAITING_FOR_INPUT → WAITING transitions are handled by
+            # chunk_coordinator.process_pending_batch_inputs() during
+            # the next schedule() call to keep coordinator state consistent.
+
         return engine_core_outputs
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:
@@ -542,6 +576,9 @@ class OmniARScheduler(VLLMScheduler):
         delay_free_blocks |= connector_delay_free_blocks
         if not delay_free_blocks:
             self._free_blocks(request)
+
+        if self.chunk_coordinator:
+            self.chunk_coordinator.free_finished_request(request_id)
 
         return kv_xfer_params
 

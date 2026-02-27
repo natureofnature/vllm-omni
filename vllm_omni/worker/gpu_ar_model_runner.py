@@ -36,6 +36,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
@@ -56,7 +57,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner):
+class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
@@ -73,6 +74,12 @@ class GPUARModelRunner(OmniGPUModelRunner):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        self.init_omni_connectors(
+            vllm_config=self.vllm_config,
+            model_config=self.model_config,
+            kv_transfer_manager=self.kv_transfer_manager,
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -96,14 +103,36 @@ class GPUARModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
-        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
+        # [Omni] Register requests that need chunk recv (from coordinator via scheduler_output)
+        for request in getattr(scheduler_output, "pending_chunk_registrations", []):
+            self.register_chunk_recv(request)
+
+        # [Omni] Register requests that need batch stage input recv
+        for request in getattr(scheduler_output, "pending_input_registrations", []):
+            self.register_chunk_recv(request)
+
+        # [Omni] Consume batch stage inputs that arrived via bg thread
+        self.recv_stage_inputs(scheduler_output)
+
+        # [Omni] Handle KV transfer via unified mixin (delegates to kv_transfer_manager)
+        self.kv_extracted_req_ids = self.send_kv_cache(
             finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
         )
+
+        # [Omni] Flush accumulated batch outputs for requests that finished.
+        # Use both scheduler_output.finished_req_ids (requests freed this cycle)
+        # and any stale entries in _pending_batch_send whose request is no
+        # longer tracked by the model runner.
+        if self._pending_batch_send:
+            flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+            stale = {rid for rid in self._pending_batch_send if rid not in self.requests}
+            flush_ids.update(stale)
+            if flush_ids:
+                self.flush_batch_outputs(flush_ids)
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -144,9 +173,11 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._empty_output_with_connector_signals()
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                if result is not None and hasattr(result, "omni_connector_output"):
+                    result.omni_connector_output = self.get_omni_connector_output()
+                return result
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -542,6 +573,19 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 if mm_payload:
                     payload.update(mm_payload)
             pooler_output.append(payload)
+
+        if self._async_chunk and self._custom_process_func is not None:
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if req_state is not None and pooler_output[i]:
+                    self.send_chunk(request=req_state, pooling_output=pooler_output[i])
+
+        if not self._async_chunk and self._custom_process_func is not None:
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if pooler_output[i] and req_state is not None:
+                    self.accumulate_batch_output(rid, pooler_output[i], req_state)
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -562,6 +606,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output

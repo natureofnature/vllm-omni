@@ -912,25 +912,24 @@ def _stage_worker(
             except Exception:
                 _in_flight_ms_by_rid[rid] = 0.0
 
-            # Resolve input data strictly via connectors if payload
-            # is larger than shm_threshold_bytes or using other connectors
-            ein, _rx_metrics = try_recv_via_connector(
-                task=t,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
-
-            if ein is None or _rx_metrics is None:
-                raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
+            if not t.get("from_connector") and stage_id > 0:
+                ein = t.get("engine_inputs")
+                _rx_decode_ms_by_rid[rid] = 0.0
+                _rx_bytes_by_rid[rid] = 0
+            else:
+                ein, _rx_metrics = try_recv_via_connector(
+                    task=t,
+                    connectors=connectors,
+                    stage_id=stage_id,
                 )
-
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+                ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+                if ein is None or _rx_metrics is None:
+                    raise RuntimeError(
+                        f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                        "Ensure connectors are configured for all incoming edges."
+                    )
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             batch_request_ids.append(rid)
             if isinstance(ein, (str, dict)):
@@ -1296,22 +1295,24 @@ async def _stage_worker_async(
         except Exception:
             _in_flight_ms_by_rid[rid] = 0.0
         try:
-            ein, _rx_metrics = try_recv_via_connector(
-                task=task,
-                connectors=connectors,
-                stage_id=stage_id,
-            )
-            # TODO: hack type annotation for now.
-            # A better way is to refine type annotation of connection and task/payloads, maybe using template types.
-            ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
-
-            if ein is None or _rx_metrics is None:
-                raise RuntimeError(
-                    f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
-                    "Ensure connectors are configured for all incoming edges."
+            if not task.get("from_connector") and stage_id > 0:
+                ein = task.get("engine_inputs")
+                _rx_decode_ms_by_rid[rid] = 0.0
+                _rx_bytes_by_rid[rid] = 0
+            else:
+                ein, _rx_metrics = try_recv_via_connector(
+                    task=task,
+                    connectors=connectors,
+                    stage_id=stage_id,
                 )
-            _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
-            _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
+                ein = cast(OmniPromptType | Sequence[OmniPromptType] | None, ein)
+                if ein is None or _rx_metrics is None:
+                    raise RuntimeError(
+                        f"[Stage-{stage_id}] Missing connector payload for request {rid}. "
+                        "Ensure connectors are configured for all incoming edges."
+                    )
+                _rx_decode_ms_by_rid[rid] = float(_rx_metrics.get("rx_decode_time_ms", 0.0))
+                _rx_bytes_by_rid[rid] = int(_rx_metrics.get("rx_transfer_bytes", 0))
 
             logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()

@@ -23,6 +23,9 @@ if not hasattr(RequestStatus, "WAITING_FOR_CHUNK"):
     # as a non-finished state and remains compatible with existing comparisons.
     extend_enum(RequestStatus, "WAITING_FOR_CHUNK", -1)
 
+if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
+    extend_enum(RequestStatus, "WAITING_FOR_INPUT", -2)
+
 for module_name, module in sys.modules.items():
     # only do patch on module of vllm, pass others
     if "vllm" not in module_name:
