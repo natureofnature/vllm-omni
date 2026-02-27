@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from vllm_omni.distributed.omni_connectors.adapter import try_send_via_connector
+from vllm_omni.entrypoints.talker_prompt_utils import compute_talker_prompt_ids_length
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
 
 logger = logging.getLogger(__name__)
@@ -162,72 +162,97 @@ class CfgCompanionTracker:
 
     # -- Forward parent with CFG KV --
 
+    @staticmethod
+    def _prepare_downstream_sampling_params(
+        req_id: str,
+        stage_id: int,
+        stage_list: Sequence[Any],
+        sampling_params: OmniSamplingParams,
+        cfg_request_ids: dict[str, str],
+    ) -> OmniSamplingParams:
+        prepared_params = copy.deepcopy(sampling_params)
+        if (
+            cfg_request_ids
+            and stage_id < len(stage_list)
+            and getattr(stage_list[stage_id], "stage_type", None) == "diffusion"
+            and isinstance(prepared_params, OmniDiffusionSamplingParams)
+        ):
+            prepared_params.cfg_kv_request_ids = dict(cfg_request_ids)
+            logger.info(
+                "Attaching cfg_kv_request_ids=%s to request %s for stage-%d",
+                prepared_params.cfg_kv_request_ids,
+                req_id,
+                stage_id,
+            )
+        return prepared_params
+
+    @staticmethod
+    def _build_seed_input(original_prompt: Any, engine_outputs: Any) -> dict[str, Any]:
+        prompt_token_ids = getattr(engine_outputs, "prompt_token_ids", None)
+        if prompt_token_ids is None and isinstance(engine_outputs, list) and engine_outputs:
+            prompt_token_ids = getattr(engine_outputs[0], "prompt_token_ids", None)
+
+        seed_input = copy.deepcopy(original_prompt) if isinstance(original_prompt, dict) else {"prompt_token_ids": []}
+        try:
+            next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids)) if prompt_token_ids else 1
+        except Exception:
+            logger.warning(
+                "compute_talker_prompt_ids_length failed while forwarding CFG parent; falling back to len()",
+                exc_info=True,
+            )
+            next_prompt_len = max(1, len(prompt_token_ids)) if prompt_token_ids else 1
+
+        seed_input["prompt_token_ids"] = [0] * next_prompt_len
+        seed_input["multi_modal_data"] = None
+        seed_input["mm_processor_kwargs"] = None
+        return seed_input
+
     def forward_parent_with_cfg(
         self,
         req_id: str,
         parent_result: dict[str, Any],
         stage_list: Sequence[Any],
-        connectors: dict[tuple[str, str], Any],
         sampling_params_list: Sequence[OmniSamplingParams],
         request_id_to_prompt: dict[str, Any],
         final_stage_id_to_prompt: dict[str, int],
         metrics: Any,
         remaining_by_stage: list[int],
     ) -> bool:
-        """Forward a parent request to the next stage with CFG KV request IDs attached."""
+        """Seed downstream stages for a CFG-enabled parent request.
+
+        Stage-0 already produced and sent the real stage payload via the model-runner
+        connector path. The orchestrator only needs to create the downstream seed
+        requests once all CFG companions are ready.
+        """
+
         stage_id = parent_result["stage_id"]
         next_stage_id = stage_id + 1
-        if next_stage_id > final_stage_id_to_prompt.get(req_id, 0):
+        final_stage_id = final_stage_id_to_prompt.get(req_id, 0)
+        if next_stage_id > final_stage_id:
             return True
 
-        next_stage = stage_list[next_stage_id]
-        try:
-            with metrics.stage_postprocess_timer(stage_id, req_id):
-                next_inputs = next_stage.process_engine_inputs(
-                    stage_list,
-                    [request_id_to_prompt[req_id]],
-                    source_outputs_override=parent_result["engine_outputs"],
-                )
-        except Exception as e:
-            logger.exception(
-                "Process engine inputs error for req %s at stage %d: %s",
-                req_id,
-                next_stage_id,
-                e,
-            )
-            return False
+        seed_input = self._build_seed_input(
+            request_id_to_prompt[req_id],
+            parent_result["engine_outputs"],
+        )
+        cfg_request_ids = self.get_companion_request_ids(req_id)
 
-        sp_next = copy.deepcopy(sampling_params_list[next_stage_id])
-        if isinstance(sp_next, OmniDiffusionSamplingParams):
-            sp_next.cfg_kv_request_ids = self.get_companion_request_ids(req_id)
-            logger.info(
-                "Attaching cfg_kv_request_ids=%s to request %s",
-                sp_next.cfg_kv_request_ids,
-                req_id,
-            )
-
-        connector_key = (str(stage_id), str(next_stage_id))
-        connector = connectors.get(connector_key)
-        sent_via_connector = False
-        if connector:
-            sent_via_connector = try_send_via_connector(
-                connector=connector,
-                stage_id=stage_id,
-                next_stage_id=next_stage_id,
+        for ds_stage_id in range(next_stage_id, final_stage_id + 1):
+            sp_ds = self._prepare_downstream_sampling_params(
                 req_id=req_id,
-                next_inputs=next_inputs,
-                sampling_params=sp_next,
-                original_prompt=request_id_to_prompt[req_id],
-                next_stage_queue_submit_fn=stage_list[next_stage_id].submit,
-                metrics=metrics,
+                stage_id=ds_stage_id,
+                stage_list=stage_list,
+                sampling_params=sampling_params_list[ds_stage_id],
+                cfg_request_ids=cfg_request_ids,
             )
-
-        if not sent_via_connector:
-            raise RuntimeError(
-                f"Failed to send CFG request {req_id} to stage-{next_stage_id} via connector. "
-                "Configure a connector for this edge or inspect connector logs for details."
-            )
-
-        logger.debug("Forwarded CFG-enabled request %s to stage-%d", req_id, next_stage_id)
-        remaining_by_stage[next_stage_id] += 1
+            seed_task = {
+                "request_id": req_id,
+                "engine_inputs": seed_input,
+                "sampling_params": sp_ds,
+                "from_connector": False,
+            }
+            stage_list[ds_stage_id].submit(seed_task)
+            metrics.stage_first_ts[ds_stage_id] = metrics.stage_first_ts[ds_stage_id] or time.time()
+            remaining_by_stage[ds_stage_id] += 1
+            logger.debug("Forwarded CFG-enabled request %s to stage-%d via seed task", req_id, ds_stage_id)
         return True

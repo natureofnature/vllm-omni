@@ -210,7 +210,6 @@ class Qwen2_5OmniForConditionalGeneration(
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
         sampler=None,
-        additional_information: dict[str, object] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -651,8 +650,8 @@ class Qwen2_5OmniForConditionalGeneration(
         # Rules:
         # - Prefill segments are wrapped with special tokens: [BOS][PAD...][EOS]
         # - Decode segments consist of a single non-special token.
-        # - If additional_information is provided (can be a list split by request or a
-        #   concatenated tensor plus a list of shapes), then for each request, reconstruct
+        # - If model_intermediate_buffer fields are provided (can be a list split by request
+        #   or a concatenated tensor plus a list of shapes), then for each request, reconstruct
         #   the thinker→talker input embeddings for the Prefill segments;
         # - For Decode segments, if per-request auxiliary decode embeddings are provided (optional),
         #   add them; otherwise, keep the original embedding.

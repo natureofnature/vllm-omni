@@ -3,16 +3,16 @@
 # Stage 1: Talker (text embeddings → 8-layer RVQ codec codes)
 # Stage 2: Code2Wav (8-layer RVQ codes → audio waveform)
 
-# The following config has been verified on 2x H100-80G GPUs.
+# The following config uses 3x GPUs: thinker→GPU0, talker→GPU1, code2wav→GPU2.
 async_chunk: false
 stage_args:
   - stage_id: 0
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "0"
+      max_batch_size: 64
     engine_args:
       model_stage: thinker
-      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
@@ -25,6 +25,7 @@ stage_args:
       max_num_batched_tokens: 32768
       hf_config_name: thinker_config
       tensor_parallel_size: 1
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_batch
     final_output: true
     final_output_type: text
     is_comprehension: true
@@ -41,13 +42,13 @@ stage_args:
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
       devices: "1"
+      max_batch_size: 64
     engine_args:
       model_stage: talker
-      max_num_seqs: 64
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      gpu_memory_utilization: 0.6
+      gpu_memory_utilization: 0.9
       enforce_eager: false
       trust_remote_code: true
       engine_output_type: latent  # Output codec codes for code2wav
@@ -55,6 +56,7 @@ stage_args:
       max_num_batched_tokens: 32768
       distributed_executor_backend: "mp"
       hf_config_name: talker_config
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.talker2code2wav_batch
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker
     # final_output: true
@@ -71,10 +73,10 @@ stage_args:
   - stage_id: 2
     stage_type: llm  # Use llm stage type for AR stages
     runtime:
-      devices: "1"
+      devices: "2"
+      max_batch_size: 32
     engine_args:
       model_stage: code2wav
-      max_num_seqs: 32
       model_arch: Qwen3OmniMoeForConditionalGeneration
       worker_type: generation
       scheduler_cls: vllm_omni.core.sched.omni_generation_scheduler.OmniGenerationScheduler

@@ -5,6 +5,7 @@
 
 import json
 import sys
+import warnings
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -317,7 +318,18 @@ def build_stage_connectors(
     stage_id: int,
     connectors_config: dict[str, Any],
 ) -> dict[tuple[str, str], Any] | None:
-    """Instantiate OmniConnectors for a stage based on config."""
+    """Instantiate stage-input connectors for compat callers.
+
+    .. deprecated::
+        Repo-internal runtime code should use ``get_stage_connector_config()``
+        plus ``OmniConnectorModelRunnerMixin`` initialization instead.
+    """
+    warnings.warn(
+        "build_stage_connectors is deprecated; use get_stage_connector_config() "
+        "and OmniConnectorModelRunnerMixin initialization instead",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     if not connectors_config:
         return {}
 
@@ -332,8 +344,8 @@ def build_stage_connectors(
     connectors: dict[tuple[str, str], Any] = {}
     # Convert dictionary-formatted config to ConnectorSpec objects.
     # Only instantiate INPUT connectors ("from_stage_X") — the stage worker
-    # only receives via connectors.  Output connectors are handled at the
-    # orchestrator level (try_send_via_connector uses orchestrator connectors).
+    # only receives via connectors. Legacy adapter-based send paths are not
+    # part of the active runtime flow and are intentionally not recreated here.
     stage_connector_specs = {}
     for key, config in connectors_config.items():
         if not key.startswith("from_stage_"):

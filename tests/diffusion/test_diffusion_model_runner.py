@@ -60,6 +60,7 @@ def _make_runner(cache_backend, cache_backend_name: str, enable_cache_dit_summar
         receive_kv_cache=lambda req, target_device=None: None,
         receive_multi_kv_cache=lambda req, cfg_kv_collect_func=None, target_device=None: None,
     )
+    runner._kv_transfer_manager = runner.kv_transfer_manager
     return runner
 
 
@@ -163,3 +164,32 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.cache_backend is None
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
+
+
+def test_execute_model_uses_mixin_multi_kv_receive(monkeypatch):
+    runner = _make_runner(cache_backend=None, cache_backend_name="none")
+    req = _make_request(skip_cache_refresh=True)
+    req.request_id = "req-1"
+
+    receive_calls = []
+    apply_calls = []
+
+    def _receive(request_id, target_device=None):
+        receive_calls.append((request_id, target_device))
+        return {"layer_blocks": {}}, 64
+
+    def _apply(req_obj, data):
+        apply_calls.append((req_obj, data))
+
+    runner._kv_transfer_manager = SimpleNamespace(
+        receive_kv_cache_for_request=_receive,
+        apply_kv_cache_to_request=_apply,
+    )
+
+    monkeypatch.setattr(model_runner_module, "set_forward_context", _noop_forward_context)
+
+    output = DiffusionModelRunner.execute_model(runner, req)
+
+    assert output.output == "ok"
+    assert receive_calls == [("req-1", getattr(runner.pipeline, "device", None))]
+    assert apply_calls == [(req, {"layer_blocks": {}})]

@@ -11,6 +11,12 @@ from vllm.platforms import current_platform
 
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.payload_span import (
+    THINKER_DECODE_EMBEDDINGS_KEY,
+    THINKER_DECODE_TOKEN_END_KEY,
+    THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_OUTPUT_TOKEN_IDS_KEY,
+)
 
 
 def _compute_talker_prompt_ids_length(info, device: torch.device | str = "cuda") -> int:
@@ -98,10 +104,20 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
+    request_finished = bool(request.is_finished())
+    effective_finished = bool(is_finished or request_finished)
+
+    # Finish sentinel: empty pooling_output with is_finished()=True
+    # sent when the engine-core marks the request as completed one cycle
+    # after the last real token was sampled.
+    if request_finished and pooling_output.get("0") is None:
+        return {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+
     if chunk_id == 0:
-        all_token_ids = request.all_token_ids  # prefill + decode
+        all_token_ids = request.all_token_ids
         prompt_token_ids = request.prompt_token_ids
-        # Convert ConstantList to regular list for OmniSerializer serialization
         all_token_ids = _ensure_list(all_token_ids)
         prompt_token_ids = _ensure_list(prompt_token_ids)
         talker_additional_info = {
@@ -109,14 +125,13 @@ def thinker2talker_async_chunk(
             "thinker_hidden_states": pooling_output.get("24").detach().cpu(),
             "thinker_sequences": all_token_ids,
             "thinker_input_ids": prompt_token_ids,
-            # Provide thinker-side TTS token embeddings for talker projection
             "tts_bos_embed": pooling_output.get("tts_bos_embed").detach().cpu(),
             "tts_eos_embed": pooling_output.get("tts_eos_embed").detach().cpu(),
             "tts_pad_embed": pooling_output.get("tts_pad_embed").detach().cpu(),
-            "finished": torch.tensor(is_finished, dtype=torch.bool),
+            "finished": torch.tensor(effective_finished, dtype=torch.bool),
         }
         if transfer_manager.request_payload.get(request_id) is None:
-            if not is_finished:
+            if not effective_finished:
                 transfer_manager.request_payload[request_id] = talker_additional_info
                 return None
         else:
@@ -129,26 +144,91 @@ def thinker2talker_async_chunk(
                 dim=0,
             )
             talker_additional_info["thinker_hidden_states"] = torch.cat(
-                (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
+                (
+                    save_payload.get("thinker_hidden_states"),
+                    talker_additional_info.get("thinker_hidden_states"),
+                ),
                 dim=0,
             )
+        talker_additional_info["next_stage_prompt_len"] = _compute_talker_prompt_ids_length(
+            talker_additional_info,
+            device="cpu",
+        )
     else:
         output_token_ids = request.output_token_ids
-        # Convert ConstantList to regular list for OmniSerializer serialization
         output_token_ids = _ensure_list(output_token_ids)
 
         talker_additional_info = {
-            "finished": torch.tensor(is_finished, dtype=torch.bool),
+            "finished": torch.tensor(effective_finished, dtype=torch.bool),
         }
         if output_token_ids:
-            talker_additional_info["override_keys"] = ["thinker_decode_embeddings", "thinker_output_token_ids"]
-            talker_additional_info["thinker_decode_embeddings"] = pooling_output.get("0").detach().cpu()
-            talker_additional_info["thinker_output_token_ids"] = output_token_ids
+            decode_embeddings = pooling_output.get("0").detach().cpu()
+            talker_additional_info["override_keys"] = [
+                THINKER_DECODE_EMBEDDINGS_KEY,
+                THINKER_OUTPUT_TOKEN_IDS_KEY,
+                THINKER_DECODE_TOKEN_START_KEY,
+                THINKER_DECODE_TOKEN_END_KEY,
+            ]
+            talker_additional_info[THINKER_DECODE_EMBEDDINGS_KEY] = decode_embeddings
+            talker_additional_info[THINKER_OUTPUT_TOKEN_IDS_KEY] = output_token_ids
+            token_end = len(output_token_ids)
+            token_start = token_end - int(decode_embeddings.shape[0])
+            if token_start >= 0:
+                talker_additional_info[THINKER_DECODE_TOKEN_START_KEY] = token_start
+                talker_additional_info[THINKER_DECODE_TOKEN_END_KEY] = token_end
         else:
-            # When prefilling a chunked thinker, thinker_hidden_states needs to be updated.
             talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
     return talker_additional_info
+
+
+def thinker2talker_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Batch-mode thinker->talker processor (async-style signature).
+
+    Unlike ``thinker2talker_async_chunk`` which is called per-step,
+    this is called once when the thinker finishes processing a request.
+    It packs the complete thinker outputs into a single payload with
+    ``finished=True``.
+    """
+    embeddings = pooling_output.get("0")
+    hidden_states = pooling_output.get("24")
+    tts_bos = pooling_output.get("tts_bos_embed")
+    tts_eos = pooling_output.get("tts_eos_embed")
+    tts_pad = pooling_output.get("tts_pad_embed")
+    if any(v is None for v in (embeddings, hidden_states, tts_bos, tts_eos, tts_pad)):
+        return None
+
+    if hasattr(request, "all_token_ids"):
+        all_token_ids = _ensure_list(request.all_token_ids)
+    else:
+        prompt_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+        output_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        all_token_ids = prompt_ids + output_ids
+    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+
+    # Compute next_stage_prompt_len using the full thinker_sequences
+    # This is the correct place to compute it because we have all the data
+    info = {
+        "thinker_sequences": all_token_ids,
+        "thinker_input_ids": prompt_token_ids,
+    }
+    next_stage_prompt_len = _compute_talker_prompt_ids_length(info, device="cpu")
+
+    return {
+        "thinker_prefill_embeddings": embeddings.detach().cpu(),
+        "thinker_hidden_states": hidden_states.detach().cpu(),
+        "thinker_sequences": all_token_ids,
+        "thinker_input_ids": prompt_token_ids,
+        "tts_bos_embed": tts_bos.detach().cpu(),
+        "tts_eos_embed": tts_eos.detach().cpu(),
+        "tts_pad_embed": tts_pad.detach().cpu(),
+        "next_stage_prompt_len": next_stage_prompt_len,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 def thinker2talker(
@@ -224,6 +304,33 @@ def talker2code2wav_async_chunk(
     """
     Pooling version.
     """
+
+    request_finished = bool(request.is_finished())
+    effective_finished = bool(is_finished or request_finished)
+
+    if request_finished and "code_predictor_codes" not in pooling_output:
+        request_id = request.external_req_id
+        accumulated = transfer_manager.code_prompt_token_ids.get(request_id)
+        if accumulated and len(accumulated) > 0:
+            connector = getattr(transfer_manager, "connector", None)
+            raw_cfg = getattr(connector, "config", {}) or {}
+            cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+            chunk_size = int(cfg.get("codec_chunk_frames", 25))
+            left_context_size = int(cfg.get("codec_left_context_frames", 25))
+            length = len(accumulated)
+            chunk_length = length % chunk_size
+            context_length = chunk_length if chunk_length != 0 else chunk_size
+            left_context_size = max(0, min(length - context_length, left_context_size))
+            end_index = min(length, left_context_size + context_length)
+            return {
+                "code_predictor_codes": (torch.tensor(accumulated[-end_index:]).transpose(0, 1).reshape(-1).tolist()),
+                "left_context_size": left_context_size,
+                "finished": torch.tensor(True, dtype=torch.bool),
+            }
+        return {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+
     if "code_predictor_codes" not in pooling_output:
         return None
 
@@ -260,11 +367,10 @@ def talker2code2wav_async_chunk(
     transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size_config
-    if chunk_length != 0 and not is_finished:
+    if chunk_length != 0 and not effective_finished:
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config
-    # ensure left context does not exceed available length
     left_context_size = max(0, min(length - context_length, left_context_size_config))
     end_index = min(length, left_context_size + context_length)
 
@@ -278,9 +384,42 @@ def talker2code2wav_async_chunk(
     info = {
         "code_predictor_codes": codes,
         "left_context_size": left_context_size,
-        "finished": torch.tensor(is_finished, dtype=torch.bool),
+        "finished": torch.tensor(effective_finished, dtype=torch.bool),
     }
     return info
+
+
+def talker2code2wav_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Batch-mode talker->code2wav processor (async-style signature).
+
+    Called once when the talker finishes processing a request.
+    Extracts codec codes from pooling_output and sends the complete
+    set with ``finished=True``.
+    """
+    if "code_predictor_codes" not in pooling_output:
+        return None
+
+    code_predictor_codes = pooling_output["code_predictor_codes"]
+    if code_predictor_codes is None:
+        return None
+    if isinstance(code_predictor_codes, torch.Tensor):
+        if code_predictor_codes.numel() == 0 or not code_predictor_codes.any():
+            return None
+    elif hasattr(code_predictor_codes, "__len__") and len(code_predictor_codes) == 0:
+        return None
+
+    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
+    if sum(codec_codes) == 0:
+        return None
+
+    return {
+        "code_predictor_codes": codec_codes,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
 
 
 def talker2code2wav(

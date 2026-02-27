@@ -92,12 +92,12 @@ class MammothModa2DiTPipeline(nn.Module):
             nn.Linear(in_features, out_features, bias=True),
         )
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+    def get_dummy_model_intermediate_buffer(self, num_reqs: int) -> list[dict[str, object]]:
         if num_reqs <= 0:
             raise ValueError(f"num_reqs must be positive, got {num_reqs}")
         if num_reqs > 1:
             raise NotImplementedError(
-                f"get_dummy_runtime_additional_information does not support num_reqs > 1, got {num_reqs}"
+                f"get_dummy_model_intermediate_buffer does not support num_reqs > 1, got {num_reqs}"
             )
         text_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
         image_prompt_embeds = torch.zeros((1, self._llm_hidden_size), dtype=torch.float32)
@@ -134,8 +134,8 @@ class MammothModa2DiTPipeline(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,  # noqa: ARG002
     ) -> OmniOutput:
-        runtime_addi = kwargs.get("runtime_additional_information", None)
-        info = runtime_addi[0]
+        runtime_buffer = kwargs.get("model_intermediate_buffer", None)
+        info = runtime_buffer[0]
         text_cond = info["text_prompt_embeds"]
         image_cond = info["image_prompt_embeds"]
         negative_cond = info.get("negative_prompt_embeds")

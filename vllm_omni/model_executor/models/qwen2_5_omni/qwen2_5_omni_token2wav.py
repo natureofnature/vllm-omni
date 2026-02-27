@@ -1699,6 +1699,11 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             architectures=["Qwen2_5OmniToken2WavDiTModel"],
         )
 
+        try:
+            self.codec_embed_size = self.token2wav.text_embed.codec_embed.weight.size(0)
+        except Exception:
+            self.codec_embed_size = -1
+
         # Provide placeholder to align with vLLM runner expectations
         def _empty_intermediate_tensors():
             return None
@@ -1713,6 +1718,12 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         # Token2Wav does not use sampler; return vLLM default for API parity
         return Sampler()
 
+    def _clamp_codec(self, code: torch.Tensor) -> torch.Tensor:
+        if self.codec_embed_size > 0:
+            code = code.clone()
+            code[code >= self.codec_embed_size] = 0
+        return code
+
     def forward(
         self,
         code: torch.Tensor,
@@ -1724,7 +1735,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         intermediate_tensors: IntermediateTensors | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        # Delegate to HF token2wav model
+        code = self._clamp_codec(code)
         return self.token2wav(
             code=code,
             conditioning=conditioning,
@@ -1848,6 +1859,7 @@ class Qwen2_5OmniToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
         prev_generated: torch.Tensor,
         finished: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        codec_all = self._clamp_codec(codec_all)
         mel = self.token2wav(
             code=codec_all,
             conditioning=conditioning,
