@@ -308,6 +308,10 @@ class OmniGPUModelRunner(GPUModelRunner):
             )
             self.requests[req_id] = req_state
 
+            ext_id = getattr(new_req_data, "external_req_id", None)
+            if ext_id is not None:
+                req_state.external_req_id = ext_id
+
             # If prompt embeddings are provided, decode and attach to inter_data
             try:
                 if getattr(new_req_data, "prompt_embeds", None) is not None:

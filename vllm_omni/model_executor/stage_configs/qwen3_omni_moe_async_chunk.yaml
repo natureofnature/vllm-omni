@@ -3,7 +3,7 @@
 # Stage 1: Talker (text embeddings → 16-layer RVQ codec codes)
 # Stage 2: Code2Wav (16-layer RVQ codes → audio waveform)
 
-# The following config has been verified on 2x H100-80G GPUs.
+# The following config uses 3x GPUs: thinker→GPU0, talker→GPU1, code2wav→GPU2.
 async_chunk: true
 stage_args:
   - stage_id: 0
@@ -78,7 +78,7 @@ stage_args:
   - stage_id: 2
     stage_type: llm  # Use llm stage type to launch OmniLLM
     runtime:
-      devices: "1"
+      devices: "2"
       max_batch_size: 64
     engine_args:
       model_stage: code2wav

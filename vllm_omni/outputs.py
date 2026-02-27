@@ -9,6 +9,30 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm_omni.inputs.data import OmniPromptType
 
 
+@dataclass
+class OmniConnectorOutput:
+    """Communication results from Model Runner to Scheduler.
+
+    Carries transfer readiness signals so the Scheduler can make scheduling
+    decisions without ever calling connector.put()/get() directly.
+
+    Attributes:
+        chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
+        chunk_finished_req_ids: Request IDs whose final chunk has arrived.
+        chunk_data: Chunk payloads keyed by request ID (AR: additional_information,
+            Generation: prompt_token_ids). Passed as Python object reference
+            within the same process -- no serialization overhead.
+        kv_sent_req_ids: Request IDs whose KV cache was successfully sent.
+        stage_recv_req_ids: Request IDs that received batch stage inputs.
+    """
+
+    chunk_ready_req_ids: set[str] = field(default_factory=set)
+    chunk_finished_req_ids: set[str] = field(default_factory=set)
+    chunk_data: dict[str, Any] = field(default_factory=dict)
+    kv_sent_req_ids: list[str] = field(default_factory=list)
+    stage_recv_req_ids: set[str] = field(default_factory=set)
+
+
 class OmniModelRunnerOutput(ModelRunnerOutput):
     """Model runner output for omni models.
 
@@ -24,6 +48,7 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None
+    omni_connector_output: OmniConnectorOutput | None = None
 
 
 @dataclass

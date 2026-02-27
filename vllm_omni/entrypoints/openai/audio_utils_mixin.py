@@ -47,6 +47,9 @@ class AudioMixin:
 
         audio_tensor, sample_rate = self._apply_speed_adjustment(audio_tensor, speed, sample_rate)
 
+        if audio_tensor.ndim == 1:
+            audio_tensor = audio_tensor.reshape(-1, 1)
+
         supported_formats = {
             "wav": ("WAV", "audio/wav", {}),
             "pcm": ("RAW", "audio/pcm", {"subtype": "PCM_16"}),

@@ -17,7 +17,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length, try_send_via_connector
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -418,10 +417,11 @@ class AsyncOmni(OmniBase):
                 )
                 if submit_flag and stage_id == 0:
                     submit_flag = False
-                    prompt_token_ids = engine_outputs.prompt_token_ids
-                    engine_input = copy.deepcopy(prompt)
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
+                    # Seed downstream stages with minimal placeholder prompt_token_ids
+                    # The actual length will be determined when the connector payload arrives
+                    # and update_request_data() reads next_stage_prompt_len from it
+                    engine_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
+                    engine_input["prompt_token_ids"] = [0]  # Minimal placeholder
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {
@@ -461,46 +461,26 @@ class AsyncOmni(OmniBase):
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
             stage.set_engine_outputs(engine_outputs)
-            # Forward to next stage if there is one
+            # Forward to next stage using seed-request pattern
             next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
-                next_stage: OmniStage = self.stage_list[next_stage_id]
-                # Derive inputs for the next stage, record postprocess time
-                with metrics.stage_postprocess_timer(stage_id, request_id):
-                    next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
-                sp_next: SamplingParams = sampling_params_list[next_stage_id]
-
-                # Check if we have a connector for this edge
-                connector_key = (str(stage_id), str(next_stage_id))
-                connector = self.connectors.get(connector_key)
-
-                sent_via_connector = False
-                if connector:
-                    sent_via_connector = try_send_via_connector(
-                        connector=connector,
-                        stage_id=stage_id,
-                        next_stage_id=next_stage_id,
-                        req_id=request_id,
-                        next_inputs=next_inputs,
-                        sampling_params=sp_next,
-                        original_prompt=prompt,
-                        next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
-                        metrics=metrics,
-                    )
-
-                if not sent_via_connector:
-                    # Fallback logic removed as we now enforce connector usage.
-                    # If no connector is found or send fails, we log an error and raise,
-                    # because continuing would cause the request to be silently dropped
-                    # and the orchestrator to hang waiting for completion.
-                    error_msg = (
-                        f"[{self._name}] Failed to send request {request_id} to stage-{next_stage_id} via connector. "
-                        "Configure a connector for this edge or inspect connector logs for details."
-                    )
-                    logger.error(error_msg)
-                    raise RuntimeError(error_msg)
-                logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
-            else:
+            if next_stage_id <= final_stage_id_for_e2e and stage_id == 0:
+                # Seed downstream stages with placeholder prompt_token_ids
+                # The actual length will be determined when the connector payload arrives
+                seed_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
+                seed_input["prompt_token_ids"] = [0]  # Minimal placeholder
+                seed_input["multi_modal_data"] = seed_input["mm_processor_kwargs"] = None
+                for ds_stage_id in range(1, len(self.stage_list)):
+                    sp_ds = sampling_params_list[ds_stage_id]
+                    seed_task = {
+                        "request_id": request_id,
+                        "engine_inputs": seed_input,
+                        "sampling_params": sp_ds,
+                        "from_connector": False,
+                    }
+                    self.stage_list[ds_stage_id].submit(seed_task)
+                    metrics.stage_first_ts[ds_stage_id] = metrics.stage_first_ts[ds_stage_id] or time.time()
+                logger.debug(f"[{self._name}] Seeded downstream stages for request {request_id}")
+            elif next_stage_id > final_stage_id_for_e2e:
                 logger.debug(f"[{self._name}] Request {request_id} fully completed")
 
     def _process_single_result(

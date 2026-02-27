@@ -1,3 +1,5 @@
+from typing import Any
+
 import torch
 from vllm.inputs import TextPrompt
 
@@ -6,6 +8,115 @@ from vllm_omni.inputs.data import OmniTokensPrompt
 TALKER_CODEC_PAD_TOKEN_ID = 8292
 TALKER_CODEC_START_TOKEN_ID = 8293
 TALKER_CODEC_END_TOKEN_ID = 8294
+
+
+def _ensure_list(x):
+    """Convert ConstantList / tensor-like to Python list."""
+    if hasattr(x, "_x"):
+        return list(x._x)
+    elif not isinstance(x, list):
+        return x
+    return list(x)
+
+
+# =========================
+# Batch-mode processors (new mixin path)
+# =========================
+
+
+def thinker2talker_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    """Batch-mode thinker->talker processor for Qwen2.5-Omni.
+
+    Called once when the thinker finishes.  Packs the full hidden states
+    (prompt + generated) into a dict that becomes the talker's
+    ``additional_information``.
+    """
+    hidden = pooling_output.get("hidden")
+    if hidden is None:
+        return None
+
+    if hasattr(request, "all_token_ids"):
+        prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    else:
+        prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+
+    prompt_len = len(prompt_token_ids)
+    h = hidden.detach().cpu().to(torch.float32)
+
+    # Qwen2.5: talker prompt is [START] + [PAD]*prompt_len + [END] → length = prompt_len + 2
+    next_stage_prompt_len = prompt_len + 2
+
+    payload = {
+        "thinker_result": h[prompt_len:],
+        "prompt_embeds": h[:prompt_len],
+        "prompt_token_ids": prompt_token_ids,
+        "thinker_output_token_ids": output_token_ids,
+        "thinker_result_shape": list(h[prompt_len:].shape),
+        "prompt_embeds_shape": list(h[:prompt_len].shape),
+        "next_stage_prompt_len": next_stage_prompt_len,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+
+    # Debug logging
+    print(
+        f"[DEBUG thinker2talker_batch] prompt_len={prompt_len}, "
+        f"thinker_result.shape={h[prompt_len:].shape}, "
+        f"prompt_embeds.shape={h[:prompt_len].shape}, "
+        f"output_token_ids_len={len(output_token_ids)}"
+    )
+
+    return payload
+
+
+def talker2code2wav_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    """Batch-mode talker->code2wav processor for Qwen2.5-Omni.
+
+    The talker's sampled token IDs are the codec codes.  We pass them
+    through so that ``update_request_data`` can set them as the code2wav
+    stage's ``prompt_token_ids``.
+    """
+    output_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    if not output_ids:
+        return None
+
+    # Remove end token if present (8294)
+    if output_ids and output_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
+        output_ids = output_ids[:-1]
+
+    # Filter out special tokens: start (8293), pad (8292), mask (8296), and negative values
+    # Valid codec tokens are in range [0, 8291] (vocab_size=8448, but codec range is smaller)
+    filtered_ids = []
+    for tid in output_ids:
+        if tid >= 0 and tid < TALKER_CODEC_PAD_TOKEN_ID:  # < 8292
+            filtered_ids.append(tid)
+
+    # Debug logging
+    print(
+        f"[DEBUG talker2code2wav_batch] original_len={len(output_ids)}, "
+        f"filtered_len={len(filtered_ids)}, "
+        f"first_10={filtered_ids[:10] if len(filtered_ids) >= 10 else filtered_ids}, "
+        f"last_10={filtered_ids[-10:] if len(filtered_ids) >= 10 else filtered_ids}"
+    )
+
+    return {
+        "code_predictor_codes": filtered_ids,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+
+
+# =========================
+# Old orchestrator-style processors
+# =========================
 
 
 def thinker2talker(

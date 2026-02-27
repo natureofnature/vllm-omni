@@ -369,7 +369,12 @@ class Qwen3OmniMoeForConditionalGeneration(
                         left_context_size.append(info["left_context_size"])
             else:
                 logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, voice_type, left_context_size, seq_token_counts)
+            audio_tensors = self.generate_audio(
+                codes,
+                voice_type,
+                left_context_size,
+                seq_token_counts,
+            )
 
             return audio_tensors
 
@@ -611,7 +616,12 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
-        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + span_len
+        if self.vllm_config.model_config.async_chunk and span_len == 1:
+            token_advance = 1 if update_dict.pop("_advance_num_processed_tokens", False) else 0
+        else:
+            token_advance = span_len
+        next_num_processed = info_dict.get("num_processed_tokens", 0) + token_advance
+        update_dict["num_processed_tokens"] = next_num_processed
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -888,18 +898,35 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict,
     ):
         """
-        Project thinker outputs to talker inputs during prefill stage.
+        Project thinker outputs to talker inputs during decode stage.
         Returns:
-            (input_ids, input_embeds) for talker
+            projected embed for one decode step
         """
         cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
         thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
+
+        # Batched delivery: multiple embeds arrived as [N, H].
+        # Pre-cache them so the per-step logic below always sees
+        # at most a single new embed (or None).
+        if thinker_decode_embed is not None and thinker_decode_embed.ndim >= 2 and thinker_decode_embed.shape[0] > 1:
+            thinker_decode_embed = thinker_decode_embed.to(device)
+            if cached_thinker_decode_embeds is None:
+                cached_thinker_decode_embeds = thinker_decode_embed
+            else:
+                cached_thinker_decode_embeds = torch.cat(
+                    [cached_thinker_decode_embeds.to(device), thinker_decode_embed], dim=0
+                )
+            update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
+            thinker_decode_embed = None
+
         start_index = info_dict.get("num_processed_tokens", 0)
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
         if start_index >= len(thinker_output_token_ids) - 1:
             if info_dict.get("finished_flag"):
+                update_dict["_advance_num_processed_tokens"] = False
                 return self.tts_pad_embed.to(device)
             update_dict["finished_flag"] = True
+            update_dict["_advance_num_processed_tokens"] = False
             return self.tts_eos_embed.to(device)
         if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
             cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
@@ -909,7 +936,13 @@ class Qwen3OmniMoeForConditionalGeneration(
                 cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
                 update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
         else:
-            thinker_embed = thinker_decode_embed.to(device)
+            if thinker_decode_embed is None:
+                update_dict["_advance_num_processed_tokens"] = False
+                update_dict["thinker_decode_embeddings"] = None
+                return self.tts_pad_embed.to(device)
+            else:
+                thinker_embed = thinker_decode_embed.to(device)
+        update_dict["_advance_num_processed_tokens"] = True
         update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
