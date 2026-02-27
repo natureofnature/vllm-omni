@@ -39,17 +39,26 @@ from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = logging.getLogger(__name__)
 
 
-class GPUGenerationModelRunner(OmniGPUModelRunner):
+class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
     """Generation model runner for vLLM-Omni (non-autoregressive).
 
     - Reuses GPUModelRunner preparation, multimodal handling, and TP/PP/DP glue.
     - Does not compute logits or perform token sampling.
     - Executes generation process and returns tensors via `pooler_output`.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._idle_log_counter: int = 0
+        self.init_omni_connectors(
+            vllm_config=self.vllm_config,
+            model_config=self.model_config,
+        )
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -87,6 +96,30 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
+        n_scheduled = scheduler_output.total_num_scheduled_tokens
+        if n_scheduled or self._idle_log_counter % 5000 == 0:
+            logger.info(
+                "[Stage-%s] execute_model: total_scheduled=%s, pending_chunk=%s, pending_input=%s (idle_count=%s)",
+                getattr(self, "_stage_id", "?"),
+                n_scheduled,
+                len(getattr(scheduler_output, "pending_chunk_registrations", [])),
+                len(getattr(scheduler_output, "pending_input_registrations", [])),
+                self._idle_log_counter,
+            )
+
+        # [Omni] Register requests that need chunk/input recv
+        chunk_registrations = list(getattr(scheduler_output, "pending_chunk_registrations", []))
+        input_registrations = list(getattr(scheduler_output, "pending_input_registrations", []))
+        for request in chunk_registrations:
+            self.register_chunk_recv(request)
+        for request in input_registrations:
+            self.register_chunk_recv(request)
+        self.recv_stage_inputs(scheduler_output)
+        finished_req_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+        if finished_req_ids:
+            for req_id in finished_req_ids:
+                self.cleanup_finished_request(req_id)
+
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -105,8 +138,18 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             if self.model_config.async_chunk and num_scheduled_tokens:
                 self._update_request_states(scheduler_output)
             self._update_states(scheduler_output)
+            protected_req_ids = set(self.requests.keys())
+            protected_req_ids.update(
+                req_id
+                for req_id in (
+                    getattr(request, "request_id", None) for request in chunk_registrations + input_registrations
+                )
+                if req_id is not None
+            )
+            self.prune_inactive_requests(protected_req_ids)
             if not scheduler_output.total_num_scheduled_tokens:
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                self._idle_log_counter += 1
+                return self._empty_output_with_connector_signals()
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -129,10 +172,9 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                     # is called into to avoid out of sync issues.
                     self._dummy_run(1)
                 if not has_kv_transfer_group():
-                    # Return empty ModelRunnerOutput if no work to do.
-                    return EMPTY_MODEL_RUNNER_OUTPUT
-
-                return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                    return self._empty_output_with_connector_signals()
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                return self.attach_omni_connector_output(result)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -255,6 +297,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
 
+            self._maybe_dump_execute_model_snapshot(
+                scheduler_output=scheduler_output,
+                num_scheduled_tokens_np=num_scheduled_tokens_np,
+                input_ids=input_ids,
+                inputs_embeds=inputs_embeds,
+                positions=positions,
+                model_kwargs=model_kwargs,
+            )
+
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
         # with CUDA graph capture.
@@ -284,6 +335,12 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 scheduler_output, clear_metadata=clear_kv_metadata
             ) as kv_connector_output,
         ):
+            logger.info(
+                "[Stage-%s] execute_model: entering _run_generation_model, num_tokens=%s, num_reqs=%s",
+                getattr(self, "_stage_id", "?"),
+                num_tokens_unpadded,
+                num_reqs,
+            )
             outputs = self._run_generation_model(
                 input_ids=input_ids,
                 positions=positions,
@@ -291,6 +348,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
                 inputs_embeds=inputs_embeds,
                 model_kwargs=model_kwargs,
                 logits_indices=logits_indices,
+            )
+            logger.info(
+                "[Stage-%s] execute_model: _run_generation_model returned, type=%s",
+                getattr(self, "_stage_id", "?"),
+                type(outputs).__name__,
             )
 
         _, multimodal_outputs = self.extract_multimodal_outputs(outputs)
@@ -315,9 +377,11 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
         self,
         grammar_output: GrammarOutput | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        # NOTE: Even though the model is non-autoregressive, we still need
-        # this function to match the interface of the engine core.
-        # In this case, this function
+        logger.info(
+            "[Stage-%s] sample_tokens: called, has_state=%s",
+            getattr(self, "_stage_id", "?"),
+            self.execute_model_state is not None,
+        )
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
@@ -329,7 +393,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return copy(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
@@ -404,6 +468,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             num_nans_in_logits={},
             cudagraph_stats=cudagraph_stats,
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
+        )
+        output.omni_connector_output = self.get_omni_connector_output()
+        logger.info(
+            "[Stage-%s] sample_tokens: output ready, req_ids=%s, pooler_len=%s, async=%s",
+            getattr(self, "_stage_id", "?"),
+            output.req_ids,
+            len(output.pooler_output),
+            self.use_async_scheduling,
         )
 
         if not self.use_async_scheduling:
@@ -676,12 +748,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner):
             # Some generation-stage models (e.g. MammothModa2DiTPipeline) require
             # model-specific runtime information (such as image size and conditioning
             # embeddings) even during the dummy profiling run that vLLM uses to
-            # estimate KV-cache capacity.  get_dummy_runtime_additional_information
-            # provides placeholder values of the correct shape so that the profiling
-            # run does not raise an error due to missing inputs.
-            if hasattr(self.model, "get_dummy_runtime_additional_information"):
-                runtime_addi = self.model.get_dummy_runtime_additional_information(num_reqs)
-                model_kwargs["runtime_additional_information"] = runtime_addi
+            # estimate KV-cache capacity. Provide placeholder values through the
+            # same model_intermediate_buffer contract used in real execution.
+            if hasattr(self.model, "get_dummy_model_intermediate_buffer"):
+                model_kwargs["model_intermediate_buffer"] = self.model.get_dummy_model_intermediate_buffer(num_reqs)
 
             if self.uses_mrope:
                 positions = self.mrope_positions.gpu[:, :num_tokens_padded]

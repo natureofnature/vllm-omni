@@ -1,5 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# DEPRECATED: OmniChunkTransferAdapter is superseded by:
+#   - OmniConnectorModelRunnerMixin (transport side)
+#   - ChunkSchedulingCoordinator (scheduling side)
+# This module is preserved for backward compatibility and will be removed
+# once all callers migrate.
 
 import importlib
 from collections import defaultdict, deque
@@ -150,7 +156,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
             if self.model_mode == "ar":
                 self._update_request_payload(external_req_id, payload_data)
-                request.additional_information = payload_data
                 if payload_data.get("finished"):
                     self.finished_requests.add(req_id)
             else:
@@ -328,24 +333,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         requests: dict[str, Request] | None = None,
     ) -> None:
         """
-        Add additional info for cached requests and
-        clean up ready chunks from scheduler output.
+        Clean up ready chunks from scheduler output.
         """
-        if requests is not None:
-            self.attach_cached_additional_information(scheduler_output, requests)
         self._clear_chunk_ready(scheduler_output)
-
-    @staticmethod
-    def attach_cached_additional_information(scheduler_output: Any, requests: dict[str, Request]) -> None:
-        cached_reqs = getattr(scheduler_output, "scheduled_cached_reqs", None)
-        if not cached_reqs:
-            return
-        if not hasattr(cached_reqs, "additional_information"):
-            cached_reqs.additional_information = {}
-        for req_id in cached_reqs.req_ids:
-            request = requests.get(req_id) if req_id else None
-            additional_info = getattr(request, "additional_information", None) if request else None
-            cached_reqs.additional_information[req_id] = additional_info
 
     def _process_chunk_queue(
         self,

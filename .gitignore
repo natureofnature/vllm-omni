@@ -152,6 +152,7 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+debug_artifacts/
 
 # Claude
 CLAUDE.md

@@ -13,7 +13,6 @@ except ImportError:
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec, OmniTransferConfig
 from .utils.initialization import (
-    build_stage_connectors,
     get_connectors_config_for_stage,
     get_stage_connector_config,
     initialize_connectors_from_config,
@@ -46,5 +45,4 @@ __all__ = [
     # Manager helpers
     "initialize_orchestrator_connectors",
     "get_stage_connector_config",
-    "build_stage_connectors",
 ]

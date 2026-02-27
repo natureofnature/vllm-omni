@@ -378,7 +378,6 @@ class CosyVoice3Model(
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
-        additional_information: dict[str, object] | None = None,
         **kwargs: object,
     ) -> OmniOutput:
         if self.model_stage == "talker":
@@ -400,7 +399,7 @@ class CosyVoice3Model(
 
             return OmniOutput(text_hidden_states=hidden_states, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "code2wav":
-            runtime_info = kwargs.get("runtime_additional_information", [])
+            runtime_info = kwargs.get("model_intermediate_buffer", [])
             if not runtime_info:
                 length = 30 * 24000
                 audio = np.zeros((length,))
