@@ -68,6 +68,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._ar_log_counter: int = 0
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
@@ -114,6 +115,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # [Omni] Consume batch stage inputs that arrived via bg thread
         self.recv_stage_inputs(scheduler_output)
 
+        self._ar_log_counter += 1
+        _finished = list(getattr(scheduler_output, "finished_req_ids", set()))
+        if _finished or self._ar_log_counter % 5000 == 1:
+            logger.info(
+                "[Stage-%s AR] execute_model: scheduled=%s, "
+                "pending_batch_send=%s, req_count=%s, "
+                "finished_req_ids=%s (call#%s)",
+                getattr(self, "_stage_id", "?"),
+                scheduler_output.total_num_scheduled_tokens,
+                list(self._pending_batch_send.keys()),
+                len(self.requests),
+                _finished[:5],
+                self._ar_log_counter,
+            )
+
         # [Omni] Handle KV transfer via unified mixin (delegates to kv_transfer_manager)
         self.kv_extracted_req_ids = self.send_kv_cache(
             finished_reqs=getattr(scheduler_output, "finished_requests_needing_kv_transfer", {}),
@@ -132,6 +148,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             stale = {rid for rid in self._pending_batch_send if rid not in self.requests}
             flush_ids.update(stale)
             if flush_ids:
+                logger.info(
+                    "[Stage-%s AR] flush_batch_outputs: flushing %s (from finished=%s, stale=%s)",
+                    getattr(self, "_stage_id", "?"),
+                    flush_ids,
+                    set(getattr(scheduler_output, "finished_req_ids", set())),
+                    stale,
+                )
                 self.flush_batch_outputs(flush_ids)
 
         if self.vllm_config.model_config.enable_return_routed_experts:
@@ -151,6 +174,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ):
             # Update persistent batch states.
             self._update_states(scheduler_output)
+
+            # [Omni] Post-update stale flush: requests removed by
+            # _update_states are now detectable as stale.
+            if self._pending_batch_send:
+                stale = {rid for rid in self._pending_batch_send if rid not in self.requests}
+                if stale:
+                    logger.info("[Stage-%s AR] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
+                    self.flush_batch_outputs(stale)
 
             if has_ec_transfer() and get_ec_transfer().is_producer:
                 with self.maybe_get_ec_connector_output(
@@ -556,6 +587,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     try:
                         if isinstance(v, torch.Tensor) and v.shape[0] == hidden_states_cpu.shape[0]:
                             mm_payload[k] = v.detach().to("cpu")[start:end].contiguous()
+                        elif isinstance(v, torch.Tensor):
+                            mm_payload[k] = v.detach().to("cpu").contiguous()
                         elif isinstance(v, dict):
                             sub_dict: dict[str, torch.Tensor] = {}
                             for sk, sv in v.items():
@@ -575,16 +608,38 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             pooler_output.append(payload)
 
         if self._async_chunk and self._custom_process_func is not None:
+            _chunk_sent = 0
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
                 if req_state is not None and pooler_output[i]:
                     self.send_chunk(request=req_state, pooling_output=pooler_output[i])
+                    _chunk_sent += 1
+            if _chunk_sent and self._ar_log_counter % 5000 == 1:
+                logger.info(
+                    "[Stage-%s AR] sample_tokens: sent %s chunks (async_chunk)",
+                    getattr(self, "_stage_id", "?"),
+                    _chunk_sent,
+                )
+        elif self._async_chunk:
+            if self._ar_log_counter == 1:
+                logger.warning(
+                    "[Stage-%s AR] sample_tokens: async_chunk=True but custom_process_func=%s",
+                    getattr(self, "_stage_id", "?"),
+                    self._custom_process_func,
+                )
 
         if not self._async_chunk and self._custom_process_func is not None:
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
                 if pooler_output[i] and req_state is not None:
                     self.accumulate_batch_output(rid, pooler_output[i], req_state)
+            if self._ar_log_counter % 5000 == 1:
+                logger.info(
+                    "[Stage-%s AR] sample_tokens: accumulated batch for %s reqs, pending_batch_send=%s",
+                    getattr(self, "_stage_id", "?"),
+                    len(req_ids_output_copy),
+                    list(self._pending_batch_send.keys()),
+                )
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.model_config.enable_return_routed_experts:

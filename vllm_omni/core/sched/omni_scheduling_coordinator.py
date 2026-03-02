@@ -111,6 +111,9 @@ class OmniSchedulingCoordinator:
             return
 
         self._batch_input_received.update(stage_recv_req_ids)
+        if not self._async_chunk and stage_recv_req_ids:
+            self.finished_requests.update(stage_recv_req_ids)
+            logger.info("[Coordinator stage-%s] batch recv → finished_requests: %s", self._stage_id, stage_recv_req_ids)
         self.pending_input_registrations = []
 
         remaining: deque[Any] = deque()

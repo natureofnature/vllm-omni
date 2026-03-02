@@ -19,6 +19,8 @@ from vllm_omni.core.sched.omni_scheduling_coordinator import ChunkSchedulingCoor
 from vllm_omni.core.sched.output import OmniCachedRequestData, OmniNewRequestData, OmniSchedulerOutput
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 
+logger = init_logger(__name__)
+
 
 class OmniGenerationScheduler(VLLMScheduler):
     def __init__(self, *args, **kwargs):
@@ -67,16 +69,31 @@ class OmniGenerationScheduler(VLLMScheduler):
         req_index = 0
         if self.chunk_coordinator:
             oco = self._latest_omni_connector_output
+            _sr = oco.stage_recv_req_ids if oco else set()
+            _cf = oco.chunk_finished_req_ids if oco else set()
+            if _sr or _cf or not hasattr(self, "_gen_sched_log_ctr"):
+                self._gen_sched_log_ctr = getattr(self, "_gen_sched_log_ctr", 0)
+                logger.info(
+                    "[GenSched] schedule: stage_recv=%s, chunk_finished=%s, "
+                    "waiting=%s, running=%s, finished_reqs=%s, "
+                    "waiting_for_input=%s",
+                    _sr,
+                    _cf,
+                    len(self.waiting),
+                    len(self.running),
+                    self.chunk_coordinator.finished_requests,
+                    len(self.chunk_coordinator._waiting_for_input),
+                )
             self.chunk_coordinator.process_pending_chunks(
                 self.waiting,
                 self.running,
                 chunk_ready_req_ids=oco.chunk_ready_req_ids if oco else set(),
-                chunk_finished_req_ids=oco.chunk_finished_req_ids if oco else set(),
+                chunk_finished_req_ids=_cf,
             )
             self.chunk_coordinator.process_pending_batch_inputs(
                 self.waiting,
                 self.running,
-                stage_recv_req_ids=oco.stage_recv_req_ids if oco else set(),
+                stage_recv_req_ids=_sr,
             )
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
@@ -560,6 +577,13 @@ class OmniGenerationScheduler(VLLMScheduler):
         # Consume OmniConnectorOutput from mixin (stores for next schedule())
         omni_output = getattr(model_runner_output, "omni_connector_output", None)
         if omni_output is not None:
+            if omni_output.stage_recv_req_ids or omni_output.chunk_finished_req_ids:
+                logger.info(
+                    "[GenSched] update_from_output: recv stage_recv=%s, chunk_finished=%s, chunk_data_keys=%s",
+                    omni_output.stage_recv_req_ids,
+                    omni_output.chunk_finished_req_ids,
+                    list(omni_output.chunk_data.keys()) if omni_output.chunk_data else [],
+                )
             self._latest_omni_connector_output = omni_output
             if self.chunk_coordinator and omni_output.chunk_data:
                 self.chunk_coordinator.update_request_data(

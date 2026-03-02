@@ -161,10 +161,13 @@ def thinker2talker_batch(
     if any(v is None for v in (embeddings, hidden_states, tts_bos, tts_eos, tts_pad)):
         return None
 
-    all_token_ids = request.all_token_ids
-    prompt_token_ids = request.prompt_token_ids
-    all_token_ids = _ensure_list(all_token_ids)
-    prompt_token_ids = _ensure_list(prompt_token_ids)
+    if hasattr(request, "all_token_ids"):
+        all_token_ids = _ensure_list(request.all_token_ids)
+    else:
+        prompt_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+        output_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        all_token_ids = prompt_ids + output_ids
+    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
 
     return {
         "thinker_embeddings": embeddings.detach().cpu(),
