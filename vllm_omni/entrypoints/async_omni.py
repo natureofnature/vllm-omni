@@ -17,7 +17,6 @@ from vllm.v1.engine.exceptions import EngineDeadError
 
 from vllm_omni.config import OmniModelConfig
 from vllm_omni.diffusion.data import DiffusionParallelConfig
-from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.distributed.ray_utils.utils import try_close_ray
 from vllm_omni.engine.input_processor import OmniInputProcessor
 from vllm_omni.entrypoints.client_request_state import ClientRequestState
@@ -400,11 +399,9 @@ class AsyncOmni(OmniBase):
                 if submit_flag and stage_id == 0:
                     submit_flag = False
                     prompt_token_ids = engine_outputs.prompt_token_ids
-                    try:
-                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                    except Exception:
-                        logger.warning("compute_talker_prompt_ids_length failed, falling back to len()", exc_info=True)
-                        next_prompt_len = max(1, len(prompt_token_ids)) if prompt_token_ids else 1
+                    # Phase 1 fix: Qwen2.5-Omni requires P+2 length (adds voice_spk+pad and output+bos tokens)
+                    # Old compute_talker_prompt_ids_length() uses Qwen3-specific token IDs
+                    next_prompt_len = len(prompt_token_ids) + 2 if prompt_token_ids else 1
                     engine_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
                     engine_input["prompt_token_ids"] = [0] * next_prompt_len
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
@@ -452,13 +449,9 @@ class AsyncOmni(OmniBase):
                 prompt_token_ids = getattr(
                     engine_outputs[0] if isinstance(engine_outputs, list) else engine_outputs, "prompt_token_ids", None
                 )
-                try:
-                    next_prompt_len = (
-                        max(1, compute_talker_prompt_ids_length(prompt_token_ids)) if prompt_token_ids else 1
-                    )
-                except Exception:
-                    logger.warning("compute_talker_prompt_ids_length failed, falling back to len()", exc_info=True)
-                    next_prompt_len = max(1, len(prompt_token_ids)) if prompt_token_ids else 1
+                # Phase 1 fix: Qwen2.5-Omni requires P+2 length (adds voice_spk+pad and output+bos tokens)
+                # Old compute_talker_prompt_ids_length() uses Qwen3-specific token IDs
+                next_prompt_len = len(prompt_token_ids) + 2 if prompt_token_ids else 1
                 seed_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
                 seed_input["prompt_token_ids"] = [0] * next_prompt_len
                 seed_input["multi_modal_data"] = seed_input["mm_processor_kwargs"] = None

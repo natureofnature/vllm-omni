@@ -49,14 +49,25 @@ def thinker2talker_batch(
     prompt_len = len(prompt_token_ids)
     h = hidden.detach().cpu().to(torch.float32)
 
-    return {
+    payload = {
         "thinker_result": h[prompt_len:],
         "prompt_embeds": h[:prompt_len],
         "prompt_token_ids": prompt_token_ids,
         "thinker_output_token_ids": output_token_ids,
         "thinker_result_shape": list(h[prompt_len:].shape),
         "prompt_embeds_shape": list(h[:prompt_len].shape),
+        "finished": torch.tensor(True, dtype=torch.bool),
     }
+
+    # Debug logging
+    print(
+        f"[DEBUG thinker2talker_batch] prompt_len={prompt_len}, "
+        f"thinker_result.shape={h[prompt_len:].shape}, "
+        f"prompt_embeds.shape={h[:prompt_len].shape}, "
+        f"output_token_ids_len={len(output_token_ids)}"
+    )
+
+    return payload
 
 
 def talker2code2wav_batch(
@@ -74,11 +85,27 @@ def talker2code2wav_batch(
     if not output_ids:
         return None
 
-    if output_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
+    # Remove end token if present (8294)
+    if output_ids and output_ids[-1] == TALKER_CODEC_END_TOKEN_ID:
         output_ids = output_ids[:-1]
 
+    # Filter out special tokens: start (8293), pad (8292), mask (8296), and negative values
+    # Valid codec tokens are in range [0, 8291] (vocab_size=8448, but codec range is smaller)
+    filtered_ids = []
+    for tid in output_ids:
+        if tid >= 0 and tid < TALKER_CODEC_PAD_TOKEN_ID:  # < 8292
+            filtered_ids.append(tid)
+
+    # Debug logging
+    print(
+        f"[DEBUG talker2code2wav_batch] original_len={len(output_ids)}, "
+        f"filtered_len={len(filtered_ids)}, "
+        f"first_10={filtered_ids[:10] if len(filtered_ids) >= 10 else filtered_ids}, "
+        f"last_10={filtered_ids[-10:] if len(filtered_ids) >= 10 else filtered_ids}"
+    )
+
     return {
-        "code_predictor_codes": output_ids,
+        "code_predictor_codes": filtered_ids,
         "finished": torch.tensor(True, dtype=torch.bool),
     }
 
