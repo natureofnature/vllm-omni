@@ -184,11 +184,34 @@ class OmniSchedulingCoordinator:
 
         For AR mode: writes to ``request.additional_information``.
         For Generation mode: updates ``request.prompt_token_ids``.
+
+        Additionally, if the payload contains ``next_stage_prompt_len``,
+        updates the request's ``prompt_token_ids`` to the correct length.
         """
         for req_id, payload in chunk_data.items():
             request = requests.get(req_id)
             if request is None:
                 continue
+
+            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni)
+            if "next_stage_prompt_len" in payload:
+                next_len = payload["next_stage_prompt_len"]
+                if isinstance(next_len, int) and next_len > 0:
+                    new_prompt = [0] * next_len
+                    request.prompt_token_ids = new_prompt
+                    request.num_prompt_tokens = next_len
+                    # Reset internal token tracking to match new prompt
+                    # Must clear in-place to keep ConstantList wrappers valid
+                    request._all_token_ids.clear()
+                    request._all_token_ids.extend(new_prompt)
+                    request._output_token_ids.clear()
+                    request.num_computed_tokens = 0
+                    logger.info(
+                        "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
+                        self._stage_id,
+                        next_len,
+                        req_id,
+                    )
 
             if model_mode == "ar":
                 request.additional_information = payload

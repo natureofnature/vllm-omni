@@ -398,12 +398,11 @@ class AsyncOmni(OmniBase):
                 )
                 if submit_flag and stage_id == 0:
                     submit_flag = False
-                    prompt_token_ids = engine_outputs.prompt_token_ids
-                    # Phase 1 fix: Qwen2.5-Omni requires P+2 length (adds voice_spk+pad and output+bos tokens)
-                    # Old compute_talker_prompt_ids_length() uses Qwen3-specific token IDs
-                    next_prompt_len = len(prompt_token_ids) + 2 if prompt_token_ids else 1
+                    # Seed downstream stages with minimal placeholder prompt_token_ids
+                    # The actual length will be determined when the connector payload arrives
+                    # and update_request_data() reads next_stage_prompt_len from it
                     engine_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
-                    engine_input["prompt_token_ids"] = [0] * next_prompt_len
+                    engine_input["prompt_token_ids"] = [0]  # Minimal placeholder
                     engine_input["multi_modal_data"] = engine_input["mm_processor_kwargs"] = None
                     for i in range(1, len(self.stage_list)):
                         task = {
@@ -446,14 +445,10 @@ class AsyncOmni(OmniBase):
             # Forward to next stage using seed-request pattern
             next_stage_id = stage_id + 1
             if next_stage_id <= final_stage_id_for_e2e and stage_id == 0:
-                prompt_token_ids = getattr(
-                    engine_outputs[0] if isinstance(engine_outputs, list) else engine_outputs, "prompt_token_ids", None
-                )
-                # Phase 1 fix: Qwen2.5-Omni requires P+2 length (adds voice_spk+pad and output+bos tokens)
-                # Old compute_talker_prompt_ids_length() uses Qwen3-specific token IDs
-                next_prompt_len = len(prompt_token_ids) + 2 if prompt_token_ids else 1
+                # Seed downstream stages with placeholder prompt_token_ids
+                # The actual length will be determined when the connector payload arrives
                 seed_input = copy.deepcopy(prompt) if isinstance(prompt, dict) else {"prompt_token_ids": []}
-                seed_input["prompt_token_ids"] = [0] * next_prompt_len
+                seed_input["prompt_token_ids"] = [0]  # Minimal placeholder
                 seed_input["multi_modal_data"] = seed_input["mm_processor_kwargs"] = None
                 for ds_stage_id in range(1, len(self.stage_list)):
                     sp_ds = sampling_params_list[ds_stage_id]

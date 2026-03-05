@@ -169,6 +169,14 @@ def thinker2talker_batch(
         all_token_ids = prompt_ids + output_ids
     prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
 
+    # Compute next_stage_prompt_len using the full thinker_sequences
+    # This is the correct place to compute it because we have all the data
+    info = {
+        "thinker_sequences": all_token_ids,
+        "thinker_input_ids": prompt_token_ids,
+    }
+    next_stage_prompt_len = _compute_talker_prompt_ids_length(info, device="cpu")
+
     return {
         "thinker_embeddings": embeddings.detach().cpu(),
         "thinker_hidden_states": hidden_states.detach().cpu(),
@@ -177,6 +185,7 @@ def thinker2talker_batch(
         "tts_bos_embed": tts_bos.detach().cpu(),
         "tts_eos_embed": tts_eos.detach().cpu(),
         "tts_pad_embed": tts_pad.detach().cpu(),
+        "next_stage_prompt_len": next_stage_prompt_len,
         "finished": torch.tensor(True, dtype=torch.bool),
     }
 

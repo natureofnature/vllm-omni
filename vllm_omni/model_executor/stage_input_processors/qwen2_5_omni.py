@@ -49,6 +49,9 @@ def thinker2talker_batch(
     prompt_len = len(prompt_token_ids)
     h = hidden.detach().cpu().to(torch.float32)
 
+    # Qwen2.5: talker prompt is [START] + [PAD]*prompt_len + [END] → length = prompt_len + 2
+    next_stage_prompt_len = prompt_len + 2
+
     payload = {
         "thinker_result": h[prompt_len:],
         "prompt_embeds": h[:prompt_len],
@@ -56,6 +59,7 @@ def thinker2talker_batch(
         "thinker_output_token_ids": output_token_ids,
         "thinker_result_shape": list(h[prompt_len:].shape),
         "prompt_embeds_shape": list(h[:prompt_len].shape),
+        "next_stage_prompt_len": next_stage_prompt_len,
         "finished": torch.tensor(True, dtype=torch.bool),
     }
 

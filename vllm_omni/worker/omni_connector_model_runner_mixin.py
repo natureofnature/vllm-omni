@@ -185,6 +185,11 @@ class OmniConnectorModelRunnerMixin:
         )
         return results
 
+    @staticmethod
+    def _is_all_zero_tensor(t: Any) -> bool:
+        """Return True if *t* is a torch.Tensor whose elements are all zero."""
+        return isinstance(t, torch.Tensor) and t.numel() > 0 and not t.any()
+
     def accumulate_batch_output(
         self,
         req_id: str,
@@ -197,9 +202,21 @@ class OmniConnectorModelRunnerMixin:
         along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
         with the latest value.
 
+        All-zero tensors (e.g. ``code_predictor_codes`` emitted during
+        prefill) are dropped so that they do not pollute downstream stages
+        with garbage / noise frames.
+
         The data is actually sent when ``flush_batch_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
+        # ---- Filter out all-zero tensors from the incoming pooler_output ----
+        filtered: dict[str, Any] = {}
+        for k, v in pooler_output.items():
+            if self._is_all_zero_tensor(v):
+                continue  # skip prefill zero-filled placeholders
+            filtered[k] = v
+        pooler_output = filtered
+
         existing = self._pending_batch_send.get(req_id)
         if existing is None:
             self._pending_batch_send[req_id] = (pooler_output, request)
