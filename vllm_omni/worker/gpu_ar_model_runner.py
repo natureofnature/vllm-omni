@@ -41,6 +41,57 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 logger = init_logger(__name__)
 
 
+class _AsyncChunkRequestAdapter:
+    """Thin adapter that wraps ``CachedRequestState`` to expose the
+    attributes expected by async-chunk processor functions
+    (``external_req_id``, ``all_token_ids``, ``is_finished()``).
+
+    ``CachedRequestState`` uses ``req_id`` whereas
+    ``OmniEngineCoreRequest`` uses ``request_id`` / ``external_req_id``.
+    This adapter bridges the gap without mutating the original object.
+    """
+
+    __slots__ = ("_inner", "_external_req_id", "_finished")
+
+    def __init__(self, cached_state: Any, external_req_id: str, finished: bool):
+        self._inner = cached_state
+        self._external_req_id = external_req_id
+        self._finished = finished
+
+    # ---- attributes expected by process functions ----
+    @property
+    def external_req_id(self) -> str:
+        return self._external_req_id
+
+    @property
+    def request_id(self) -> str:  # for send_chunk
+        return self._inner.req_id
+
+    @property
+    def req_id(self) -> str:
+        return self._inner.req_id
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        prompt = self._inner.prompt_token_ids or []
+        return list(prompt) + list(self._inner.output_token_ids)
+
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        return self._inner.prompt_token_ids
+
+    @property
+    def output_token_ids(self) -> list[int]:
+        return self._inner.output_token_ids
+
+    def is_finished(self) -> bool:
+        return self._finished
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else to the inner CachedRequestState
+        return getattr(self._inner, name)
+
+
 class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor | None
@@ -138,6 +189,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             cache_dtype=str(self.cache_config.cache_dtype),
             request_id_resolver=self._resolve_global_request_id,
         )
+
+        # [Omni] Async-chunk: send a final finished=True sentinel for requests
+        # that completed in the previous engine-core cycle.  The last real
+        # send_chunk call (in sample_tokens) had finished=False because
+        # stop-token detection runs *after* the model runner returns.
+        if self._async_chunk and _finished:
+            self._send_async_chunk_finish_sentinels(_finished)
 
         # [Omni] Flush accumulated batch outputs for requests that finished.
         # Use both scheduler_output.finished_req_ids (requests freed this cycle)
@@ -609,10 +667,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         if self._async_chunk and self._custom_process_func is not None:
             _chunk_sent = 0
+            _finished_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
                 if req_state is not None and pooler_output[i]:
-                    self.send_chunk(request=req_state, pooling_output=pooler_output[i])
+                    ext_id = self._resolve_global_request_id(rid)
+                    wrapped = _AsyncChunkRequestAdapter(
+                        req_state,
+                        external_req_id=ext_id,
+                        finished=(rid in _finished_ids),
+                    )
+                    self.send_chunk(request=wrapped, pooling_output=pooler_output[i])
                     _chunk_sent += 1
             if _chunk_sent and self._ar_log_counter % 5000 == 1:
                 logger.info(
@@ -699,3 +764,45 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 return global_id.decode("utf-8")
             return str(global_id)
         return req_id
+
+    def _send_async_chunk_finish_sentinels(self, finished_req_ids: list[str]) -> None:
+        """Send a final ``finished=True`` sentinel chunk for completed requests.
+
+        In async-chunk mode, ``send_chunk`` is called from ``sample_tokens``
+        where the model runner doesn't yet know whether a stop token was
+        generated (that decision is made by the engine core *after*
+        ``sample_tokens`` returns).  As a result, the last real chunk is
+        always sent with ``finished=False``.
+
+        This helper is called at the start of the *next* ``execute_model``
+        cycle, when ``scheduler_output.finished_req_ids`` lists the requests
+        that completed in the previous cycle.  For each such request that
+        was active in async-chunk sending, we enqueue one final sentinel
+        payload whose ``finished`` flag is ``True`` so the downstream
+        consumer knows the stream is complete.
+        """
+        if not self._custom_process_func:
+            return
+        for rid in finished_req_ids:
+            req_state = self.requests.get(rid)
+            if req_state is None:
+                continue
+            ext_id = self._resolve_global_request_id(rid)
+            # Check that we've actually been sending chunks for this request
+            if ext_id not in self._put_req_chunk:
+                continue
+            wrapped = _AsyncChunkRequestAdapter(
+                req_state,
+                external_req_id=ext_id,
+                finished=True,
+            )
+            # Send the finish sentinel with an empty pooling_output.
+            # The process function should recognise finished=True and
+            # flush/emit accordingly.
+            self.send_chunk(request=wrapped, pooling_output={})
+            logger.info(
+                "[Stage-%s AR] sent async-chunk finish sentinel for req=%s (ext=%s)",
+                getattr(self, "_stage_id", "?"),
+                rid,
+                ext_id,
+            )

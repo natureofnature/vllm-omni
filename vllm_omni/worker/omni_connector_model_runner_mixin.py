@@ -113,6 +113,10 @@ class OmniConnectorModelRunnerMixin:
         self._chunk_data: dict[str, Any] = {}
         self._stage_recv_req_ids: set[str] = set()
 
+        # -- persistent set of request IDs whose chunk stream is complete --
+        # Prevents re-registration after the finish sentinel has been received.
+        self._chunk_stream_completed: set[str] = set()
+
         # -- batch mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
         self._pending_batch_send: dict[str, tuple[Any, Any]] = {}
@@ -358,6 +362,9 @@ class OmniConnectorModelRunnerMixin:
         with self._lock:
             if request_id in self._batch_recv_results or request_id in self._stage_recv_req_ids:
                 return
+            # Don't re-register if the finish sentinel was already received
+            if request_id in self._chunk_stream_completed:
+                return
             self._pending_load_reqs[request_id] = request
         self._work_available.set()
 
@@ -397,7 +404,8 @@ class OmniConnectorModelRunnerMixin:
             return False
         if not self.is_data_transfer_rank():
             return True
-        request_id = self._resolve_external_req_id(request, request.request_id)
+        raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
+        request_id = self._resolve_external_req_id(request, raw_req_id)
         chunk_id = self._put_req_chunk[request_id]
 
         payload_data = None
@@ -667,6 +675,7 @@ class OmniConnectorModelRunnerMixin:
             with self._lock:
                 if is_finished:
                     self._chunk_finished_req_ids.add(req_id)
+                    self._chunk_stream_completed.add(req_id)
                 self._chunk_data[req_id] = payload_data
                 self._finished_load_reqs.add(req_id)
                 if is_finished:

@@ -97,6 +97,15 @@ def thinker2talker_async_chunk(
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
+
+    # Finish sentinel: empty pooling_output with is_finished()=True
+    # sent when the engine-core marks the request as completed one cycle
+    # after the last real token was sampled.
+    if request.is_finished() and not pooling_output.get("0"):
+        return {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+
     if chunk_id == 0:
         all_token_ids = request.all_token_ids  # prefill + decode
         prompt_token_ids = request.prompt_token_ids
@@ -127,6 +136,11 @@ def thinker2talker_async_chunk(
                 (save_payload.get("thinker_hidden_states"), talker_additional_info.get("thinker_hidden_states")),
                 dim=0,
             )
+        # Compute next_stage_prompt_len so the downstream scheduler can
+        # resize the request's prompt_token_ids before prefill.
+        talker_additional_info["next_stage_prompt_len"] = _compute_talker_prompt_ids_length(
+            talker_additional_info, device="cpu"
+        )
     else:
         output_token_ids = request.output_token_ids
         # Convert ConstantList to regular list for OmniSerializer serialization
@@ -262,6 +276,25 @@ def talker2code2wav_async_chunk(
     """
     Pooling version.
     """
+    # Finish sentinel: flush any remaining accumulated codes when the
+    # engine-core marks the request as completed.
+    if request.is_finished() and "code_predictor_codes" not in pooling_output:
+        request_id = request.external_req_id
+        accumulated = transfer_manager.code_prompt_token_ids.get(request_id)
+        if accumulated and len(accumulated) > 0:
+            chunk_size = left_context_size = 25
+            length = len(accumulated)
+            chunk_length = length % chunk_size
+            context_length = chunk_length if chunk_length != 0 else chunk_size
+            end_index = min(length, left_context_size + context_length)
+            return {
+                "code_predictor_codes": (torch.tensor(accumulated[-end_index:]).transpose(0, 1).reshape(-1).tolist()),
+                "finished": torch.tensor(True, dtype=torch.bool),
+            }
+        return {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
+
     if "code_predictor_codes" not in pooling_output:
         return None
 

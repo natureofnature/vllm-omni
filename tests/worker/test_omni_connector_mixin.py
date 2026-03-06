@@ -409,5 +409,110 @@ class TestKVSentReqIdsAccumulation(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+class TestChunkStreamCompletedGuard(unittest.TestCase):
+    """Test that register_chunk_recv is skipped after finish sentinel.
+
+    This validates the fix for the race condition where the scheduling
+    coordinator re-registers a request for chunk polling after its
+    upstream chunk stream has already finished (is_finished sentinel
+    received), causing the bg recv thread to poll for a non-existent
+    shared-memory segment (e.g. ``_0_7`` when only 7 chunks 0–6 exist).
+    """
+
+    def _make_host(self, stage_id: int = 1) -> MixinHost:
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
+        )
+        host._omni_connector = MockConnector(stage_id=stage_id)
+        host._stage_id = stage_id
+        host._async_chunk = True
+        return host
+
+    def test_register_blocked_after_finish_sentinel(self):
+        """register_chunk_recv must be a no-op after the finish sentinel."""
+        host = self._make_host(stage_id=1)
+
+        req = _make_request("req-1", "ext-req-1")
+
+        # Simulate the bg thread having received the finish sentinel:
+        with host._lock:
+            host._chunk_stream_completed.add("req-1")
+
+        # Now try to re-register — this mimics the coordinator asking
+        # the model runner to poll for the next (non-existent) chunk.
+        host.register_chunk_recv(req)
+
+        # The request must NOT appear in _pending_load_reqs
+        self.assertNotIn(
+            "req-1",
+            host._pending_load_reqs,
+            "register_chunk_recv should skip requests whose chunk stream is already complete",
+        )
+
+        host.shutdown_omni_connectors()
+
+    def test_register_allowed_before_finish(self):
+        """register_chunk_recv works normally before finish sentinel."""
+        host = self._make_host(stage_id=1)
+        req = _make_request("req-1", "ext-req-1")
+
+        host.register_chunk_recv(req)
+        self.assertIn(
+            "req-1",
+            host._pending_load_reqs,
+            "register_chunk_recv should add request to pending when stream is not yet complete",
+        )
+
+        host.shutdown_omni_connectors()
+
+    def test_finish_sentinel_populates_completed_set(self):
+        """Receiving is_finished=True adds to _chunk_stream_completed."""
+        host = self._make_host(stage_id=1)
+
+        # Simulate _poll_single_request receiving is_finished=True
+        req_id = "req-1"
+        with host._lock:
+            host._chunk_finished_req_ids.add(req_id)
+            host._chunk_stream_completed.add(req_id)
+            host._chunk_data[req_id] = {"finished": True}
+            host._finished_load_reqs.add(req_id)
+            host._pending_load_reqs.pop(req_id, None)
+
+        self.assertIn(req_id, host._chunk_stream_completed)
+
+        # Subsequent register_chunk_recv should be blocked
+        req = _make_request(req_id, f"ext-{req_id}")
+        host.register_chunk_recv(req)
+        self.assertNotIn(req_id, host._pending_load_reqs)
+
+        host.shutdown_omni_connectors()
+
+    def test_stage_0_always_skipped(self):
+        """Stage-0 has no upstream, register_chunk_recv is always no-op."""
+        host = self._make_host(stage_id=0)
+        host._stage_id = 0
+
+        req = _make_request("req-1")
+        host.register_chunk_recv(req)
+        self.assertNotIn("req-1", host._pending_load_reqs)
+
+        host.shutdown_omni_connectors()
+
+    def test_batch_recv_guard_still_works(self):
+        """Pre-existing guard: batch recv results prevent registration."""
+        host = self._make_host(stage_id=1)
+
+        with host._lock:
+            host._batch_recv_results["req-1"] = {"some": "data"}
+
+        req = _make_request("req-1", "ext-req-1")
+        host.register_chunk_recv(req)
+        self.assertNotIn("req-1", host._pending_load_reqs)
+
+        host.shutdown_omni_connectors()
+
+
 if __name__ == "__main__":
     unittest.main()
