@@ -161,6 +161,29 @@ class OmniConnectorModelRunnerMixin:
             except Exception:
                 pass
 
+    def cleanup_finished_request(self, req_id: str) -> None:
+        """Clean up per-request state after a request is fully finished.
+
+        Call this when a request is freed from the model runner to prevent
+        memory leaks in the mixin's tracking dicts/sets.  The external
+        request ID is resolved before cleaning up ``_put_req_chunk`` which
+        is keyed by external ID.
+        """
+        ext_id = self._request_ids_mapping.pop(req_id, None)
+        if ext_id is not None:
+            self._put_req_chunk.pop(ext_id, None)
+            self._request_payload.pop(ext_id, None)
+            self._code_prompt_token_ids.pop(ext_id, None)
+        else:
+            # Fallback: try req_id directly (Stage-0 doesn't use mapping)
+            self._put_req_chunk.pop(req_id, None)
+            self._request_payload.pop(req_id, None)
+            self._code_prompt_token_ids.pop(req_id, None)
+        self._get_req_chunk.pop(req_id, None)
+        self._chunk_stream_completed.discard(req_id)
+        self._batch_recv_results.pop(req_id, None)
+        self._stage_recv_req_ids.discard(req_id)
+
     # ------------------------------------------------------------------ #
     #  Batch mode  (recv_stage_inputs / send_stage_outputs)
     # ------------------------------------------------------------------ #
@@ -406,6 +429,10 @@ class OmniConnectorModelRunnerMixin:
             return True
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         request_id = self._resolve_external_req_id(request, raw_req_id)
+        # Cache the internal→external mapping so that finish sentinels can
+        # resolve the external ID even after the request is freed.
+        if raw_req_id and raw_req_id != request_id:
+            self._request_ids_mapping.setdefault(raw_req_id, request_id)
         chunk_id = self._put_req_chunk[request_id]
 
         payload_data = None

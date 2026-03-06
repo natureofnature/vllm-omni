@@ -92,6 +92,49 @@ class _AsyncChunkRequestAdapter:
         return getattr(self._inner, name)
 
 
+class _FinishSentinelAdapter:
+    """Minimal adapter for sending finish sentinels without a live request.
+
+    Unlike ``_AsyncChunkRequestAdapter`` this does NOT require a
+    ``CachedRequestState`` inner object.  It only carries the identifiers
+    needed by ``send_chunk`` and the process functions to emit a
+    ``finished=True`` sentinel payload.
+    """
+
+    __slots__ = ("_req_id", "_external_req_id")
+
+    def __init__(self, req_id: str, external_req_id: str):
+        self._req_id = req_id
+        self._external_req_id = external_req_id
+
+    @property
+    def external_req_id(self) -> str:
+        return self._external_req_id
+
+    @property
+    def request_id(self) -> str:
+        return self._req_id
+
+    @property
+    def req_id(self) -> str:
+        return self._req_id
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        return []
+
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        return []
+
+    @property
+    def output_token_ids(self) -> list[int]:
+        return []
+
+    def is_finished(self) -> bool:
+        return True
+
+
 class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor | None
@@ -214,6 +257,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     stale,
                 )
                 self.flush_batch_outputs(flush_ids)
+
+        # [Omni] Clean up per-request mixin state for finished requests.
+        # Must happen AFTER sentinel sending and batch flushing (which need
+        # _put_req_chunk / _request_ids_mapping), but timing relative to
+        # _update_states doesn't matter since cleanup uses its own dicts.
+        if _finished:
+            for rid in _finished:
+                self.cleanup_finished_request(rid)
 
         if self.vllm_config.model_config.enable_return_routed_experts:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -750,7 +801,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return async_output
 
     def _resolve_global_request_id(self, req_id: str) -> str:
-        """Resolve global request ID from request state."""
+        """Resolve global request ID from request state or mappings.
+
+        Checks ``_request_ids_mapping`` first (populated by
+        ``register_chunk_recv``), then falls back to request state's
+        ``additional_information_cpu``, and finally to ``req_id`` itself.
+        """
+        # Fast path: check the mapping populated by register_chunk_recv
+        mapped = self._request_ids_mapping.get(req_id)
+        if mapped is not None:
+            return mapped
+
         req_state = self.requests.get(req_id)
         if not req_state:
             return req_id
@@ -780,21 +841,30 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         was active in async-chunk sending, we enqueue one final sentinel
         payload whose ``finished`` flag is ``True`` so the downstream
         consumer knows the stream is complete.
+
+        The sentinel is constructed using ``_FinishSentinelAdapter`` which
+        does NOT require the ``CachedRequestState`` to still be alive in
+        ``self.requests``.  This is critical because ``_update_states``
+        from the previous cycle may have already freed the request.
         """
         if not self._custom_process_func:
             return
         for rid in finished_req_ids:
-            req_state = self.requests.get(rid)
-            if req_state is None:
-                continue
-            ext_id = self._resolve_global_request_id(rid)
-            # Check that we've actually been sending chunks for this request
+            # Resolve external ID without depending on self.requests.
+            # Try _request_ids_mapping first (populated by register_chunk_recv),
+            # then fall back to self.requests if still available, then rid itself.
+            ext_id = self._request_ids_mapping.get(rid)
+            if ext_id is None:
+                ext_id = self._resolve_global_request_id(rid)
+
+            # Check that we've actually been sending chunks for this request.
+            # _put_req_chunk is keyed by external_req_id (set by send_chunk).
             if ext_id not in self._put_req_chunk:
                 continue
-            wrapped = _AsyncChunkRequestAdapter(
-                req_state,
+
+            wrapped = _FinishSentinelAdapter(
+                req_id=rid,
                 external_req_id=ext_id,
-                finished=True,
             )
             # Send the finish sentinel with an empty pooling_output.
             # The process function should recognise finished=True and

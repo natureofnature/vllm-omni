@@ -514,5 +514,100 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+class TestCleanupFinishedRequest(unittest.TestCase):
+    """Test cleanup_finished_request frees per-request mixin state."""
+
+    def _make_host(self, stage_id: int = 1) -> MixinHost:
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=stage_id, async_chunk=True),
+        )
+        host._omni_connector = MockConnector(stage_id=stage_id)
+        host._stage_id = stage_id
+        host._async_chunk = True
+        return host
+
+    def test_cleanup_removes_all_state(self):
+        """cleanup_finished_request removes all tracking dicts/sets."""
+        host = self._make_host(stage_id=1)
+        req_id = "req-1"
+        ext_id = "ext-req-1"
+
+        # Simulate state accumulated during a request's lifetime
+        host._request_ids_mapping[req_id] = ext_id
+        host._put_req_chunk[ext_id] = 5
+        host._get_req_chunk[req_id] = 3
+        host._request_payload[ext_id] = {"some": "data"}
+        host._code_prompt_token_ids[ext_id] = [[1, 2, 3]]
+        host._chunk_stream_completed.add(req_id)
+        host._batch_recv_results[req_id] = {"result": True}
+        host._stage_recv_req_ids.add(req_id)
+
+        # Cleanup
+        host.cleanup_finished_request(req_id)
+
+        # All state should be gone
+        self.assertNotIn(req_id, host._request_ids_mapping)
+        self.assertNotIn(ext_id, host._put_req_chunk)
+        self.assertNotIn(req_id, host._get_req_chunk)
+        self.assertNotIn(ext_id, host._request_payload)
+        self.assertNotIn(ext_id, host._code_prompt_token_ids)
+        self.assertNotIn(req_id, host._chunk_stream_completed)
+        self.assertNotIn(req_id, host._batch_recv_results)
+        self.assertNotIn(req_id, host._stage_recv_req_ids)
+
+        host.shutdown_omni_connectors()
+
+    def test_cleanup_without_mapping(self):
+        """cleanup works for Stage-0 where _request_ids_mapping isn't set."""
+        host = self._make_host(stage_id=0)
+        host._stage_id = 0
+        req_id = "req-1"
+
+        # Stage-0 uses req_id directly (no ext_id mapping)
+        host._put_req_chunk[req_id] = 3
+        host._get_req_chunk[req_id] = 0
+
+        host.cleanup_finished_request(req_id)
+
+        self.assertNotIn(req_id, host._put_req_chunk)
+        self.assertNotIn(req_id, host._get_req_chunk)
+
+        host.shutdown_omni_connectors()
+
+
+class TestSendChunkCachesMapping(unittest.TestCase):
+    """Test that send_chunk caches internal→external req ID mapping."""
+
+    def test_send_chunk_populates_request_ids_mapping(self):
+        """send_chunk should cache the internal→external mapping."""
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        host._omni_connector = MockConnector(stage_id=0)
+        host._stage_id = 0
+        host._async_chunk = True
+
+        def mock_process(transfer_manager, pooling_output, request):
+            return {"data": "test", "finished": False}
+
+        host._custom_process_func = mock_process
+
+        request = _make_request("internal-1", "external-1")
+        host.send_chunk(request, pooling_output={"v": 1})
+
+        # The mapping should be cached
+        self.assertEqual(
+            host._request_ids_mapping.get("internal-1"),
+            "external-1",
+        )
+
+        time.sleep(0.1)
+        host.shutdown_omni_connectors()
+
+
 if __name__ == "__main__":
     unittest.main()
