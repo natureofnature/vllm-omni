@@ -118,8 +118,7 @@ It is intended for deployments that already use Yuanrong Datasystem and want a r
 
 - `OmniConnectorFactory` constructs it from a `ConnectorSpec`
 - stage edge configuration is resolved by `load_omni_transfer_config()`
-- `OmniConnectorModelRunnerMixin` can use it for batch and chunk transfer
-- `OmniKVTransferManager` can use it for KV-cache payload transfer
+- All callers (batch forwarding, chunk transfer, KV transfer, etc.) interact with it through the same `put()` / `get()` contract
 
 This means the connector is not exposed directly to stage logic. Stages only interact with the generic connector contract, and the backend choice remains a configuration concern.
 
@@ -260,27 +259,13 @@ From the connector API perspective the result is the same, but operationally the
 
 ### 8. Integration with Stage Communication
 
-#### 8.1 Batch and Chunk Transfer
+All callers use the connector through the same `put()` / `get()` contract:
 
-`OmniConnectorModelRunnerMixin` can use `YuanrongConnector` exactly like other connectors:
+- the sender calls `put()` to serialize and store the payload
+- the receiver calls `get()` to retrieve and deserialize it
+- no connector-specific metadata is required, since the Datasystem key is the rendezvous point
 
-- the sender calls `put()`
-- the receiver background thread calls `get()`
-- the returned object is consumed under the generic connector contract
-
-Because no extra metadata is required, the control path remains relatively simple.
-
-#### 8.2 KV Cache Transfer
-
-`OmniKVTransferManager` can also use `YuanrongConnector` because KV-cache payloads are ultimately wrapped as Python dictionaries before being sent through the connector API.
-
-However, this connector remains an object-store-style backend:
-
-- payloads are fully serialized
-- payloads are fully deserialized
-- there is no raw tensor fast path
-
-So it is functionally compatible with KV transfer, but not optimized for the largest KV payloads.
+Because `put()` returns `metadata=None`, the connector is naturally compatible with callers that do not forward metadata (e.g. polling-based flows). The trade-off is that all payloads incur full serialization and deserialization costs, and there is no raw tensor fast path, which makes the connector functional but not optimized for the largest payloads.
 
 ### 9. Data Flow in the Pipeline
 

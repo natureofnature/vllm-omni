@@ -95,8 +95,7 @@ Its primary role is to provide a general-purpose remote connector for stage payl
 
 - `OmniConnectorFactory` instantiates it from `ConnectorSpec`
 - `load_omni_transfer_config()` maps edge config to the connector spec
-- `OmniConnectorModelRunnerMixin` uses it for batch and chunk transfer
-- `OmniKVTransferManager` can use it for KV cache transfer through the same `put()` / `get()` API
+- All callers (batch forwarding, chunk transfer, KV transfer, etc.) interact with it through the same `put()` / `get()` contract
 
 This means the rest of the pipeline does not need store-specific logic. It only relies on the generic connector contract.
 
@@ -209,25 +208,13 @@ This design gives the connector a bounded waiting model rather than an indefinit
 
 ### 7. Integration with Stage Communication
 
-#### 7.1 Batch and Chunk Transfer
+All callers use the connector through the same `put()` / `get()` contract:
 
-`OmniConnectorModelRunnerMixin` can use `MooncakeStoreConnector` without any special-case transport logic:
+- the sender calls `put()` to serialize and store the payload
+- the receiver calls `get()` to retrieve and deserialize it
+- no connector-specific metadata is required, since the store key is the rendezvous point
 
-- sender calls `put()`
-- receiver background thread polls `get()`
-- returned objects are treated the same way as with other connectors
-
-Since no extra metadata is required, the stage-to-stage control path is slightly simpler than with the SHM and RDMA connectors.
-
-#### 7.2 KV Cache Transfer
-
-`OmniKVTransferManager` extracts KV cache blocks into a Python dictionary and sends them through the connector API. In this mode, `MooncakeStoreConnector` works as a generic remote transport:
-
-- it supports the payload shape
-- it preserves the same API contract
-- but it still incurs full serialization and deserialization costs
-
-For this reason, it is functional for KV transfer but not the highest-performance option for large KV payloads.
+Because `put()` returns `metadata=None`, the connector is naturally compatible with callers that do not forward metadata (e.g. polling-based flows). The trade-off is that all payloads incur full serialization and deserialization costs, which makes the connector functional but not the highest-performance option for large payloads such as KV cache blocks.
 
 ### 8. Data Flow in the Pipeline
 

@@ -53,16 +53,10 @@ This makes `SharedMemoryConnector` the simplest connector in the OmniConnector f
 - `health()`
 - `close()`
 
-Within the larger system, it is used in three ways:
+Within the larger system:
 
-1. **Auto-created edge connector**
-   `load_omni_transfer_config()` automatically fills missing edges with `SharedMemoryConnector`.
-
-2. **Batch / chunk data plane**
-   `OmniConnectorModelRunnerMixin` sends stage outputs with `put()` and polls stage inputs with `get()`.
-
-3. **Legacy adapter path**
-   `try_send_via_connector()` and `try_recv_via_connector()` still support the older queue-plus-metadata flow.
+- `load_omni_transfer_config()` automatically fills missing edges with `SharedMemoryConnector`.
+- Callers interact with the connector exclusively through the `put()` / `get()` / `cleanup()` contract — the connector does not require caller-specific logic.
 
 Compared with the remote Mooncake-based connectors, `SharedMemoryConnector` is intentionally minimal and local-only.
 

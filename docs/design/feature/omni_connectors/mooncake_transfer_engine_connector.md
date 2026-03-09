@@ -242,8 +242,7 @@ It is integrated into the system through the standard connector plumbing:
 - `OmniConnectorFactory` constructs the connector from `ConnectorSpec`
 - `load_omni_transfer_config()` resolves the edge-level connector configuration
 - `get_connectors_config_for_stage()` and `resolve_omni_kv_config_for_stage()` inject the connector role
-- `OmniConnectorModelRunnerMixin` uses it for batch and chunk traffic
-- `OmniKVTransferManager` uses it for KV transfer, especially when metadata is not pushed through the control plane
+- All callers (batch forwarding, chunk transfer, KV transfer, etc.) interact with it through the same `put()` / `get()` contract
 
 The key system-level distinction is that this connector is **role-aware**:
 
@@ -558,28 +557,29 @@ This table is the sender-side truth source for both metadata queries and pull re
 
 #### 8.2 Metadata Resolution Paths
 
-The connector supports two metadata paths.
+The `metadata` parameter in `get()` is optional. The connector supports two resolution modes depending on whether the caller supplies it.
 
-**Path A: Metadata supplied directly**
+**With metadata**
 
-This is the normal path for stage batch and chunk transfer. The sender metadata produced by `put()` is forwarded through the control plane and passed to `get(...)`.
+When the caller passes metadata, the connector uses it directly. The metadata carries:
 
-**Path B: Metadata queried on demand**
+- `source_host` / `source_port` — sender ZMQ endpoint
+- `data_size` — payload byte count
+- `is_fast_path` — whether the receiver gets a `ManagedBuffer` or a deserialized object
 
-This path exists for polling-based consumers such as KV transfer. The receiver first calls:
+This mode is suitable when the control plane already forwards the sender's `put()` output to the receiver.
+
+**Without metadata**
+
+When `get(metadata=None)` is called, the connector queries the sender over ZMQ to discover the same fields (`data_size`, `is_fast_path`). The caller must first call:
 
 ```python
 update_sender_info(sender_host, sender_zmq_port)
 ```
 
-Then `get(metadata=None)` queries the sender with `_query_metadata_from_sender(...)`.
+so that the connector knows where to send the query.
 
-This allows the receiver to discover:
-
-- `data_size`
-- `is_fast_path`
-
-without the metadata having been pushed through the orchestration queue.
+This mode is suitable for polling-based flows (e.g. KV transfer, async chunk transfer) where the receiver does not have metadata from the control plane.
 
 #### 8.3 Destination Allocation
 
