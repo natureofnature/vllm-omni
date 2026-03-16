@@ -178,6 +178,7 @@ class AsyncOmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
+        kv_sender_info: dict | None = None,
     ) -> OmniRequestOutput:
         """Generate images from multiple prompts in a single engine call.
 
@@ -197,7 +198,13 @@ class AsyncOmniDiffusion:
         """
         if request_id is None:
             request_id = f"diff-batch-{uuid.uuid4().hex[:8]}"
-        return await self._generate_batch(prompts, sampling_params, request_id, lora_request)
+        return await self._generate_batch(
+            prompts,
+            sampling_params,
+            request_id,
+            lora_request,
+            kv_sender_info,
+        )
 
     # ------------------------------------------------------------------
     # Internal batch generation
@@ -209,6 +216,7 @@ class AsyncOmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str,
         lora_request: LoRARequest | None = None,
+        kv_sender_info: dict | None = None,
     ) -> OmniRequestOutput:
         """Generate images from multiple prompts in a single engine call."""
         if not prompts:
@@ -224,6 +232,7 @@ class AsyncOmniDiffusion:
             prompts=prompts,
             sampling_params=sampling_params,
             request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+            kv_sender_info=kv_sender_info,
         )
 
         logger.debug("Starting batch generation for %d prompts, request_id=%s", len(prompts), request_id)
@@ -261,6 +270,7 @@ class AsyncOmniDiffusion:
         sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
+        kv_sender_info: dict | None = None,
     ) -> OmniRequestOutput:
         """Generate images asynchronously from a single text prompt.
 
@@ -292,6 +302,7 @@ class AsyncOmniDiffusion:
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            kv_sender_info=kv_sender_info,
         )
 
         logger.debug("Starting generation for request %s", request_id)

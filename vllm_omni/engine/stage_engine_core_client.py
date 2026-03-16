@@ -6,7 +6,9 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import socket
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
@@ -69,6 +71,8 @@ class StageEngineCoreClient(AsyncMPClient):
             self.model_stage = metadata.model_stage
 
         self.engine_outputs: Any = None
+        self.client_addresses = dict(client_addresses or {})
+        self._kv_sender_host = self._resolve_contact_host()
 
         logger.info(
             "[StageEngineCoreClient] Stage-%s initializing EngineCore",
@@ -114,6 +118,52 @@ class StageEngineCoreClient(AsyncMPClient):
         await super().add_request_async(request)
 
     # ==================== Stage Methods ====================
+
+    @staticmethod
+    def _detect_local_ip() -> str | None:
+        """Best-effort local IP detection for cross-node connector bootstrap."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.connect(("8.8.8.8", 80))
+                return sock.getsockname()[0]
+        except Exception:
+            try:
+                return socket.gethostbyname(socket.gethostname())
+            except Exception:
+                return None
+
+    def _resolve_contact_host(self) -> str | None:
+        """Resolve a routable host for this stage from its client addresses."""
+        for key in ("input_address", "output_address", "stats_update_address"):
+            address = self.client_addresses.get(key)
+            if not address:
+                continue
+            host = urlparse(address).hostname
+            if host in {None, "", "*", "0.0.0.0", "::"}:
+                continue
+            if host in {"localhost", "127.0.0.1"}:
+                detected = self._detect_local_ip()
+                if detected:
+                    return detected
+                continue
+            return host
+        return self._detect_local_ip()
+
+    def get_kv_sender_info(
+        self,
+        *,
+        base_port: int = 50051,
+        kv_transfer_port_offset: int = 100,
+    ) -> dict[str, Any] | None:
+        """Build sender bootstrap info for diffusion KV transfer receivers."""
+        if self._kv_sender_host is None:
+            self._kv_sender_host = self._resolve_contact_host()
+        if self._kv_sender_host is None:
+            return None
+        return {
+            "host": self._kv_sender_host,
+            "zmq_port": base_port + kv_transfer_port_offset + int(self.stage_id),
+        }
 
     def set_engine_outputs(self, engine_outputs: EngineCoreOutput) -> None:
         """Set engine outputs (called by orchestrator)."""
