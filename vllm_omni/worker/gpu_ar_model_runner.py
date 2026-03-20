@@ -24,7 +24,15 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+
+    class ExtractHiddenStatesProposer:  # type: ignore[no-redef]
+        pass
+
+
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -37,6 +45,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -202,8 +211,9 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
-            if hasattr(self.model, "_clear_warmup_state"):
-                self.model._clear_warmup_state()
+            model = getattr(self, "model", None)
+            if model is not None and hasattr(model, "_clear_warmup_state"):
+                model._clear_warmup_state()
 
         chunk_registrations = list(getattr(scheduler_output, "pending_chunk_registrations", []))
         input_registrations = list(getattr(scheduler_output, "pending_input_registrations", []))
@@ -490,8 +500,10 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+            maybe_get_kv_connector_output_compat(
+                self,
+                scheduler_output,
+                clear_metadata=clear_kv_metadata,
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(
@@ -736,7 +748,8 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
         # This was deferred from target model forward to allow draft model
         # to also save its KV cache.
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            if hasattr(self, "clear_kv_connector_metadata"):
+                self.clear_kv_connector_metadata()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()

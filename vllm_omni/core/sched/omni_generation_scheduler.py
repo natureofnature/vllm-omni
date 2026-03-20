@@ -6,7 +6,17 @@ from vllm.distributed.kv_events import KVEventBatch
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-from vllm.v1.core.sched.interface import PauseState
+
+try:
+    from vllm.v1.core.sched.interface import PauseState
+except ImportError:
+    from enum import Enum
+
+    class PauseState(Enum):
+        UNPAUSED = "unpaused"
+        PAUSED_ALL = "paused_all"
+
+
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
@@ -23,6 +33,7 @@ from vllm_omni.core.sched.output import (
     OmniSchedulerOutput,
 )
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
+from vllm_omni.v1_compat import kv_cache_manager_new_step_starts
 
 logger = init_logger(__name__)
 
@@ -58,11 +69,12 @@ class OmniGenerationScheduler(VLLMScheduler):
         """
 
         token_budget = self.max_num_scheduled_tokens
-        if self._pause_state == PauseState.PAUSED_ALL:
+        pause_state = getattr(self, "_pause_state", PauseState.UNPAUSED)
+        if pause_state == PauseState.PAUSED_ALL:
             token_budget = 0
         scheduled_timestamp = time.monotonic()
 
-        self.kv_cache_manager.new_step_starts()
+        kv_cache_manager_new_step_starts(self.kv_cache_manager)
 
         scheduled_new_reqs: list[Request] = []
 
@@ -170,7 +182,7 @@ class OmniGenerationScheduler(VLLMScheduler):
             self.waiting
             and token_budget > 0
             and len(self.running) < self.max_num_running_reqs
-            and self._pause_state == PauseState.UNPAUSED
+            and pause_state == PauseState.UNPAUSED
         ):
             request = self.waiting.peek_request()
             # OMNI: Skip requests that are not in self.requests

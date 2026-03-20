@@ -308,7 +308,10 @@ def talker2code2wav_async_chunk(
     request_finished = bool(request.is_finished())
     effective_finished = bool(is_finished or request_finished)
 
-    if request_finished and "code_predictor_codes" not in pooling_output:
+    # The finish sentinel can arrive before request.is_finished() flips on the
+    # local request object. Flush any cached codec codes as soon as this chunk
+    # is explicitly marked finished.
+    if effective_finished and "code_predictor_codes" not in pooling_output:
         request_id = request.external_req_id
         accumulated = transfer_manager.code_prompt_token_ids.get(request_id)
         if accumulated and len(accumulated) > 0:
@@ -351,20 +354,19 @@ def talker2code2wav_async_chunk(
         if len(code_predictor_codes) == 0:
             return None
 
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if not code_predictor_codes.any():
-            return None
+    code_frames = code_predictor_codes.to(torch.long).cpu()
+    if code_frames.ndim == 1:
+        new_frames = [code_frames.reshape(-1).tolist()]
+    elif code_frames.ndim == 2:
+        # Qwen3-Omni talker already emits [frames, codebooks] here.
+        new_frames = code_frames.tolist()
     else:
-        code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
-        if not code_tensor.any():
-            return None
-
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
+        raise ValueError(f"Invalid code_predictor_codes shape for Qwen3-Omni async_chunk: {tuple(code_frames.shape)}")
+    if len(new_frames) == 0:
         return None
 
     request_id = request.external_req_id
-    transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+    transfer_manager.code_prompt_token_ids[request_id].extend(new_frames)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not effective_finished:
@@ -407,14 +409,13 @@ def talker2code2wav_batch(
     if code_predictor_codes is None:
         return None
     if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0 or not code_predictor_codes.any():
+        if code_predictor_codes.numel() == 0:
             return None
     elif hasattr(code_predictor_codes, "__len__") and len(code_predictor_codes) == 0:
         return None
 
+    # Codec code 0 is valid; only empty payloads should be skipped.
     codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
-        return None
 
     return {
         "code_predictor_codes": codec_codes,

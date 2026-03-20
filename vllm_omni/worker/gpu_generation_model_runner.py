@@ -25,7 +25,15 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+
+    class ExtractHiddenStatesProposer:  # type: ignore[no-redef]
+        pass
+
+
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -37,6 +45,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -331,8 +340,10 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
-            self.maybe_get_kv_connector_output(
-                scheduler_output, clear_metadata=clear_kv_metadata
+            maybe_get_kv_connector_output_compat(
+                self,
+                scheduler_output,
+                clear_metadata=clear_kv_metadata,
             ) as kv_connector_output,
         ):
             logger.info(
@@ -417,7 +428,8 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
 
         # Clear KV connector metadata after draft model runs (if spec decode).
         if self.speculative_config is not None:
-            self.clear_kv_connector_metadata()
+            if hasattr(self, "clear_kv_connector_metadata"):
+                self.clear_kv_connector_metadata()
 
         pooler_output: list[object] = []
         if isinstance(multimodal_outputs, torch.Tensor):

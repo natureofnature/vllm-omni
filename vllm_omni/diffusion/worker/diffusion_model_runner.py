@@ -10,6 +10,7 @@ model-related operations.
 
 from __future__ import annotations
 
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -71,6 +72,7 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # on both the diffusion runner and the mixin-facing attribute.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
         self._kv_transfer_manager = self.kv_transfer_manager
+        self._bootstrap_kv_receive_routing()
         # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
         model_config = getattr(od_config, "model_config", None) or getattr(vllm_config, "model_config", None)
         if model_config is not None:
@@ -79,6 +81,29 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 model_config=model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
             )
+
+    def _bootstrap_kv_receive_routing(self) -> None:
+        """Seed KV key builders from diffusion config."""
+        omni_kv_cfg = getattr(self.od_config, "omni_kv_config", {}) or {}
+        connector_cfg = omni_kv_cfg.get("connector_config", {}) if isinstance(omni_kv_cfg, dict) else {}
+        if not isinstance(connector_cfg, dict):
+            connector_cfg = {}
+        rank_mapping = connector_cfg.get("rank_mapping", {})
+        if not isinstance(rank_mapping, dict):
+            rank_mapping = {}
+
+        to_tp = getattr(getattr(self.od_config, "parallel_config", None), "tensor_parallel_size", 1) or 1
+        self._from_tp = int(rank_mapping.get("from_tp", 1))
+        self._to_tp = int(rank_mapping.get("to_tp", to_tp))
+        try:
+            self._local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except (TypeError, ValueError):
+            self._local_rank = 0
+
+        self.kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
+        self.kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
+        self.kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
+        self.kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""

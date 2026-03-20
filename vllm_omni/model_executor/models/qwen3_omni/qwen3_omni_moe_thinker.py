@@ -146,20 +146,21 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         cu_seqlens = np.repeat(grid_thw_np[:, 1] * grid_thw_np[:, 2], grid_thw_np[:, 0]).cumsum(axis=0, dtype=np.int32)
         cu_seqlens = np.concatenate([np.zeros(1, dtype=np.int32), cu_seqlens])
 
-        sequence_lengths = MMEncoderAttention.maybe_compute_sequence_lengths(self.attn_backend, cu_seqlens)
-        if sequence_lengths is not None:
-            sequence_lengths = torch.from_numpy(sequence_lengths).to(self.device, non_blocking=True)
-        max_seqlen = torch.tensor(
-            MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens),
-            dtype=torch.int32,
-            device=self.device,
-        )
-        cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
-            self.attn_backend,
-            cu_seqlens,
-            self.hidden_size,
-            self.tp_size,
-        )
+        supports_mm_sequence_lengths = hasattr(MMEncoderAttention, "maybe_compute_sequence_lengths")
+        sequence_lengths = None
+        max_seqlen_value = int(np.diff(cu_seqlens).max()) if len(cu_seqlens) > 1 else 0
+        if supports_mm_sequence_lengths:
+            sequence_lengths = MMEncoderAttention.maybe_compute_sequence_lengths(self.attn_backend, cu_seqlens)
+            if sequence_lengths is not None:
+                sequence_lengths = torch.from_numpy(sequence_lengths).to(self.device, non_blocking=True)
+            max_seqlen_value = MMEncoderAttention.compute_max_seqlen(self.attn_backend, cu_seqlens)
+            cu_seqlens = MMEncoderAttention.maybe_recompute_cu_seqlens(
+                self.attn_backend,
+                cu_seqlens,
+                self.hidden_size,
+                self.tp_size,
+            )
+        max_seqlen = torch.tensor(max_seqlen_value, dtype=torch.int32, device=self.device)
         cu_seqlens = torch.from_numpy(cu_seqlens).to(self.device, non_blocking=True)
 
         hidden_states = hidden_states.unsqueeze(1)
@@ -168,13 +169,16 @@ class Qwen3Omni_VisionTransformer(_Qwen3Omni_VisionTransformer):
         deepstack_visual_indexes = self.deepstack_visual_indexes
 
         for layer_num, blk in enumerate(self.blocks):
+            attn_kwargs = {
+                "cu_seqlens": cu_seqlens,
+                "rotary_pos_emb_cos": rotary_pos_emb_cos,
+                "rotary_pos_emb_sin": rotary_pos_emb_sin,
+                "max_seqlen": max_seqlen,
+                "sequence_lengths": sequence_lengths,
+            }
             hidden_states = hidden_states + blk.attn(
                 blk.norm1(hidden_states),
-                cu_seqlens=cu_seqlens,
-                rotary_pos_emb_cos=rotary_pos_emb_cos,
-                rotary_pos_emb_sin=rotary_pos_emb_sin,
-                max_seqlen=max_seqlen,
-                sequence_lengths=sequence_lengths,
+                **attn_kwargs,
             )
             hidden_states = hidden_states + blk.mlp(blk.norm2(hidden_states))
 

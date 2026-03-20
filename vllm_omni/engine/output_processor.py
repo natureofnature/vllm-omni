@@ -1,3 +1,4 @@
+import inspect
 from typing import Any
 
 import numpy as np
@@ -19,6 +20,8 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+_OUTPUT_PROCESSOR_SUPPORTS_TRACING = "tracing_enabled" in inspect.signature(VLLMOutputProcessor.__init__).parameters
 
 
 class OmniRequestState(RequestState):
@@ -280,12 +283,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 (e.g., "image", "audio", "latent"). Used to tag multimodal
                 outputs with the correct modality key.
         """
-        super().__init__(
-            tokenizer=tokenizer,
-            log_stats=log_stats,
-            stream_interval=stream_interval,
-            tracing_enabled=tracing_enabled,
-        )
+        init_kwargs = {
+            "tokenizer": tokenizer,
+            "log_stats": log_stats,
+            "stream_interval": stream_interval,
+        }
+        if _OUTPUT_PROCESSOR_SUPPORTS_TRACING:
+            init_kwargs["tracing_enabled"] = tracing_enabled
+        super().__init__(**init_kwargs)
         self.engine_core_output_type = engine_core_output_type
 
     def add_request(
