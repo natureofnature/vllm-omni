@@ -84,6 +84,31 @@ def _validate_stage_inputs(stage_list, engine_input_source):
     return stage.engine_outputs
 
 
+_QWEN3_CODEC_CODEBOOK_SIZE = 2048
+
+
+def _extract_last_valid_qwen3_codec_frame(code_predictor_codes: Any) -> list[int] | None:
+    """Return the last valid codec frame for async Qwen3 code2wav handoff."""
+    if not isinstance(code_predictor_codes, torch.Tensor) or code_predictor_codes.numel() == 0:
+        return None
+
+    code_frames = code_predictor_codes.to(torch.long).cpu()
+    if code_frames.ndim == 1:
+        frame = code_frames.reshape(-1)
+        if frame.numel() == 0 or not bool(frame.any().item()):
+            return None
+        if int(frame.max().item()) >= _QWEN3_CODEC_CODEBOOK_SIZE:
+            return None
+        return frame.tolist()
+    if code_frames.ndim != 2:
+        raise ValueError(f"Invalid code_predictor_codes shape for Qwen3-Omni async_chunk: {tuple(code_frames.shape)}")
+
+    valid_mask = code_frames.any(dim=1) & (code_frames.max(dim=1).values < _QWEN3_CODEC_CODEBOOK_SIZE)
+    if not bool(valid_mask.any().item()):
+        return None
+    return code_frames[valid_mask][-1].reshape(-1).tolist()
+
+
 # =========================
 # Thinker -> Talker
 # =========================
@@ -111,6 +136,9 @@ def thinker2talker_async_chunk(
     # sent when the engine-core marks the request as completed one cycle
     # after the last real token was sampled.
     if request_finished and pooling_output.get("0") is None:
+        decode_embed_offsets = getattr(transfer_manager, "thinker_decode_embed_offsets", None)
+        if isinstance(decode_embed_offsets, dict):
+            decode_embed_offsets.pop(request_id, None)
         return {
             "finished": torch.tensor(True, dtype=torch.bool),
         }
@@ -163,6 +191,13 @@ def thinker2talker_async_chunk(
         }
         if output_token_ids:
             decode_embeddings = pooling_output.get("0").detach().cpu()
+            decode_embed_offsets = getattr(transfer_manager, "thinker_decode_embed_offsets", None)
+            if decode_embed_offsets is None:
+                decode_embed_offsets = {}
+                transfer_manager.thinker_decode_embed_offsets = decode_embed_offsets
+            if chunk_id == 1:
+                decode_embed_offsets[request_id] = 0
+
             talker_additional_info["override_keys"] = [
                 THINKER_DECODE_EMBEDDINGS_KEY,
                 THINKER_OUTPUT_TOKEN_IDS_KEY,
@@ -171,11 +206,13 @@ def thinker2talker_async_chunk(
             ]
             talker_additional_info[THINKER_DECODE_EMBEDDINGS_KEY] = decode_embeddings
             talker_additional_info[THINKER_OUTPUT_TOKEN_IDS_KEY] = output_token_ids
-            token_end = len(output_token_ids)
-            token_start = token_end - int(decode_embeddings.shape[0])
-            if token_start >= 0:
-                talker_additional_info[THINKER_DECODE_TOKEN_START_KEY] = token_start
-                talker_additional_info[THINKER_DECODE_TOKEN_END_KEY] = token_end
+
+            decode_rows = int(decode_embeddings.shape[0]) if decode_embeddings.ndim > 1 else 1
+            token_start = int(decode_embed_offsets.get(request_id, 0))
+            token_end = token_start + decode_rows
+            decode_embed_offsets[request_id] = token_end
+            talker_additional_info[THINKER_DECODE_TOKEN_START_KEY] = token_start
+            talker_additional_info[THINKER_DECODE_TOKEN_END_KEY] = token_end
         else:
             talker_additional_info["thinker_prefill_embeddings"] = pooling_output.get("0").detach().cpu()
             talker_additional_info["thinker_hidden_states"] = pooling_output.get("24").detach().cpu()
@@ -308,7 +345,10 @@ def talker2code2wav_async_chunk(
     request_finished = bool(request.is_finished())
     effective_finished = bool(is_finished or request_finished)
 
-    if request_finished and "code_predictor_codes" not in pooling_output:
+    # The finish sentinel can arrive before request.is_finished() flips on the
+    # local request object. Flush any cached codec codes as soon as this chunk
+    # is explicitly marked finished.
+    if effective_finished and "code_predictor_codes" not in pooling_output:
         request_id = request.external_req_id
         accumulated = transfer_manager.code_prompt_token_ids.get(request_id)
         if accumulated and len(accumulated) > 0:
@@ -340,31 +380,12 @@ def talker2code2wav_async_chunk(
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 25))
 
-    code_predictor_codes = pooling_output["code_predictor_codes"]
-
-    if code_predictor_codes is None:
-        return None
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0:
-            return None
-    elif hasattr(code_predictor_codes, "__len__"):
-        if len(code_predictor_codes) == 0:
-            return None
-
-    if isinstance(code_predictor_codes, torch.Tensor):
-        if not code_predictor_codes.any():
-            return None
-    else:
-        code_tensor = torch.tensor(code_predictor_codes, dtype=torch.long)
-        if not code_tensor.any():
-            return None
-
-    codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
+    frame = _extract_last_valid_qwen3_codec_frame(pooling_output.get("code_predictor_codes"))
+    if frame is None:
         return None
 
     request_id = request.external_req_id
-    transfer_manager.code_prompt_token_ids[request_id].append(codec_codes)
+    transfer_manager.code_prompt_token_ids[request_id].append(frame)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
     chunk_length = length % chunk_size_config
     if chunk_length != 0 and not effective_finished:
@@ -407,14 +428,13 @@ def talker2code2wav_batch(
     if code_predictor_codes is None:
         return None
     if isinstance(code_predictor_codes, torch.Tensor):
-        if code_predictor_codes.numel() == 0 or not code_predictor_codes.any():
+        if code_predictor_codes.numel() == 0:
             return None
     elif hasattr(code_predictor_codes, "__len__") and len(code_predictor_codes) == 0:
         return None
 
+    # Codec code 0 is valid; only empty payloads should be skipped.
     codec_codes = code_predictor_codes.to(torch.long).transpose(0, 1).cpu().to(torch.long).reshape(-1).tolist()
-    if sum(codec_codes) == 0:
-        return None
 
     return {
         "code_predictor_codes": codec_codes,

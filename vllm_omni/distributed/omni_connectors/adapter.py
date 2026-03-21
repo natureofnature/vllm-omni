@@ -12,6 +12,7 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from vllm_omni.entrypoints.talker_prompt_utils import compute_talker_prompt_ids_length  # noqa: F401
 from vllm_omni.metrics import OrchestratorAggregator
 
 from .utils.logging import get_connector_logger

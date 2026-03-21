@@ -5,6 +5,11 @@ from unittest.mock import MagicMock
 import pytest
 import torch
 
+from vllm_omni.payload_span import (
+    CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+    CACHED_THINKER_DECODE_TOKEN_END_KEY,
+    CACHED_THINKER_DECODE_TOKEN_START_KEY,
+)
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -280,6 +285,33 @@ def test_update_intermediate_buffer_skips_unknown_req_id():
     OmniGPUModelRunner._update_intermediate_buffer(runner, "unknown_req", {"key": torch.tensor([1.0])})
 
     assert "unknown_req" not in runner.model_intermediate_buffer
+
+
+def test_update_intermediate_buffer_replaces_stale_cached_decode_span():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model_intermediate_buffer["r1"] = {
+        CACHED_THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[1.0], [2.0]], dtype=torch.float32),
+        CACHED_THINKER_DECODE_TOKEN_START_KEY: 0,
+        CACHED_THINKER_DECODE_TOKEN_END_KEY: 2,
+    }
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            CACHED_THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[73.0], [74.0]], dtype=torch.float32),
+            CACHED_THINKER_DECODE_TOKEN_START_KEY: 73,
+            CACHED_THINKER_DECODE_TOKEN_END_KEY: 75,
+        },
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf[CACHED_THINKER_DECODE_TOKEN_START_KEY] == 73
+    assert buf[CACHED_THINKER_DECODE_TOKEN_END_KEY] == 75
+    assert torch.allclose(
+        buf[CACHED_THINKER_DECODE_EMBEDDINGS_KEY].to(torch.float32),
+        torch.tensor([[73.0], [74.0]], dtype=torch.float32),
+    )
 
 
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():

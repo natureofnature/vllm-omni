@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -33,6 +34,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
+_ENGINE_CORE_REQUEST_ACCEPTS_EOS_TOKEN_ID = "eos_token_id" in inspect.signature(OmniEngineCoreRequest).parameters
 
 
 def build_engine_core_request_from_tokens(
@@ -57,8 +59,10 @@ def build_engine_core_request_from_tokens(
     # Clone params and set max_tokens if needed
     sampling_params = None
     pooling_params = None
+    eos_token_id = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
+        eos_token_id = getattr(sampling_params, "eos_token_id", None)
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
     else:
@@ -72,7 +76,7 @@ def build_engine_core_request_from_tokens(
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
-    return OmniEngineCoreRequest(
+    request_kwargs = dict(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=None,
@@ -85,6 +89,10 @@ def build_engine_core_request_from_tokens(
         prompt_embeds=prompt_embeds,
         additional_information=additional_info_payload,
     )
+    if _ENGINE_CORE_REQUEST_ACCEPTS_EOS_TOKEN_ID:
+        request_kwargs["eos_token_id"] = eos_token_id
+
+    return OmniEngineCoreRequest(**request_kwargs)
 
 
 # ============================================================

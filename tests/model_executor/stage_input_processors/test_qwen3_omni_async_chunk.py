@@ -114,6 +114,44 @@ def test_thinker2talker_uses_request_finish_state_without_explicit_kwarg():
     assert rid not in tm.request_payload
 
 
+def test_async_chunk_emits_only_last_valid_codec_frame():
+    tm = _tm(chunk_frames=1, left_context=1)
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={
+            "code_predictor_codes": torch.tensor(
+                [
+                    [0] * 16,
+                    [2150] * 16,
+                    _FRAME,
+                ],
+                dtype=torch.long,
+            )
+        },
+        request=_req("rid-valid-frame", finished=False),
+    )
+
+    assert payload is not None
+    assert payload["finished"].item() is False
+    assert payload["left_context_size"] == 0
+    assert payload["code_predictor_codes"] == _FRAME
+    assert tm.code_prompt_token_ids["rid-valid-frame"] == [_FRAME]
+
+
+def test_async_chunk_drops_invalid_codec_frames():
+    tm = _tm(chunk_frames=1, left_context=1)
+
+    payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"code_predictor_codes": torch.tensor([[2150] * 16], dtype=torch.long)},
+        request=_req("rid-invalid-frame", finished=False),
+    )
+
+    assert payload is None
+    assert tm.code_prompt_token_ids["rid-invalid-frame"] == []
+
+
 def test_holds_partial_chunk_while_request_is_still_running():
     tm = _tm(chunk_frames=25, left_context=25)
 

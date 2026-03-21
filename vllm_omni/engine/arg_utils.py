@@ -1,9 +1,11 @@
 import argparse
 import dataclasses
+import inspect
 from dataclasses import dataclass, field
 from typing import Any
 
 import vllm.envs as envs
+from vllm.config import ModelConfig
 from vllm.engine.arg_utils import EngineArgs
 from vllm.logger import init_logger
 from vllm.transformers_utils.gguf_utils import is_gguf
@@ -152,62 +154,68 @@ class OmniEngineArgs(EngineArgs):
         }
         stage_connector_config["extra"]["stage_id"] = self.stage_id
 
-        # Create OmniModelConfig directly from engine args
-        # Note: We pass the actual init parameters matching vLLM's EngineArgs.create_model_config()
-        omni_config = OmniModelConfig(
+        # Create OmniModelConfig directly from engine args.
+        # Installed vLLM variants do not all expose the same ModelConfig init vars,
+        # so include optional arguments only when the base post-init still accepts them.
+        base_model_kwargs = {
             # Base ModelConfig fields (matching vLLM's EngineArgs.create_model_config)
-            model=self.model,
-            model_weights=self.model_weights,
-            hf_config_path=self.hf_config_path,
-            runner=self.runner,
-            convert=self.convert,
-            tokenizer=self.tokenizer,
-            tokenizer_mode=self.tokenizer_mode,
-            trust_remote_code=self.trust_remote_code,
-            allowed_local_media_path=self.allowed_local_media_path,
-            allowed_media_domains=self.allowed_media_domains,
-            dtype=self.dtype,
-            seed=self.seed,
-            revision=self.revision,
-            code_revision=self.code_revision,
-            hf_token=self.hf_token,
-            hf_overrides=self.hf_overrides,
-            tokenizer_revision=self.tokenizer_revision,
-            max_model_len=self.max_model_len,
-            quantization=self.quantization,
-            allow_deprecated_quantization=self.allow_deprecated_quantization,
-            enforce_eager=self.enforce_eager,
-            enable_return_routed_experts=self.enable_return_routed_experts,
-            max_logprobs=self.max_logprobs,
-            logprobs_mode=self.logprobs_mode,
-            disable_sliding_window=self.disable_sliding_window,
-            disable_cascade_attn=self.disable_cascade_attn,
-            skip_tokenizer_init=self.skip_tokenizer_init,
-            enable_prompt_embeds=self.enable_prompt_embeds,
-            served_model_name=self.served_model_name,
-            language_model_only=language_model_only,
-            limit_mm_per_prompt=limit_mm_per_prompt,
-            enable_mm_embeds=enable_mm_embeds,
-            interleave_mm_strings=interleave_mm_strings,
-            media_io_kwargs=media_io_kwargs,
-            skip_mm_profiling=skip_mm_profiling,
-            config_format=self.config_format,
-            mm_processor_kwargs=mm_processor_kwargs,
-            mm_processor_cache_gb=mm_processor_cache_gb,
-            mm_processor_cache_type=mm_processor_cache_type,
-            mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
-            mm_encoder_only=mm_encoder_only,
-            mm_encoder_tp_mode=mm_encoder_tp_mode,
-            mm_encoder_attn_backend=mm_encoder_attn_backend,
-            pooler_config=self.pooler_config,
-            generation_config=self.generation_config,
-            override_generation_config=self.override_generation_config,
-            enable_sleep_mode=self.enable_sleep_mode,
-            model_impl=self.model_impl,
-            override_attention_dtype=self.override_attention_dtype,
-            logits_processors=self.logits_processors,
-            video_pruning_rate=video_pruning_rate,
-            io_processor_plugin=self.io_processor_plugin,
+            "model": self.model,
+            "model_weights": self.model_weights,
+            "hf_config_path": self.hf_config_path,
+            "runner": self.runner,
+            "convert": self.convert,
+            "tokenizer": self.tokenizer,
+            "tokenizer_mode": self.tokenizer_mode,
+            "trust_remote_code": self.trust_remote_code,
+            "allowed_local_media_path": self.allowed_local_media_path,
+            "allowed_media_domains": self.allowed_media_domains,
+            "dtype": self.dtype,
+            "seed": self.seed,
+            "revision": self.revision,
+            "code_revision": self.code_revision,
+            "hf_token": self.hf_token,
+            "hf_overrides": self.hf_overrides,
+            "tokenizer_revision": self.tokenizer_revision,
+            "max_model_len": self.max_model_len,
+            "quantization": self.quantization,
+            "allow_deprecated_quantization": self.allow_deprecated_quantization,
+            "enforce_eager": self.enforce_eager,
+            "enable_return_routed_experts": self.enable_return_routed_experts,
+            "max_logprobs": self.max_logprobs,
+            "logprobs_mode": self.logprobs_mode,
+            "disable_sliding_window": self.disable_sliding_window,
+            "disable_cascade_attn": self.disable_cascade_attn,
+            "skip_tokenizer_init": self.skip_tokenizer_init,
+            "enable_prompt_embeds": self.enable_prompt_embeds,
+            "served_model_name": self.served_model_name,
+            "limit_mm_per_prompt": limit_mm_per_prompt,
+            "enable_mm_embeds": enable_mm_embeds,
+            "interleave_mm_strings": interleave_mm_strings,
+            "media_io_kwargs": media_io_kwargs,
+            "skip_mm_profiling": skip_mm_profiling,
+            "config_format": self.config_format,
+            "mm_processor_kwargs": mm_processor_kwargs,
+            "mm_processor_cache_gb": mm_processor_cache_gb,
+            "mm_processor_cache_type": mm_processor_cache_type,
+            "mm_shm_cache_max_object_size_mb": mm_shm_cache_max_object_size_mb,
+            "mm_encoder_only": mm_encoder_only,
+            "mm_encoder_tp_mode": mm_encoder_tp_mode,
+            "mm_encoder_attn_backend": mm_encoder_attn_backend,
+            "pooler_config": self.pooler_config,
+            "generation_config": self.generation_config,
+            "override_generation_config": self.override_generation_config,
+            "enable_sleep_mode": self.enable_sleep_mode,
+            "model_impl": self.model_impl,
+            "override_attention_dtype": self.override_attention_dtype,
+            "logits_processors": self.logits_processors,
+            "video_pruning_rate": video_pruning_rate,
+            "io_processor_plugin": self.io_processor_plugin,
+        }
+        if "language_model_only" in inspect.signature(ModelConfig.__post_init__).parameters:
+            base_model_kwargs["language_model_only"] = language_model_only
+
+        omni_config = OmniModelConfig(
+            **base_model_kwargs,
             # Omni-specific fields
             stage_id=self.stage_id,
             async_chunk=self.async_chunk,

@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import field
 from typing import Any
 
@@ -103,7 +104,7 @@ class OmniModelConfig(ModelConfig):
     def __post_init__(
         self,
         # Multimodal config init vars
-        language_model_only: bool,
+        language_model_only: bool | None,
         limit_mm_per_prompt: dict[str, int | dict[str, int]] | None,
         enable_mm_embeds: bool | None,
         media_io_kwargs: dict[str, dict[str, Any]] | None,
@@ -119,22 +120,24 @@ class OmniModelConfig(ModelConfig):
         video_pruning_rate: float | None,
     ) -> None:
         # Call parent's __post_init__ to handle all standard ModelConfig initialization
-        super().__post_init__(
-            language_model_only=language_model_only,
-            limit_mm_per_prompt=limit_mm_per_prompt,
-            enable_mm_embeds=enable_mm_embeds,
-            media_io_kwargs=media_io_kwargs,
-            mm_processor_kwargs=mm_processor_kwargs,
-            mm_processor_cache_gb=mm_processor_cache_gb,
-            mm_processor_cache_type=mm_processor_cache_type,
-            mm_shm_cache_max_object_size_mb=mm_shm_cache_max_object_size_mb,
-            mm_encoder_only=mm_encoder_only,
-            mm_encoder_tp_mode=mm_encoder_tp_mode,
-            mm_encoder_attn_backend=mm_encoder_attn_backend,
-            interleave_mm_strings=interleave_mm_strings,
-            skip_mm_profiling=skip_mm_profiling,
-            video_pruning_rate=video_pruning_rate,
-        )
+        super_kwargs = {
+            "limit_mm_per_prompt": limit_mm_per_prompt,
+            "enable_mm_embeds": enable_mm_embeds,
+            "media_io_kwargs": media_io_kwargs,
+            "mm_processor_kwargs": mm_processor_kwargs,
+            "mm_processor_cache_gb": mm_processor_cache_gb,
+            "mm_processor_cache_type": mm_processor_cache_type,
+            "mm_shm_cache_max_object_size_mb": mm_shm_cache_max_object_size_mb,
+            "mm_encoder_only": mm_encoder_only,
+            "mm_encoder_tp_mode": mm_encoder_tp_mode,
+            "mm_encoder_attn_backend": mm_encoder_attn_backend,
+            "interleave_mm_strings": interleave_mm_strings,
+            "skip_mm_profiling": skip_mm_profiling,
+            "video_pruning_rate": video_pruning_rate,
+        }
+        if "language_model_only" in inspect.signature(ModelConfig.__post_init__).parameters:
+            super_kwargs["language_model_only"] = bool(language_model_only)
+        super().__post_init__(**super_kwargs)
 
         # Qwen3-TTS: infer codec frame rate from the model config for online serving.
         if self.codec_frame_rate_hz is None and self.model_arch == "Qwen3TTSTalkerForConditionalGenerationARVLLM":

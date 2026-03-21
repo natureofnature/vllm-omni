@@ -13,6 +13,66 @@ from vllm_omni.model_executor.stage_input_processors.chunk_size_utils import (
 logger = init_logger(__name__)
 
 
+def _sanitize_qwen3_tts_audio_codes(audio_codes: torch.Tensor) -> torch.Tensor:
+    """Drop invalid / sentinel codec frames before code2wav."""
+    _CODEBOOK_SIZE = 2048
+    if audio_codes.ndim != 2 or audio_codes.numel() == 0:
+        return audio_codes
+    valid_mask = (
+        audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE) & (audio_codes.min(dim=1).values >= 0)
+    )
+    return audio_codes[valid_mask]
+
+
+def _flatten_qwen3_tts_codes(
+    audio_codes: torch.Tensor,
+    ref_code: torch.Tensor | None,
+) -> tuple[list[int], int]:
+    audio_codes = _sanitize_qwen3_tts_audio_codes(audio_codes.to(torch.long))
+    if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+        ref_code = ref_code.to(torch.long).cpu().contiguous()
+        ref_code_len = int(ref_code.shape[0])
+        audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
+    else:
+        ref_code_len = 0
+    codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+    return codec_codes, ref_code_len
+
+
+def talker2code2wav_batch(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    """Connector send-side hook for the no-async Stage-0 -> Stage-1 handoff.
+
+    This is intentionally not the same contract as talker2code2wav(...), which
+    serves the older direct stage-list path and returns OmniTokensPrompt objects.
+    Connector send-side calls custom_process_next_stage_input_func with
+    (transfer_manager, pooling_output, request, ...), so Stage-0 must emit a
+    payload dict that Stage-1 can consume through the runtime connector path.
+    """
+    del transfer_manager, request
+    if not isinstance(pooling_output, dict) or "audio_codes" not in pooling_output:
+        return None
+    audio_codes = pooling_output["audio_codes"]
+    if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0:
+        return None
+    ref_code = pooling_output.get("ref_code")
+    if isinstance(ref_code, list):
+        ref_code = ref_code[0] if ref_code else None
+    codec_codes, ref_code_len = _flatten_qwen3_tts_codes(audio_codes, ref_code)
+    if not codec_codes:
+        return None
+    payload = {
+        "code_predictor_codes": codec_codes,
+        "finished": torch.tensor(True, dtype=torch.bool),
+    }
+    if ref_code_len > 0:
+        payload["left_context_size"] = ref_code_len
+    return payload
+
+
 def talker2code2wav(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -27,24 +87,11 @@ def talker2code2wav(
     code2wav_inputs: list[OmniTokensPrompt] = []
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
-        # audio_codes shape: [num_frames, Q] where Q=num_quantizers (16)
-        audio_codes = output.multimodal_output["audio_codes"].to(torch.long)
-        # Filter invalid frames: zero-padded (EOS) and frames containing
-        # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
-        _CODEBOOK_SIZE = 2048
-        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
-        audio_codes = audio_codes[valid_mask]
+        audio_codes = output.multimodal_output["audio_codes"]
         ref_code = output.multimodal_output.get("ref_code")
         if isinstance(ref_code, list):
             ref_code = ref_code[0] if ref_code else None
-        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-            ref_code = ref_code.to(torch.long).cpu().contiguous()
-            ref_code_len = int(ref_code.shape[0])
-            audio_codes = torch.cat([ref_code.to(audio_codes.device), audio_codes], dim=0)
-        else:
-            ref_code_len = 0
-        # Code2Wav expects codebook-major flat: [Q*num_frames]
-        codec_codes = audio_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+        codec_codes, ref_code_len = _flatten_qwen3_tts_codes(audio_codes, ref_code)
         additional_information = {"left_context_size": [ref_code_len]} if ref_code_len > 0 else None
         code2wav_inputs.append(
             OmniTokensPrompt(

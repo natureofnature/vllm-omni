@@ -1,6 +1,6 @@
-import sys
 import hashlib
 import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
@@ -19,7 +19,15 @@ from vllm.utils.import_utils import LazyLoader
 from vllm.utils.math_utils import cdiv
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+
+try:
+    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+except ImportError:
+
+    class ExtractHiddenStatesProposer:  # type: ignore[no-redef]
+        pass
+
+
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
@@ -27,6 +35,9 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.payload_span import (
+    CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+    CACHED_THINKER_DECODE_TOKEN_END_KEY,
+    CACHED_THINKER_DECODE_TOKEN_START_KEY,
     THINKER_DECODE_EMBEDDINGS_KEY,
     THINKER_DECODE_TOKEN_END_KEY,
     THINKER_DECODE_TOKEN_START_KEY,
@@ -278,6 +289,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
+        if not req_state.prompt_token_ids and req_state.prompt_embeds is not None and not req_state.mm_features:
+            # Some downstream text-only stages are seeded with prompt embeds but no
+            # token ids. They still need linear M-RoPE positions for the prompt.
+            num_prompt_embeds = int(req_state.prompt_embeds.shape[0])
+            req_state.mrope_positions = torch.arange(num_prompt_embeds, dtype=torch.long).expand(3, -1)
+            req_state.mrope_position_delta = 0
+            return
+
         if supports_mrope(self.get_model()):
             # Model implements SupportsMRoPE interface
             # Pass all extracted metadata; models use what they need via **kwargs
@@ -314,6 +333,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         class attribute.  When set, ``get_mrope_input_positions`` is expected
         to return positions covering **both** prefill and decode tokens.
         """
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        for req_id in self.input_batch.req_ids:
+            req = self.requests[req_id]
+            if req.mrope_positions is None or req.mrope_positions.shape[1] != 0:
+                continue
+
+            prompt_len = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+            if prompt_len <= 0:
+                continue
+
+            # Some seeded downstream requests still arrive with an empty cached
+            # M-RoPE tensor even though the prompt length is non-zero.
+            req.mrope_positions = torch.arange(prompt_len, dtype=torch.long).expand(3, -1)
+            req.mrope_position_delta = 0
+
         # Run upstream logic (handles prompt positions + linear decode fallback)
         super()._calc_mrope_positions(scheduler_output)
 
@@ -1599,7 +1634,65 @@ class OmniGPUModelRunner(GPUModelRunner):
         if req_state is None:
             return
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        incoming_cached_span = get_tensor_span(
+            upd,
+            tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+            end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+        )
         for k, v in upd.items():
+            if k == CACHED_THINKER_DECODE_EMBEDDINGS_KEY:
+                existing_cached_span = get_tensor_span(
+                    existing,
+                    tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+                    start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+                    end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+                )
+                if incoming_cached_span is not None:
+                    merged_span = (
+                        incoming_cached_span
+                        if existing_cached_span is None
+                        else merge_tensor_spans(existing_cached_span, incoming_cached_span)
+                    )
+                    if merged_span is not None:
+                        tensor, start, end = merged_span
+                        existing[CACHED_THINKER_DECODE_EMBEDDINGS_KEY] = tensor.detach().to("cpu").contiguous()
+                        existing[CACHED_THINKER_DECODE_TOKEN_START_KEY] = start
+                        existing[CACHED_THINKER_DECODE_TOKEN_END_KEY] = end
+                        continue
+                    if existing_cached_span is not None:
+                        if incoming_cached_span[1] >= existing_cached_span[2]:
+                            logger.warning(
+                                "[Stage-%s] req=%s replacing stale cached thinker decode "
+                                "span due to non-contiguous postprocess update: "
+                                "existing=(%s,%s) incoming=(%s,%s)",
+                                getattr(self, "_stage_id", "?"),
+                                req_id,
+                                existing_cached_span[1],
+                                existing_cached_span[2],
+                                incoming_cached_span[1],
+                                incoming_cached_span[2],
+                            )
+                            tensor, start, end = incoming_cached_span
+                            existing[CACHED_THINKER_DECODE_EMBEDDINGS_KEY] = tensor.detach().to("cpu").contiguous()
+                            existing[CACHED_THINKER_DECODE_TOKEN_START_KEY] = start
+                            existing[CACHED_THINKER_DECODE_TOKEN_END_KEY] = end
+                            continue
+                        logger.warning(
+                            "[Stage-%s] req=%s keeping existing cached thinker decode "
+                            "span due to non-contiguous postprocess update: "
+                            "existing=(%s,%s) incoming=(%s,%s)",
+                            getattr(self, "_stage_id", "?"),
+                            req_id,
+                            existing_cached_span[1],
+                            existing_cached_span[2],
+                            incoming_cached_span[1],
+                            incoming_cached_span[2],
+                        )
+                        continue
+            if k in {CACHED_THINKER_DECODE_TOKEN_START_KEY, CACHED_THINKER_DECODE_TOKEN_END_KEY}:
+                if incoming_cached_span is not None:
+                    continue
             if isinstance(v, torch.Tensor):
                 existing[k] = v.detach().to("cpu").contiguous()
             elif isinstance(v, list):

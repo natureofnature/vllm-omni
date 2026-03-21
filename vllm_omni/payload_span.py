@@ -38,6 +38,8 @@ def merge_tensor_spans(existing_span: TensorSpan | None, incoming_span: TensorSp
 
     existing_tensor, existing_start, existing_end = existing_span
     incoming_tensor, incoming_start, incoming_end = incoming_span
+    if incoming_tensor.device != existing_tensor.device or incoming_tensor.dtype != existing_tensor.dtype:
+        incoming_tensor = incoming_tensor.to(device=existing_tensor.device, dtype=existing_tensor.dtype)
     if incoming_start == existing_end:
         return torch.cat([existing_tensor, incoming_tensor], dim=0), existing_start, incoming_end
     if incoming_start < existing_end:

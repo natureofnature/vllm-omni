@@ -38,6 +38,17 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.payload_span import (
+    CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+    CACHED_THINKER_DECODE_TOKEN_END_KEY,
+    CACHED_THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_DECODE_EMBEDDINGS_KEY,
+    THINKER_DECODE_TOKEN_END_KEY,
+    THINKER_DECODE_TOKEN_START_KEY,
+    get_tensor_span,
+    get_tensor_span_row,
+    merge_tensor_spans,
+)
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -792,21 +803,79 @@ class Qwen3OmniMoeForConditionalGeneration(
         Cache thinker embeds for decode stage.
         """
         thinker_decode_embeds = info_dict.get("thinker_decode_embeddings", None)
+        start_index = int(info_dict.get("num_processed_tokens", 0))
+        clear_incoming_decode_embed = thinker_decode_embeds is not None
+        incoming_span = get_tensor_span(
+            info_dict,
+            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=THINKER_DECODE_TOKEN_START_KEY,
+            end_key=THINKER_DECODE_TOKEN_END_KEY,
+        )
         if thinker_decode_embeds is not None:
-            cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
-            if cached_thinker_decode_embeds is None:
-                update_dict["cached_thinker_decode_embeddings"] = thinker_decode_embeds
+            cached_span = get_tensor_span(
+                info_dict,
+                tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+                start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+                end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+            )
+            if incoming_span is not None:
+                incoming_span = (
+                    incoming_span[0].to(device=self._module_device(self.talker), dtype=torch.bfloat16),
+                    incoming_span[1],
+                    incoming_span[2],
+                )
+            if cached_span is None:
+                if incoming_span is not None:
+                    (
+                        update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                        update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                        update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                    ) = incoming_span
+                else:
+                    update_dict["cached_thinker_decode_embeddings"] = thinker_decode_embeds
             else:
-                cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
+                cached_span = (
+                    cached_span[0].to(device=self._module_device(self.talker), dtype=torch.bfloat16),
+                    cached_span[1],
+                    cached_span[2],
                 )
-                thinker_decode_embeds = thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
-                )
-                update_dict["cached_thinker_decode_embeddings"] = torch.cat(
-                    [cached_thinker_decode_embeds, thinker_decode_embeds], dim=0
-                )
-        update_dict["thinker_decode_embeddings"] = None
+                if incoming_span is not None:
+                    merged_span = merge_tensor_spans(cached_span, incoming_span)
+                    if merged_span is not None:
+                        (
+                            update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                        ) = merged_span
+                    elif incoming_span[1] >= cached_span[2] and start_index >= cached_span[2]:
+                        logger.warning(
+                            "Talker decode cache replaced stale non-contiguous thinker span: "
+                            "existing=(%s,%s) incoming=(%s,%s)",
+                            cached_span[1],
+                            cached_span[2],
+                            incoming_span[1],
+                            incoming_span[2],
+                        )
+                        (
+                            update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                        ) = incoming_span
+                    else:
+                        clear_incoming_decode_embed = False
+                else:
+                    thinker_decode_embeds = thinker_decode_embeds.to(
+                        device=self._module_device(self.talker), dtype=torch.bfloat16
+                    )
+                    update_dict["cached_thinker_decode_embeddings"] = torch.cat(
+                        [cached_span[0], thinker_decode_embeds], dim=0
+                    )
+                    update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY] = cached_span[1]
+                    update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY] = cached_span[1] + int(
+                        update_dict["cached_thinker_decode_embeddings"].shape[0]
+                    )
+        if clear_incoming_decode_embed:
+            update_dict["thinker_decode_embeddings"] = None
 
     def _thinker_to_talker_prefill(
         self,
@@ -901,63 +970,147 @@ class Qwen3OmniMoeForConditionalGeneration(
         Returns:
             projected embed for one decode step
         """
-        cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
+        cached_span = get_tensor_span(
+            info_dict,
+            tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+            end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+        )
         thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
+        clear_incoming_decode_embed = thinker_decode_embed is not None
+        incoming_span = get_tensor_span(
+            info_dict,
+            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=THINKER_DECODE_TOKEN_START_KEY,
+            end_key=THINKER_DECODE_TOKEN_END_KEY,
+        )
 
-        # Batched delivery: multiple embeds arrived as [N, H].
-        # Pre-cache them so the per-step logic below always sees
-        # at most a single new embed (or None).
-        if thinker_decode_embed is not None and thinker_decode_embed.ndim >= 2 and thinker_decode_embed.shape[0] > 1:
-            thinker_decode_embed = thinker_decode_embed.to(device)
-            if cached_thinker_decode_embeds is None:
-                cached_thinker_decode_embeds = thinker_decode_embed
+        # Normalize any explicit incoming span into the cached absolute-row view.
+        if incoming_span is not None:
+            start_index = int(info_dict.get("num_processed_tokens", 0))
+            incoming_tensor = incoming_span[0].to(device)
+            incoming_span = (incoming_tensor, incoming_span[1], incoming_span[2])
+            if cached_span is None:
+                cached_span = incoming_span
             else:
-                cached_thinker_decode_embeds = torch.cat(
-                    [cached_thinker_decode_embeds.to(device), thinker_decode_embed], dim=0
+                cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+                merged_span = merge_tensor_spans(cached_span, incoming_span)
+                if merged_span is not None:
+                    cached_span = merged_span
+                elif incoming_span[1] >= cached_span[2] and start_index >= cached_span[2]:
+                    logger.warning(
+                        "Talker decode replaced stale cached span with newer incoming "
+                        "span: existing=(%s,%s) incoming=(%s,%s)",
+                        cached_span[1],
+                        cached_span[2],
+                        incoming_span[1],
+                        incoming_span[2],
+                    )
+                    cached_span = incoming_span
+                else:
+                    clear_incoming_decode_embed = False
+            (
+                update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+            ) = cached_span
+            if clear_incoming_decode_embed:
+                thinker_decode_embed = None
+                incoming_span = None
+        # Legacy fallback: cache batched decode embeds even when explicit span metadata is absent.
+        elif thinker_decode_embed is not None and thinker_decode_embed.ndim >= 2 and thinker_decode_embed.shape[0] > 1:
+            thinker_decode_embed = thinker_decode_embed.to(device)
+            if cached_span is None:
+                cached_span = (thinker_decode_embed, 0, int(thinker_decode_embed.shape[0]))
+            else:
+                cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+                cached_span = (
+                    torch.cat([cached_span[0], thinker_decode_embed], dim=0),
+                    cached_span[1],
+                    cached_span[2] + int(thinker_decode_embed.shape[0]),
                 )
-            update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
+            (
+                update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+            ) = cached_span
             thinker_decode_embed = None
 
         start_index = info_dict.get("num_processed_tokens", 0)
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
-        if start_index >= len(thinker_output_token_ids) - 1:
-            logger.warning(
-                "Talker decode reached EOS/pad boundary: start_index=%s thinker_tokens=%s finished_flag=%s",
-                start_index,
-                len(thinker_output_token_ids),
-                info_dict.get("finished_flag", False),
-            )
-            if info_dict.get("finished_flag"):
-                update_dict["_advance_num_processed_tokens"] = False
+        if cached_span is not None:
+            cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+        if incoming_span is not None:
+            incoming_span = (incoming_span[0].to(device), incoming_span[1], incoming_span[2])
+
+        thinker_embed = get_tensor_span_row(cached_span, start_index)
+        if thinker_embed is None:
+            thinker_embed = get_tensor_span_row(incoming_span, start_index)
+
+        if thinker_embed is None and thinker_decode_embed is not None:
+            thinker_decode_embed = thinker_decode_embed.to(device)
+            if thinker_decode_embed.ndim == 1:
+                thinker_embed = thinker_decode_embed
+            elif thinker_decode_embed.shape[0] == 1:
+                thinker_embed = thinker_decode_embed[0]
+
+        available_end = -1
+        if cached_span is not None:
+            available_end = max(available_end, cached_span[2])
+        if incoming_span is not None:
+            available_end = max(available_end, incoming_span[2])
+        if available_end < 0 and thinker_decode_embed is not None:
+            available_end = start_index + 1
+        legacy_decode_end = len(thinker_output_token_ids) - 1
+        if available_end < 0 and legacy_decode_end >= 0:
+            available_end = legacy_decode_end
+        terminal_decode_end = max(available_end, legacy_decode_end)
+
+        if thinker_embed is None:
+            finished = bool(info_dict.get("finished", False))
+            finished_flag = bool(info_dict.get("finished_flag", False))
+            advance_to_terminal = terminal_decode_end >= 0 and start_index < terminal_decode_end
+
+            if finished_flag:
+                update_dict["_advance_num_processed_tokens"] = advance_to_terminal
+                if clear_incoming_decode_embed:
+                    update_dict["thinker_decode_embeddings"] = None
                 return self.tts_pad_embed.to(device)
-            update_dict["finished_flag"] = True
-            update_dict["_advance_num_processed_tokens"] = False
-            return self.tts_eos_embed.to(device)
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
-        else:
-            if thinker_decode_embed is None:
-                logger.warning_once(
-                    "Async-chunk talker decode fell back to tts_pad_embed with no "
-                    "cached or incoming thinker decode embed. This should be rare "
-                    "and may indicate an unexpected payload visibility gap. "
-                    "start_index=%s thinker_tokens=%s finished_flag=%s",
+
+            if available_end >= 0 and start_index >= available_end:
+                if finished:
+                    update_dict["finished_flag"] = True
+                    update_dict["_advance_num_processed_tokens"] = advance_to_terminal
+                    if clear_incoming_decode_embed:
+                        update_dict["thinker_decode_embeddings"] = None
+                    return self.tts_eos_embed.to(device)
+                logger.warning(
+                    "Talker decode reached available decode boundary: start_index=%s "
+                    "available_end=%s thinker_tokens=%s finished=%s finished_flag=%s",
                     start_index,
+                    available_end,
                     len(thinker_output_token_ids),
-                    info_dict.get("finished_flag", False),
+                    finished,
+                    finished_flag,
                 )
-                update_dict["_advance_num_processed_tokens"] = False
+            logger.warning_once(
+                "Async-chunk talker decode fell back to tts_pad_embed with no "
+                "cached or incoming thinker decode embed. This should be rare "
+                "and may indicate an unexpected payload visibility gap. "
+                "start_index=%s available_end=%s thinker_tokens=%s finished=%s finished_flag=%s",
+                start_index,
+                available_end,
+                len(thinker_output_token_ids),
+                finished,
+                finished_flag,
+            )
+            update_dict["_advance_num_processed_tokens"] = False
+            if clear_incoming_decode_embed:
                 update_dict["thinker_decode_embeddings"] = None
-                return self.tts_pad_embed.to(device)
-            else:
-                thinker_embed = thinker_decode_embed.to(device)
+            return self.tts_pad_embed.to(device)
         update_dict["_advance_num_processed_tokens"] = True
-        update_dict["thinker_decode_embeddings"] = None
+        if clear_incoming_decode_embed:
+            update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(

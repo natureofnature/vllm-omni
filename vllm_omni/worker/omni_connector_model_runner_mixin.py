@@ -83,7 +83,10 @@ class OmniConnectorModelRunnerMixin:
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
         self._model_mode: str = getattr(model_config, "worker_type", "ar")
-        self._stage_id: int = getattr(model_config, "stage_id", 0)
+        stage_id = getattr(model_config, "stage_id", 0)
+        if isinstance(stage_id, str):
+            stage_id = int(stage_id)
+        self._stage_id: int = stage_id if isinstance(stage_id, int) else 0
 
         self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
@@ -385,12 +388,11 @@ class OmniConnectorModelRunnerMixin:
         if "code_predictor_codes" in payload:
             code_predictor_codes = payload.get("code_predictor_codes")
             if isinstance(code_predictor_codes, torch.Tensor):
-                return code_predictor_codes.numel() > 0 and bool(code_predictor_codes.any())
-            if hasattr(code_predictor_codes, "__len__") and len(code_predictor_codes) == 0:
-                return False
-            try:
-                return any(int(x) != 0 for x in code_predictor_codes)
-            except TypeError:
+                return code_predictor_codes.numel() > 0
+            # Codec code 0 is valid; non-empty code payloads are consumable.
+            if hasattr(code_predictor_codes, "__len__"):
+                return len(code_predictor_codes) > 0
+            else:
                 return code_predictor_codes is not None
 
         for key, value in payload.items():
@@ -973,11 +975,13 @@ class OmniConnectorModelRunnerMixin:
         if req_id in self._kv_pending_transfers:
             return
         self._kv_triggered_requests.add(req_id)
-        self._kv_pending_transfers[req_id] = {
+        transfer = {
             "seq_len": seq_len,
             "block_ids": block_ids,
-            "custom_metadata": custom_metadata,
         }
+        if custom_metadata is not None:
+            transfer["custom_metadata"] = custom_metadata
+        self._kv_pending_transfers[req_id] = transfer
 
     def drain_pending_kv_transfers(self) -> dict[str, dict[str, Any]]:
         """Drain pending KV transfers and move them to active.
@@ -1053,9 +1057,11 @@ class OmniConnectorModelRunnerMixin:
             self._chunk_finished_req_ids.clear()
             request_metadata = dict(self._local_request_metadata)
             self._local_request_metadata.clear()
-            # Once a finished req has a staged payload ready for runtime sync,
-            # the local cache becomes the only data-plane source of truth.
-            for req_id in newly_finished:
+            # _request_payload is the async accumulation buffer for future recv
+            # chunks. Clearing it on every consumable wake-up drops intermediate
+            # thinker decode spans before the model side can consume them.
+            # Only terminal chunk_finished requests may release that buffer.
+            for req_id in chunk_finished:
                 if req_id not in self._local_stage_payload_cache:
                     continue
                 ext_req_id = self._request_ids_mapping.get(req_id, req_id)
@@ -1265,15 +1271,19 @@ class OmniConnectorModelRunnerMixin:
                     self._local_stage_payload_cache[req_id] = payload_data
                 staged_payload = self._local_stage_payload_cache[req_id]
                 self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
-                if payload_consumable:
+                # A finish-only sentinel still needs one terminal wake-up so
+                # the downstream stage can sync the merged local payload and
+                # flush/finish even when the last recv carries no new
+                # consumable chunk bytes.
+                if payload_consumable or is_finished:
                     self._finished_load_reqs.add(req_id)
-                elif is_finished:
+                if is_finished and not payload_consumable:
                     logger.debug(
                         "[Stage-%s] finish sentinel arrived for req=%s without new consumable payload",
                         self._stage_id,
                         req_id,
                     )
-                else:
+                elif not payload_consumable:
                     logger.debug(
                         "[Stage-%s] req=%s received metadata-only / non-consumable async payload; delaying wake-up",
                         self._stage_id,
@@ -1570,14 +1580,21 @@ class OmniConnectorModelRunnerMixin:
         if not isinstance(connector_config, dict):
             connector_config = {
                 "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", {}),
+                "extra": getattr(connector_config, "extra", None),
             }
 
         name = connector_config.get("name")
-        if not name:
+        if not isinstance(name, str) or not name.strip():
             return None
+        name = name.strip()
 
-        spec = ConnectorSpec(name=name, extra=connector_config.get("extra", {}))
+        extra = connector_config.get("extra")
+        if extra is None:
+            extra = {}
+        elif not isinstance(extra, dict):
+            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
+
+        spec = ConnectorSpec(name=name, extra=extra)
         try:
             return OmniConnectorFactory.create_connector(spec)
         except Exception as exc:
@@ -1587,7 +1604,7 @@ class OmniConnectorModelRunnerMixin:
     def _load_custom_func(model_config: Any) -> Any | None:
         """Load custom_process_next_stage_input_func from config."""
         func_path = getattr(model_config, "custom_process_next_stage_input_func", None)
-        if not func_path:
+        if not isinstance(func_path, str) or not func_path:
             return None
         try:
             module_path, func_name = func_path.rsplit(".", 1)
@@ -1624,7 +1641,9 @@ class OmniConnectorModelRunnerMixin:
                 to_stage = connector_config.get("to_stage")
             else:
                 to_stage = getattr(connector_config, "to_stage", None)
-            if to_stage is not None:
+            if isinstance(to_stage, int):
+                return to_stage
+            if isinstance(to_stage, str) and to_stage.strip():
                 return int(to_stage)
         return self._stage_id + 1
 
