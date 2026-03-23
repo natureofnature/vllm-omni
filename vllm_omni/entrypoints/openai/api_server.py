@@ -1281,7 +1281,7 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
 
     try:
         # Build params - pass through user values directly
-        prompt: OmniTextPrompt = {"prompt": request.prompt}
+        prompt: OmniTextPrompt = {"prompt": request.prompt, "modalities": ["image"]}
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
@@ -1427,8 +1427,12 @@ async def edit_images(
         if not input_images_list:
             raise HTTPException(status_code=422, detail="Field 'image' or 'url' is required")
         pil_images = await _load_input_images(input_images_list)
+        if prompt.get("prompt") and "<|image_pad|>" not in prompt["prompt"]:
+            prompt["prompt"] = f"<|image_pad|>{prompt['prompt']}"
+        prompt["modalities"] = ["image", "img2img"]
         prompt["multi_modal_data"] = {}
         prompt["multi_modal_data"]["image"] = pil_images
+        prompt["multi_modal_data"]["img2img"] = pil_images
 
         # 3 Build sample params
         gen_params = OmniDiffusionSamplingParams()

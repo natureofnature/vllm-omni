@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import dataclasses
 import json
 import os
@@ -111,6 +112,49 @@ def _inject_global_id(target: Any, request_id: str) -> None:
             target["additional_information"] = {}
         if isinstance(target["additional_information"], dict):
             target["additional_information"]["global_request_id"] = [str(request_id)]
+
+
+def _normalize_split_stage0_img2img_prompt(prompt: Any) -> Any:
+    """Rewrite split stage-0 i2i prompts into two adjacent img2img blocks.
+
+    One-stage Bagel i2i builds the parent KV in two consecutive non-causal
+    cache updates: VAE block first, then ViT block. The split AR path cannot
+    reproduce that faithfully with one multimodal placeholder because vLLM only
+    splits PrefixLM ranges on placeholder boundaries (or explicit non-embed
+    gaps). For split stage-0 only, materialize one logical reference image as
+    two adjacent img2img items so the AR prompt carries two independent
+    multimodal ranges without a real separator token.
+    """
+    if not isinstance(prompt, dict):
+        return prompt
+
+    modalities = prompt.get("modalities") or []
+    if "img2img" not in modalities:
+        return prompt
+
+    mm_data = prompt.get("multi_modal_data")
+    if not isinstance(mm_data, dict) or "img2img" not in mm_data:
+        return prompt
+
+    normalized = copy.deepcopy(prompt)
+
+    raw_items = mm_data["img2img"]
+    items = raw_items if isinstance(raw_items, list) else [raw_items]
+    paired_items = []
+    paired_uuids = []
+    for idx, item in enumerate(items):
+        base = f"split-img2img-{idx}-{id(item)}"
+        paired_items.extend([item, item])
+        paired_uuids.extend([f"{base}-vae", f"{base}-vit"])
+
+    text = normalized.get("prompt") or ""
+    text = text.replace("<|image_pad|>", "").replace("<|fim_middle|>", "")
+
+    normalized["modalities"] = ["img2img"]
+    normalized["multi_modal_data"] = {"img2img": paired_items}
+    normalized["multi_modal_uuids"] = {"img2img": paired_uuids}
+    normalized["prompt"] = ("<|fim_middle|>" * len(paired_items)) + text
+    return normalized
 
 
 def _upgrade_to_omni_request(
@@ -350,15 +394,17 @@ class AsyncOmniEngine:
                         coordinator=coordinator,
                         addresses=addresses,
                     )
+                    logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
+                    # Keep the stage-specific device visibility until vLLM
+                    # finishes starting all child processes.
+                    launch_cm.__exit__(None, None, None)
+                    logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
                 finally:
                     if previous_visible_devices is None:
                         current_omni_platform.unset_device_control_env_var()
                     else:
                         current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
-            logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
-            launch_cm.__exit__(None, None, None)
-            logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
             assert started_stage is not None
             return started_stage
         except Exception:
@@ -469,32 +515,33 @@ class AsyncOmniEngine:
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
 
                     if metadata.stage_type == "diffusion":
-                        previous_visible_devices = os.environ.get(device_control_env)
-                        try:
-                            setup_stage_devices(stage_id, metadata.runtime_cfg)
-                            omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                            if omni_conn_cfg:
-                                from vllm_omni.entrypoints.utils import inject_omni_kv_config
+                        with llm_stage_launch_lock:
+                            previous_visible_devices = os.environ.get(device_control_env)
+                            try:
+                                setup_stage_devices(stage_id, metadata.runtime_cfg)
+                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                                if omni_conn_cfg:
+                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
 
-                                inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                            _inject_kv_stage_info(stage_cfg, stage_id)
-                            stage_clients[stage_id] = initialize_diffusion_stage(
-                                self.model,
-                                stage_cfg,
-                                metadata,
-                                batch_size=self.diffusion_batch_size,
-                            )
-                            logger.info(
-                                "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
-                                stage_id,
-                                self.diffusion_batch_size,
-                            )
-                            continue
-                        finally:
-                            if previous_visible_devices is None:
-                                current_omni_platform.unset_device_control_env_var()
-                            else:
-                                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                                _inject_kv_stage_info(stage_cfg, stage_id)
+                                stage_clients[stage_id] = initialize_diffusion_stage(
+                                    self.model,
+                                    stage_cfg,
+                                    metadata,
+                                    batch_size=self.diffusion_batch_size,
+                                )
+                                logger.info(
+                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
+                                    stage_id,
+                                    self.diffusion_batch_size,
+                                )
+                            finally:
+                                if previous_visible_devices is None:
+                                    current_omni_platform.unset_device_control_env_var()
+                                else:
+                                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
+                        continue
 
                     llm_stage_ids.append(stage_id)
                     llm_launch_futures[stage_id] = launch_executor.submit(
@@ -644,6 +691,26 @@ class AsyncOmniEngine:
         # dict, e.g. for multi_modal_data).
         original_prompt = prompt
 
+        if (
+            final_stage_id > 0
+            and isinstance(original_prompt, dict)
+            and "img2img" in (original_prompt.get("modalities") or [])
+        ):
+            if not request_id.startswith("chatcmpl-"):
+                prompt = _normalize_split_stage0_img2img_prompt(prompt)
+                if (
+                    isinstance(prompt, dict)
+                    and "multi_modal_uuids" in prompt
+                    and "prompt" in prompt
+                    and "prompt_token_ids" not in prompt
+                ):
+                    prompt = dict(prompt)
+                    tok_prompt = self.input_processor.renderer._tokenize_prompt(
+                        {"prompt": prompt["prompt"]},
+                        self.input_processor.renderer.default_cmpl_tok_params,
+                    )
+                    prompt["prompt_token_ids"] = tok_prompt["prompt_token_ids"]
+
         stage_type = self.stage_metadata[0].get("stage_type")
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
@@ -712,6 +779,11 @@ class AsyncOmniEngine:
         for ep in expanded:
             cid = f"{parent_id}{ep.request_id_suffix}"
             companion_prompt = ep.prompt
+            companion_stage0_params = (
+                stage0_params.clone() if hasattr(stage0_params, "clone") else copy.deepcopy(stage0_params)
+            )
+            companion_sampling_params_list = list(sampling_params_list)
+            companion_sampling_params_list[0] = companion_stage0_params
 
             # Run through same input processing as the main prompt
             if isinstance(companion_prompt, dict):
@@ -720,7 +792,7 @@ class AsyncOmniEngine:
             request = self.input_processor.process_inputs(
                 request_id=cid,
                 prompt=companion_prompt,
-                params=stage0_params,
+                params=companion_stage0_params,
                 supported_tasks=self.supported_tasks,
             )
             request = _upgrade_to_omni_request(request, companion_prompt)
@@ -741,11 +813,11 @@ class AsyncOmniEngine:
                     "parent_id": parent_id,
                     "role": ep.role,
                     "prompt": request,
-                    "sampling_params_list": sampling_params_list,
+                    "sampling_params_list": companion_sampling_params_list,
                 }
             )
 
-        logger.info(
+        logger.debug(
             "[AsyncOmniEngine] CFG expansion for req %s: %d companions",
             parent_id,
             len(expanded),

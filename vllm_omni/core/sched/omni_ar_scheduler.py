@@ -456,6 +456,21 @@ class OmniARScheduler(VLLMScheduler):
             kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
             if kv_extracted_ids:
                 for req_id in kv_extracted_ids:
+                    req = self.requests.get(req_id)
+                    if req is not None and not req.is_finished():
+                        eco = engine_core_outputs.get(req.client_index)
+                        if eco is None:
+                            eco = EngineCoreOutputs()
+                            engine_core_outputs[req.client_index] = eco
+                        eco.outputs.append(
+                            EngineCoreOutput(
+                                request_id=req_id,
+                                new_token_ids=[],
+                                kv_transfer_params={"kv_ready": True},
+                            )
+                        )
+                        logger.debug(f"[Omni] Emitted KV-ready signal for {req_id} after transfer extraction")
+
                     # Mark transfer as finished
                     if req_id in self.active_kv_transfers:
                         self.active_kv_transfers.remove(req_id)

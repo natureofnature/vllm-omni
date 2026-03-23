@@ -61,3 +61,25 @@ def test_build_add_request_message_preserves_additional_information():
     assert request.additional_information.entries["text"].list_data == ["hello world"]
     assert request.additional_information.entries["speaker"].list_data == ["vivian"]
     output_processor.add_request.assert_called_once()
+
+
+def test_cfg_companion_params_are_cloned():
+    """Companion params must be a deep copy so mutations don't affect the original."""
+    import copy
+
+    params = SamplingParams(max_tokens=2048)
+    params.min_tokens = 7
+    params.stop = ["</s>"]
+    params.stop_token_ids = [42]
+    params.extra_args = {"negative_prompt": ""}
+
+    companion = params.clone() if hasattr(params, "clone") else copy.deepcopy(params)
+
+    assert companion is not params
+    assert companion.max_tokens == 2048
+    assert companion.min_tokens == 7
+    assert companion.stop == ["</s>"]
+    assert companion.stop_token_ids == [42]
+
+    companion.max_tokens = 1
+    assert params.max_tokens == 2048
