@@ -12,6 +12,7 @@ transport half lives in OmniConnectorModelRunnerMixin.
 
 from __future__ import annotations
 
+import time
 from collections import deque
 from typing import Any
 
@@ -51,6 +52,11 @@ class OmniSchedulingCoordinator:
         self._waiting_for_input: deque[Any] = deque()
         self.pending_input_registrations: list[Any] = []
 
+        # Monotonic timestamp recording when each request first entered
+        # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
+        # collect_timed_out_request_ids() to detect orphaned waits.
+        self._waiting_since: dict[str, float] = {}
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
@@ -73,7 +79,8 @@ class OmniSchedulingCoordinator:
         if self._stage_id == 0 or not self._async_chunk:
             return
 
-        self.finished_requests.update(chunk_finished_req_ids)
+        terminal_ready_req_ids = chunk_ready_req_ids.intersection(chunk_finished_req_ids)
+        self.finished_requests.update(chunk_finished_req_ids - terminal_ready_req_ids)
         self.pending_chunk_registrations = []
 
         self._process_chunk_queue(
@@ -88,9 +95,14 @@ class OmniSchedulingCoordinator:
             RequestStatus.RUNNING,
             chunk_ready_req_ids,
         )
+        self.finished_requests.update(terminal_ready_req_ids)
 
         while len(running_queue) > self._scheduler_max_num_seqs:
             request = running_queue.pop()
+            # Must reset status to WAITING so the scheduler treats it as
+            # schedulable work.  KV blocks are NOT freed here (unlike a
+            # real preemption), so PREEMPTED would be incorrect.
+            request.status = RequestStatus.WAITING
             waiting_queue.prepend_requests([request])
 
     def process_pending_full_payload_inputs(
@@ -124,6 +136,7 @@ class OmniSchedulingCoordinator:
         for request in self._waiting_for_input:
             if request.request_id in stage_recv_req_ids:
                 request.status = RequestStatus.WAITING
+                self._waiting_since.pop(request.request_id, None)
                 waiting_queue.add_request(request)
             else:
                 remaining.append(request)
@@ -141,12 +154,14 @@ class OmniSchedulingCoordinator:
                     if request.request_id in self.finished_requests:
                         continue
                     request.status = RequestStatus.WAITING_FOR_INPUT
+                    self._waiting_since.setdefault(request.request_id, time.monotonic())
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
                     self.pending_input_registrations.append(request)
                 elif request.status == RequestStatus.WAITING_FOR_INPUT:
                     if request.request_id in stage_recv_req_ids:
                         request.status = RequestStatus.WAITING
+                        self._waiting_since.pop(request.request_id, None)
                     else:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
@@ -168,6 +183,59 @@ class OmniSchedulingCoordinator:
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
+        self._waiting_since.pop(request_id, None)
+
+    def collect_timed_out_request_ids(
+        self,
+        timeout_s: float,
+    ) -> set[str]:
+        """Return IDs of requests that have been waiting longer than *timeout_s*.
+
+        Uses ``_waiting_since`` timestamps (always up-to-date) to detect
+        timed-out requests.  This method is safe to call at any point in
+        the scheduling cycle — it does **not** rely on coordinator internal
+        queues (which are empty after ``restore_queues()``).
+
+        Clears ``_waiting_since`` for timed-out IDs and defensively removes
+        them from coordinator internal queues if present.  The caller
+        (scheduler) should then remove the requests from its queues,
+        set ``FINISHED_ERROR``, and call ``_free_request()`` so that
+        ``cleanup_finished_request()`` fires in the model runner mixin.
+        """
+        if timeout_s <= 0:
+            return set()
+        now = time.monotonic()
+        timed_out_ids: set[str] = set()
+        for req_id, start_time in self._waiting_since.items():
+            if now - start_time > timeout_s:
+                timed_out_ids.add(req_id)
+        if not timed_out_ids:
+            return set()
+
+        # Defensively remove from coordinator internal queues (may already
+        # be empty if restore_queues() has run).
+        for queue_attr in (
+            "_waiting_for_chunk_waiting",
+            "_waiting_for_chunk_running",
+            "_waiting_for_input",
+        ):
+            queue = getattr(self, queue_attr)
+            remaining: deque[Any] = deque()
+            for request in queue:
+                if request.request_id not in timed_out_ids:
+                    remaining.append(request)
+            setattr(self, queue_attr, remaining)
+
+        for req_id in timed_out_ids:
+            self._waiting_since.pop(req_id, None)
+            logger.warning(
+                "[Coordinator stage-%s] Request %s timed out waiting for chunk/input (waited > %.0fs)",
+                self._stage_id,
+                req_id,
+                timeout_s,
+            )
+
+        return timed_out_ids
 
     def restore_queues(
         self,
@@ -206,28 +274,40 @@ class OmniSchedulingCoordinator:
             if request is None:
                 continue
 
-            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni)
+            # Handle next_stage_prompt_len if present (for models like Qwen3-Omni).
+            # Only apply when the request has not started decoding yet
+            # (no output tokens). Resetting a mid-decode request would
+            # destroy generated tokens and desync KV cache state.
             if "next_stage_prompt_len" in metadata:
                 next_len = metadata["next_stage_prompt_len"]
                 if isinstance(next_len, int) and next_len > 0:
-                    current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
-                    current_prompt_len = len(current_prompt_ids)
-                    if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
-                        new_prompt = [0] * next_len
-                        request.prompt_token_ids = new_prompt
-                        request.num_prompt_tokens = next_len
-                        # Reset internal token tracking to match new prompt
-                        # Must clear in-place to keep ConstantList wrappers valid
-                        request._all_token_ids.clear()
-                        request._all_token_ids.extend(new_prompt)
-                        request._output_token_ids.clear()
-                        request.num_computed_tokens = 0
+                    output_token_ids = getattr(request, "_output_token_ids", None)
+                    has_decode_output = output_token_ids is not None and len(output_token_ids) > 0
+                    if has_decode_output:
                         logger.debug(
-                            "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
+                            "[Coordinator stage-%s] Skipping prompt resize for req %s: "
+                            "request already has %s output tokens",
                             self._stage_id,
-                            next_len,
                             req_id,
+                            len(output_token_ids),
                         )
+                    else:
+                        current_prompt_ids = getattr(request, "prompt_token_ids", []) or []
+                        current_prompt_len = len(current_prompt_ids)
+                        if current_prompt_len != next_len or getattr(request, "num_prompt_tokens", None) != next_len:
+                            new_prompt = [0] * next_len
+                            request.prompt_token_ids = new_prompt
+                            request.num_prompt_tokens = next_len
+                            request._all_token_ids.clear()
+                            request._all_token_ids.extend(new_prompt)
+                            request._output_token_ids.clear()
+                            request.num_computed_tokens = 0
+                            logger.debug(
+                                "[Coordinator stage-%s] Updated prompt_token_ids length to %s for req %s",
+                                self._stage_id,
+                                next_len,
+                                req_id,
+                            )
 
             if model_mode != "ar":
                 new_ids = metadata.get("code_predictor_codes", [])
@@ -274,10 +354,12 @@ class OmniSchedulingCoordinator:
                     continue
                 self.pending_chunk_registrations.append(request)
                 request.status = RequestStatus.WAITING_FOR_CHUNK
+                self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
                 if request.request_id in chunk_ready_req_ids:
                     request.status = target_status
                     self.requests_with_ready_chunks.add(request.request_id)
+                    self._waiting_since.pop(request.request_id, None)
                     continue
             queue.remove(request)
             waiting_for_chunk_list.append(request)

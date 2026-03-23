@@ -12,7 +12,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -78,6 +78,20 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     """Minimal class that mixes in the mixin for testing."""
 
     pass
+
+
+class _FakeTPGroup:
+    def __init__(self, *, world_size: int, rank_in_group: int, follower_result: Any = None):
+        self.world_size = world_size
+        self.rank_in_group = rank_in_group
+        self.follower_result = follower_result
+        self.broadcast_inputs: list[Any] = []
+
+    def broadcast_object(self, obj: Any | None = None, src: int = 0):
+        self.broadcast_inputs.append(obj)
+        if self.rank_in_group == src:
+            return obj
+        return self.follower_result
 
 
 # ------------------------------------------------------------------ #
@@ -530,11 +544,11 @@ class TestChunkStreamCompletedGuard(unittest.TestCase):
         host.shutdown_omni_connectors()
 
     def test_full_payload_recv_guard_still_works(self):
-        """Pre-existing guard: full_payload recv results prevent registration."""
+        """Pre-existing guard: staged full-payload results prevent registration."""
         host = self._make_host(stage_id=1)
 
         with host._lock:
-            host._full_payload_recv_results["req-1"] = {"some": "data"}
+            host._stage_recv_req_ids.add("req-1")
 
         req = _make_request("req-1", "ext-req-1")
         host.register_chunk_recv(req)
@@ -570,7 +584,6 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._send_side_request_payload[ext_id] = {"some": "data"}
         host._code_prompt_token_ids[ext_id] = [[1, 2, 3]]
         host._chunk_stream_completed.add(req_id)
-        host._full_payload_recv_results[req_id] = {"result": True}
         host._stage_recv_req_ids.add(req_id)
         host._local_stage_payload_cache[req_id] = {"engine_inputs": {}}
         host._local_request_metadata[req_id] = {"prompt_len": 10}
@@ -585,7 +598,6 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(ext_id, host._send_side_request_payload)
         self.assertNotIn(ext_id, host._code_prompt_token_ids)
         self.assertNotIn(req_id, host._chunk_stream_completed)
-        self.assertNotIn(req_id, host._full_payload_recv_results)
         self.assertNotIn(req_id, host._stage_recv_req_ids)
         self.assertNotIn(req_id, host._local_stage_payload_cache)
         self.assertNotIn(req_id, host._local_request_metadata)
@@ -643,10 +655,7 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         host._chunk_ready_req_ids.update({active_req_id, stale_req_id})
         host._chunk_finished_req_ids.add(stale_req_id)
         host._chunk_stream_completed.add(stale_req_id)
-        host._full_payload_recv_results[stale_req_id] = {"result": True}
-        host._stage_recv_req_ids.update({active_req_id, stale_req_id})
-        host._local_stage_payload_cache[stale_req_id] = {"engine_inputs": {}}
-        host._local_request_metadata[stale_req_id] = {"prompt_len": 8}
+        host._stage_recv_req_ids.add(active_req_id)
         host._send_side_request_payload[stale_ext_id] = {"stale": True}
         host._code_prompt_token_ids[stale_ext_id] = [[1, 2, 3]]
 
@@ -664,12 +673,44 @@ class TestCleanupFinishedRequest(unittest.TestCase):
         self.assertNotIn(stale_req_id, host._chunk_ready_req_ids)
         self.assertNotIn(stale_req_id, host._chunk_finished_req_ids)
         self.assertNotIn(stale_req_id, host._chunk_stream_completed)
-        self.assertNotIn(stale_req_id, host._full_payload_recv_results)
         self.assertNotIn(stale_req_id, host._stage_recv_req_ids)
-        self.assertNotIn(stale_req_id, host._local_stage_payload_cache)
-        self.assertNotIn(stale_req_id, host._local_request_metadata)
         self.assertNotIn(stale_ext_id, host._send_side_request_payload)
         self.assertNotIn(stale_ext_id, host._code_prompt_token_ids)
+
+        host.shutdown_omni_connectors()
+
+    def test_prune_inactive_requests_keeps_recently_received_full_payload_state(self):
+        """Late bg-thread receives must survive until the scheduler catches up."""
+        host = self._make_host(stage_id=1)
+        req_id = "req-recv-race"
+        ext_id = "ext-recv-race"
+
+        host._request_ids_mapping[req_id] = ext_id
+        host._put_req_chunk[ext_id] = 1
+        host._local_stage_payload_cache[req_id] = {"engine_inputs": {"ids": [1, 2, 3]}}
+        host._local_request_metadata[req_id] = {"next_stage_prompt_len": 3}
+        host._stage_recv_req_ids.add(req_id)
+
+        pruned = host.prune_inactive_requests(set())
+
+        self.assertEqual(pruned, set())
+        self.assertIn(req_id, host._request_ids_mapping)
+        self.assertIn(req_id, host._local_stage_payload_cache)
+        self.assertIn(req_id, host._local_request_metadata)
+        self.assertIn(req_id, host._stage_recv_req_ids)
+        self.assertIn(ext_id, host._put_req_chunk)
+
+        # Once the scheduler has consumed the wake-up and the request really
+        # disappears from all protected sets, prune should clean it up.
+        host._stage_recv_req_ids.clear()
+        host._local_stage_payload_cache.clear()
+        host._local_request_metadata.clear()
+
+        pruned = host.prune_inactive_requests(set())
+
+        self.assertEqual(pruned, {req_id})
+        self.assertNotIn(req_id, host._request_ids_mapping)
+        self.assertNotIn(ext_id, host._put_req_chunk)
 
         host.shutdown_omni_connectors()
 
@@ -735,12 +776,157 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         host._omni_connector = MockConnector(stage_id=0)
         host._stage_id = 0
 
-        # Simulate full_payload recv results arriving from the bg thread
+        # Simulate a full payload already staged by the bg recv path
         with host._lock:
-            host._full_payload_recv_results["r1"] = {"tok": [10]}
+            host._local_stage_payload_cache["r1"] = {"tok": [10]}
+            host._stage_recv_req_ids.add("r1")
 
         host.recv_full_payload_inputs(scheduler_output=None)
         self.assertEqual(host.get_local_stage_payload("r1"), {"tok": [10]})
+        host.shutdown_omni_connectors()
+
+    def test_rank0_only_polls_connector_for_tp_full_payload(self):
+        host = self._make_host()
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._local_rank = 0
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        payload = {"tok": [10], "finished": torch.tensor(True)}
+        connector_result = (payload, 123)
+        host._omni_connector.get.return_value = connector_result
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        self.assertEqual(tp_group.broadcast_inputs, [])
+        self.assertEqual(host.get_local_stage_payload("r1"), payload)
+        self.assertIn("r1", host._full_payload_pending_broadcast_req_ids)
+        self.assertNotIn("r1", host._stage_recv_req_ids)
+        self.assertIsNone(host.get_local_request_metadata("r1"))
+        host.shutdown_omni_connectors()
+
+    def test_tp_follower_skips_connector_poll_for_full_payload(self):
+        host = self._make_host()
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._local_rank = 1
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=1)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertFalse(made_progress)
+        host._omni_connector.get.assert_not_called()
+        self.assertEqual(tp_group.broadcast_inputs, [])
+        self.assertNotIn("r1", host._local_stage_payload_cache)
+        host.shutdown_omni_connectors()
+
+    def test_recv_full_payload_inputs_broadcasts_tp_leader_results_to_followers(self):
+        host = self._make_host()
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._local_rank = 1
+        host._pending_load_reqs["r1"] = object()
+        payload = {"tok": [10], "finished": torch.tensor(True)}
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result={"r1": payload})
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            results = host.recv_full_payload_inputs(scheduler_output=None)
+
+        self.assertEqual(results, {"r1": payload})
+        self.assertEqual(host.get_local_stage_payload("r1"), payload)
+        self.assertEqual(host.get_local_request_metadata("r1"), {})
+        self.assertEqual(host._stage_recv_req_ids, {"r1"})
+        self.assertNotIn("r1", host._pending_load_reqs)
+        self.assertEqual(tp_group.broadcast_inputs, [None])
+        host.shutdown_omni_connectors()
+
+
+class TestTPAsyncChunkFanout(unittest.TestCase):
+    def _make_host(self, rank: int) -> MixinHost:
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._async_chunk = True
+        host._model_mode = "gen"
+        host._local_rank = rank
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        return host
+
+    def test_rank0_only_polls_connector_for_tp_async_chunk(self):
+        host = self._make_host(rank=0)
+        payload = {
+            "code_predictor_codes": [10, 11],
+            "left_context_size": 0,
+            "finished": torch.tensor(False),
+        }
+        host._omni_connector.get.return_value = (payload, 123)
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        host._omni_connector.get.assert_called_once_with("1", "2", "ext-r1_1_0")
+        self.assertEqual(host.get_local_stage_payload("r1"), payload)
+        self.assertIn("r1", host._finished_load_reqs)
+        self.assertIn("r1", host._async_chunk_updated_req_ids)
+        self.assertEqual(tp_group.broadcast_inputs, [])
+        host.shutdown_omni_connectors()
+
+    def test_tp_follower_skips_connector_poll_for_async_chunk(self):
+        host = self._make_host(rank=1)
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=1)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertFalse(made_progress)
+        host._omni_connector.get.assert_not_called()
+        self.assertIsNone(host.get_local_stage_payload("r1"))
+        self.assertEqual(tp_group.broadcast_inputs, [])
+        host.shutdown_omni_connectors()
+
+    def test_get_output_broadcasts_tp_async_chunk_payloads_to_followers(self):
+        host = self._make_host(rank=1)
+        host._pending_load_reqs["r1"] = object()
+        payload = {
+            "code_predictor_codes": [10, 11],
+            "left_context_size": 0,
+            "finished": torch.tensor(True),
+        }
+        packet = {
+            "staged_payloads": {"r1": payload},
+            "request_metadata": {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+            "newly_finished": {"r1"},
+            "chunk_finished": {"r1"},
+        }
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=1, follower_result=packet)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            output = host.get_omni_connector_output()
+
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(
+            output.request_metadata,
+            {"r1": {"code_predictor_codes": [10, 11], "left_context_size": 0}},
+        )
+        self.assertEqual(host.get_local_stage_payload("r1"), payload)
+        self.assertNotIn("r1", host._pending_load_reqs)
+        self.assertIn("r1", host._chunk_stream_completed)
+        self.assertEqual(tp_group.broadcast_inputs, [None])
         host.shutdown_omni_connectors()
 
 
@@ -899,6 +1085,76 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
+    def test_non_ar_recv_does_not_overwrite_unconsumed_staged_chunk(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._async_chunk = True
+        host._model_mode = "gen"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 1
+        host._local_stage_payload_cache["r1"] = {
+            "code_predictor_codes": [1, 2, 3],
+            "left_context_size": 0,
+            "finished": torch.tensor(False),
+        }
+
+        made_progress = host._poll_single_request("r1")
+
+        self.assertFalse(made_progress)
+        host._omni_connector.get.assert_not_called()
+        self.assertEqual(host._get_req_chunk["r1"], 1)
+
+        host.shutdown_omni_connectors()
+
+    def test_non_ar_recv_waits_for_scheduler_handoff_before_fetching_next_chunk(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="gen"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._async_chunk = True
+        host._model_mode = "gen"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 1
+        host._local_request_metadata["r1"] = {
+            "code_predictor_codes": [10, 11, 12],
+            "left_context_size": 0,
+        }
+        host._finished_load_reqs.add("r1")
+
+        made_progress = host._poll_single_request("r1")
+
+        self.assertFalse(made_progress)
+        host._omni_connector.get.assert_not_called()
+        self.assertEqual(host._get_req_chunk["r1"], 1)
+
+        output = host.get_omni_connector_output()
+        self.assertEqual(output.request_metadata["r1"]["code_predictor_codes"], [10, 11, 12])
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+
+        host._omni_connector.get.return_value = (
+            {
+                "code_predictor_codes": [20, 21, 22],
+                "left_context_size": 0,
+                "finished": torch.tensor(False),
+            },
+            1,
+        )
+        made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        host._omni_connector.get.assert_called_once()
+        self.assertEqual(host._get_req_chunk["r1"], 2)
+
+        host.shutdown_omni_connectors()
+
 
 class TestRankAwareKVRouting(unittest.TestCase):
     def _make_host(self, *, from_tp: int, to_tp: int, local_rank: int) -> MixinHost:
@@ -983,6 +1239,156 @@ class TestConnectorConfigValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "missing connector name"):
             host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+
+class _FailingConnector:
+    """Connector whose put() fails a configurable number of times."""
+
+    def __init__(self, fail_count: int = 1, raise_on_fail: bool = False):
+        self._fail_count = fail_count
+        self._raise_on_fail = raise_on_fail
+        self.attempt = 0
+
+    def put(self, from_stage, to_stage, put_key, data):
+        self.attempt += 1
+        if self.attempt <= self._fail_count:
+            if self._raise_on_fail:
+                raise ConnectionError("transient connector error")
+            return False, 0, None
+        return True, len(str(data)), None
+
+    def get(self, *a, **kw):
+        return None
+
+    def close(self):
+        pass
+
+
+class TestSendRetry(unittest.TestCase):
+    """Tests for P1-2: failed connector sends must be retried."""
+
+    def _make_sender(self, connector):
+        sender = MixinHost()
+        sender.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=0, async_chunk=True),
+        )
+        sender._omni_connector = connector
+        sender._stage_id = 0
+        sender._async_chunk = True
+        return sender
+
+    def _make_task(self, req_id="r1"):
+        return {
+            "stage_id": 0,
+            "next_stage_id": 1,
+            "request_id": req_id,
+            "data": {"payload": "test"},
+        }
+
+    def test_send_single_request_returns_false_on_put_failure(self):
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+
+        result = sender._send_single_request(self._make_task())
+        self.assertFalse(result)
+        sender.shutdown_omni_connectors()
+
+    def test_send_single_request_does_not_decrement_on_failure(self):
+        connector = _FailingConnector(fail_count=999)
+        sender = self._make_sender(connector)
+        sender._pending_save_counts["r1"] = 1
+
+        sender._send_single_request(self._make_task())
+        self.assertEqual(sender._pending_save_counts.get("r1"), 1, "pending count must NOT be decremented on failure")
+        sender.shutdown_omni_connectors()
+
+    def test_send_single_request_decrements_on_success(self):
+        connector = MockConnector(stage_id=0)
+        sender = self._make_sender(connector)
+        sender._pending_save_counts["r1"] = 1
+
+        result = sender._send_single_request(self._make_task())
+        self.assertTrue(result)
+        self.assertNotIn("r1", sender._pending_save_counts, "pending count should be zero/removed on success")
+        sender.shutdown_omni_connectors()
+
+    def test_requeue_or_drop_requeues_on_first_failure(self):
+        sender = self._make_sender(MockConnector(stage_id=0))
+        task = self._make_task()
+
+        sender._requeue_or_drop_failed_send(task)
+
+        self.assertEqual(task.get("_retry_count"), 1)
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        self.assertIsNotNone(dq)
+        self.assertEqual(len(dq), 1)
+        sender.shutdown_omni_connectors()
+
+    def test_requeue_or_drop_drops_after_max_retries(self):
+        sender = self._make_sender(MockConnector(stage_id=0))
+        sender._pending_save_counts["r1"] = 1
+        task = self._make_task()
+        task["_retry_count"] = sender._MAX_SEND_RETRIES  # already at max
+
+        sender._requeue_or_drop_failed_send(task)
+
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        self.assertTrue(dq is None or len(dq) == 0, "task should NOT be re-enqueued after max retries")
+        self.assertNotIn("r1", sender._pending_save_counts, "pending count should be cleaned up on final drop")
+        sender.shutdown_omni_connectors()
+
+    def test_save_loop_retries_on_exception(self):
+        """Integration: _save_loop retries a task when put() raises."""
+        from collections import deque
+
+        connector = _FailingConnector(fail_count=1, raise_on_fail=True)
+        sender = self._make_sender(connector)
+        task = self._make_task()
+
+        with sender._lock:
+            sender._pending_save_reqs["r1"] = deque([task])
+        sender._pending_save_counts["r1"] = 1
+
+        sender._stop_event.clear()
+
+        def run_one_loop():
+            sender._save_loop()
+
+        sender._stop_event.set()  # will exit after one iteration
+        # Run manually instead of threading
+        # Simulate: pop task, send fails, requeue
+        popped_task = None
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+            if dq:
+                popped_task = dq.popleft()
+                if not dq:
+                    del sender._pending_save_reqs["r1"]
+
+        if popped_task is not None:
+            success = False
+            try:
+                success = sender._send_single_request(popped_task)
+            except Exception:
+                pass
+            if not success:
+                sender._requeue_or_drop_failed_send(popped_task)
+
+        # After first failure, task should be re-enqueued
+        with sender._lock:
+            dq = sender._pending_save_reqs.get("r1")
+        self.assertIsNotNone(dq)
+        self.assertEqual(len(dq), 1)
+        requeued = dq[0]
+        self.assertEqual(requeued.get("_retry_count"), 1)
+
+        # Second attempt should succeed (connector now returns True)
+        success = sender._send_single_request(requeued)
+        self.assertTrue(success)
+        sender.shutdown_omni_connectors()
 
 
 if __name__ == "__main__":

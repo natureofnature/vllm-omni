@@ -276,6 +276,17 @@ class Orchestrator:
                     continue
                 idle = False
 
+                if not raw_outputs.outputs and raw_outputs.finished_requests:
+                    if raw_outputs.scheduler_stats is not None:
+                        self.output_processors[stage_id].update_scheduler_stats(
+                            raw_outputs.scheduler_stats,
+                        )
+                    await self._route_finished_only(
+                        stage_id,
+                        raw_outputs.finished_requests,
+                    )
+                    continue
+
                 # 2) Process raw outputs through the output processor
                 request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
 
@@ -383,6 +394,28 @@ class Orchestrator:
         if finished and stage_id == req_state.final_stage_id:
             self._cleanup_companion_state(req_id)
             self.request_states.pop(req_id, None)
+
+    async def _route_finished_only(
+        self,
+        stage_id: int,
+        finished_request_ids: set[str],
+    ) -> None:
+        """Send a terminal signal when the scheduler emits only finished ids."""
+        if not finished_request_ids:
+            return
+
+        for req_id in finished_request_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+            await self.output_async_queue.put(
+                {
+                    "type": "finished_only",
+                    "request_id": req_id,
+                    "stage_id": stage_id,
+                    "finished": stage_id == req_state.final_stage_id,
+                }
+            )
 
     def _cleanup_companion_state(self, parent_id: str) -> None:
         """Remove all companion tracking state for a completed parent."""
@@ -552,7 +585,7 @@ class Orchestrator:
         to consume.
         """
         outputs = await self.stage_clients[stage_id].get_output_async()
-        if not outputs.outputs:
+        if not outputs.outputs and not outputs.finished_requests and outputs.scheduler_stats is None:
             return None
         return outputs
 

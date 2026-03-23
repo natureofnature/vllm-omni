@@ -124,6 +124,20 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
             self.register_chunk_recv(request)
         self.recv_full_payload_inputs(scheduler_output)
         finished_req_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+
+        # [Omni] Flush any pending full_payload_mode outputs BEFORE cleanup.
+        # This mirrors GPUARModelRunner's ordering: flush/sentinel first,
+        # then cleanup. Cleaning up before flush would discard send-side
+        # state (_put_req_chunk, _request_ids_mapping) that flush needs.
+        # Check unconditionally (not gated on finished_req_ids) so that
+        # stale-only pending payloads are also flushed.
+        if self._pending_full_payload_send:
+            flush_ids = set(finished_req_ids)
+            stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
+            flush_ids.update(stale)
+            if flush_ids:
+                self.flush_full_payload_outputs(flush_ids)
+
         if finished_req_ids:
             for req_id in finished_req_ids:
                 self.cleanup_finished_request(req_id)
@@ -155,6 +169,15 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
                 if req_id is not None
             )
             self.prune_inactive_requests(protected_req_ids)
+
+            # [Omni] Post-update stale flush: requests removed by
+            # _update_states are now detectable as stale.
+            if self._pending_full_payload_send:
+                stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
+                if stale:
+                    logger.info("[Stage-%s Gen] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
+                    self.flush_full_payload_outputs(stale)
+
             if not scheduler_output.total_num_scheduled_tokens:
                 self._idle_log_counter += 1
                 return self._empty_output_with_connector_signals()

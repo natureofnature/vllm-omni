@@ -1512,6 +1512,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         prompt_logprobs = None
         prompt_token_ids = None
         kv_transfer_params = None
+        latest_outputs_by_modality: dict[str, OmniRequestOutput] = {}
+        rendered_modalities: set[str] = set()
         response_metrics: dict[str, Any] | None = None
 
         # Build requested modalities set for filtering
@@ -1521,13 +1523,16 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         for omni_outputs in final_outputs:
             choices_data = []
-            if omni_outputs.request_output is not None and not getattr(omni_outputs.request_output, "finished", False):
-                continue
 
             # Filter outputs based on requested modalites
             if requested_modalities is not None and omni_outputs.final_output_type not in requested_modalities:
                 logger.warning(f"final output type: {omni_outputs.final_output_type} is not needed by the request")
                 continue
+
+            if omni_outputs.request_output is not None:
+                latest_outputs_by_modality[omni_outputs.final_output_type] = omni_outputs
+                if not getattr(omni_outputs.request_output, "finished", False):
+                    continue
 
             if omni_outputs.final_output_type == "text":
                 (
@@ -1553,7 +1558,30 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 continue
             if omni_outputs.metrics:
                 response_metrics = omni_outputs.metrics
+            if choices_data:
+                rendered_modalities.add(omni_outputs.final_output_type)
             choices.extend(choices_data)
+
+        for modality in ("audio", "image"):
+            if requested_modalities is not None and modality not in requested_modalities:
+                continue
+            if modality in rendered_modalities:
+                continue
+
+            fallback_output = latest_outputs_by_modality.get(modality)
+            if fallback_output is None or fallback_output.request_output is None:
+                continue
+
+            logger.warning(
+                "[OpenAI chat full] req=%s using fallback %s output from latest accumulated non-final result",
+                request_id,
+                modality,
+            )
+            if modality == "audio":
+                choices.extend(self._create_audio_choice(fallback_output, role, request, stream=False))
+            elif modality == "image":
+                choices.extend(self._create_image_choice(fallback_output, role, request, stream=False))
+            rendered_modalities.add(modality)
 
         response = OmniChatCompletionResponse(
             id=request_id,

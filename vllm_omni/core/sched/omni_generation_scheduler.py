@@ -44,6 +44,9 @@ class OmniGenerationScheduler(VLLMScheduler):
         model_config = self.vllm_config.model_config
         self.chunk_coordinator: ChunkSchedulingCoordinator | None = None
         self._latest_omni_connector_output: OmniConnectorOutput | None = None
+        self._deferred_terminal_chunk_req_ids: set[str] = set()
+        self._deferred_terminal_request_metadata: dict[str, dict] = {}
+        self._reqs_with_pooler_history: set[str] = set()
         stage_id = getattr(model_config, "stage_id", 0)
         async_chunk_flag = getattr(model_config, "async_chunk", False)
         needs_coordinator = async_chunk_flag or stage_id > 0
@@ -56,6 +59,9 @@ class OmniGenerationScheduler(VLLMScheduler):
 
     def _free_request(self, request: Request, *args, **kwargs):
         result = super()._free_request(request, *args, **kwargs)
+        self._deferred_terminal_chunk_req_ids.discard(request.request_id)
+        self._deferred_terminal_request_metadata.pop(request.request_id, None)
+        self._reqs_with_pooler_history.discard(request.request_id)
         if self.chunk_coordinator:
             self.chunk_coordinator.free_finished_request(request.request_id)
         return result
@@ -376,6 +382,52 @@ class OmniGenerationScheduler(VLLMScheduler):
         pooler_outputs = model_runner_output.pooler_output
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        chunk_finished_req_ids_now = set(omni_output.chunk_finished_req_ids) if omni_output else set()
+        request_metadata_now = (
+            dict(omni_output.request_metadata) if omni_output and omni_output.request_metadata else {}
+        )
+        forced_finished_req_ids_by_client: dict[int, set[str]] = defaultdict(set)
+
+        # Under async scheduling, a terminal chunk-finished signal can arrive in an
+        # empty connector-only output one cycle before the final pooler payload.
+        # Preserve that terminal marker and merge it into the next real model
+        # output for the same request so the last audio frame and terminal state
+        # are evaluated together.
+        if chunk_finished_req_ids_now and not model_runner_output.req_ids and not pooler_outputs:
+            handled_finish_only_req_ids: set[str] = set()
+            for req_id in set(chunk_finished_req_ids_now):
+                request = self.requests.get(req_id)
+                if request is None or req_id not in self._reqs_with_pooler_history:
+                    continue
+                request.status = RequestStatus.FINISHED_STOPPED
+                finished = self._handle_stopped_request(request)
+                if finished:
+                    self._free_request(request)
+                    forced_finished_req_ids_by_client[request.client_index].add(req_id)
+                    if self.chunk_coordinator is not None:
+                        self.chunk_coordinator.free_finished_request(req_id)
+                self.running = remove_all(self.running, {request})
+                self.waiting.remove_requests({request})
+                self.skipped_waiting.remove_requests({request})
+                handled_finish_only_req_ids.add(req_id)
+            remaining_ids = set(chunk_finished_req_ids_now) - handled_finish_only_req_ids
+            if remaining_ids:
+                self._deferred_terminal_chunk_req_ids.update(remaining_ids)
+                for req_id in remaining_ids:
+                    if req_id in request_metadata_now:
+                        self._deferred_terminal_request_metadata[req_id] = dict(request_metadata_now[req_id])
+            chunk_finished_req_ids_now = remaining_ids
+        elif self._deferred_terminal_chunk_req_ids and model_runner_output.req_ids:
+            carried_req_ids = self._deferred_terminal_chunk_req_ids.intersection(model_runner_output.req_ids)
+            if carried_req_ids:
+                chunk_finished_req_ids_now.update(carried_req_ids)
+                for req_id in carried_req_ids:
+                    if req_id not in request_metadata_now:
+                        if (deferred_meta := self._deferred_terminal_request_metadata.get(req_id)) is not None:
+                            request_metadata_now[req_id] = dict(deferred_meta)
+                    self._deferred_terminal_chunk_req_ids.discard(req_id)
+                    self._deferred_terminal_request_metadata.pop(req_id, None)
 
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
         perf_stats: PerfStats | None = None
@@ -445,9 +497,25 @@ class OmniGenerationScheduler(VLLMScheduler):
             new_token_ids = generated_token_ids
             kv_transfer_params = None
             pooler_output = pooler_outputs[req_index] if pooler_outputs else None
+            if pooler_output is not None:
+                self._reqs_with_pooler_history.add(req_id)
             status_before_stop = request.status
             finish_reason = None
             routed_experts = None
+            terminal_prompt_len = len(request.prompt_token_ids)
+            if req_metadata := request_metadata_now.get(req_id):
+                code_predictor_codes = req_metadata.get("code_predictor_codes")
+                if code_predictor_codes:
+                    terminal_prompt_len = len(code_predictor_codes)
+                else:
+                    next_stage_prompt_len = req_metadata.get("next_stage_prompt_len")
+                    if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+                        terminal_prompt_len = next_stage_prompt_len
+            reached_terminal_chunk = (
+                req_id in chunk_finished_req_ids_now
+                and pooler_output is not None
+                and request.num_computed_tokens >= terminal_prompt_len
+            )
 
             # Diffusion request: completes in one step; mark finished and free resources
             if (
@@ -458,6 +526,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                     and request.request_id in self.chunk_coordinator.finished_requests
                     and request.num_computed_tokens >= len(request.prompt_token_ids)
                 )
+                or reached_terminal_chunk
             ):
                 request.status = RequestStatus.FINISHED_STOPPED
                 # Optional: set a stop_reason for front-end clarity
@@ -561,6 +630,33 @@ class OmniGenerationScheduler(VLLMScheduler):
                         request.request_id,
                     )
 
+        # [Omni] Abort requests that have been waiting for chunk/input
+        # longer than the configured timeout.  See comment in
+        # OmniARScheduler.update_from_output for why finish_requests()
+        # cannot be used here.
+        if self.chunk_coordinator is not None:
+            _timeout = getattr(self, "_omni_chunk_timeout_s", 300.0)
+            timed_out_ids = self.chunk_coordinator.collect_timed_out_request_ids(_timeout)
+            if timed_out_ids:
+                timed_out_reqs = [self.requests[rid] for rid in timed_out_ids if rid in self.requests]
+                timed_out_set = set(timed_out_reqs)
+                self.running = remove_all(self.running, timed_out_set)
+                self.waiting.remove_requests(timed_out_reqs)
+                self.skipped_waiting.remove_requests(timed_out_reqs)
+                for request in timed_out_reqs:
+                    request.status = RequestStatus.FINISHED_ERROR
+                    self._free_request(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=request.get_finished_reason(),
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                            num_cached_tokens=max(getattr(request, "num_cached_tokens", 0), 0),
+                        )
+                    )
+
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
             self._update_from_kv_xfer_finished(kv_connector_output)
@@ -594,6 +690,16 @@ class OmniGenerationScheduler(VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
+        if forced_finished_req_ids_by_client:
+            for client_index, finished_set in forced_finished_req_ids_by_client.items():
+                if (eco := engine_core_outputs.get(client_index)) is not None:
+                    if eco.finished_requests is None:
+                        eco.finished_requests = set(finished_set)
+                    else:
+                        eco.finished_requests.update(finished_set)
+                else:
+                    engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=set(finished_set))
+
         if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
@@ -603,7 +709,6 @@ class OmniGenerationScheduler(VLLMScheduler):
             eco.scheduler_stats = stats
 
         # Consume OmniConnectorOutput from mixin (stores for next schedule())
-        omni_output = getattr(model_runner_output, "omni_connector_output", None)
         if omni_output is not None:
             if omni_output.stage_recv_req_ids or omni_output.chunk_finished_req_ids:
                 logger.info(

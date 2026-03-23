@@ -418,7 +418,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 elif not isinstance(initial_model_buffer, dict):
                     initial_model_buffer = self._resolve_initial_model_buffer(initial_model_buffer)
                 if initial_model_buffer:
-                    self.model_intermediate_buffer[req_id] = dict(initial_model_buffer)
+                    existing_model_buffer = self.model_intermediate_buffer.setdefault(req_id, {})
+                    for key, value in dict(initial_model_buffer).items():
+                        existing_model_buffer.setdefault(key, value)
             except Exception as e:
                 logger.error(f"Error storing initial model buffer: {e}")
 
@@ -1021,7 +1023,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         chunk_ready_req_ids = getattr(self, "_chunk_ready_req_ids", None)
         chunk_finished_req_ids = getattr(self, "_chunk_finished_req_ids", None)
         chunk_stream_completed = getattr(self, "_chunk_stream_completed", None)
-        full_payload_recv_results = getattr(self, "_full_payload_recv_results", None)
+        full_payload_pending_broadcast_req_ids = getattr(self, "_full_payload_pending_broadcast_req_ids", None)
         stage_recv_req_ids = getattr(self, "_stage_recv_req_ids", None)
         get_req_chunk = getattr(self, "_get_req_chunk", None)
 
@@ -1038,8 +1040,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             local_request_metadata.pop(req_id, None)
         if isinstance(pending_load_reqs, dict):
             pending_load_reqs.pop(req_id, None)
-        if isinstance(full_payload_recv_results, dict):
-            full_payload_recv_results.pop(req_id, None)
+        if full_payload_pending_broadcast_req_ids is not None:
+            full_payload_pending_broadcast_req_ids.discard(req_id)
         if isinstance(get_req_chunk, dict):
             get_req_chunk.pop(req_id, None)
         if finished_load_reqs is not None:
@@ -1075,15 +1077,45 @@ class OmniGPUModelRunner(GPUModelRunner):
             pending_load_reqs = getattr(self, "_pending_load_reqs", None)
             if isinstance(pending_load_reqs, dict):
                 protected_req_ids.update(pending_load_reqs.keys())
+            stage_recv_req_ids = getattr(self, "_stage_recv_req_ids", None)
+            if stage_recv_req_ids is not None:
+                protected_req_ids.update(stage_recv_req_ids)
+            local_request_metadata = getattr(self, "_local_request_metadata", None)
+            if isinstance(local_request_metadata, dict):
+                protected_req_ids.update(local_request_metadata.keys())
             if hasattr(self, "prune_inactive_requests"):
                 self.prune_inactive_requests(protected_req_ids)
         if hasattr(self, "_lock"):
             with self._lock:
+                full_payload_pending_broadcast_req_ids = set(
+                    getattr(self, "_full_payload_pending_broadcast_req_ids", set())
+                )
+                if full_payload_pending_broadcast_req_ids:
+                    staged_payloads = {
+                        req_id: payload
+                        for req_id, payload in self._local_stage_payload_cache.items()
+                        if req_id not in full_payload_pending_broadcast_req_ids
+                    }
+                    for req_id in staged_payloads:
+                        self._local_stage_payload_cache.pop(req_id, None)
+                else:
+                    staged_payloads = dict(self._local_stage_payload_cache)
+                    self._local_stage_payload_cache.clear()
+        else:
+            full_payload_pending_broadcast_req_ids = set(
+                getattr(self, "_full_payload_pending_broadcast_req_ids", set())
+            )
+            if full_payload_pending_broadcast_req_ids:
+                staged_payloads = {
+                    req_id: payload
+                    for req_id, payload in self._local_stage_payload_cache.items()
+                    if req_id not in full_payload_pending_broadcast_req_ids
+                }
+                for req_id in staged_payloads:
+                    self._local_stage_payload_cache.pop(req_id, None)
+            else:
                 staged_payloads = dict(self._local_stage_payload_cache)
                 self._local_stage_payload_cache.clear()
-        else:
-            staged_payloads = dict(self._local_stage_payload_cache)
-            self._local_stage_payload_cache.clear()
         for req_id, payload in staged_payloads.items():
             if payload is None:
                 continue
@@ -1473,14 +1505,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             None, self.vllm_config, cudagraph_runtime_mode=_cudagraph_mode, batch_descriptor=batch_desc
         ):
             req_embeds, code_predictor_codes = self.talker_mtp(req_input_ids, req_embeds, last_talker_hidden, text_step)
-        # update the inputs_embeds and code_predictor_codes
-        code_predictor_codes_cpu = code_predictor_codes.detach().to("cpu").contiguous()
+        # Keep code predictor outputs on GPU for gpu_resident_buffer_keys such
+        # as Qwen3-TTS audio_codes. Forcing a D2H copy here can mix CPU decode
+        # chunks with GPU-prefill placeholders inside model_intermediate_buffer
+        # and later crash torch.cat() in make_omni_output under concurrency.
         out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
-            update_dict = {out_key: code_predictor_codes_cpu[idx : idx + 1]}
+            update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
             self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(

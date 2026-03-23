@@ -263,6 +263,28 @@ def thinker2talker_full_payload(
     }
 
 
+def _get_qwen3_multimodal_output(stage_output: Any, completion_output: Any) -> dict[str, Any]:
+    """Read multimodal_output from request output first, then completion.
+
+    On current vLLM/vLLM-Omni builds, non-async pipeline outputs can attach
+    multimodal payloads either to the outer request output or to the inner
+    CompletionOutput. Prefer the request-level dict and keep the older
+    completion-level layout as a fallback.
+    """
+    request_mm = getattr(stage_output, "multimodal_output", None)
+    if isinstance(request_mm, dict) and request_mm:
+        return request_mm
+
+    completion_mm = getattr(completion_output, "multimodal_output", None)
+    if isinstance(completion_mm, dict) and completion_mm:
+        return completion_mm
+
+    raise RuntimeError(
+        "Missing multimodal_output for Qwen3-Omni stage handoff: "
+        f"request_has_mm={bool(request_mm)} completion_has_mm={bool(completion_mm)}"
+    )
+
+
 def thinker2talker(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -294,18 +316,19 @@ def thinker2talker(
     # Process each thinker output
     for i, thinker_output in enumerate(thinker_outputs):
         output = thinker_output.outputs[0]
+        mm_output = _get_qwen3_multimodal_output(thinker_output, output)
 
         info = {
-            "thinker_prefill_embeddings": output.multimodal_output["0"].detach().to(device=device, dtype=torch.float),
-            "thinker_hidden_states": output.multimodal_output["24"].detach().to(device=device, dtype=torch.float),
+            "thinker_prefill_embeddings": mm_output["0"].detach().to(device=device, dtype=torch.float),
+            "thinker_hidden_states": mm_output["24"].detach().to(device=device, dtype=torch.float),
             "thinker_sequences": (
                 thinker_output.prompt_token_ids + output.token_ids
             ),  # the thinker_sequences is the whole ids
             "thinker_input_ids": thinker_output.prompt_token_ids,
             # Provide thinker-side TTS token embeddings for talker projection
-            "tts_bos_embed": output.multimodal_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_eos_embed": output.multimodal_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
-            "tts_pad_embed": output.multimodal_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
+            "tts_bos_embed": mm_output["tts_bos_embed"].detach().to(device=device, dtype=torch.float),
+            "tts_eos_embed": mm_output["tts_eos_embed"].detach().to(device=device, dtype=torch.float),
+            "tts_pad_embed": mm_output["tts_pad_embed"].detach().to(device=device, dtype=torch.float),
         }
         speaker = extract_speaker_from_prompt(prompt, index=i)
         if speaker is not None:
@@ -495,11 +518,12 @@ def talker2code2wav(
     # Process each talker output
     for talker_output in talker_outputs:
         output = talker_output.outputs[0]
+        mm_output = _get_qwen3_multimodal_output(talker_output, output)
         seq_len = len(output.token_ids) - 1
         # Extract codec codes from talker output
         # Expected shape: [8, seq_len] (8-layer RVQ codes)
         codec_codes = (
-            output.multimodal_output["code_predictor_codes"][-seq_len:]
+            mm_output["code_predictor_codes"][-seq_len:]
             .to(torch.long)
             .transpose(0, 1)
             .cpu()

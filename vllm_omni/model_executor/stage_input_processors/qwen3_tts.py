@@ -77,6 +77,13 @@ def talker2code2wav_full_payload(
     }
     if ref_code_len > 0:
         payload["left_context_size"] = ref_code_len
+    logger.info(
+        "talker2code2wav_full_payload: audio_codes_shape=%s ref_code_len=%s codec_len=%s payload_keys=%s",
+        tuple(audio_codes.shape),
+        ref_code_len,
+        len(codec_codes),
+        sorted(payload.keys()),
+    )
     return payload
 
 
@@ -293,6 +300,15 @@ def talker2code2wav_async_chunk(
     num_frames = len(window_frames)
     code_predictor_codes = [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)]
 
+    logger.info(
+        "talker2code2wav_async_chunk: req=%s length=%s context_length=%s left_context_size=%s finished=%s codec_len=%s",
+        request_id,
+        length,
+        context_length,
+        left_context_size,
+        finished,
+        len(code_predictor_codes),
+    )
     info: dict[str, Any] = {
         "code_predictor_codes": code_predictor_codes,
         "left_context_size": left_context_size,

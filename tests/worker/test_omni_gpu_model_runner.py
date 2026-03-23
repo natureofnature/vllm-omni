@@ -358,6 +358,39 @@ def test_update_states_seeds_initial_model_buffer(monkeypatch):
     assert runner.input_batch.req_ids == ["r1"]
 
 
+def test_update_states_preserves_existing_model_buffer_when_seeding_initial_buffer(monkeypatch):
+    import vllm_omni.worker.gpu_model_runner as mod
+
+    monkeypatch.setattr(mod, "get_pp_group", lambda: SimpleNamespace(is_last_rank=True))
+
+    runner = _make_runner_for_update_states(())
+    runner._get_valid_sampled_token_count = lambda: []
+    runner.model_intermediate_buffer["r1"] = {
+        "thinker_prefill_embeddings": torch.tensor([1.0]),
+        "thinker_hidden_states": torch.tensor([2.0]),
+    }
+    new_req = SimpleNamespace(
+        req_id="r1",
+        prompt_token_ids=[101],
+        prompt_embeds=None,
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        block_ids=([0],),
+        num_computed_tokens=0,
+        lora_request=None,
+        initial_model_buffer={"global_request_id": ["g1"]},
+    )
+    scheduler_output = _make_scheduler_output()
+    scheduler_output.scheduled_new_reqs = [new_req]
+
+    OmniGPUModelRunner._update_states(runner, scheduler_output)
+
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["thinker_prefill_embeddings"], torch.tensor([1.0]))
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["thinker_hidden_states"], torch.tensor([2.0]))
+    assert runner.model_intermediate_buffer["r1"]["global_request_id"] == ["g1"]
+
+
 def test_sync_local_stage_payloads_merges_without_scheduler_relay():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner._local_stage_payload_cache = {
@@ -394,14 +427,14 @@ def test_sync_local_stage_payloads_skips_unknown_req_id():
         "ext-unknown": {"stale": True},
         "unknown_req": {"stale": True},
     }
-    runner._local_request_metadata = {"unknown_req": {"left_context_size": 7}}
+    runner._local_request_metadata = {}
     runner._pending_load_reqs = {}
     runner._finished_load_reqs = {"unknown_req"}
     runner._chunk_ready_req_ids = {"unknown_req"}
     runner._chunk_finished_req_ids = {"unknown_req"}
     runner._chunk_stream_completed = {"unknown_req"}
-    runner._full_payload_recv_results = {"unknown_req": {"engine_inputs": True}}
-    runner._stage_recv_req_ids = {"unknown_req"}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._stage_recv_req_ids = set()
     runner._get_req_chunk = {"unknown_req": 3}
     runner.model_intermediate_buffer["unknown_req"] = {"stale": True}
 
@@ -416,7 +449,7 @@ def test_sync_local_stage_payloads_skips_unknown_req_id():
     assert runner._chunk_ready_req_ids == set()
     assert runner._chunk_finished_req_ids == set()
     assert runner._chunk_stream_completed == set()
-    assert runner._full_payload_recv_results == {}
+    assert runner._full_payload_pending_broadcast_req_ids == set()
     assert runner._stage_recv_req_ids == set()
     assert runner._get_req_chunk == {}
     assert runner._local_stage_payload_cache == {}
@@ -444,6 +477,58 @@ def test_sync_local_stage_payloads_keeps_pending_recv_request():
     assert runner._local_stage_payload_cache == {}
 
 
+def test_sync_local_stage_payloads_keeps_recently_received_full_payload_state():
+    runner = _make_runner(req_ids=(), hidden_size=4)
+    runner.requests = {}
+    runner._pending_load_reqs = {}
+    runner._local_stage_payload_cache = {
+        "req-1": {
+            "thinker_prefill_embeddings": torch.ones(1, 1),
+        }
+    }
+    runner._local_request_metadata = {"req-1": {"next_stage_prompt_len": 3}}
+    runner._stage_recv_req_ids = {"req-1"}
+    runner.drop_inactive_request_runtime_state = MagicMock()
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    runner.drop_inactive_request_runtime_state.assert_not_called()
+    assert runner._stage_recv_req_ids == {"req-1"}
+    assert runner._local_request_metadata == {"req-1": {"next_stage_prompt_len": 3}}
+    assert torch.allclose(
+        runner.model_intermediate_buffer["req-1"]["thinker_prefill_embeddings"],
+        torch.ones(1, 1),
+    )
+    assert runner._local_stage_payload_cache == {}
+
+
+def test_sync_local_stage_payloads_preserves_full_payload_pending_broadcast_cache():
+    runner = _make_runner(req_ids=(), hidden_size=4)
+    runner.requests = {}
+    runner._pending_load_reqs = {}
+    runner._local_stage_payload_cache = {
+        "req-1": {
+            "thinker_prefill_embeddings": torch.ones(1, 1),
+        }
+    }
+    runner._local_request_metadata = {"req-1": {"next_stage_prompt_len": 3}}
+    runner._stage_recv_req_ids = {"req-1"}
+    runner._full_payload_pending_broadcast_req_ids = {"req-1"}
+    runner.drop_inactive_request_runtime_state = MagicMock()
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    runner.drop_inactive_request_runtime_state.assert_not_called()
+    assert runner._stage_recv_req_ids == {"req-1"}
+    assert runner._full_payload_pending_broadcast_req_ids == {"req-1"}
+    assert runner._local_request_metadata == {"req-1": {"next_stage_prompt_len": 3}}
+    assert runner.model_intermediate_buffer == {}
+    assert torch.allclose(
+        runner._local_stage_payload_cache["req-1"]["thinker_prefill_embeddings"],
+        torch.ones(1, 1),
+    )
+
+
 def test_generation_execute_model_idle_path_keeps_connector_signals(monkeypatch):
     import vllm_omni.worker.gpu_generation_model_runner as mod
 
@@ -454,6 +539,7 @@ def test_generation_execute_model_idle_path_keeps_connector_signals(monkeypatch)
     runner.register_chunk_recv = MagicMock()
     runner.recv_full_payload_inputs = MagicMock()
     runner.cleanup_finished_request = MagicMock()
+    runner._pending_full_payload_send = {}
     runner.synchronize_input_prep = lambda: _noop_forward_context()
     runner._update_states = MagicMock()
     runner.prune_inactive_requests = MagicMock()

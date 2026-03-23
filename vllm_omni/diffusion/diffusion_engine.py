@@ -370,6 +370,7 @@ class DiffusionEngine:
                 # classifier-free guidance with an empty negative prompt.
                 guidance_scale=0.0,
                 num_outputs_per_prompt=1,
+                need_kv_receive=False,
                 # Disable CFG for warmup to avoid triggering CFG parallel
                 # validation when cfg_parallel_size > 1.
                 extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},

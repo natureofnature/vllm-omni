@@ -386,6 +386,41 @@ class OmniARScheduler(VLLMScheduler):
                         request.request_id,
                     )
 
+        # [Omni] Abort requests that have been waiting for chunk/input
+        # longer than the configured timeout.
+        #
+        # Cannot use finish_requests() here because WAITING_FOR_CHUNK
+        # requests from _waiting_for_chunk_running are placed back into
+        # self.running by restore_queues(), but their status remains
+        # WAITING_FOR_CHUNK.  finish_requests() uses status to decide
+        # which queue to remove from, so it would look in self.waiting
+        # instead of self.running, leaving a zombie entry.
+        #
+        # Instead we remove from BOTH queues unconditionally (request
+        # is in exactly one; the other removal is a no-op).
+        if self.chunk_coordinator is not None:
+            _timeout = getattr(self, "_omni_chunk_timeout_s", 300.0)
+            timed_out_ids = self.chunk_coordinator.collect_timed_out_request_ids(_timeout)
+            if timed_out_ids:
+                timed_out_reqs = [self.requests[rid] for rid in timed_out_ids if rid in self.requests]
+                timed_out_set = set(timed_out_reqs)
+                self.running = remove_all(self.running, timed_out_set)
+                self.waiting.remove_requests(timed_out_reqs)
+                self.skipped_waiting.remove_requests(timed_out_reqs)
+                for request in timed_out_reqs:
+                    request.status = RequestStatus.FINISHED_ERROR
+                    self._free_request(request)
+                    outputs[request.client_index].append(
+                        EngineCoreOutput(
+                            request_id=request.request_id,
+                            new_token_ids=[],
+                            finish_reason=request.get_finished_reason(),
+                            events=request.take_events(),
+                            trace_headers=request.trace_headers,
+                            num_cached_tokens=request.num_cached_tokens,
+                        )
+                    )
+
         # [Omni] Cleanup state for finished requests
         for req in stopped_running_reqs:
             if req.request_id not in self.waiting_for_transfer_free:

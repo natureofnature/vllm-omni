@@ -325,7 +325,49 @@ def log_test_name_before_test(request):
     yield
 
 
-def _run_pre_test_cleanup(enable_force=False):
+def _normalize_runtime_devices(devices: Any) -> list[int]:
+    if devices is None:
+        return []
+    if isinstance(devices, int):
+        return [devices]
+    if isinstance(devices, str):
+        return [int(device.strip()) for device in devices.split(",") if device.strip()]
+    if isinstance(devices, list):
+        normalized: list[int] = []
+        for device in devices:
+            normalized.extend(_normalize_runtime_devices(device))
+        return normalized
+    return []
+
+
+def _extract_cleanup_devices_from_stage_config(stage_config_path: str | None) -> list[int] | None:
+    if not stage_config_path or not os.path.exists(stage_config_path):
+        return None
+
+    try:
+        with open(stage_config_path, encoding="utf-8") as f:
+            cfg = yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"Stage-config cleanup note: failed to read {stage_config_path}: {e}")
+        return None
+
+    devices: list[int] = []
+    for stage in cfg.get("stage_args", []):
+        runtime_cfg = stage.get("runtime") or {}
+        devices.extend(_normalize_runtime_devices(runtime_cfg.get("devices")))
+
+    unique_devices = sorted(set(devices))
+    return unique_devices or None
+
+
+def _extract_cleanup_devices_from_serve_args(serve_args: list[str]) -> list[int] | None:
+    for idx, arg in enumerate(serve_args):
+        if arg == "--stage-configs-path" and idx + 1 < len(serve_args):
+            return _extract_cleanup_devices_from_stage_config(serve_args[idx + 1])
+    return None
+
+
+def _run_pre_test_cleanup(enable_force=False, devices: list[int] | None = None):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
@@ -337,15 +379,16 @@ def _run_pre_test_cleanup(enable_force=False):
         try:
             from tests.utils import wait_for_gpu_memory_to_clear
 
+            target_devices = devices if devices is not None else list(range(num_gpus))
             wait_for_gpu_memory_to_clear(
-                devices=list(range(num_gpus)),
+                devices=target_devices,
                 threshold_ratio=0.05,
             )
         except Exception as e:
             print(f"Pre-test cleanup note: {e}")
 
 
-def _run_post_test_cleanup(enable_force=False):
+def _run_post_test_cleanup(enable_force=False, devices: list[int] | None = None):
     if os.getenv("VLLM_TEST_CLEAN_GPU_MEMORY", "0") != "1" and not enable_force:
         print("GPU cleanup disabled")
         return
@@ -1259,13 +1302,14 @@ class OmniServer:
         env_dict: dict[str, str] | None = None,
         use_omni: bool = True,
     ) -> None:
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
-        cleanup_dist_env_and_memory()
         self.model = model
         self.serve_args = serve_args
         self.env_dict = env_dict
         self.use_omni = use_omni
+        self.cleanup_devices = _extract_cleanup_devices_from_serve_args(serve_args)
+        _run_pre_test_cleanup(enable_force=True, devices=self.cleanup_devices)
+        _run_post_test_cleanup(enable_force=True, devices=self.cleanup_devices)
+        cleanup_dist_env_and_memory()
         self.proc: subprocess.Popen | None = None
         self.host = "127.0.0.1"
         if port is None:
@@ -1384,8 +1428,8 @@ class OmniServer:
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.proc:
             self._kill_process_tree(self.proc.pid)
-        _run_pre_test_cleanup(enable_force=True)
-        _run_post_test_cleanup(enable_force=True)
+        _run_pre_test_cleanup(enable_force=True, devices=self.cleanup_devices)
+        _run_post_test_cleanup(enable_force=True, devices=self.cleanup_devices)
         cleanup_dist_env_and_memory()
 
 
@@ -1522,8 +1566,12 @@ def assert_omni_response(response: OmniResponse, request_config: dict[str, Any],
                         "The output does not contain any of the keywords."
                     )
 
-        # Verify similarity
-        if "text" in modalities and "audio" in modalities:
+        # Verify similarity unless the test explicitly opts out.
+        if (
+            "text" in modalities
+            and "audio" in modalities
+            and not request_config.get("skip_audio_text_similarity", False)
+        ):
             assert response.similarity > 0.9, "The audio content is not same as the text"
             print(f"similarity is: {response.similarity}")
 

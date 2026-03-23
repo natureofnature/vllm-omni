@@ -35,6 +35,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+_FINAL_OUTPUT_DRAIN_TIMEOUT_S = 0.1
 
 
 class AsyncOmni(EngineClient, OmniBase):
@@ -267,11 +268,18 @@ class AsyncOmni(EngineClient, OmniBase):
         if req_state is None:
             return
 
+        seen_terminal_result = False
+
         while True:
-            result = await req_state.queue.get()
+            if seen_terminal_result:
+                try:
+                    result = await asyncio.wait_for(req_state.queue.get(), timeout=_FINAL_OUTPUT_DRAIN_TIMEOUT_S)
+                except asyncio.TimeoutError:
+                    break
+            else:
+                result = await req_state.queue.get()
 
             stage_id = result.get("stage_id", 0)
-
             # Check for errors
             if "error" in result:
                 logger.error(
@@ -281,6 +289,11 @@ class AsyncOmni(EngineClient, OmniBase):
                     result["error"],
                 )
                 raise RuntimeError(result)
+
+            if result.get("type") == "finished_only":
+                if result.get("finished"):
+                    seen_terminal_result = True
+                continue
 
             # Process the result (constructs OmniRequestOutput)
             output_to_yield = self._process_single_result(
@@ -303,7 +316,7 @@ class AsyncOmni(EngineClient, OmniBase):
 
             # The Orchestrator sets "finished" when the final stage is done
             if result.get("finished"):
-                break
+                seen_terminal_result = True
 
     # ==================== Output Handler ====================
 
