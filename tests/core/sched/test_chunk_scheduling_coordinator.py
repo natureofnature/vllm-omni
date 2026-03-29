@@ -11,6 +11,7 @@ from __future__ import annotations
 import unittest
 from types import SimpleNamespace
 
+import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     ChunkSchedulingCoordinator,
     OmniSchedulingCoordinator,
@@ -33,6 +34,10 @@ class _RequestStatus:
 try:
     from vllm.v1.request import RequestStatus
 except ImportError:
+    RequestStatus = _RequestStatus  # type: ignore[misc,assignment]
+
+if not hasattr(RequestStatus, "WAITING_FOR_INPUT"):
+    coord_mod.RequestStatus = _RequestStatus  # type: ignore[assignment]
     RequestStatus = _RequestStatus  # type: ignore[misc,assignment]
 
 
