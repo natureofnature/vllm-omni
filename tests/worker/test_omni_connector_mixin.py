@@ -14,12 +14,15 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
 )
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 # ------------------------------------------------------------------ #
 #  Mock helpers
