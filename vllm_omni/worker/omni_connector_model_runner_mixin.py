@@ -27,7 +27,7 @@ from vllm.logger import init_logger
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
-from vllm_omni.payload_span import (
+from vllm_omni.worker.payload_span import (
     THINKER_DECODE_EMBEDDINGS_KEY,
     THINKER_DECODE_TOKEN_END_KEY,
     THINKER_DECODE_TOKEN_START_KEY,
