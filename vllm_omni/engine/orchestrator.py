@@ -411,8 +411,8 @@ class Orchestrator:
         if self.async_chunk:
             return
         for raw_output in raw_outputs.outputs:
-            kv_ready = getattr(raw_output, "kv_transfer_params", None) is not None
-            if not kv_ready:
+            kv_params = getattr(raw_output, "kv_transfer_params", None)
+            if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
                 continue
             req_id = raw_output.request_id
             req_state = self.request_states.get(req_id)
