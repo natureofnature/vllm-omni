@@ -98,20 +98,20 @@ class OmniARScheduler(VLLMScheduler):
         stop_decode_on_trigger = self.kv_transfer_criteria.get("stop_after_transfer", True)
 
         if request.request_id in self.transfer_triggered_requests:
-            # Already triggered; if stop_after_transfer is enabled, wait for
-            # KV extraction to finish then stop.  (Fallback for special_token
-            # or any path that did not stop immediately at trigger time.)
-            if stop_decode_on_trigger and request.request_id not in self.active_kv_transfers:
-                request.status = RequestStatus.FINISHED_STOPPED
-                return True
+            # Already triggered.  When stop_decode_on_trigger is True AND
+            # transfer was actually queued, the request was already stopped
+            # at trigger time (see below).  Any request that reaches this
+            # point either has stop_decode_on_trigger=False (continue
+            # decoding) or was not actually queued (should not be stopped).
             return False
 
         if criteria_type == "prefill_finished":
             if request.num_computed_tokens >= request.num_prompt_tokens:
                 self.transfer_triggered_requests.add(request.request_id)
                 self._mark_request_for_kv_transfer(request.request_id, request.num_computed_tokens)
+                actually_queued = request.request_id in self.requests_needing_kv_transfer
 
-                if stop_decode_on_trigger:
+                if stop_decode_on_trigger and actually_queued:
                     # Stop immediately so the request is NOT scheduled in
                     # the next step, freeing scheduling budget for companion
                     # requests whose chunked-prefill boundaries must be
@@ -128,7 +128,6 @@ class OmniARScheduler(VLLMScheduler):
             if target_token_id is not None and target_token_id in new_token_ids:
                 self.transfer_triggered_requests.add(request.request_id)
 
-                # Calculate precise snapshot length (trim to sentinel)
                 try:
                     idx = new_token_ids.index(target_token_id)
                     tokens_to_exclude = len(new_token_ids) - (idx + 1)
@@ -137,8 +136,9 @@ class OmniARScheduler(VLLMScheduler):
                     snapshot_len = request.num_computed_tokens
 
                 self._mark_request_for_kv_transfer(request.request_id, snapshot_len)
+                actually_queued = request.request_id in self.requests_needing_kv_transfer
 
-                if stop_decode_on_trigger:
+                if stop_decode_on_trigger and actually_queued:
                     self.waiting_for_transfer_free.add(request.request_id)
                     request.status = RequestStatus.FINISHED_STOPPED
                     return True
