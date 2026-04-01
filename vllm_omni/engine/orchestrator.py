@@ -358,11 +358,6 @@ class Orchestrator:
                 await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
         if finished and stage_id == req_state.final_stage_id:
-            _sf_ts = req_state.stage_submit_ts.get(stage_id, 0)
-            if _sf_ts > 0:
-                logger.info(
-                    "[EPDG] stage_done req=%s stage=%d ms=%.2f", req_id, stage_id, (_time.time() - _sf_ts) * 1000
-                )
             self._cleanup_companion_state(req_id)
             self.request_states.pop(req_id, None)
 
