@@ -418,9 +418,6 @@ class Orchestrator:
             req_state = self.request_states.get(req_id)
             if req_state is None:
                 continue
-            _s0_ts = req_state.stage_submit_ts.get(stage_id, 0)
-            if _s0_ts > 0:
-                logger.info("[EPDG] stage0_kv_ready req=%s ms=%.2f", req_id, (_time.time() - _s0_ts) * 1000)
             if req_id in self._companion_ids:
                 await self._handle_cfg_companion_ready(req_id)
                 continue
