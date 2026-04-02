@@ -171,10 +171,20 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         # dummy run to ensure coordinate_batch_across_dp
                         # is called into to avoid out of sync issues.
                         self._dummy_run(1)
+
+                    kv_ids = self.kv_extracted_req_ids
+                    self.kv_extracted_req_ids = None
+
                     if not has_kv_transfer_group():
-                        # Return empty ModelRunnerOutput if no work to do.
-                        return EMPTY_MODEL_RUNNER_OUTPUT
-                    return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                        output = EMPTY_MODEL_RUNNER_OUTPUT
+                    else:
+                        output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+
+                    if kv_ids:
+                        output = copy(output)
+                        output.kv_extracted_req_ids = kv_ids
+
+                    return output
                 if self.cache_config.kv_sharing_fast_prefill:
                     assert not self.num_prompt_logprobs, (
                         "--kv-sharing-fast-prefill produces incorrect "
