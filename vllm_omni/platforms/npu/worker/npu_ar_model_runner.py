@@ -149,7 +149,15 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         encoder_cache=self.encoder_cache,
                     ) as ec_connector_output:
                         self._execute_mm_encoder(scheduler_output)
-                        return make_empty_encoder_model_runner_output(scheduler_output)
+
+                        kv_ids = self.kv_extracted_req_ids
+                        self.kv_extracted_req_ids = None
+
+                        output = make_empty_encoder_model_runner_output(scheduler_output)
+                        if kv_ids:
+                            output = copy(output)
+                            output.kv_extracted_req_ids = kv_ids
+                        return output
 
                 if not num_scheduled_tokens:
                     if (
