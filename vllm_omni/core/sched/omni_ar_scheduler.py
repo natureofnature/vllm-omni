@@ -504,6 +504,7 @@ class OmniARScheduler(VLLMScheduler):
                             if req_id in self.transfer_triggered_requests:
                                 self.transfer_triggered_requests.remove(req_id)
                             self.active_kv_transfers.discard(req_id)
+                            self.pending_stop_after_extraction.discard(req_id)
                             logger.debug(f"Freed blocks for {req_id} after transfer extraction")
                         self.waiting_for_transfer_free.remove(req_id)
                 except Exception:
