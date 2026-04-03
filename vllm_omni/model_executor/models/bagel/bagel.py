@@ -836,7 +836,14 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             req_len = end - start
 
             if img2img_idx < len(info_list):
-                num_vae, num_vit, img_H, img_W = info_list[img2img_idx]
+                cur_info = info_list[img2img_idx]
+            elif info_list:
+                cur_info = info_list[-1]
+            else:
+                cur_info = None
+
+            if cur_info is not None:
+                num_vae, num_vit, img_H, img_W = cur_info
                 num_img2img = num_vae + 1 + num_vit  # +1 separator
 
                 if req_len >= num_img2img:
@@ -894,7 +901,8 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                     )
                     decode_offset = rope - req_len
                     self._pending_decode_offsets.append(decode_offset)
-                    img2img_idx += 1
+                    if img2img_idx < len(info_list):
+                        img2img_idx += 1
                     continue
 
             rope = int(new_positions[end - 1].item()) + 1
