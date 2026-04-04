@@ -452,6 +452,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 _tok.add_tokens([t])
         self._start_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_start|>"))
         self._end_of_image_id = int(_tok.convert_tokens_to_ids("<|vision_end|>"))
+        self._img2img_token_id = int(_tok.convert_tokens_to_ids("<|fim_middle|>"))
         self._vae_token_mask: torch.Tensor | None = None
         self.device = get_local_device()
         self._install_mot_modules(config)
@@ -539,15 +540,48 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         *,
         num_computed_tokens: int | None = None,
     ) -> dict[str, Any] | None:
-        return self._ropes_metadata.pop(req_id, None)
+        meta = self._ropes_metadata.pop(req_id, None)
+        if meta is None:
+            return None
+        if num_computed_tokens is not None and "image_shape" in meta:
+            prefill_rope = meta["ropes"][0] if meta.get("ropes") else 0
+            if num_computed_tokens > prefill_rope:
+                meta["ropes"] = [num_computed_tokens]
+        return meta
+
+    def prepare_runner_inputs(
+        self,
+        input_ids: torch.Tensor | None,
+        positions: torch.Tensor | None,
+        inputs_embeds: torch.Tensor | None,
+        req_ids: list[str],
+        num_computed_tokens: list[int],
+        num_scheduled_tokens: list[int],
+        input_ids_buffer: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Restore input_ids so _adjust_positions_for_img2img can locate
+        the <|fim_middle|> placeholder for thinking-mode pre_text_len
+        detection."""
+        if inputs_embeds is not None and input_ids is None and input_ids_buffer is not None:
+            input_ids = input_ids_buffer
+        return input_ids, positions
 
     def flush_pending_metadata(self, req_ids: list[str]) -> None:
-        """Map pending metadata (batch order) to req_ids after forward()."""
+        """Map pending metadata (batch order) to req_ids after forward().
+
+        Guard: if a request already has metadata with ``image_shape``
+        (written during img2img prefill), don't overwrite it with
+        decode-step metadata that lacks ``image_shape``.
+        """
         pending = self._ropes_pending
         self._ropes_pending = []
         for i, meta in enumerate(pending):
             if i < len(req_ids):
-                self._ropes_metadata[req_ids[i]] = meta
+                rid = req_ids[i]
+                existing = self._ropes_metadata.get(rid)
+                if existing and "image_shape" in existing and "image_shape" not in meta:
+                    continue
+                self._ropes_metadata[rid] = meta
 
     def _parse_and_validate_multimodal_inputs(self, **kwargs: object) -> dict:
         mm_input_by_modality = {}
@@ -677,7 +711,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
         seq_len = inputs_embeds.shape[0] if inputs_embeds is not None else positions.shape[0]
 
         if self._pending_img2img_info:
-            positions = self._adjust_positions_for_img2img(positions)
+            positions = self._adjust_positions_for_img2img(positions, input_ids)
             use_mot = True
 
         elif self._last_img2img_info is not None:
@@ -687,7 +721,7 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
 
             if seq_len >= num_img2img:
                 self._pending_img2img_info = [info]
-                positions = self._adjust_positions_for_img2img(positions)
+                positions = self._adjust_positions_for_img2img(positions, input_ids)
                 use_mot = True
             else:
                 rope = int(positions[seq_len - 1].item()) + 1
@@ -697,15 +731,23 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
             return self._mot_forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
         return super().forward(input_ids, positions, intermediate_tensors, inputs_embeds, **kwargs)
 
-    def _adjust_positions_for_img2img(self, positions: torch.Tensor) -> torch.Tensor:
-        """Rewrite position IDs to match the single-stage DiT scheme:
-        VAE tokens -> position 0, separator -> position 0,
-        ViT tokens -> position 1, text -> 2, 3, ...
+    def _adjust_positions_for_img2img(
+        self,
+        positions: torch.Tensor,
+        input_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Rewrite position IDs for img2img.
 
-        Also computes ``self._vae_token_mask`` (bool tensor, True for actual
-        VAE latent patches that should use gen-mode weights) and pushes
-        per-request ropes + image_shape to the FIFO consumed by
-        ``get_kv_transfer_metadata``.
+        Supports an optional ``pre_text_len`` prefix (thinking-mode) detected
+        via the ``<|fim_middle|>`` token in *input_ids*:
+
+            pre_text -> 0 .. M-1
+            VAE      -> M       (all share)
+            separator-> M
+            ViT      -> M+1     (all share)
+            post_text-> M+2, M+3, ...
+
+        When M=0 (standard img2img) this reduces to VAE->0, ViT->1, text->2..
         """
         info_list = self._pending_img2img_info
         self._pending_img2img_info = []
@@ -742,24 +784,42 @@ class OmniBagelForConditionalGeneration(BagelForConditionalGeneration):
                 num_img2img = num_vae + 1 + num_vit  # +1 separator
 
                 if req_len >= num_img2img:
-                    new_positions[start : start + num_vae] = 0
-                    new_positions[start + num_vae] = 0  # separator
-                    vit_start = start + num_vae + 1
-                    new_positions[vit_start : vit_start + num_vit] = 1
-                    num_text = req_len - num_img2img
-                    if num_text > 0:
-                        text_start = start + num_img2img
-                        new_positions[text_start:end] = torch.arange(
-                            2, 2 + num_text, device=positions.device, dtype=positions.dtype
+                    pre_text_len = 0
+                    if input_ids is not None:
+                        req_ids_slice = input_ids[start:end]
+                        indices = (req_ids_slice == self._img2img_token_id).nonzero(as_tuple=True)[0]
+                        if indices.numel() > 0:
+                            pre_text_len = int(indices[0].item())
+
+                    M = pre_text_len
+                    img_start = start + M
+                    post_text_start = img_start + num_img2img
+
+                    if M > 0:
+                        new_positions[start:img_start] = torch.arange(
+                            0, M, device=positions.device, dtype=positions.dtype
                         )
 
-                    # VAE gen-mode mask: only actual VAE patches (not markers)
-                    vae_patches_start = start + 1  # skip start_marker
-                    vae_patches_end = start + num_vae - 1  # before end_marker
+                    new_positions[img_start : img_start + num_vae] = M
+                    new_positions[img_start + num_vae] = M  # separator
+                    vit_start = img_start + num_vae + 1
+                    new_positions[vit_start : vit_start + num_vit] = M + 1
+
+                    num_post_text = end - post_text_start
+                    if num_post_text > 0:
+                        new_positions[post_text_start:end] = torch.arange(
+                            M + 2,
+                            M + 2 + num_post_text,
+                            device=positions.device,
+                            dtype=positions.dtype,
+                        )
+
+                    vae_patches_start = img_start + 1
+                    vae_patches_end = img_start + num_vae - 1
                     if vae_patches_end > vae_patches_start:
                         vae_mask[vae_patches_start:vae_patches_end] = True
 
-                    rope = 2 + num_text
+                    rope = M + 2 + num_post_text
                     self._ropes_pending.append(
                         {
                             "ropes": [rope],
