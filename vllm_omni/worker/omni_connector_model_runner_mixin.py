@@ -1949,7 +1949,6 @@ class OmniConnectorModelRunnerMixin:
         if not getattr(model_config, "async_chunk", False):
             input_func = getattr(model_config, "custom_process_input_func", None)
             if isinstance(input_func, str) and input_func:
-                candidates.append(input_func)
                 try:
                     module_path, func_name = input_func.rsplit(".", 1)
                     if func_name.endswith("_full_payload") or func_name.endswith("_batch"):
@@ -1957,8 +1956,9 @@ class OmniConnectorModelRunnerMixin:
                     else:
                         candidates.append(f"{module_path}.{func_name}_full_payload")
                         candidates.append(f"{module_path}.{func_name}_batch")
+                        candidates.append(input_func)
                 except ValueError:
-                    pass
+                    candidates.append(input_func)
 
         tried: set[str] = set()
         for func_path in candidates:
@@ -1970,11 +1970,42 @@ class OmniConnectorModelRunnerMixin:
                 module = importlib.import_module(module_path)
                 func = getattr(module, func_name, None)
                 if callable(func):
+                    if not OmniConnectorModelRunnerMixin._is_connector_payload_builder(func):
+                        logger.debug(
+                            "Skipping incompatible connector payload hook %s; signature=%s",
+                            func_path,
+                            inspect.signature(func),
+                        )
+                        continue
                     return func_path, func
             except Exception:
                 logger.warning("Failed to load custom func: %s", func_path, exc_info=True)
 
         return None, None
+
+    @staticmethod
+    def _is_connector_payload_builder(func: Any) -> bool:
+        """Whether *func* matches the mixin payload-builder contract."""
+        try:
+            signature = inspect.signature(func)
+        except (TypeError, ValueError):
+            return False
+
+        params = signature.parameters
+        if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+            return True
+
+        required = {"transfer_manager", "pooling_output", "request"}
+        supported = {
+            name
+            for name, param in params.items()
+            if param.kind
+            in (
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.KEYWORD_ONLY,
+            )
+        }
+        return required.issubset(supported)
 
     def _resolve_external_req_id(self, request: Any, fallback_req_id: str) -> str:
         """Resolve the external request ID consistently.

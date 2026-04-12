@@ -353,6 +353,27 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
         host.shutdown_omni_connectors()
 
 
+class TestLoadCustomFuncSelection(unittest.TestCase):
+    def test_skips_legacy_stage_list_processors_for_full_payload_mode(self):
+        legacy_paths = [
+            "vllm_omni.model_executor.stage_input_processors.mimo_audio.llm2code2wav",
+            "vllm_omni.model_executor.stage_input_processors.mammoth_moda2.ar2dit",
+            "vllm_omni.model_executor.stage_input_processors.cosyvoice3.text2flow",
+            "vllm_omni.model_executor.stage_input_processors.glm_image.ar2diffusion",
+        ]
+
+        for func_path in legacy_paths:
+            selected_path, func = MixinHost._load_custom_func(
+                SimpleNamespace(
+                    async_chunk=False,
+                    custom_process_input_func=func_path,
+                    custom_process_next_stage_input_func=None,
+                )
+            )
+            assert selected_path != func_path
+            assert func is None or MixinHost._is_connector_payload_builder(func)
+
+
 class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
     """Test B4: send_full_payload_outputs with full_payload_mode custom process func."""
 
