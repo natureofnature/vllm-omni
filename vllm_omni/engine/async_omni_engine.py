@@ -68,6 +68,7 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
 )
 from vllm_omni.entrypoints.utils import (
+    inject_omni_kv_config,
     load_and_resolve_stage_configs,
 )
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
@@ -86,8 +87,105 @@ def _patch_generation_config_if_needed(model_config: Any) -> None:
         model_config.try_get_generation_config = lambda: {}
 
 
-def _inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
-    """Inject stage_id and engine_input_source into omni_kv_config.
+def _get_attr_or_item(obj: Any, key: str, default: Any = None) -> Any:
+    """Read *key* from *obj* regardless of whether it's a dict or object."""
+    if hasattr(obj, "get"):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _tp_size_for_stage(stage_configs: Sequence[Any], stage_id: Any) -> int | None:
+    """Resolve tensor_parallel_size for *stage_id* from the loaded stage configs."""
+    id_strs = {str(stage_id)}
+    try:
+        id_strs.add(str(int(stage_id)))
+    except (TypeError, ValueError):
+        pass
+
+    for stage_cfg in stage_configs:
+        if str(getattr(stage_cfg, "stage_id", None)) not in id_strs:
+            continue
+        engine_args = getattr(stage_cfg, "engine_args", None)
+        if engine_args is None:
+            return 1
+        parallel_config = _get_attr_or_item(engine_args, "parallel_config")
+        if parallel_config is not None:
+            tp = _get_attr_or_item(parallel_config, "tensor_parallel_size", 1)
+        else:
+            tp = _get_attr_or_item(engine_args, "tensor_parallel_size", 1)
+        try:
+            return max(1, int(tp))
+        except (TypeError, ValueError):
+            return 1
+    return None
+
+
+def _inject_inferred_kv_tp_topology(
+    omni_kv: Any,
+    stage_id: int,
+    stage_configs: Sequence[Any],
+    engine_input_source: Sequence[int] | None = None,
+) -> None:
+    """Infer adjacent-stage TP topology and inject it into omni_kv_config.
+
+    This keeps heterogeneous TP working without requiring user-authored
+    rank_mapping blocks in config files.
+    """
+    if omni_kv is None:
+        return
+
+    if hasattr(omni_kv, "get"):
+        need_send = bool(omni_kv.get("need_send_cache", False))
+        need_recv = bool(omni_kv.get("need_recv_cache", False))
+        omni_from_stage = omni_kv.get("omni_from_stage")
+        omni_to_stage = omni_kv.get("omni_to_stage")
+        rank_mapping = omni_kv.get("rank_mapping")
+    else:
+        need_send = bool(getattr(omni_kv, "need_send_cache", False))
+        need_recv = bool(getattr(omni_kv, "need_recv_cache", False))
+        omni_from_stage = getattr(omni_kv, "omni_from_stage", None)
+        omni_to_stage = getattr(omni_kv, "omni_to_stage", None)
+        rank_mapping = getattr(omni_kv, "rank_mapping", None)
+
+    if not need_send and not need_recv:
+        return
+
+    current_tp = _tp_size_for_stage(stage_configs, stage_id)
+    if current_tp is None:
+        return
+
+    peer_stage_id = None
+    from_tp = None
+    to_tp = None
+    if str(omni_from_stage) == str(stage_id):
+        peer_stage_id = omni_to_stage
+        from_tp = current_tp
+        to_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+    elif str(omni_to_stage) == str(stage_id):
+        peer_stage_id = omni_from_stage
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+    elif need_recv and engine_input_source:
+        peer_stage_id = engine_input_source[0]
+        from_tp = _tp_size_for_stage(stage_configs, peer_stage_id)
+        to_tp = current_tp
+
+    if from_tp is None or to_tp is None:
+        return
+
+    if not isinstance(rank_mapping, dict):
+        rank_mapping = {}
+    rank_mapping.setdefault("from_tp", int(from_tp))
+    rank_mapping.setdefault("to_tp", int(to_tp))
+
+    if hasattr(omni_kv, "__setitem__"):
+        omni_kv["rank_mapping"] = rank_mapping
+    else:
+        setattr(omni_kv, "rank_mapping", rank_mapping)
+
+
+def _inject_kv_stage_info(stage_cfg: Any, stage_id: int, stage_configs: Sequence[Any] | None = None) -> None:
+    """Inject stage_id, engine_input_source, and inferred TP topology into omni_kv_config.
 
     OmniKVTransferManager needs stage_id to compute recv_stages for the
     receiving side. In the old Omni architecture, OmniDiffusion.__init__
@@ -115,6 +213,14 @@ def _inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
                 omni_kv.setdefault("engine_input_source", list(engine_input_source))
             elif hasattr(omni_kv, "__setitem__") and "engine_input_source" not in omni_kv:
                 omni_kv["engine_input_source"] = list(engine_input_source)
+
+        if stage_configs:
+            _inject_inferred_kv_tp_topology(
+                omni_kv,
+                stage_id=stage_id,
+                stage_configs=stage_configs,
+                engine_input_source=engine_input_source,
+            )
     except Exception as e:
         logger.debug("Failed to inject stage info into omni_kv_config: %s", e)
 
@@ -525,18 +631,16 @@ class AsyncOmniEngine:
                     )
 
                     omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
+                    omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                    if omni_conn_cfg:
+                        inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                    _inject_kv_stage_info(stage_cfg, stage_id, self.stage_configs)
 
                     if metadata.stage_type == "diffusion":
                         with llm_stage_launch_lock:
                             previous_visible_devices = os.environ.get(device_control_env)
                             try:
                                 setup_stage_devices(stage_id, metadata.runtime_cfg)
-                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                                if omni_conn_cfg:
-                                    from vllm_omni.entrypoints.utils import inject_omni_kv_config
-
-                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                _inject_kv_stage_info(stage_cfg, stage_id)
                                 stage_clients[stage_id] = initialize_diffusion_stage(
                                     self.model,
                                     stage_cfg,

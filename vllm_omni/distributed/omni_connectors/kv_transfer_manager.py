@@ -3,6 +3,7 @@
 """Unified OmniConnector and KV cache transfer management."""
 
 import json
+import os
 import struct
 import time
 from collections.abc import Callable
@@ -10,11 +11,15 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 import torch
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 
 from .factory import OmniConnectorFactory
 from .utils.config import ConnectorSpec
-from .utils.initialization import KV_TRANSFER_PORT_OFFSET
+from .utils.initialization import KV_RANK_PORT_STRIDE, KV_TRANSFER_PORT_OFFSET
 from .utils.kv_utils import normalize_layer_kv
 
 logger = init_logger(__name__)
@@ -57,6 +62,8 @@ class OmniKVCacheConfig:
     need_recv_cache: bool = False
     need_send_cache: bool = False
     recv_timeout: float = 30.0
+    from_tp: int = 1
+    to_tp: int = 1
 
 
 @dataclass
@@ -72,82 +79,44 @@ class KVCacheTransferData:
         """Convert to dictionary for serialization."""
         return asdict(self)
 
-    def to_bytes(self) -> bytes:
-        """Convert to compact binary format for fast transfer."""
+    def _build_tensors_desc(self, *, cpu: bool) -> tuple[list[dict[str, Any]], list, int, torch.device | None]:
+        """Iterate layer blocks and build tensor descriptors + data chunks.
+
+        Returns ``(tensors_desc, chunks, total_bytes, device)``.
+        *chunks* contains ``bytes`` when *cpu* is True, flat uint8 GPU tensors otherwise.
+        """
         tensors_desc: list[dict[str, Any]] = []
-        tensor_bufs: list[bytes] = []
-        data_offset = 0
-
-        for cache_name in ("key_cache", "value_cache"):
-            cache_list = self.layer_blocks.get(cache_name, [])
-            for layer_idx, tensor in enumerate(cache_list):
-                if tensor is None:
-                    tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
-                    continue
-
-                t = tensor.detach().cpu().contiguous()
-                dtype_str = str(t.dtype).removeprefix("torch.")
-                raw = t.view(torch.uint8).numpy().tobytes()
-                tensors_desc.append(
-                    {
-                        "n": f"{cache_name}_{layer_idx}",
-                        "i": layer_idx,
-                        "d": dtype_str,
-                        "s": list(t.shape),
-                        "o": data_offset,
-                        "b": len(raw),
-                    }
-                )
-                tensor_bufs.append(raw)
-                data_offset += len(raw)
-
-        header = json.dumps(
-            {
-                "rid": self.request_id,
-                "bids": self.block_ids,
-                "meta": self.metadata,
-                "td": tensors_desc,
-                "nl": len(self.layer_blocks.get("key_cache", [])),
-            },
-            separators=(",", ":"),
-        ).encode("utf-8")
-        return b"".join([struct.pack(">I", len(header)), header] + tensor_bufs)
-
-    def to_gpu_tensor(self) -> torch.Tensor:
-        """Convert to a packed GPU tensor for raw-data connectors."""
-        tensors_desc: list[dict[str, Any]] = []
-        gpu_tensors: list[torch.Tensor] = []
+        chunks: list = []
         data_offset = 0
         device = None
 
         for cache_name in ("key_cache", "value_cache"):
-            cache_list = self.layer_blocks.get(cache_name, [])
-            for layer_idx, tensor in enumerate(cache_list):
+            for layer_idx, tensor in enumerate(self.layer_blocks.get(cache_name, [])):
                 if tensor is None:
                     tensors_desc.append({"n": f"{cache_name}_{layer_idx}", "x": True})
                     continue
-
                 t = tensor.detach().contiguous()
-                if device is None and t.is_cuda:
+                if cpu:
+                    t = t.cpu()
+                elif device is None and t.is_cuda:
                     device = t.device
-                dtype_str = str(t.dtype).removeprefix("torch.")
                 nbytes = t.numel() * t.element_size()
                 tensors_desc.append(
                     {
                         "n": f"{cache_name}_{layer_idx}",
                         "i": layer_idx,
-                        "d": dtype_str,
+                        "d": str(t.dtype).removeprefix("torch."),
                         "s": list(t.shape),
                         "o": data_offset,
                         "b": nbytes,
                     }
                 )
-                gpu_tensors.append(t.view(torch.uint8).flatten())
+                chunks.append(t.view(torch.uint8).numpy().tobytes() if cpu else t.view(torch.uint8).flatten())
                 data_offset += nbytes
 
-        if device is None:
-            raise RuntimeError("No CUDA tensors found, use to_bytes() instead")
+        return tensors_desc, chunks, data_offset, device
 
+    def _build_header_bytes(self, tensors_desc: list[dict[str, Any]]) -> bytes:
         header = json.dumps(
             {
                 "rid": self.request_id,
@@ -158,19 +127,26 @@ class KVCacheTransferData:
             },
             separators=(",", ":"),
         ).encode("utf-8")
+        return struct.pack(">I", len(header)) + header
 
-        header_prefix = struct.pack(">I", len(header)) + header
-        total_size = len(header_prefix) + data_offset
-        output = torch.empty(total_size, dtype=torch.uint8, device=device)
-        header_tensor = torch.frombuffer(bytearray(header_prefix), dtype=torch.uint8)
-        output[: len(header_prefix)].copy_(header_tensor)
+    def to_bytes(self) -> bytes:
+        """Convert to compact binary format for fast transfer."""
+        tensors_desc, chunks, _, _ = self._build_tensors_desc(cpu=True)
+        return b"".join([self._build_header_bytes(tensors_desc)] + chunks)
 
+    def to_gpu_tensor(self) -> torch.Tensor:
+        """Convert to a packed GPU tensor for raw-data connectors."""
+        tensors_desc, chunks, data_offset, device = self._build_tensors_desc(cpu=False)
+        if device is None:
+            raise RuntimeError("No CUDA tensors found, use to_bytes() instead")
+        header_prefix = self._build_header_bytes(tensors_desc)
+        output = torch.empty(len(header_prefix) + data_offset, dtype=torch.uint8, device=device)
+        output[: len(header_prefix)].copy_(torch.frombuffer(bytearray(header_prefix), dtype=torch.uint8))
         pos = len(header_prefix)
-        for t_flat in gpu_tensors:
+        for t_flat in chunks:
             n = t_flat.numel()
             output[pos : pos + n].copy_(t_flat)
             pos += n
-
         return output
 
     @staticmethod
@@ -237,11 +213,8 @@ class KVCacheTransferData:
         return layer_idx
 
     @staticmethod
-    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
-        """Reconstruct KV cache data from the packed bytes format."""
-        raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
-        header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
-
+    def _populate_caches(header: dict[str, Any], get_tensor: callable) -> dict[str, Any]:
+        """Shared deserialization loop for both CPU and GPU paths."""
         num_layers = header["nl"]
         key_cache: list[torch.Tensor | None] = [None] * num_layers
         value_cache: list[torch.Tensor | None] = [None] * num_layers
@@ -249,20 +222,9 @@ class KVCacheTransferData:
         for info in header["td"]:
             if info.get("x"):
                 continue
-
             name: str = info["n"]
             torch_dtype = KVCacheTransferData._resolve_torch_dtype(info["d"])
-            offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, len(tensor_data_mv))
-            t = (
-                torch.frombuffer(
-                    tensor_data_mv,
-                    dtype=torch.uint8,
-                    offset=offset,
-                    count=nbytes,
-                )
-                .view(torch_dtype)
-                .reshape(info["s"])
-            )
+            t = get_tensor(info).view(torch_dtype).reshape(info["s"])
             layer_idx = KVCacheTransferData._resolve_layer_idx(info, num_layers)
             if name.startswith("key_cache_"):
                 key_cache[layer_idx] = t
@@ -277,36 +239,29 @@ class KVCacheTransferData:
         }
 
     @staticmethod
+    def from_bytes(raw: "bytes | bytearray | memoryview") -> dict[str, Any]:
+        """Reconstruct KV cache data from the packed bytes format."""
+        raw_mv = memoryview(raw) if not isinstance(raw, memoryview) else raw
+        header, tensor_data_mv = KVCacheTransferData._load_header_from_memoryview(raw_mv)
+        data_len = len(tensor_data_mv)
+
+        def _get(info: dict) -> torch.Tensor:
+            offset, nbytes = KVCacheTransferData._validate_tensor_span(info["n"], info, data_len)
+            return torch.frombuffer(tensor_data_mv, dtype=torch.uint8, offset=offset, count=nbytes)
+
+        return KVCacheTransferData._populate_caches(header, _get)
+
+    @staticmethod
     def from_bytes_gpu(gpu_tensor: torch.Tensor) -> dict[str, Any]:
         """Reconstruct KV cache data from a packed GPU tensor."""
         header, data_start = KVCacheTransferData._load_header_from_tensor(gpu_tensor)
+        data_len = int(gpu_tensor.numel()) - data_start
 
-        num_layers = header["nl"]
-        key_cache: list[torch.Tensor | None] = [None] * num_layers
-        value_cache: list[torch.Tensor | None] = [None] * num_layers
-        tensor_data_bytes = int(gpu_tensor.numel()) - data_start
+        def _get(info: dict) -> torch.Tensor:
+            offset, nbytes = KVCacheTransferData._validate_tensor_span(info["n"], info, data_len)
+            return gpu_tensor[data_start + offset : data_start + offset + nbytes].clone()
 
-        for info in header["td"]:
-            if info.get("x"):
-                continue
-
-            name: str = info["n"]
-            torch_dtype = KVCacheTransferData._resolve_torch_dtype(info["d"])
-            offset, nbytes = KVCacheTransferData._validate_tensor_span(name, info, tensor_data_bytes)
-            t = gpu_tensor[data_start + offset : data_start + offset + nbytes].clone()
-            t = t.view(torch_dtype).reshape(info["s"])
-            layer_idx = KVCacheTransferData._resolve_layer_idx(info, num_layers)
-            if name.startswith("key_cache_"):
-                key_cache[layer_idx] = t
-            elif name.startswith("value_cache_"):
-                value_cache[layer_idx] = t
-
-        return {
-            "request_id": header["rid"],
-            "layer_blocks": {"key_cache": key_cache, "value_cache": value_cache},
-            "block_ids": header["bids"],
-            "metadata": header["meta"],
-        }
+        return KVCacheTransferData._populate_caches(header, _get)
 
 
 class OmniKVTransferManager:
@@ -341,6 +296,31 @@ class OmniKVTransferManager:
             else (None, None)
         )
 
+        self._local_rank = self._get_local_rank()
+
+        # Auto-detect TP size when rank_mapping is not explicitly configured.
+        # Assumes homogeneous TP (sender and receiver have the same TP size).
+        if config.from_tp <= 1 and config.to_tp <= 1:
+            detected_tp = self._get_tp_world_size()
+            self._from_tp: int = detected_tp
+            self._to_tp: int = detected_tp
+        else:
+            self._from_tp: int = config.from_tp
+            self._to_tp: int = config.to_tp
+
+        # Injectable hooks (compatible with PR #2677 OmniConnectorModelRunnerMixin).
+        # When the mixin is used it overrides these; otherwise built-in defaults apply.
+        self.kv_send_key_builder: Callable | None = None
+        self.kv_recv_key_builder: Callable | None = None
+        self.kv_payload_merger: Callable | None = None
+        self.kv_payload_slicer: Callable | None = None
+
+        # Base sender endpoint (rank-0 host/port) stored during
+        # update_sender_info().  Used by the receive path to construct
+        # per-rank metadata for heterogeneous TP without querying a registry.
+        self._sender_base_host: str | None = None
+        self._sender_base_zmq_port: int | None = None
+
         if config.need_send_cache and config.connector_config:
             try:
                 _ = self.connector
@@ -348,11 +328,235 @@ class OmniKVTransferManager:
             except Exception as e:
                 logger.warning("Failed to eagerly initialize sender connector: %s", e)
 
+    @staticmethod
+    def _get_local_rank() -> int:
+        """Return the TP-local rank of this worker process.
+
+        Uses ``get_tensor_model_parallel_rank()`` which returns the rank
+        within the TP group only, not the stage-global rank.  This is
+        correct even when cfg_parallel_size > 1 or other parallel
+        dimensions are present.
+        """
+        try:
+            return get_tensor_model_parallel_rank()
+        except Exception:
+            pass
+        try:
+            return int(os.environ.get("LOCAL_RANK", "0"))
+        except (ValueError, TypeError):
+            return 0
+
+    @staticmethod
+    def _get_tp_world_size() -> int:
+        """Return the TP world size (tensor-parallel dimension only).
+
+        Uses ``get_tensor_model_parallel_world_size()`` so that
+        cfg_parallel, SP, PP etc. are not included in the count.
+        """
+        try:
+            return get_tensor_model_parallel_world_size()
+        except Exception:
+            pass
+        return 1
+
+    @staticmethod
+    def _kv_zmq_port(base_port: int, from_stage: int, local_rank: int = 0) -> int:
+        """Compute the ZMQ port for a KV-transfer connector.
+
+        Each TP rank gets its own port so that TP > 1 deployments do not
+        cause ``EADDRINUSE`` when multiple sender workers bind on the same
+        host.  The formula is backward-compatible: rank 0 produces the same
+        port as the previous ``base + OFFSET + stage`` formula.
+        """
+        return base_port + KV_TRANSFER_PORT_OFFSET + local_rank * KV_RANK_PORT_STRIDE + from_stage
+
+    # ------------------------------------------------------------------ #
+    #  Rank-aware KV key building (PR #2677 compatible)
+    # ------------------------------------------------------------------ #
+
+    def _validate_kv_tp_topology(self) -> None:
+        """Reject heterogeneous TP mappings that cannot be routed losslessly."""
+        if self._from_tp <= 0 or self._to_tp <= 0:
+            raise ValueError(f"Invalid KV TP mapping: from_tp={self._from_tp}, to_tp={self._to_tp}")
+        larger = max(self._from_tp, self._to_tp)
+        smaller = min(self._from_tp, self._to_tp)
+        if larger % smaller != 0:
+            raise ValueError(f"KV TP mapping must be divisible: from_tp={self._from_tp}, to_tp={self._to_tp}")
+
+    def _get_kv_target_ranks(self) -> list[int]:
+        """Which remote ranks this local rank sends KV shards to (send side)."""
+        self._validate_kv_tp_topology()
+        if self._from_tp == self._to_tp:
+            return [self._local_rank]
+        if self._from_tp > self._to_tp:
+            return [self._local_rank // (self._from_tp // self._to_tp)]
+        ratio = self._to_tp // self._from_tp
+        return [self._local_rank * ratio + i for i in range(ratio)]
+
+    def _get_kv_source_ranks(self) -> list[int]:
+        """Which remote ranks this local rank receives KV shards from (recv side)."""
+        self._validate_kv_tp_topology()
+        if self._from_tp == self._to_tp:
+            return [self._local_rank]
+        if self._from_tp > self._to_tp:
+            ratio = self._from_tp // self._to_tp
+            return [self._local_rank * ratio + i for i in range(ratio)]
+        return [self._local_rank // (self._to_tp // self._from_tp)]
+
+    @staticmethod
+    def get_kv_connector_key(
+        req_id: str,
+        from_stage: int | str,
+        chunk_id: int,
+        from_rank: int,
+        to_rank: int,
+    ) -> str:
+        """Build connector key that includes rank info for KV transfers.
+
+        Format matches PR #2677: ``{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}``
+        """
+        return f"{req_id}_{from_stage}_{chunk_id}_{from_rank}_{to_rank}"
+
+    def _build_rank_aware_send_keys(
+        self,
+        request_id: str,
+        from_stage: str,
+        to_stage: str,
+    ) -> list[str]:
+        """Build send-side connector keys, checking injectable hook first."""
+        key_builder = self.kv_send_key_builder
+        if callable(key_builder):
+            keys = list(key_builder(request_id, from_stage, to_stage))
+            if keys:
+                return keys
+        if self._from_tp <= 1 and self._to_tp <= 1:
+            return [f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"]
+        target_ranks = self._get_kv_target_ranks()
+        return [self.get_kv_connector_key(request_id, from_stage, 0, self._local_rank, r) for r in target_ranks]
+
+    def _build_rank_aware_recv_keys(
+        self,
+        request_id: str,
+        from_stage: str,
+        to_stage: str,
+    ) -> list[tuple[str, int | None]]:
+        """Build recv-side connector keys with sender rank info.
+
+        Returns a list of ``(key, from_rank)`` tuples.  ``from_rank`` is
+        ``None`` when TP <= 1 (single sender, no per-rank routing needed).
+        For TP > 1, ``from_rank`` identifies which sender rank owns the
+        key so that the connector can route metadata queries to the
+        correct endpoint.
+        """
+        key_builder = self.kv_recv_key_builder
+        if callable(key_builder):
+            raw = list(key_builder(request_id, from_stage, to_stage))
+            if raw:
+                if isinstance(raw[0], tuple):
+                    return raw
+                return [(k, None) for k in raw]
+        if self._from_tp <= 1 and self._to_tp <= 1:
+            return [(f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}", None)]
+        source_ranks = self._get_kv_source_ranks()
+        return [(self.get_kv_connector_key(request_id, from_stage, 0, r, self._local_rank), r) for r in source_ranks]
+
+    def _merge_received_rank_shards(self, payloads: list[dict[str, Any]]) -> dict[str, Any] | None:
+        """Merge multiple source-rank KV shards for one target rank."""
+        merger = self.kv_payload_merger
+        if callable(merger):
+            return merger(payloads)
+        if not payloads:
+            return None
+        if len(payloads) == 1:
+            return payloads[0]
+
+        base_payload = payloads[0]
+        if not isinstance(base_payload, dict) or "layer_blocks" not in base_payload:
+            return base_payload
+
+        merged: dict[str, Any] = {
+            "request_id": base_payload.get("request_id"),
+            "block_ids": list(base_payload.get("block_ids", [])),
+            "metadata": dict(base_payload.get("metadata", {})),
+        }
+        merged_layer_blocks: dict[str, list[torch.Tensor | None]] = {}
+
+        for cache_name in ("key_cache", "value_cache"):
+            cache_lists = [payload.get("layer_blocks", {}).get(cache_name, []) for payload in payloads]
+            num_layers = max((len(cache_list) for cache_list in cache_lists), default=0)
+            merged_cache: list[torch.Tensor | None] = []
+
+            for layer_idx in range(num_layers):
+                layer_tensors = [
+                    cache_list[layer_idx]
+                    for cache_list in cache_lists
+                    if layer_idx < len(cache_list) and cache_list[layer_idx] is not None
+                ]
+                if not layer_tensors:
+                    merged_cache.append(None)
+                elif len(layer_tensors) == 1 or not isinstance(layer_tensors[0], torch.Tensor):
+                    merged_cache.append(layer_tensors[0])
+                else:
+                    merged_cache.append(torch.cat(layer_tensors, dim=1).contiguous())
+
+            merged_layer_blocks[cache_name] = merged_cache
+
+        merged["layer_blocks"] = merged_layer_blocks
+        return merged
+
+    def _slice_received_rank_shard(self, payload: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Optionally slice a received payload to extract this rank's portion."""
+        slicer = self.kv_payload_slicer
+        if callable(slicer):
+            return slicer(payload)
+        if not payload or self._to_tp <= self._from_tp or "layer_blocks" not in payload:
+            return payload
+
+        metadata = payload.get("metadata", {})
+        slice_metadata = metadata.get("tp_head_slice") if isinstance(metadata, dict) else None
+        if isinstance(slice_metadata, dict) and slice_metadata.get("applied"):
+            tagged_rank = slice_metadata.get("target_rank")
+            if tagged_rank is not None and tagged_rank != self._local_rank:
+                logger.warning(
+                    "Received pre-sliced KV payload for unexpected target rank: expected=%s got=%s",
+                    self._local_rank,
+                    tagged_rank,
+                )
+            return payload
+
+        ratio = self._to_tp // self._from_tp
+        offset_in_sender = self._local_rank % ratio
+        updated_metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        updated_metadata["tp_head_slice"] = {
+            "applied": True,
+            "side": "receiver",
+            "target_rank": self._local_rank,
+            "from_tp": self._from_tp,
+            "to_tp": self._to_tp,
+            "offset_in_shard": offset_in_sender,
+            "num_slices": ratio,
+        }
+        return {
+            "request_id": payload.get("request_id"),
+            "layer_blocks": self._slice_layer_blocks(payload["layer_blocks"], offset_in_sender, ratio),
+            "block_ids": list(payload.get("block_ids", [])),
+            "metadata": updated_metadata,
+        }
+
+    # ------------------------------------------------------------------ #
+    #  Factory helpers
+    # ------------------------------------------------------------------ #
+
     @classmethod
     def _create(cls, cfg: dict | None) -> "OmniKVTransferManager":
         """Create manager from raw config dict."""
         if not cfg or not isinstance(cfg, dict):
             return cls(OmniKVCacheConfig())
+
+        rank_mapping = cfg.get("rank_mapping", {})
+        if not isinstance(rank_mapping, dict):
+            rank_mapping = {}
+
         return cls(
             OmniKVCacheConfig(
                 connector_config=cfg.get("connector_config"),
@@ -363,18 +567,17 @@ class OmniKVTransferManager:
                 need_recv_cache=cfg.get("need_recv_cache", False),
                 need_send_cache=cfg.get("need_send_cache", False),
                 recv_timeout=cfg.get("recv_timeout", 30.0),
+                from_tp=int(rank_mapping.get("from_tp", 1)),
+                to_tp=int(rank_mapping.get("to_tp", 1)),
             )
         )
 
     @classmethod
-    def from_model_config(cls, config: Any) -> "OmniKVTransferManager":
-        """Create from model config (for AR model runner)."""
+    def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
+        """Create from model or OmniDiffusion config."""
         return cls._create(getattr(config, "omni_kv_config", None))
 
-    @classmethod
-    def from_od_config(cls, config: Any) -> "OmniKVTransferManager":
-        """Create from OmniDiffusion config (for diffusion runner)."""
-        return cls._create(getattr(config, "omni_kv_config", None))
+    from_model_config = from_od_config
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any, model_config: Any) -> "OmniKVTransferManager":
@@ -417,45 +620,33 @@ class OmniKVTransferManager:
                         )
                         c_extra["to_stage"] = str(self.config.to_stage) if self.config.to_stage is not None else "1"
 
+                        try:
+                            stage_int = int(self.config.from_stage) if self.config.from_stage is not None else 0
+                        except (TypeError, ValueError):
+                            stage_int = 0
+                        zmq_port = self._kv_zmq_port(base_port, stage_int, self._local_rank)
+
                         if self.config.need_send_cache:
                             c_extra["role"] = "sender"
-                            from_stage = self.config.from_stage
-                            if from_stage is not None:
-                                try:
-                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
-                                except (TypeError, ValueError):
-                                    c_extra["zmq_port"] = base_port + KV_TRANSFER_PORT_OFFSET
+                            c_extra["zmq_port"] = zmq_port
                         elif self.config.need_recv_cache:
                             c_extra["role"] = "receiver"
-                            from_stage = self.config.from_stage
-                            sender_port = base_port + KV_TRANSFER_PORT_OFFSET
-                            if from_stage is not None:
-                                try:
-                                    sender_port = base_port + KV_TRANSFER_PORT_OFFSET + int(from_stage)
-                                except (TypeError, ValueError):
-                                    pass
                             c_extra.setdefault("sender_host", c_extra.get("host", "127.0.0.1"))
-                            c_extra.setdefault("sender_zmq_port", sender_port)
+                            c_extra.setdefault("sender_zmq_port", zmq_port)
 
                     logger.info(
-                        "Initializing OmniConnector (purpose=kv_transfer) with config: %s, role: %s",
-                        cfg,
+                        "Initializing OmniConnector type=%s role=%s",
+                        c_type,
                         c_extra.get("role", "N/A"),
                     )
                     self._connector = OmniConnectorFactory.create_connector(ConnectorSpec(name=c_type, extra=c_extra))
-                except Exception as e:
-                    logger.error(f"Failed to initialize OmniConnector: {e}")
-                    import traceback
-
-                    traceback.print_exc()
-                    # Cache failure sentinel to avoid repeated initialization attempts in hot paths.
+                except Exception:
+                    logger.exception("Failed to initialize OmniConnector")
                     self._connector = False
 
         return self._connector if self._connector else None
 
-    def get_connector(self):
-        """Get connector (compatibility wrapper for existing code)."""
-        return self.connector
+    get_connector = property(lambda self: self.connector)
 
     def _resolve_sender_info(
         self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None
@@ -513,8 +704,231 @@ class OmniKVTransferManager:
                     cache_list[idx] = tensor.clone()
         return data
 
+    @staticmethod
+    def _slice_kv_tensor_heads(
+        tensor: torch.Tensor | None,
+        offset_in_shard: int,
+        num_slices: int,
+    ) -> torch.Tensor | None:
+        """Slice one KV tensor along its head dimension."""
+        if tensor is None:
+            return None
+        if not isinstance(tensor, torch.Tensor):
+            return tensor
+        if tensor.dim() < 2:
+            raise ValueError(f"Expected KV tensor with a head dimension, got shape={tuple(tensor.shape)}")
+        if num_slices <= 0:
+            raise ValueError(f"num_slices must be > 0, got {num_slices}")
+        if not (0 <= offset_in_shard < num_slices):
+            raise ValueError(f"offset_in_shard must be in [0, {num_slices}), got {offset_in_shard}")
+
+        heads_in_shard = tensor.shape[1]
+        if heads_in_shard % num_slices != 0:
+            raise ValueError(
+                "KV head count must be divisible for heterogeneous TP slicing: "
+                f"heads_in_shard={heads_in_shard}, num_slices={num_slices}"
+            )
+
+        heads_per_slice = heads_in_shard // num_slices
+        start = offset_in_shard * heads_per_slice
+        end = start + heads_per_slice
+        return tensor[:, start:end, ...].contiguous()
+
+    def _slice_layer_blocks(
+        self,
+        layer_blocks: dict[str, Any],
+        offset_in_shard: int,
+        num_slices: int,
+    ) -> dict[str, list[torch.Tensor | None]]:
+        """Slice all KV layers for one logical receiver rank."""
+        sliced_blocks: dict[str, list[torch.Tensor | None]] = {}
+        for cache_name in ("key_cache", "value_cache"):
+            cache_list = layer_blocks.get(cache_name, [])
+            sliced_blocks[cache_name] = [
+                self._slice_kv_tensor_heads(tensor, offset_in_shard, num_slices) for tensor in cache_list
+            ]
+        return sliced_blocks
+
+    def _slice_transfer_data_for_target(self, kv_data: KVCacheTransferData, target_rank: int) -> KVCacheTransferData:
+        """Pre-slice sender payload for one target rank when sender TP < receiver TP."""
+        ratio = self._to_tp // self._from_tp
+        offset_in_sender = target_rank % ratio
+        metadata = dict(kv_data.metadata) if isinstance(kv_data.metadata, dict) else {}
+        metadata["tp_head_slice"] = {
+            "applied": True,
+            "side": "sender",
+            "target_rank": target_rank,
+            "source_rank": self._local_rank,
+            "from_tp": self._from_tp,
+            "to_tp": self._to_tp,
+            "offset_in_shard": offset_in_sender,
+            "num_slices": ratio,
+        }
+        return KVCacheTransferData(
+            request_id=kv_data.request_id,
+            layer_blocks=self._slice_layer_blocks(kv_data.layer_blocks, offset_in_sender, ratio),
+            block_ids=list(kv_data.block_ids),
+            metadata=metadata,
+        )
+
+    def _serialize_transfer_payload(self, kv_data: KVCacheTransferData) -> torch.Tensor | bytes | dict[str, Any]:
+        """Serialize KV transfer data using the connector's fastest supported path."""
+        if getattr(self.connector, "supports_raw_data", False):
+            try:
+                return kv_data.to_gpu_tensor()
+            except Exception:
+                pass
+        try:
+            return kv_data.to_bytes()
+        except Exception:
+            return kv_data.to_dict()
+
+    @staticmethod
+    def _collect_request_kv_payload(req: Any) -> dict[str, object]:
+        """Collect request-side KV objects for object broadcast."""
+        kv_payload: dict[str, object] = {}
+        for attr in ("past_key_values", "kv_metadata"):
+            val = getattr(req, attr, None)
+            if val is not None:
+                kv_payload[attr] = val
+
+        if hasattr(req, "sampling_params") and req.sampling_params is not None:
+            for key in list(vars(req.sampling_params).keys()):
+                if key in ("past_key_values", "kv_metadata") or (
+                    key.startswith("cfg_")
+                    and (
+                        key.endswith("_past_key_values")
+                        or key.endswith("_kv_metadata")
+                        or key
+                        in (
+                            "cfg_kv_request_ids",
+                            "cfg_active_branch",
+                            "cfg_branch_roles",
+                            "cfg_branch_past_key_values",
+                            "cfg_branch_kv_metadata",
+                        )
+                    )
+                ):
+                    val = getattr(req.sampling_params, key, None)
+                    if val is not None:
+                        kv_payload[f"sp.{key}"] = val
+
+        return kv_payload
+
+    @staticmethod
+    def _apply_request_kv_payload(
+        req: Any,
+        kv_payload: dict[str, object],
+        target_device: torch.device | None = None,
+    ) -> None:
+        """Apply a broadcast KV payload back onto a request object."""
+        for attr in ("past_key_values", "kv_metadata"):
+            val = kv_payload.get(attr)
+            if val is not None:
+                if target_device is not None:
+                    val = _move_to_device(val, target_device)
+                setattr(req, attr, val)
+
+        if hasattr(req, "sampling_params") and req.sampling_params is not None:
+            for key, val in kv_payload.items():
+                if key.startswith("sp."):
+                    if target_device is not None:
+                        val = _move_to_device(val, target_device)
+                    setattr(req.sampling_params, key[3:], val)
+
+    @staticmethod
+    def _discover_cfg_branch_roles(req: Any) -> list[str]:
+        """Discover CFG branch roles in a stable order."""
+        sampling_params = getattr(req, "sampling_params", None)
+        if sampling_params is None:
+            return []
+
+        roles: list[str] = []
+        branch_map = getattr(sampling_params, "cfg_branch_past_key_values", None) or {}
+        for preferred_role in ("cfg_text", "cfg_img"):
+            if (
+                preferred_role in branch_map
+                or getattr(sampling_params, f"{preferred_role}_past_key_values", None) is not None
+            ):
+                roles.append(preferred_role)
+
+        for role in branch_map.keys():
+            if role not in roles and branch_map.get(role) is not None:
+                roles.append(role)
+
+        for key in vars(sampling_params).keys():
+            if not (key.startswith("cfg_") and key.endswith("_past_key_values")):
+                continue
+            role = key.removesuffix("_past_key_values")
+            if role in ("cfg_branch",) or role in roles:
+                continue
+            if getattr(sampling_params, key, None) is not None:
+                roles.append(role)
+
+        return roles
+
+    @classmethod
+    def _build_cfg_rank_local_payloads(cls, req: Any, cfg_size: int) -> list[dict[str, object] | None]:
+        """Build per-cfg-rank payloads so each rank receives only its branch KV."""
+        full_payload = cls._collect_request_kv_payload(req)
+        payloads: list[dict[str, object] | None] = []
+
+        main_payload = {
+            key: value
+            for key, value in full_payload.items()
+            if key in ("past_key_values", "kv_metadata", "sp.past_key_values", "sp.kv_metadata")
+        }
+        branch_roles = cls._discover_cfg_branch_roles(req)
+        if branch_roles:
+            main_payload["sp.cfg_branch_roles"] = list(branch_roles)
+            main_payload["sp.cfg_active_branch"] = None
+        payloads.append(main_payload or None)
+
+        sampling_params = getattr(req, "sampling_params", None)
+        branch_map = getattr(sampling_params, "cfg_branch_past_key_values", None) or {}
+        branch_metadata_map = getattr(sampling_params, "cfg_branch_kv_metadata", None) or {}
+
+        for role in branch_roles:
+            if sampling_params is None:
+                payloads.append(None)
+                continue
+
+            branch_kv = branch_map.get(role)
+            if branch_kv is None:
+                branch_kv = getattr(sampling_params, f"{role}_past_key_values", None)
+            branch_metadata = branch_metadata_map.get(role)
+            if branch_metadata is None:
+                branch_metadata = getattr(sampling_params, f"{role}_kv_metadata", None)
+            if branch_kv is None:
+                payloads.append(None)
+                continue
+
+            local_payload = dict(main_payload)
+            local_payload["sp.cfg_active_branch"] = role
+            local_payload["sp.cfg_branch_roles"] = list(branch_roles)
+            local_payload["sp.cfg_branch_past_key_values"] = {role: branch_kv}
+            local_payload[f"sp.{role}_past_key_values"] = branch_kv
+            if branch_metadata is not None:
+                local_payload["sp.cfg_branch_kv_metadata"] = {role: branch_metadata}
+                local_payload[f"sp.{role}_kv_metadata"] = branch_metadata
+
+            payloads.append(local_payload)
+
+        while len(payloads) < cfg_size:
+            payloads.append(None)
+
+        return payloads[:cfg_size]
+
     def update_sender_info(self, sender_info: dict[str, Any], sender_stage_id: str | int | None = None) -> None:
-        """Update receiver-side sender info before loading remote KV cache."""
+        """Update receiver-side sender info before loading remote KV cache.
+
+        The orchestrator always reports rank-0's ZMQ port.  When TP > 1 the
+        receiver must offset the port so that each TP rank connects to the
+        corresponding sender rank's port.
+
+        The base host/port are also stored so that the receive path can
+        construct per-rank metadata for heterogeneous TP scenarios.
+        """
         if not self.config.need_recv_cache:
             return
 
@@ -523,18 +937,39 @@ class OmniKVTransferManager:
             logger.warning("Invalid sender_info format: %s", sender_info)
             return
 
+        sender_host = actual_info.get("host")
+        base_zmq_port = actual_info.get("zmq_port")
+
+        # Store base sender info for per-rank metadata construction.
+        self._sender_base_host = sender_host
+        if base_zmq_port is not None:
+            self._sender_base_zmq_port = int(base_zmq_port)
+
+        # --- Default sender: offset to match this receiver's corresponding sender rank ---
+        zmq_port = base_zmq_port
+        if zmq_port is not None and self._local_rank > 0:
+            zmq_port = int(zmq_port) + self._local_rank * KV_RANK_PORT_STRIDE
+
         if self.config.connector_config:
-            self.config.connector_config["sender_host"] = actual_info.get("host")
-            self.config.connector_config["sender_zmq_port"] = actual_info.get("zmq_port")
+            self.config.connector_config["sender_host"] = sender_host
+            self.config.connector_config["sender_zmq_port"] = zmq_port
 
         if self._connector and hasattr(self._connector, "update_sender_info"):
             try:
-                self._connector.update_sender_info(actual_info.get("host"), actual_info.get("zmq_port"))
+                self._connector.update_sender_info(sender_host, zmq_port)
             except Exception:
                 if hasattr(self._connector, "sender_host"):
-                    self._connector.sender_host = actual_info.get("host")
+                    self._connector.sender_host = sender_host
                 if hasattr(self._connector, "sender_zmq_port"):
-                    self._connector.sender_zmq_port = actual_info.get("zmq_port")
+                    self._connector.sender_zmq_port = zmq_port
+
+        logger.info(
+            "Sender info updated: host=%s, base_port=%s, adjusted_port=%s (local_rank=%s)",
+            sender_host,
+            base_zmq_port,
+            zmq_port,
+            self._local_rank,
+        )
 
     def handle_finished_requests_kv_transfer(
         self,
@@ -692,35 +1127,50 @@ class OmniKVTransferManager:
 
         kv_data.request_id = transfer_req_id
         serialization_start = time.perf_counter()
-        transfer_data: torch.Tensor | bytes | dict[str, Any]
-        supports_raw = getattr(self.connector, "supports_raw_data", False)
+        send_keys = self._build_rank_aware_send_keys(transfer_req_id, from_stage, to_stage)
+        kv_send_key_builder = getattr(self, "kv_send_key_builder", None)
+        sender_slice_active = self._from_tp < self._to_tp and len(send_keys) > 1 and not callable(kv_send_key_builder)
+        per_key_payloads: list[tuple[str, torch.Tensor | bytes | dict[str, Any]]] = []
 
-        try:
-            if supports_raw:
-                transfer_data = kv_data.to_gpu_tensor()
+        if sender_slice_active:
+            target_ranks = self._get_kv_target_ranks()
+            if len(target_ranks) != len(send_keys):
+                logger.warning(
+                    "Skip sender-side KV slicing because target rank count does not match send key count: "
+                    "target_ranks=%s send_keys=%s",
+                    len(target_ranks),
+                    len(send_keys),
+                )
+                sender_slice_active = False
             else:
-                raise RuntimeError("Connector does not support raw tensor")
-        except Exception:
-            try:
-                transfer_data = kv_data.to_bytes()
-            except Exception:
-                data_dict = kv_data.to_dict()
-                data_dict["request_id"] = transfer_req_id
-                transfer_data = data_dict
+                for put_key, target_rank in zip(send_keys, target_ranks, strict=False):
+                    sliced_kv_data = self._slice_transfer_data_for_target(kv_data, target_rank)
+                    per_key_payloads.append((put_key, self._serialize_transfer_payload(sliced_kv_data)))
+
+        if not per_key_payloads:
+            transfer_data = self._serialize_transfer_payload(kv_data)
+            per_key_payloads = [(put_key, transfer_data) for put_key in send_keys]
 
         serialization_ms = (time.perf_counter() - serialization_start) * 1000
         logger.info("KV cache serialized for %s in %.1f ms", transfer_req_id, serialization_ms)
 
         transfer_start = time.perf_counter()
-        success, size, _ = self._transfer_with_retry(from_stage, to_stage, f"kv_cache_{transfer_req_id}", transfer_data)
+        total_size = 0
+        all_succeeded = True
+        for put_key, transfer_data in per_key_payloads:
+            success, size, _ = self._transfer_with_retry(from_stage, to_stage, put_key, transfer_data)
+            total_size += size
+            all_succeeded = all_succeeded and success
+
         elapsed = time.perf_counter() - transfer_start
 
-        if success:
-            mbps = (size / 1024 / 1024) / elapsed if elapsed > 0 else 0
+        if all_succeeded:
+            mbps = (total_size / 1024 / 1024) / elapsed if elapsed > 0 else 0
             logger.info(
-                "KV transfer OK: %s, %s bytes, %.3fs, %.1f MB/s",
+                "KV transfer OK: %s, %s bytes across %s key(s), %.3fs, %.1f MB/s",
                 transfer_req_id,
-                size,
+                total_size,
+                len(send_keys),
                 elapsed,
                 mbps,
             )
@@ -731,7 +1181,7 @@ class OmniKVTransferManager:
         self,
         from_stage: str,
         to_stage: str,
-        request_id: str,
+        put_key: str,
         data: "dict[str, Any] | bytes | torch.Tensor",
         max_retries: int = 3,
     ) -> tuple[bool, int, dict[str, Any] | None]:
@@ -740,7 +1190,7 @@ class OmniKVTransferManager:
         Args:
             from_stage: Source stage identifier
             to_stage: Target stage identifier
-            request_id: Request identifier for the key
+            put_key: Pre-built connector key (rank-aware when TP > 1)
             data: Data to transfer
             max_retries: Maximum number of retry attempts
 
@@ -749,14 +1199,12 @@ class OmniKVTransferManager:
         """
         for attempt in range(max_retries):
             try:
-                # Build the full key for connector
-                full_request_id = f"omni_{from_stage}_to_{to_stage}_{request_id}"
                 success, size, metadata = self.connector.put(
-                    from_stage=from_stage, to_stage=to_stage, put_key=full_request_id, data=data
+                    from_stage=from_stage, to_stage=to_stage, put_key=put_key, data=data
                 )
                 if success:
                     return success, size, metadata
-                logger.warning(f"Transfer attempt {attempt + 1} failed for {request_id}")
+                logger.warning(f"Transfer attempt {attempt + 1} failed for {put_key}")
             except Exception as e:
                 logger.warning(f"Transfer attempt {attempt + 1} exception: {e}")
 
@@ -801,22 +1249,43 @@ class OmniKVTransferManager:
         poll_interval = 0.01
         max_poll_interval = 0.5
 
-        logger.info(f"Wait for KV cache for request {request_id} from stage {from_stage} to {to_stage}...")
+        recv_key_pairs = self._build_rank_aware_recv_keys(request_id, from_stage, to_stage)
+        pending_pairs = list(recv_key_pairs)
+        received_payloads: dict[str, tuple[dict[str, Any], int]] = {}
+
+        logger.info(
+            "Wait for KV cache for request %s from stage %s to %s via %s key(s)...",
+            request_id,
+            from_stage,
+            to_stage,
+            len(recv_key_pairs),
+        )
 
         try:
             while True:
-                # Build the full key for connector
-                full_request_id = f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}"
                 link_start = time.perf_counter()
-                result = self.connector.get(
-                    from_stage=from_stage,
-                    to_stage=to_stage,
-                    get_key=full_request_id,
-                )
-                if result:
+                for get_key, from_rank in list(pending_pairs):
+                    # Construct per-rank metadata so the connector queries
+                    # the correct sender endpoint (heterogeneous TP path).
+                    # When from_rank is None (TP<=1), metadata stays None
+                    # and the connector falls back to its default sender.
+                    rank_metadata: dict[str, Any] | None = None
+                    if from_rank is not None and self._sender_base_host and self._sender_base_zmq_port is not None:
+                        rank_metadata = {
+                            "source_host": self._sender_base_host,
+                            "source_port": self._sender_base_zmq_port + from_rank * KV_RANK_PORT_STRIDE,
+                        }
+
+                    result = self.connector.get(
+                        from_stage=from_stage,
+                        to_stage=to_stage,
+                        get_key=get_key,
+                        metadata=rank_metadata,
+                    )
+                    if not result:
+                        continue
+
                     raw_data, size = result
-                    elapsed = time.time() - start_time
-                    link_ms = (time.perf_counter() - link_start) * 1000
                     managed_buffer = None
 
                     if hasattr(raw_data, "tensor") and hasattr(raw_data, "release"):
@@ -844,6 +1313,21 @@ class OmniKVTransferManager:
                     else:
                         data = raw_data
 
+                    received_payloads[get_key] = (data, size)
+                    pending_pairs.remove((get_key, from_rank))
+
+                if not pending_pairs and received_payloads:
+                    elapsed = time.time() - start_time
+                    link_ms = (time.perf_counter() - link_start) * 1000
+                    ordered_payloads = [received_payloads[key][0] for key, _ in recv_key_pairs]
+                    total_size = sum(received_payloads[key][1] for key, _ in recv_key_pairs)
+
+                    if len(ordered_payloads) == 1:
+                        data = ordered_payloads[0]
+                    else:
+                        data = self._merge_received_rank_shards(ordered_payloads)
+                    data = self._slice_received_rank_shard(data)
+
                     try:
                         if isinstance(data, dict) and "layer_blocks" in data:
                             layer_blocks = data["layer_blocks"]
@@ -856,18 +1340,18 @@ class OmniKVTransferManager:
                                         continue
                                     if target_device is not None and tensor.device != target_device:
                                         cache_list[i] = tensor.to(target_device).contiguous()
-                    finally:
-                        if managed_buffer is not None:
-                            managed_buffer.release()
+                    except Exception:
+                        logger.exception("Failed to move KV cache tensors to target device")
 
                     logger.info(
-                        "Successfully received KV cache for %s, %s bytes, wait=%.3fs, link=%.1fms",
+                        "Successfully received KV cache for %s, %s bytes across %s key(s), wait=%.3fs, link=%.1fms",
                         request_id,
-                        size,
+                        total_size,
+                        len(recv_key_pairs),
                         elapsed,
                         link_ms,
                     )
-                    return data, size
+                    return data, total_size
 
                 if time.time() - start_time > timeout:
                     logger.error(f"Timeout waiting for KV cache for request {request_id} after {timeout}s")
@@ -876,11 +1360,8 @@ class OmniKVTransferManager:
                 time.sleep(poll_interval)
                 poll_interval = min(poll_interval * 2, max_poll_interval)
 
-        except Exception as e:
-            logger.error(f"Error receiving KV cache for {request_id}: {e}")
-            import traceback
-
-            traceback.print_exc()
+        except Exception:
+            logger.exception("Error receiving KV cache for %s", request_id)
             return None, 0
 
     def apply_kv_cache_to_request(self, req: Any, data: dict[str, Any]) -> None:
@@ -994,73 +1475,78 @@ class OmniKVTransferManager:
         cfg_kv_collect_func: Callable | None = None,
         target_device: torch.device | None = None,
     ) -> bool:
-        """Broadcast-aware wrapper around :meth:`receive_multi_kv_cache`.
+        """Distributed wrapper around :meth:`receive_multi_kv_cache`.
 
-        SharedMemory connector is single-reader: once rank 0 consumes the
-        segment it is deleted.  For multi-GPU stages (e.g. sequence-parallel)
-        only rank 0 receives; the result is then broadcast to every other
-        rank via the world process-group.
-
-        For single-worker stages this is equivalent to calling
-        :meth:`receive_multi_kv_cache` directly.
+        TP-aware path selection:
+        - world size 1: direct receive
+        - TP active, cfg size 1: each rank independently receives
+        - TP active, cfg size > 1: cfg-rank 0 receives, then broadcasts to
+          peers that share the same TP rank
+        - TP inactive: legacy rank-0 receive then world broadcast
         """
-        from vllm_omni.diffusion.distributed.parallel_state import get_world_group
+        from vllm_omni.diffusion.distributed.parallel_state import (
+            get_cfg_group,
+            get_classifier_free_guidance_rank,
+            get_classifier_free_guidance_world_size,
+            get_world_group,
+        )
 
         world = get_world_group()
 
         if world.world_size <= 1:
             return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
 
-        # --- rank 0: receive to CPU (needed for pickle-based broadcast) ---
+        tp_active = self._from_tp > 1 or self._to_tp > 1
+        cfg_size = 1
+        cfg_rank = 0
+        cfg_group = None
+        try:
+            cfg_size = get_classifier_free_guidance_world_size()
+            cfg_rank = get_classifier_free_guidance_rank()
+            cfg_group = get_cfg_group()
+        except Exception:
+            cfg_size = 1
+            cfg_rank = 0
+            cfg_group = None
+
+        if tp_active and cfg_size <= 1:
+            logger.info(
+                "Rank-aware KV receive: rank %s independently receiving (from_tp=%s, to_tp=%s)",
+                self._local_rank,
+                self._from_tp,
+                self._to_tp,
+            )
+            return self.receive_multi_kv_cache(req, cfg_kv_collect_func, target_device)
+
+        if tp_active and cfg_size > 1 and cfg_group is not None:
+            kv_payload: dict[str, object] | None = None
+            if cfg_rank == 0:
+                received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
+                rank_payloads = self._build_cfg_rank_local_payloads(req, cfg_size) if received else [None] * cfg_size
+                kv_payload = rank_payloads[0]
+                for dst_rank in range(1, cfg_size):
+                    cfg_group.send_object(rank_payloads[dst_rank], dst_rank)
+            else:
+                kv_payload = cfg_group.recv_object(0)
+
+            if not kv_payload:
+                return False
+
+            self._apply_request_kv_payload(req, kv_payload, target_device)
+            return True
+
+        kv_payload: dict[str, object] | None = None
         if world.rank_in_group == 0:
-            self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
+            received = self.receive_multi_kv_cache(req, cfg_kv_collect_func, torch.device("cpu"))
+            if received:
+                kv_payload = self._collect_request_kv_payload(req)
 
-            kv_payload: dict[str, object] = {}
-            for attr in ("past_key_values", "kv_metadata"):
-                val = getattr(req, attr, None)
-                if val is not None:
-                    kv_payload[attr] = val
+        kv_payload = world.broadcast_object(kv_payload, src=0)
 
-            if hasattr(req, "sampling_params") and req.sampling_params is not None:
-                for key in list(vars(req.sampling_params).keys()):
-                    if (key.startswith("cfg_") and key.endswith("_past_key_values")) or key in (
-                        "past_key_values",
-                        "kv_metadata",
-                    ):
-                        val = getattr(req.sampling_params, key, None)
-                        if val is not None:
-                            kv_payload[f"sp.{key}"] = val
-
-            payload_list = [kv_payload]
-            # Use broadcast_object_list (pickle-based) instead of broadcast_tensor_dict
-            # because the KV cache is a heterogeneous nested structure (NaiveCache objects
-            # with metadata + tensors), not a flat tensor dict.  This runs once before
-            # the denoising loop so the serialization cost is negligible.
-            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
-            kv_payload = payload_list[0]
-        else:
-            payload_list: list[dict[str, object] | None] = [None]
-            torch.distributed.broadcast_object_list(payload_list, src=world.ranks[0], group=world.cpu_group)
-            kv_payload = payload_list[0]
-
-        # --- apply on ALL ranks (rank 0 also needs CPU→GPU move) ---
         if not kv_payload:
             return False
 
-        for attr in ("past_key_values", "kv_metadata"):
-            val = kv_payload.get(attr)
-            if val is not None:
-                if target_device is not None:
-                    val = _move_to_device(val, target_device)
-                setattr(req, attr, val)
-
-        if hasattr(req, "sampling_params") and req.sampling_params is not None:
-            for key, val in kv_payload.items():
-                if key.startswith("sp."):
-                    if target_device is not None:
-                        val = _move_to_device(val, target_device)
-                    setattr(req.sampling_params, key[3:], val)
-
+        self._apply_request_kv_payload(req, kv_payload, target_device)
         return True
 
 

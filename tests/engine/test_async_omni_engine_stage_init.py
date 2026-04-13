@@ -128,3 +128,70 @@ def test_attach_llm_stage_uses_omni_input_preprocessor(monkeypatch):
     assert input_processor is not None
     assert isinstance(input_processor.input_preprocessor, DummyOmniInputPreprocessor)
     assert input_processor.input_preprocessor.renderer is input_processor.renderer
+
+
+def test_inject_kv_stage_info_infers_sender_tp_topology():
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {
+                "need_send_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {"need_recv_cache": True},
+        },
+        engine_input_source=[0],
+    )
+
+    engine_mod._inject_kv_stage_info(stage0, 0, [stage0, stage1])
+
+    assert stage0.engine_args["omni_kv_config"]["stage_id"] == 0
+    assert stage0.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
+
+
+def test_inject_kv_stage_info_infers_receiver_tp_topology():
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    stage0 = types.SimpleNamespace(
+        stage_id=0,
+        engine_args={
+            "tensor_parallel_size": 4,
+            "omni_kv_config": {"need_send_cache": True},
+        },
+        engine_input_source=[],
+    )
+    stage1 = types.SimpleNamespace(
+        stage_id=1,
+        engine_args={
+            "parallel_config": {
+                "tensor_parallel_size": 2,
+                "cfg_parallel_size": 1,
+            },
+            "omni_kv_config": {
+                "need_recv_cache": True,
+                "omni_from_stage": "0",
+                "omni_to_stage": "1",
+            },
+        },
+        engine_input_source=[0],
+    )
+
+    engine_mod._inject_kv_stage_info(stage1, 1, [stage0, stage1])
+
+    assert stage1.engine_args["omni_kv_config"]["stage_id"] == 1
+    assert stage1.engine_args["omni_kv_config"]["engine_input_source"] == [0]
+    assert stage1.engine_args["omni_kv_config"]["rank_mapping"] == {"from_tp": 4, "to_tp": 2}
