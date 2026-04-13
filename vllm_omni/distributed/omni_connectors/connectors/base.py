@@ -34,7 +34,9 @@ class OmniConnectorBase(ABC):
         pass
 
     @abstractmethod
-    def get(self, from_stage: str, to_stage: str, get_key: str, metadata=None) -> tuple[Any, int] | None:
+    def get(
+        self, from_stage: str, to_stage: str, get_key: str, metadata: dict[str, Any] | None = None
+    ) -> tuple[Any, int] | None:
         """Retrieve Python object and payload size (bytes).
 
         Args:
