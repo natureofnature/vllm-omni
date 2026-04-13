@@ -352,6 +352,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
         cfg_img_context = deepcopy(gen_context)
 
         injected_kv = req.sampling_params.past_key_values
+        local_cfg_text_on_dit = isinstance(first_prompt, dict) and bool(first_prompt.get("bagel_local_cfg_text_on_dit"))
         if injected_kv is not None:
             logger.info("Using injected KV Cache (direct)")
             gen_context["past_key_values"] = injected_kv
@@ -366,6 +367,7 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 image_shape = tuple(req.sampling_params.kv_metadata["image_shape"])
 
             cfg_text_kv = getattr(req.sampling_params, "cfg_text_past_key_values", None)
+            cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None)
             if cfg_text_kv is not None:
                 logger.info("CFG enabled with multi-KV: using injected cfg_text KV Cache")
                 cfg_text_seq_len = cfg_text_kv.key_cache[0].shape[0]
@@ -377,7 +379,40 @@ class BagelPipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 else:
                     cfg_text_context["ropes"] = [cfg_text_seq_len]
 
-                cfg_img_kv = getattr(req.sampling_params, "cfg_img_past_key_values", None) or injected_kv
+                cfg_img_kv = cfg_img_kv or injected_kv
+                cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
+                cfg_img_context["past_key_values"] = cfg_img_kv
+                cfg_img_context["kv_lens"] = [cfg_img_seq_len]
+                cfg_img_metadata = getattr(req.sampling_params, "cfg_img_kv_metadata", None)
+                if cfg_img_metadata and "ropes" in cfg_img_metadata:
+                    cfg_img_context["ropes"] = cfg_img_metadata["ropes"]
+                else:
+                    cfg_img_context["ropes"] = [cfg_img_seq_len]
+            elif local_cfg_text_on_dit:
+                logger.info("CFG enabled with local cfg_text rebuild from injected parent KV")
+                neg_prompt = extra_args.get("negative_prompt", "")
+                neg_input, neg_newlens, neg_rope = self.bagel.prepare_prompts(
+                    curr_kvlens=cfg_text_context["kv_lens"],
+                    curr_rope=cfg_text_context["ropes"],
+                    prompts=[neg_prompt],
+                    tokenizer=self.tokenizer,
+                    new_token_ids=self.new_token_ids,
+                )
+                for k, v in neg_input.items():
+                    if torch.is_tensor(v):
+                        neg_input[k] = v.to(self.device)
+                with torch.autocast(
+                    device_type=self.device.type,
+                    enabled=self.device.type != "cpu",
+                    dtype=self.od_config.dtype,
+                ):
+                    cfg_text_context["past_key_values"] = self.bagel.forward_cache_update_text(
+                        cfg_text_context["past_key_values"], **neg_input
+                    )
+                cfg_text_context["kv_lens"] = neg_newlens
+                cfg_text_context["ropes"] = neg_rope
+
+                cfg_img_kv = cfg_img_kv or injected_kv
                 cfg_img_seq_len = cfg_img_kv.key_cache[0].shape[0]
                 cfg_img_context["past_key_values"] = cfg_img_kv
                 cfg_img_context["kv_lens"] = [cfg_img_seq_len]

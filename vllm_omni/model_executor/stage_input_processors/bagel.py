@@ -96,14 +96,7 @@ def expand_cfg_prompts(
 
     if "img2img" in modalities:
         IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
-
-        cfg_text_dict: dict[str, Any] = {
-            "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
-            "modalities": ["img2img"],
-        }
-        mm_data = prompt.get("multi_modal_data")
-        if mm_data:
-            cfg_text_dict["multi_modal_data"] = mm_data
+        local_cfg_text_on_dit = bool(prompt.get("bagel_local_cfg_text_on_dit"))
 
         original_text = prompt.get("prompt", "")
         cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
@@ -111,19 +104,33 @@ def expand_cfg_prompts(
             "prompt": cfg_img_text,
             "modalities": ["img2img"],
         }
+        mm_data = prompt.get("multi_modal_data")
 
-        return [
-            ExpandedPrompt(
-                prompt=cfg_text_dict,
-                role="cfg_text",
-                request_id_suffix=CFG_TEXT_SUFFIX,
-            ),
+        expanded = [
             ExpandedPrompt(
                 prompt=cfg_img_dict,
                 role="cfg_img",
                 request_id_suffix=CFG_IMG_SUFFIX,
             ),
         ]
+
+        if not local_cfg_text_on_dit:
+            cfg_text_dict: dict[str, Any] = {
+                "prompt": f"{IMG2IMG_PLACEHOLDER}{neg_prompt}",
+                "modalities": ["img2img"],
+            }
+            if mm_data:
+                cfg_text_dict["multi_modal_data"] = mm_data
+            expanded.insert(
+                0,
+                ExpandedPrompt(
+                    prompt=cfg_text_dict,
+                    role="cfg_text",
+                    request_id_suffix=CFG_TEXT_SUFFIX,
+                ),
+            )
+
+        return expanded
 
     return []
 
@@ -181,6 +188,7 @@ def expand_cfg_prompts_think(
 
     if "img2img" in modalities:
         IMG2IMG_PLACEHOLDER = "<|fim_middle|>"
+        local_cfg_text_on_dit = bool(prompt.get("bagel_local_cfg_text_on_dit"))
 
         original_text = prompt.get("prompt", "")
         # Extract system prompt prefix (everything before <|fim_middle|>)
@@ -189,15 +197,7 @@ def expand_cfg_prompts_think(
         parts = original_text.split(IMG2IMG_PLACEHOLDER, 1)
         system_prefix = parts[0] if len(parts) > 1 else ""
 
-        cfg_text_prompt = f"{system_prefix}{IMG2IMG_PLACEHOLDER}{neg_prompt}"
-        cfg_text_dict: dict[str, Any] = {
-            "prompt": cfg_text_prompt,
-            "modalities": ["img2img"],
-        }
         mm_data = prompt.get("multi_modal_data")
-        if mm_data:
-            cfg_text_dict["multi_modal_data"] = mm_data
-
         cfg_img_text = original_text.replace(IMG2IMG_PLACEHOLDER, "")
         cfg_img_dict: dict[str, Any] = {
             "prompt": cfg_img_text,
@@ -206,13 +206,7 @@ def expand_cfg_prompts_think(
         if mm_data:
             cfg_img_dict["multi_modal_data"] = mm_data
 
-        return [
-            ExpandedPrompt(
-                prompt=cfg_text_dict,
-                role="cfg_text",
-                request_id_suffix=CFG_TEXT_SUFFIX,
-                sampling_params_override=companion_params,
-            ),
+        expanded = [
             ExpandedPrompt(
                 prompt=cfg_img_dict,
                 role="cfg_img",
@@ -220,6 +214,26 @@ def expand_cfg_prompts_think(
                 sampling_params_override=companion_params,
             ),
         ]
+
+        if not local_cfg_text_on_dit:
+            cfg_text_prompt = f"{system_prefix}{IMG2IMG_PLACEHOLDER}{neg_prompt}"
+            cfg_text_dict: dict[str, Any] = {
+                "prompt": cfg_text_prompt,
+                "modalities": ["img2img"],
+            }
+            if mm_data:
+                cfg_text_dict["multi_modal_data"] = mm_data
+            expanded.insert(
+                0,
+                ExpandedPrompt(
+                    prompt=cfg_text_dict,
+                    role="cfg_text",
+                    request_id_suffix=CFG_TEXT_SUFFIX,
+                    sampling_params_override=companion_params,
+                ),
+            )
+
+        return expanded
 
     return []
 

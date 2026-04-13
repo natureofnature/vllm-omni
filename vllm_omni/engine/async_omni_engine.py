@@ -774,6 +774,26 @@ class AsyncOmniEngine:
             "final_stage_id": final_stage_id,
         }
 
+    def _should_use_bagel_local_cfg_text_on_dit(self, final_stage_id: int, original_prompt: Any) -> bool:
+        if not isinstance(original_prompt, dict):
+            return False
+        if "img2img" not in (original_prompt.get("modalities") or []):
+            return False
+        if (
+            getattr(self.prompt_expand_func, "__module__", "")
+            != "vllm_omni.model_executor.stage_input_processors.bagel"
+        ):
+            return False
+        if final_stage_id <= 0 or final_stage_id >= len(self.stage_configs):
+            return False
+        stage_cfg = self.stage_configs[final_stage_id]
+        if getattr(stage_cfg, "stage_type", None) != "diffusion":
+            return False
+        engine_args = getattr(stage_cfg, "engine_args", None)
+        cfg_parallel_size = getattr(engine_args, "cfg_parallel_size", 1)
+        tensor_parallel_size = getattr(engine_args, "tensor_parallel_size", 1)
+        return cfg_parallel_size == 1 and tensor_parallel_size == 1
+
     def _enqueue_cfg_companions(
         self,
         parent_id: str,
@@ -1071,6 +1091,12 @@ class AsyncOmniEngine:
         # so the AR stage also generates their KV caches.
         if self.prompt_expand_func is not None and final_stage_id > 0:
             original_prompt = msg.get("original_prompt", prompt)
+            if self._should_use_bagel_local_cfg_text_on_dit(final_stage_id, original_prompt):
+                original_prompt["bagel_local_cfg_text_on_dit"] = True
+                logger.info(
+                    "[AsyncOmniEngine] Enabling Bagel local cfg_text rebuild on DiT for req %s",
+                    request_id,
+                )
             effective_spl = msg.get("sampling_params_list", [])
             stage0_params = effective_spl[0] if effective_spl else None
             if stage0_params is not None:
