@@ -112,7 +112,10 @@ class SharedMemoryConnector(OmniConnectorBase):
             if result is not None:
                 self._pending_keys.discard(get_key)
             return result
+        except FileNotFoundError:
+            return None
         except Exception:
+            logger.debug("_get_by_key: unexpected error reading SHM segment %s", get_key, exc_info=True)
             return None
         finally:
             if shm:
@@ -158,11 +161,16 @@ class SharedMemoryConnector(OmniConnectorBase):
     def cleanup(self, request_id: str) -> None:
         """Best-effort cleanup of unconsumed SHM segments for *request_id*.
 
-        If ``put()`` wrote a segment keyed by *request_id* (or containing it)
-        but ``get()`` was never called, we unlink it here so /dev/shm doesn't
-        leak.
+        Matches pending keys where *request_id* appears as the full key,
+        as a ``_``-delimited prefix, or as a ``_``-delimited suffix.
+        If ``get()`` was never called, we unlink it here so /dev/shm
+        doesn't leak.
         """
-        stale = [k for k in self._pending_keys if request_id in k]
+        stale = [
+            k
+            for k in self._pending_keys
+            if k == request_id or k.startswith(request_id + "_") or k.endswith("_" + request_id)
+        ]
         for key in stale:
             self._pending_keys.discard(key)
             try:

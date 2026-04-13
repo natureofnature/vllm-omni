@@ -804,11 +804,17 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             # Path 2: partial metadata (host/port only) — query that sender
             partial_host = metadata.get("source_host")
             partial_port = metadata.get("source_port")
-            if partial_host and partial_port:
-                queried = self._query_metadata_at(get_key, str(partial_host), int(partial_port))
-                if not queried:
-                    return None
-                metadata = queried
+            if not partial_host or not partial_port:
+                logger.warning(
+                    "get(%s): partial metadata missing source_host/source_port, cannot resolve data_size. metadata=%s",
+                    get_key,
+                    metadata,
+                )
+                return None
+            queried = self._query_metadata_at(get_key, str(partial_host), int(partial_port))
+            if not queried:
+                return None
+            metadata = queried
 
         _t1 = _time_mod.perf_counter()
         _query_ms = (_t1 - _t0) * 1000
