@@ -41,6 +41,12 @@ class OmniConnectorBase(ABC):
             from_stage: Source stage identifier
             to_stage: Destination stage identifier
             get_key: Unique request identifier
+            metadata: Optional transport-specific metadata.  When provided,
+                the connector uses it directly (e.g. source_host, source_port,
+                data_size) instead of querying the sender.  For heterogeneous
+                TP the manager may supply partial metadata (host/port only);
+                the connector will query the sender at that address to fill
+                in data_size.
 
         Returns:
             Tuple of (Python object, serialized byte size) if found, None otherwise
