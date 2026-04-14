@@ -79,8 +79,11 @@ class OmniSchedulingCoordinator:
         if self._stage_id == 0 or not self._async_chunk:
             return
 
-        terminal_ready_req_ids = chunk_ready_req_ids.intersection(chunk_finished_req_ids)
-        self.finished_requests.update(chunk_finished_req_ids - terminal_ready_req_ids)
+        # Keep terminal-ready requests in finished_requests as well: they still
+        # get one last schedulable wake-up via chunk_ready, but the scheduler
+        # must stop waiting for future chunks and continue draining any prompt
+        # growth carried by the terminal chunk.
+        self.finished_requests.update(chunk_finished_req_ids)
         self.pending_chunk_registrations = []
 
         self._process_chunk_queue(
@@ -95,7 +98,9 @@ class OmniSchedulingCoordinator:
             RequestStatus.RUNNING,
             chunk_ready_req_ids,
         )
-        self.finished_requests.update(terminal_ready_req_ids)
+        # Requests whose terminal chunk is also ready this cycle must still
+        # be scheduled once more so stage-1 can decode and emit the final
+        # audio payload before the scheduler marks them finished.
 
         while len(running_queue) > self._scheduler_max_num_seqs:
             request = running_queue.pop()
@@ -166,8 +171,8 @@ class OmniSchedulingCoordinator:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
                         self.pending_input_registrations.append(request)
-            for request in to_remove:
-                waiting_queue.remove(request)
+            if to_remove:
+                waiting_queue.remove_requests(to_remove)
 
     def process_pending_full_payload_inputs_legacy(
         self,
@@ -236,6 +241,30 @@ class OmniSchedulingCoordinator:
             )
 
         return timed_out_ids
+
+    def abort_timed_out_requests(
+        self,
+        timeout_s: float,
+        requests: dict[str, Request],
+        waiting: Any,
+        skipped_waiting: Any,
+    ) -> list[Request]:
+        """Collect timed-out requests, remove from scheduler queues, mark error.
+
+        Returns the list of aborted requests.  The caller is responsible for:
+        - removing them from ``self.running`` (via ``remove_all``)
+        - calling ``self._free_request(request)`` for each
+        - creating ``EngineCoreOutput`` entries
+        """
+        timed_out_ids = self.collect_timed_out_request_ids(timeout_s)
+        if not timed_out_ids:
+            return []
+        timed_out_reqs = [requests[rid] for rid in timed_out_ids if rid in requests]
+        waiting.remove_requests(timed_out_reqs)
+        skipped_waiting.remove_requests(timed_out_reqs)
+        for request in timed_out_reqs:
+            request.status = RequestStatus.FINISHED_ERROR
+        return timed_out_reqs
 
     def restore_queues(
         self,

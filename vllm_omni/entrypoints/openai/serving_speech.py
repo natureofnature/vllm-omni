@@ -1678,29 +1678,53 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         request_id, generator, _ = await self._prepare_speech_generation(request)
 
         final_output: OmniRequestOutput | None = None
+        async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
+        prev_count = 0
+        sample_rate = 24000
+        collected_chunks: list[torch.Tensor] = []
         async for res in generator:
             final_output = res
+            if not async_chunk:
+                continue
+
+            audio_output, audio_key = self._extract_audio_output(res)
+            if audio_key is None:
+                continue
+
+            sr_raw = audio_output.get("sr")
+            if sr_raw is not None:
+                sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+                sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+
+            audio_val = audio_output[audio_key]
+            if isinstance(audio_val, list):
+                new_chunks = audio_val[prev_count:]
+                prev_count = len(audio_val)
+            else:
+                new_chunks = [audio_val] if audio_val is not None else []
+                prev_count += len(new_chunks)
+
+            for chunk in new_chunks:
+                if hasattr(chunk, "numel") and chunk.numel() == 0:
+                    continue
+                collected_chunks.append(chunk)
 
         if final_output is None:
             raise ValueError("No output generated from the model.")
 
-        audio_output, audio_key = self._extract_audio_output(final_output)
-        if audio_key is None:
-            raise ValueError("TTS model did not produce audio output.")
+        if async_chunk:
+            audio_tensor = torch.cat(collected_chunks, dim=-1) if collected_chunks else np.zeros((0,), dtype=np.float32)
+        else:
+            audio_output, audio_key = self._extract_audio_output(final_output)
+            if audio_key is None:
+                raise ValueError("TTS model did not produce audio output.")
 
-        audio_tensor = audio_output[audio_key]
-        sr_raw = audio_output.get("sr", 24000)
-        sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
-        sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
+            audio_tensor = audio_output[audio_key]
+            sr_raw = audio_output.get("sr", 24000)
+            sr_val = sr_raw[-1] if isinstance(sr_raw, list) and sr_raw else sr_raw
+            sample_rate = sr_val.item() if hasattr(sr_val, "item") else int(sr_val)
 
-        if isinstance(audio_tensor, list):
-            async_chunk = bool(getattr(self.engine_client.model_config, "async_chunk", False))
-            if async_chunk:
-                non_empty_chunks = [candidate for candidate in audio_tensor if candidate.numel() > 0]
-                audio_tensor = (
-                    torch.cat(non_empty_chunks, dim=-1) if non_empty_chunks else np.zeros((0,), dtype=np.float32)
-                )
-            else:
+            if isinstance(audio_tensor, list):
                 audio_history = audio_tensor
                 audio_tensor = np.zeros((0,), dtype=np.float32)
                 # Non-async Qwen3-TTS returns cumulative history snapshots, so keep the latest non-empty tensor.

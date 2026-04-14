@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import inspect
 import time as _time
 from dataclasses import dataclass, field
 from typing import Any
@@ -34,6 +35,7 @@ from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
 
 logger = init_logger(__name__)
+_ENGINE_CORE_REQUEST_ACCEPTS_EOS_TOKEN_ID = "eos_token_id" in inspect.signature(OmniEngineCoreRequest).parameters
 
 
 def build_engine_core_request_from_tokens(
@@ -60,8 +62,10 @@ def build_engine_core_request_from_tokens(
     # Clone params and set max_tokens if needed
     sampling_params = None
     pooling_params = None
+    eos_token_id = None
     if isinstance(params, SamplingParams):
         sampling_params = params.clone()
+        eos_token_id = getattr(sampling_params, "eos_token_id", None)
         if sampling_params.max_tokens is None and model_config is not None:
             sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
     else:
@@ -75,7 +79,7 @@ def build_engine_core_request_from_tokens(
         log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
     )
 
-    return OmniEngineCoreRequest(
+    request_kwargs = dict(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
         mm_features=mm_features,
@@ -89,6 +93,10 @@ def build_engine_core_request_from_tokens(
         resumable=resumable,
         additional_information=additional_info_payload,
     )
+    if _ENGINE_CORE_REQUEST_ACCEPTS_EOS_TOKEN_ID:
+        request_kwargs["eos_token_id"] = eos_token_id
+
+    return OmniEngineCoreRequest(**request_kwargs)
 
 
 # ============================================================
@@ -170,6 +178,11 @@ class Orchestrator:
 
         # CFG companion tracking
         self._cfg_tracker = CfgCompanionTracker()
+        self._companion_map = self._cfg_tracker._companion_map
+        self._companion_ids = self._cfg_tracker._companion_ids
+        self._companion_to_parent = self._cfg_tracker._companion_to_parent
+        self._companion_done = self._cfg_tracker._done
+        self._deferred_parents = self._cfg_tracker._pending_parents
 
         # Per-stage metrics accumulators.
         self._batch_seq: list[int] = [0] * self.num_stages
@@ -314,7 +327,17 @@ class Orchestrator:
                     continue
                 idle = False
 
-                # Handle prefill-finished KV-ready signals before finished outputs.
+                if not raw_outputs.outputs and raw_outputs.finished_requests:
+                    if raw_outputs.scheduler_stats is not None:
+                        self.output_processors[stage_id].update_scheduler_stats(
+                            raw_outputs.scheduler_stats,
+                        )
+                    await self._route_finished_only(
+                        stage_id,
+                        raw_outputs.finished_requests,
+                    )
+                    continue
+
                 await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
 
                 # 2) Process raw outputs through the output processor
@@ -443,6 +466,52 @@ class Orchestrator:
             self._pd_kv_params.pop(req_id, None)
             self._cfg_tracker.cleanup_parent(req_id)
             self.request_states.pop(req_id, None)
+
+    async def _route_finished_only(
+        self,
+        stage_id: int,
+        finished_request_ids: set[str],
+    ) -> None:
+        """Send a terminal signal when the scheduler emits only finished ids."""
+        if not finished_request_ids:
+            return
+
+        for req_id in finished_request_ids:
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+            if req_id in self._companion_ids:
+                await self._handle_cfg_companion_ready(req_id)
+                self.request_states.pop(req_id, None)
+                continue
+            await self.output_async_queue.put(
+                {
+                    "type": "finished_only",
+                    "request_id": req_id,
+                    "stage_id": stage_id,
+                    "finished": stage_id == req_state.final_stage_id,
+                }
+            )
+            if stage_id == req_state.final_stage_id:
+                self._cleanup_companion_state(req_id)
+                self.request_states.pop(req_id, None)
+
+    def _cleanup_companion_state(self, parent_id: str) -> None:
+        """Remove all companion tracking state for a completed parent."""
+        role_map = self._companion_map.pop(parent_id, {})
+        for cid in role_map.values():
+            self._companion_ids.discard(cid)
+            self._companion_to_parent.pop(cid, None)
+        self._companion_done.pop(parent_id, None)
+        self._deferred_parents.pop(parent_id, None)
+
+    def _all_companions_done(self, parent_id: str) -> bool:
+        """Check whether all CFG companions for a parent request have finished."""
+        role_map = self._companion_map.get(parent_id, {})
+        if not role_map:
+            return True
+        done_set = self._companion_done.get(parent_id, set())
+        return all(cid in done_set for cid in role_map.values())
 
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
@@ -760,7 +829,10 @@ class Orchestrator:
         to consume.
         """
         outputs = await self.stage_clients[stage_id].get_output_async()
-        if not outputs.outputs:
+        stage_outputs = getattr(outputs, "outputs", [])
+        finished_requests = getattr(outputs, "finished_requests", set())
+        scheduler_stats = getattr(outputs, "scheduler_stats", None)
+        if not stage_outputs and not finished_requests and scheduler_stats is None:
             return None
         return outputs
 

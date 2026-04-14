@@ -26,6 +26,9 @@ connectors:
       # Must match the decoder sliding attention window.
       codec_chunk_frames: 25
       codec_left_context_frames: 72
+      # Qwen3-TTS streaming vocoder needs a larger warm-start than the generic
+      # dynamic IC minimum; 10-frame IC avoids empty early chunks under voice clone.
+      initial_codec_chunk_frames: 10
 
 stages:
   - stage_id: 0

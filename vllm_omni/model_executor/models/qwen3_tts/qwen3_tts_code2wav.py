@@ -210,6 +210,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         assert self._num_quantizers is not None
         assert self._total_upsample is not None
 
+        if runtime_additional_information is None:
+            runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
+                "runtime_additional_information"
+            )
+
         decoder = self._decoder
         q = int(self._num_quantizers)
         upsample = int(self._total_upsample)
@@ -305,9 +310,13 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            # Slice on exact codec-frame boundaries instead of proportionally.
-            start = max(0, ctx_frames * upsample)
-            end = max(start, actual_frames * upsample)
+            # Decoder output can be shorter than the raw codec length on streaming chunks.
+            # Account for that tail shrink before trimming the carried left context.
+            decoded_frames = wav.shape[0] / upsample
+            missing_tail_frames = max(0, actual_frames - decoded_frames)
+            trim_context_frames = max(0, ctx_frames - missing_tail_frames)
+            start = max(0, trim_context_frames * upsample)
+            end = max(start, min(actual_frames, decoded_frames) * upsample)
             if start >= wav.shape[0]:
                 logger.warning(
                     "Context trim start %d >= decoded length %d; returning empty audio.",

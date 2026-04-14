@@ -28,13 +28,17 @@ class Omni(OmniBase):
         self,
         sampling_params_list: Sequence[OmniSamplingParams],
     ) -> list[OmniSamplingParams]:
-        """Return per-stage params with LLM stages forced to FINAL_ONLY."""
+        """Return per-stage params with non-final text stages forced to FINAL_ONLY."""
         effective_params: list[OmniSamplingParams] = []
         for stage_id, params in enumerate(sampling_params_list):
             sp = copy.deepcopy(params)
             stage_meta = self.engine.get_stage_metadata(stage_id)
             if stage_meta.get("stage_type") != "diffusion" and hasattr(sp, "output_kind"):
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
+                # Keep multimodal final stages on their configured output mode so
+                # sync Omni can collect audio/image/video outputs instead of only
+                # seeing a trailing finished-only sentinel.
+                if (not stage_meta.get("final_output")) or stage_meta.get("final_output_type") == "text":
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
             effective_params.append(sp)
         return effective_params
 

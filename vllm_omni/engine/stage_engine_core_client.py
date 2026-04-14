@@ -177,6 +177,10 @@ class StageEngineCoreClientBase:
         )
         await super().add_request_async(request)
 
+    async def process_engine_outputs(self, outputs) -> None:
+        if outputs.finished_requests and not outputs.outputs and not outputs.scheduler_stats:
+            self.outputs_queue.put_nowait(outputs)
+
     # ==================== Stage Methods ====================
 
     @staticmethod

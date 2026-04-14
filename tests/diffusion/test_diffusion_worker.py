@@ -10,6 +10,8 @@ This module tests the DiffusionWorker implementation:
 - wake_up: Waking worker from sleep mode
 """
 
+import types
+
 import pytest
 import torch
 from pytest_mock import MockerFixture
@@ -29,6 +31,9 @@ def mock_od_config(mocker: MockerFixture):
     config.cache_backend = None
     config.cache_config = None
     config.model = "test-model"
+    config.omni_kv_config = {}
+    config.model_config = None
+    config.parallel_config = types.SimpleNamespace(tensor_parallel_size=1)
     return config
 
 

@@ -157,7 +157,7 @@ def test_mix_to_text_audio_001(omni_server, openai_client) -> None:
 @pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3 if _USE_PD else 2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3)
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_to_text_001(omni_server, openai_client) -> None:
     """
@@ -183,7 +183,7 @@ def test_text_to_text_001(omni_server, openai_client) -> None:
 @pytest.mark.advanced_model
 @pytest.mark.core_model
 @pytest.mark.omni
-@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)
+@hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=3)
 @pytest.mark.parametrize("omni_server", prefix_test_params, indirect=True)
 @pytest.mark.skip(reason="issue: #2833")
 def test_thinker_prefix_caching(omni_server, openai_client) -> None:

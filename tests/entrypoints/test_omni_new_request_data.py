@@ -30,7 +30,7 @@ def test_omni_new_request_data_copies_payloads():
     data = OmniNewRequestData.from_request(request, ([0, 1],), prefill_token_ids=[101, 102])
 
     assert data.prompt_embeds is prompt_embeds
-    assert data.additional_information is additional_information
+    assert data.initial_model_buffer is additional_information
     assert data.prefill_token_ids == [101, 102]
 
 
@@ -51,4 +51,4 @@ def test_omni_new_request_data_allows_missing_payloads():
     data = OmniNewRequestData.from_request(request, ([0],), prefill_token_ids=None)
 
     assert data.prompt_embeds is None
-    assert data.additional_information is None
+    assert data.initial_model_buffer is None

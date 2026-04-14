@@ -1941,12 +1941,30 @@ class OmniConnectorModelRunnerMixin:
         In that case, derive the full_payload_mode builder path automatically.
         """
         candidates: list[str] = []
+        is_async_chunk = bool(getattr(model_config, "async_chunk", False))
 
         next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if isinstance(next_stage_func, str) and next_stage_func:
-            candidates.append(next_stage_func)
+            if is_async_chunk:
+                candidates.append(next_stage_func)
+            else:
+                try:
+                    module_path, func_name = next_stage_func.rsplit(".", 1)
+                    if func_name.endswith("_full_payload") or func_name.endswith("_batch"):
+                        candidates.append(f"{module_path}.{func_name}")
+                    elif func_name.endswith("_async_chunk"):
+                        stem = func_name[: -len("_async_chunk")]
+                        candidates.append(f"{module_path}.{stem}_full_payload")
+                        candidates.append(f"{module_path}.{stem}_batch")
+                        candidates.append(next_stage_func)
+                    else:
+                        candidates.append(f"{module_path}.{func_name}_full_payload")
+                        candidates.append(f"{module_path}.{func_name}_batch")
+                        candidates.append(next_stage_func)
+                except ValueError:
+                    candidates.append(next_stage_func)
 
-        if not getattr(model_config, "async_chunk", False):
+        if not is_async_chunk:
             input_func = getattr(model_config, "custom_process_input_func", None)
             if isinstance(input_func, str) and input_func:
                 try:

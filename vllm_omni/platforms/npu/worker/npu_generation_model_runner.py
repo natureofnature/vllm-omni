@@ -34,6 +34,7 @@ from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_ar_model_runner import ExecuteModelState
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
+from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 
 
 class NPUGenerationModelRunner(OmniNPUModelRunner):
@@ -317,8 +318,10 @@ class NPUGenerationModelRunner(OmniNPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
             ),
-            self.maybe_get_kv_connector_output(
-                scheduler_output, defer_finalize=not clear_kv_metadata
+            maybe_get_kv_connector_output_compat(
+                self,
+                scheduler_output,
+                clear_metadata=clear_kv_metadata,
             ) as kv_connector_output,
         ):
             #  -------------------------------------- Omni-new -------------------------------------------------

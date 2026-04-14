@@ -1,5 +1,5 @@
-# Qwen3-Omni-MoE production deploy, verified on 2x H100 (stage 0 on cuda:0,
-# stages 1+2 on cuda:1).
+# Qwen3-Omni-MoE production deploy, verified on 3x H100 (stage 0 on cuda:0,
+# stage 1 on cuda:1, stage 2 on cuda:2).
 #
 # Fields omitted from a stage fall back to StageDeployConfig defaults (see
 # vllm_omni/config/stage_config.py). Notable implicit defaults for this
@@ -50,7 +50,7 @@ stages:
     enforce_eager: true
     async_scheduling: false
     max_num_batched_tokens: 51200
-    devices: "1"
+    devices: "2"
     input_connectors:
       from_stage_1: connector_of_shared_memory
     default_sampling_params:
