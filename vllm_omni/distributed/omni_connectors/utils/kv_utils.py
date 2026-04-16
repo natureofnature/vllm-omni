@@ -206,6 +206,15 @@ def build_rank_aware_recv_keys(
         if raw:
             if isinstance(raw[0], tuple):
                 return raw
+            # Hook returned plain strings (e.g. OmniConnectorModelRunnerMixin.
+            # get_rank_aware_kv_keys). Reconstruct from_rank from topology so
+            # Mooncake connector can route metadata queries to the correct
+            # sender endpoint in heterogeneous TP.
+            # TODO: have the mixin return (key, from_rank) tuples directly
+            # to avoid this indirect reconstruction.
+            source_ranks = get_kv_source_ranks(topo)
+            if len(raw) == len(source_ranks):
+                return list(zip(raw, source_ranks))
             return [(k, None) for k in raw]
     if topo.source_tp_size <= 1 and topo.target_tp_size <= 1:
         return [(f"omni_{from_stage}_to_{to_stage}_kv_cache_{request_id}", None)]
