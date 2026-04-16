@@ -295,6 +295,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         )
 
         num_inference_steps = None
+        cfg_text_scale = None
+        cfg_img_scale = None
         # Omni multistage image generation: Stage-0 (AR) should receive a clean
         # text prompt (and optional conditioning image/size) so the model's own
         # processor can construct the correct inputs.
