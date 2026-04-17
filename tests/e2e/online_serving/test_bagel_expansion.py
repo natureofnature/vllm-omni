@@ -14,6 +14,8 @@ assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
 """
 
+from pathlib import Path
+
 import pytest
 
 from tests.conftest import (
@@ -21,14 +23,50 @@ from tests.conftest import (
     OmniServerParams,
     OpenAIClientHandler,
     dummy_messages_from_mix_data,
+    modify_stage_config,
 )
 from tests.utils import hardware_marks
+
+# This test uses the default Bagel YAML, and CLI does not control devices.We modify yaml file directly.
+_BAGEL_DEFAULT_YAML = str(
+    Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs" / "bagel.yaml"
+)
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+
+
+def _make_tp_cases(model: str, tp_size: int):
+    """Build Bagel TP test cases with devices auto-derived from tp_size.
+    Devices can not be set through CLI args, so we set them in the YAML.
+    """
+    # Dit devices start from 0, due to CI GPU usage constraint,
+    # for those GPUs that encountered OOM, adjust the offset accordingly.
+    devices = ",".join(str(i) for i in range(tp_size))
+    return [
+        pytest.param(
+            OmniServerParams(
+                model=model,
+                stage_config_path=modify_stage_config(
+                    _BAGEL_DEFAULT_YAML,
+                    updates={
+                        "stage_args": {
+                            1: {
+                                "runtime.devices": devices,
+                                "engine_args.parallel_config.tensor_parallel_size": tp_size,
+                            },
+                        },
+                    },
+                ),
+                server_args=["--cache-backend", "cache_dit"],
+            ),
+            id=f"parallel_tp_{tp_size}",
+            marks=PARALLEL_FEATURE_MARKS,
+        ),
+    ]
 
 
 def _get_diffusion_feature_cases(model: str):
@@ -77,19 +115,9 @@ def _get_diffusion_feature_cases(model: str):
             marks=PARALLEL_FEATURE_MARKS,
         ),
         # Tensor-Parallel size 2 (2 GPUs, Cache-DiT backend)
-        pytest.param(
-            OmniServerParams(
-                model=model,
-                server_args=[
-                    "--cache-backend",
-                    "cache_dit",
-                    "--tensor-parallel-size",
-                    "2",
-                ],
-            ),
-            id="parallel_tp_2",
-            marks=PARALLEL_FEATURE_MARKS,
-        ),
+        # Stage 1 (DiT) needs visible GPUs matching TP size; the default YAML
+        # only exposes device "0", so we patch it here.
+        *_make_tp_cases(model, tp_size=2),
         # Ulysses-SP degree=2 (2 GPUs)
         pytest.param(
             OmniServerParams(
