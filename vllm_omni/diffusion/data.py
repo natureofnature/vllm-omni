@@ -776,6 +776,15 @@ class OmniDiffusionConfig:
         if "diffusers_call_kwargs" in kwargs and kwargs["diffusers_call_kwargs"] is None:
             kwargs["diffusers_call_kwargs"] = {}
 
+        # Forward top-level parallel knobs (e.g. --tensor-parallel-size from CLI)
+        # into parallel_config so the diffusion engine sees them.
+        par = kwargs.get("parallel_config", {})
+        if isinstance(par, Mapping):
+            par = dict(par)
+            if "tensor_parallel_size" in kwargs and "tensor_parallel_size" not in par:
+                par["tensor_parallel_size"] = kwargs["tensor_parallel_size"]
+            kwargs["parallel_config"] = par
+
         # Filter kwargs to only include valid fields
         valid_fields = {f.name for f in fields(cls)}
         filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_fields}
