@@ -83,3 +83,55 @@ def test_generate_accepts_request_after_repeated_cancellations():
         ]
 
     asyncio.run(run_test())
+
+
+def test_process_orchestrator_results_finished_only_updates_metrics():
+    async def run_test():
+        import vllm_omni.entrypoints.async_omni as async_omni_module
+
+        omni = object.__new__(AsyncOmni)
+        queue = asyncio.Queue()
+        await queue.put(
+            {
+                "type": "finished_only",
+                "request_id": "req-1",
+                "stage_id": 1,
+                "finished": True,
+            }
+        )
+        omni.request_states = {"req-1": SimpleNamespace(queue=queue)}
+
+        finalize_calls = []
+
+        metrics = SimpleNamespace(
+            stage_first_ts=[None, None],
+            stage_last_ts=[None, None],
+            e2e_done=set(),
+            on_finalize_request=lambda stage_id, req_id, start_ts: finalize_calls.append((stage_id, req_id, start_ts))
+            or metrics.e2e_done.add(str(req_id)),
+        )
+        req_start_ts = {"req-1": 12.5}
+
+        old_timeout = async_omni_module._FINAL_OUTPUT_DRAIN_TIMEOUT_S
+        async_omni_module._FINAL_OUTPUT_DRAIN_TIMEOUT_S = 0.0
+        try:
+            outputs = []
+            async for output in AsyncOmni._process_orchestrator_results(
+                omni,
+                "req-1",
+                metrics,
+                1,
+                req_start_ts,
+                3.14,
+            ):
+                outputs.append(output)
+        finally:
+            async_omni_module._FINAL_OUTPUT_DRAIN_TIMEOUT_S = old_timeout
+
+        assert outputs == []
+        assert finalize_calls == [(1, "req-1", 12.5)]
+        assert "req-1" in metrics.e2e_done
+        assert metrics.stage_first_ts[1] is not None
+        assert metrics.stage_last_ts[1] is not None
+
+    asyncio.run(run_test())

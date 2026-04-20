@@ -42,7 +42,6 @@ from vllm_omni.core.sched.output import (
     OmniSchedulerOutput,
 )
 from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
-from vllm_omni.v1_compat import kv_cache_manager_new_step_starts
 
 logger = init_logger(__name__)
 
@@ -56,7 +55,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         self._deferred_terminal_chunk_req_ids: set[str] = set()
         self._deferred_terminal_request_metadata: dict[str, dict] = {}
         self._reqs_with_pooler_history: set[str] = set()
-        self.chunk_transfer_adapter = None
         self._gen_sched_log_ctr: int = 0
         stage_id = getattr(model_config, "stage_id", 0)
         async_chunk_flag = getattr(model_config, "async_chunk", False)
@@ -91,7 +89,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             token_budget = 0
         scheduled_timestamp = time.monotonic()
 
-        kv_cache_manager_new_step_starts(self.kv_cache_manager)
+        self.kv_cache_manager.new_step_starts()
 
         scheduled_new_reqs: list[Request] = []
 
@@ -112,7 +110,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             _cf = connector_output.chunk_finished_req_ids if connector_output else set()
             self._gen_sched_log_ctr += 1
             if _sr or _cf or self._gen_sched_log_ctr <= 1:
-                logger.info(
+                logger.debug(
                     "[GenSched] schedule: stage_recv=%s, chunk_finished=%s, "
                     "waiting=%s, running=%s, finished_reqs=%s, "
                     "waiting_for_input=%s",
@@ -381,9 +379,6 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             Tuple of (req_id, client_index) for requests that were aborted. Will not
             include any that were already finished.
         """
-
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         return super().finish_requests(request_ids, finished_status)
 
@@ -764,7 +759,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         # Consume OmniConnectorOutput from mixin (stores for next schedule())
         if omni_output is not None:
             if omni_output.stage_recv_req_ids or omni_output.chunk_finished_req_ids:
-                logger.info(
+                logger.debug(
                     "[GenSched] update_from_output: recv stage_recv=%s, chunk_finished=%s, request_metadata_keys=%s",
                     omni_output.stage_recv_req_ids,
                     omni_output.chunk_finished_req_ids,

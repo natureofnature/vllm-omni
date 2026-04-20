@@ -38,6 +38,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
+# After a terminal finished_only result, allow a short drain window for any
+# already-enqueued late stage outputs before closing the async response loop.
 _FINAL_OUTPUT_DRAIN_TIMEOUT_S = 0.1
 
 
@@ -451,10 +453,8 @@ class AsyncOmni(EngineClient, OmniBase):
                 )
                 raise RuntimeError(result)
 
-            if result.get("type") == "finished_only":
-                if result.get("finished"):
-                    seen_terminal_result = True
-                continue
+            if result.get("type") == "finished_only" and result.get("finished"):
+                seen_terminal_result = True
 
             # Process the result (constructs OmniRequestOutput)
             output_to_yield = self._process_single_result(

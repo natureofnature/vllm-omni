@@ -72,7 +72,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         # Cache per-request flag to avoid repeated deserialization of additional_information
         self._omits_kv_transfer_cache: dict[str, bool] = {}
-        self.chunk_transfer_adapter = None
         # Streaming update prompt lengths are consumed during decode/output.
         self._new_prompt_len_snapshot: dict[str, int] = {}
         model_config = self.vllm_config.model_config
@@ -214,22 +213,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         finally:
             if self.chunk_coordinator:
                 self.chunk_coordinator.restore_queues(self.waiting, self.running)
-        try:
-            scheduler_output.scheduled_new_reqs = [  # type: ignore[assignment]
-                OmniNewRequestData.from_scheduled_request_data(
-                    nr,
-                    self.requests.get(getattr(nr, "req_id", "")),
-                )
-                for nr in scheduler_output.scheduled_new_reqs
-            ]
-            if self.chunk_coordinator:
-                self.chunk_coordinator.postprocess_scheduler_output(scheduler_output, self.requests)
-            # Add information about requests needing KV cache transfer
-            finished_reqs = self.get_finished_requests_needing_kv_transfer()
-        except Exception:
-            # If anything goes wrong, leave the original output unchanged
-            init_logger(__name__).exception("Failed to wrap scheduled_new_reqs with OmniNewRequestData")
-            finished_reqs = {}
+        scheduler_output.scheduled_new_reqs = [  # type: ignore[assignment]
+            OmniNewRequestData.from_scheduled_request_data(
+                nr,
+                self.requests.get(getattr(nr, "req_id", "")),
+            )
+            for nr in scheduler_output.scheduled_new_reqs
+        ]
+        if self.chunk_coordinator:
+            self.chunk_coordinator.postprocess_scheduler_output(scheduler_output, self.requests)
+        # Add information about requests needing KV cache transfer
+        finished_reqs = self.get_finished_requests_needing_kv_transfer()
 
         # Wrap in omni scheduler output to carry transfer metadata.
         base_fields = SchedulerOutput.__dataclass_fields__.keys()
@@ -287,19 +281,21 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         kv_extracted_ids = getattr(model_runner_output, "kv_extracted_req_ids", None)
         if kv_extracted_ids:
             for req_id in kv_extracted_ids:
-                try:
-                    self.completed_kv_transfers.add(req_id)
-                    req = self.requests.get(req_id)
-                    if req is not None and not req.is_finished():
-                        outputs[req.client_index].append(
-                            EngineCoreOutput(
-                                request_id=req_id,
-                                new_token_ids=[],
-                                kv_transfer_params={"kv_ready": True},
-                            )
-                        )
-                except Exception:
-                    init_logger(__name__).exception("Failed to pre-process KV extraction for %s", req_id)
+                self.completed_kv_transfers.add(req_id)
+                req = self.requests.get(req_id)
+                if req is None or req.is_finished():
+                    continue
+                client_index = getattr(req, "client_index", None)
+                if client_index is None:
+                    logger.error("Missing client_index while pre-processing KV extraction for %s", req_id)
+                    continue
+                outputs[client_index].append(
+                    EngineCoreOutput(
+                        request_id=req_id,
+                        new_token_ids=[],
+                        kv_transfer_params={"kv_ready": True},
+                    )
+                )
 
         # NOTE(woosuk): As len(num_scheduled_tokens) can be up to 1K or more,
         # the below loop can be a performance bottleneck. We should do our best
@@ -551,27 +547,24 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        # This is where we free blocks that were held for transfer
-        try:
-            omni_output = getattr(model_runner_output, "omni_connector_output", None)
-            kv_sent_ids = list(getattr(omni_output, "kv_sent_req_ids", []))
-            if kv_sent_ids:
-                self.completed_kv_transfers.update(kv_sent_ids)
-                for req_id in kv_sent_ids:
-                    if req_id in self.waiting_for_transfer_free:
-                        req = self.requests.get(req_id)
-                        if req:
-                            self.kv_cache_manager.free(req)
-                            if req_id in self.requests:
-                                del self.requests[req_id]
-                            if req_id in self.transfer_triggered_requests:
-                                self.transfer_triggered_requests.remove(req_id)
-                            self.completed_kv_transfers.discard(req_id)
+        # This is where we free blocks that were held for transfer.
+        omni_output = getattr(model_runner_output, "omni_connector_output", None)
+        kv_sent_ids = list(getattr(omni_output, "kv_sent_req_ids", []))
+        if kv_sent_ids:
+            self.completed_kv_transfers.update(kv_sent_ids)
+            for req_id in kv_sent_ids:
+                if req_id in self.waiting_for_transfer_free:
+                    req = self.requests.get(req_id)
+                    if req:
+                        self.kv_cache_manager.free(req)
+                        if req_id in self.requests:
+                            del self.requests[req_id]
+                        if req_id in self.transfer_triggered_requests:
+                            self.transfer_triggered_requests.remove(req_id)
+                        self.completed_kv_transfers.discard(req_id)
 
-                            logger.debug(f"Freed blocks for {req_id} after transfer send")
-                        self.waiting_for_transfer_free.remove(req_id)
-        except Exception:
-            init_logger(__name__).exception("Failed to free blocks after transfer send")
+                        logger.debug(f"Freed blocks for {req_id} after transfer send")
+                    self.waiting_for_transfer_free.remove(req_id)
 
         # Consume OmniConnectorOutput from mixin (stores for next schedule())
         omni_output = getattr(model_runner_output, "omni_connector_output", None)
@@ -602,9 +595,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             Tuple of (req_id, client_index) for requests that were aborted. Will not
             include any that were already finished.
         """
-
-        if self.chunk_transfer_adapter:
-            self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         return super().finish_requests(request_ids, finished_status)
 
@@ -726,7 +716,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
                 else:
                     block_ids = []
-            except Exception as e:
+            except (AttributeError, KeyError, RuntimeError, TypeError, ValueError) as e:
                 init_logger(__name__).warning(f"Failed to get block IDs for {req_id}: {e}")
                 block_ids = []
 

@@ -26,15 +26,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-
-try:
-    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-except ImportError:
-
-    class ExtractHiddenStatesProposer:  # type: ignore[no-redef]
-        pass
-
-
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
@@ -48,7 +40,6 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
-from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -267,7 +258,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
         capture_sizes = sorted(capture_sizes, reverse=True)
-        logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
+        logger.debug("Capturing talker_mtp graphs for sizes %s", capture_sizes)
 
         set_cudagraph_capturing_enabled(True)
         try:
@@ -397,7 +388,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
         self._ar_log_counter += 1
         _finished = list(getattr(scheduler_output, "finished_req_ids", set()))
         if _finished or self._ar_log_counter % 5000 == 1:
-            logger.info(
+            logger.debug(
                 "[Stage-%s AR] execute_model: scheduled=%s, "
                 "pending_full_payload_send=%s, req_count=%s, "
                 "finished_req_ids=%s (call#%s)",
@@ -461,7 +452,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
             stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
             flush_ids.update(stale)
             if flush_ids:
-                logger.info(
+                logger.debug(
                     "[Stage-%s AR] flush_full_payload_outputs: flushing %s (from finished=%s, stale=%s)",
                     getattr(self, "_stage_id", "?"),
                     flush_ids,
@@ -512,7 +503,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
             if self._pending_full_payload_send:
                 stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
                 if stale:
-                    logger.info("[Stage-%s AR] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
+                    logger.debug("[Stage-%s AR] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
                     self.flush_full_payload_outputs(stale)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
@@ -688,10 +679,9 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("gpu_model_runner: forward"),
-            maybe_get_kv_connector_output_compat(
-                self,
+            self.maybe_get_kv_connector_output(
                 scheduler_output,
-                clear_metadata=not defer_kv_connector_finalize,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
             model_output = self._model_forward(
@@ -1108,7 +1098,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
                     self.send_chunk(request=wrapped, pooling_output=pooler_output[i])
                     _chunk_sent += 1
             if _chunk_sent and self._ar_log_counter % 5000 == 1:
-                logger.info(
+                logger.debug(
                     "[Stage-%s AR] sample_tokens: sent %s chunks (async_chunk)",
                     getattr(self, "_stage_id", "?"),
                     _chunk_sent,
@@ -1127,7 +1117,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
                 if pooler_output[i] and req_state is not None:
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
             if self._ar_log_counter % 5000 == 1:
-                logger.info(
+                logger.debug(
                     (
                         "[Stage-%s AR] sample_tokens: accumulated full_payload payloads "
                         "for %s reqs, pending_full_payload_send=%s"
@@ -1238,7 +1228,7 @@ class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
             # The process function should recognise finished=True and
             # flush/emit accordingly.
             self.send_chunk(request=wrapped, pooling_output={})
-            logger.info(
+            logger.debug(
                 "[Stage-%s AR] sent async-chunk finish sentinel for req=%s (ext=%s)",
                 getattr(self, "_stage_id", "?"),
                 rid,

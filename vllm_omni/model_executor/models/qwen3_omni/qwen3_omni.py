@@ -45,6 +45,9 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_speaker_from_runtime_info,
+)
 from vllm_omni.worker.payload_span import (
     CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
     CACHED_THINKER_DECODE_TOKEN_END_KEY,
@@ -391,10 +394,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
 
-            # TODO(Peiqi): temporal hack here to support voice_type.
-            if not hasattr(self, "voice_type"):
-                self.voice_type = voice_type
-
             # Run talker forward
             with torch.inference_mode():
                 talker_hidden = self.talker.forward(
@@ -651,6 +650,13 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.tts_text_spk_token_ids[self.default_tts_text_spk_type]
         return self.tts_text_spk_token_ids[voice_type]
 
+    def _resolve_voice_type(self, info_dict: dict[str, Any] | None = None) -> str:
+        """Resolve talker voice type from request-scoped runtime metadata."""
+        speaker = extract_speaker_from_runtime_info([info_dict] if isinstance(info_dict, dict) else None)
+        if speaker:
+            return speaker
+        return self.default_tts_text_spk_type
+
     def talker_postprocess(self, hidden_states: torch.Tensor, **info_dict: object):
         """
         Postprocess the talker hidden states.
@@ -753,8 +759,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
-        # TODO(Peiqi): add voice_type support
-        voice_type = self.voice_type
+        voice_type = self._resolve_voice_type(info_dict)
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
@@ -1317,9 +1322,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 dim=0,
             )
         else:
-            trailing_text_hidden = torch.zeros(
-                tts_eos_embed.shape, device=tts_eos_embed.device, dtype=tts_eos_embed.dtype
-            )
+            trailing_text_hidden = tts_eos_embed
 
         input_embeds = assistant_text_hidden + assistant_codec_hidden
         input_ids = torch.full(

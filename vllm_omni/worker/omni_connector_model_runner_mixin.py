@@ -1934,35 +1934,23 @@ class OmniConnectorModelRunnerMixin:
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
         """Load the connector payload builder for the downstream stage.
 
-        Preferred source is ``custom_process_next_stage_input_func``. Some
-        full_payload_mode configs (async_chunk=false) only expose the next-stage prompt builder via
-        ``custom_process_input_func`` (for example ``thinker2talker``), while the
-        connector payload builder lives beside it as ``thinker2talker_full_payload``.
-        In that case, derive the full_payload_mode builder path automatically.
+        Preferred source is ``custom_process_next_stage_input_func``. In
+        sync/full-payload mode, configs should name the explicit
+        ``*_full_payload`` or ``*_batch`` payload builder. ``custom_process_input_func``
+        is only used as a narrow fallback to those explicit sibling names.
         """
         candidates: list[str] = []
         is_async_chunk = bool(getattr(model_config, "async_chunk", False))
 
         next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
         if isinstance(next_stage_func, str) and next_stage_func:
-            if is_async_chunk:
-                candidates.append(next_stage_func)
+            if not is_async_chunk and next_stage_func.endswith("_async_chunk"):
+                logger.debug(
+                    "Ignoring async-only custom_process_next_stage_input_func in sync mode: %s",
+                    next_stage_func,
+                )
             else:
-                try:
-                    module_path, func_name = next_stage_func.rsplit(".", 1)
-                    if func_name.endswith("_full_payload") or func_name.endswith("_batch"):
-                        candidates.append(f"{module_path}.{func_name}")
-                    elif func_name.endswith("_async_chunk"):
-                        stem = func_name[: -len("_async_chunk")]
-                        candidates.append(f"{module_path}.{stem}_full_payload")
-                        candidates.append(f"{module_path}.{stem}_batch")
-                        candidates.append(next_stage_func)
-                    else:
-                        candidates.append(f"{module_path}.{func_name}_full_payload")
-                        candidates.append(f"{module_path}.{func_name}_batch")
-                        candidates.append(next_stage_func)
-                except ValueError:
-                    candidates.append(next_stage_func)
+                candidates.append(next_stage_func)
 
         if not is_async_chunk:
             input_func = getattr(model_config, "custom_process_input_func", None)
@@ -1974,9 +1962,8 @@ class OmniConnectorModelRunnerMixin:
                     else:
                         candidates.append(f"{module_path}.{func_name}_full_payload")
                         candidates.append(f"{module_path}.{func_name}_batch")
-                        candidates.append(input_func)
                 except ValueError:
-                    candidates.append(input_func)
+                    pass
 
         tried: set[str] = set()
         for func_path in candidates:

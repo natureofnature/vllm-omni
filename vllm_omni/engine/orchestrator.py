@@ -505,14 +505,6 @@ class Orchestrator:
         self._companion_done.pop(parent_id, None)
         self._deferred_parents.pop(parent_id, None)
 
-    def _all_companions_done(self, parent_id: str) -> bool:
-        """Check whether all CFG companions for a parent request have finished."""
-        role_map = self._companion_map.get(parent_id, {})
-        if not role_map:
-            return True
-        done_set = self._companion_done.get(parent_id, set())
-        return all(cid in done_set for cid in role_map.values())
-
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 

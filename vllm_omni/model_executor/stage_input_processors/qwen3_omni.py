@@ -3,7 +3,6 @@
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
-import logging
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -29,8 +28,6 @@ from vllm_omni.worker.payload_span import (
 )
 
 logger = init_logger(__name__)
-
-logger = logging.getLogger(__name__)
 
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
@@ -457,7 +454,7 @@ def thinker2talker_full_payload(
     }
     next_stage_prompt_len = _compute_talker_prompt_ids_length(info, device="cpu")
 
-    return {
+    payload = {
         "thinker_prefill_embeddings": embeddings.detach().cpu(),
         "thinker_hidden_states": hidden_states.detach().cpu(),
         "thinker_sequences": all_token_ids,
@@ -468,28 +465,13 @@ def thinker2talker_full_payload(
         "next_stage_prompt_len": next_stage_prompt_len,
         "finished": torch.tensor(True, dtype=torch.bool),
     }
-
-
-def _get_qwen3_multimodal_output(stage_output: Any, completion_output: Any) -> dict[str, Any]:
-    """Read multimodal_output from request output first, then completion.
-
-    On current vLLM/vLLM-Omni builds, non-async pipeline outputs can attach
-    multimodal payloads either to the outer request output or to the inner
-    CompletionOutput. Prefer the request-level dict and keep the older
-    completion-level layout as a fallback.
-    """
-    request_mm = getattr(stage_output, "multimodal_output", None)
-    if isinstance(request_mm, dict) and request_mm:
-        return request_mm
-
-    completion_mm = getattr(completion_output, "multimodal_output", None)
-    if isinstance(completion_mm, dict) and completion_mm:
-        return completion_mm
-
-    raise RuntimeError(
-        "Missing multimodal_output for Qwen3-Omni stage handoff: "
-        f"request_has_mm={bool(request_mm)} completion_has_mm={bool(completion_mm)}"
-    )
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
+    language = extract_language_from_request(request)
+    if language is not None:
+        payload["language"] = language
+    return payload
 
 
 def thinker2talker(

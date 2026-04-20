@@ -416,8 +416,12 @@ def build_engine_args_dict(
                     engine_args_dict["custom_process_next_stage_input_func"] = f"{module_path}.{func_name}_batch"
                 else:
                     engine_args_dict["custom_process_next_stage_input_func"] = input_func
-            except ValueError:
-                pass
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to derive custom_process_next_stage_input_func from %s: %s",
+                    input_func,
+                    exc,
+                )
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 

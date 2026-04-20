@@ -25,15 +25,7 @@ from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
-
-try:
-    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-except ImportError:
-
-    class ExtractHiddenStatesProposer:  # type: ignore[no-redef]
-        pass
-
-
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
@@ -44,7 +36,6 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 from vllm_omni.worker.gpu_ar_model_runner import ExecuteModelState
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -106,7 +97,7 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
 
         n_scheduled = scheduler_output.total_num_scheduled_tokens
         if n_scheduled or self._idle_log_counter % 5000 == 0:
-            logger.info(
+            logger.debug(
                 "[Stage-%s] execute_model: total_scheduled=%s, pending_chunk=%s, pending_input=%s (idle_count=%s)",
                 getattr(self, "_stage_id", "?"),
                 n_scheduled,
@@ -177,7 +168,7 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
             if self._pending_full_payload_send:
                 stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
                 if stale:
-                    logger.info("[Stage-%s Gen] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
+                    logger.debug("[Stage-%s Gen] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
                     self.flush_full_payload_outputs(stale)
 
             if not scheduler_output.total_num_scheduled_tokens:
@@ -355,13 +346,12 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
                 slot_mapping=slot_mappings,  # OMNI: required for KV cache operations
             ),
             record_function_or_nullcontext("Forward"),
-            maybe_get_kv_connector_output_compat(
-                self,
+            self.maybe_get_kv_connector_output(
                 scheduler_output,
-                clear_metadata=not defer_kv_connector_finalize,
+                defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            logger.info(
+            logger.debug(
                 "[Stage-%s] execute_model: entering _run_generation_model, num_tokens=%s, num_reqs=%s",
                 getattr(self, "_stage_id", "?"),
                 num_tokens_unpadded,
@@ -375,7 +365,7 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
                 model_kwargs=model_kwargs,
                 logits_indices=logits_indices,
             )
-            logger.info(
+            logger.debug(
                 "[Stage-%s] execute_model: _run_generation_model returned, type=%s",
                 getattr(self, "_stage_id", "?"),
                 type(outputs).__name__,
@@ -407,7 +397,7 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
         self,
         grammar_output: GrammarOutput | None = None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
-        logger.info(
+        logger.debug(
             "[Stage-%s] sample_tokens: called, has_state=%s",
             getattr(self, "_stage_id", "?"),
             self.execute_model_state is not None,
@@ -499,7 +489,7 @@ class GPUGenerationModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner
             ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
         )
         output.omni_connector_output = self.get_omni_connector_output()
-        logger.info(
+        logger.debug(
             "[Stage-%s] sample_tokens: output ready, req_ids=%s, pooler_len=%s, async=%s",
             getattr(self, "_stage_id", "?"),
             output.req_ids,

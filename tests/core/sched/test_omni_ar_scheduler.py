@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import pytest
+from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
@@ -118,34 +119,20 @@ def test_update_from_output_applies_prompt_resize_metadata():
     assert request._output_token_ids == []
 
 
-def test_finish_requests_tolerates_missing_chunk_transfer_adapter(monkeypatch):
-    scheduler = object.__new__(OmniARScheduler)
-    scheduler.chunk_transfer_adapter = None
-    scheduler.requests = {}
-
-    calls = []
-
-    def _super_finish(self, request_ids, finished_status):
-        calls.append((tuple(request_ids), finished_status))
-        return []
-
-    monkeypatch.setattr(OmniARScheduler.__mro__[2], "finish_requests", _super_finish)
-
-    result = OmniARScheduler.finish_requests(
-        scheduler,
-        ["req-abort"],
-        RequestStatus.FINISHED_ABORTED,
-    )
-
-    assert result == []
-    assert calls == [(("req-abort",), RequestStatus.FINISHED_ABORTED)]
-
-
-def test_has_pending_kv_work_survives_schedule_clear():
+def test_has_pending_kv_work_survives_schedule_clear(monkeypatch):
     """Regression: has_unfinished_requests() must stay True when the mixin
     reports has_pending_kv_work=True, even after schedule() clears the
     connector output.  Without the latch, the engine could stop polling
     prematurely."""
+
+    class _Queue(list):
+        def remove_requests(self, reqs):
+            req_ids = {getattr(req, "request_id", req) for req in reqs}
+            self[:] = [req for req in self if getattr(req, "request_id", req) not in req_ids]
+
+        def prepend_requests(self, reqs):
+            self[:0] = list(reqs)
+
     scheduler = object.__new__(OmniARScheduler)
     scheduler.requests_needing_kv_transfer = {}
     scheduler.waiting_for_transfer_free = set()
@@ -153,38 +140,62 @@ def test_has_pending_kv_work_survives_schedule_clear():
     scheduler._latest_omni_connector_output = None
     scheduler.requests = {}
     scheduler.running = []
-    scheduler.waiting = SimpleNamespace(
-        remove_requests=lambda reqs: None,
-        __len__=lambda self: 0,
-    )
-    scheduler.skipped_waiting = SimpleNamespace(
-        remove_requests=lambda reqs: None,
-        __len__=lambda self: 0,
-    )
+    scheduler.waiting = _Queue()
+    scheduler.skipped_waiting = _Queue()
     scheduler.chunk_coordinator = OmniSchedulingCoordinator(
         scheduler_max_num_seqs=8,
         stage_id=1,
         async_chunk=False,
     )
 
-    # Mixin delivers connector output with has_pending_kv_work=True
-    connector_output = OmniConnectorOutput(has_pending_kv_work=True)
-    scheduler._latest_omni_connector_output = connector_output
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler.kv_cache_manager = SimpleNamespace(take_events=lambda: None)
+    scheduler.kv_event_publisher = SimpleNamespace(publish=lambda batch: None)
+    scheduler.make_stats = lambda *args, **kwargs: None
+    scheduler.finished_req_ids = set()
+    scheduler.finished_req_ids_dict = {}
+    scheduler.completed_kv_transfers = set()
+    scheduler.transfer_triggered_requests = set()
+    scheduler.pending_stop_after_extraction = set()
+    scheduler._omits_kv_transfer_cache = {}
+    scheduler._update_from_kv_xfer_finished = lambda *args, **kwargs: None
+    scheduler.get_finished_requests_needing_kv_transfer = lambda: {}
 
-    assert scheduler._has_pending_kv_work() is False, "latch not yet updated, should still be False"
+    def _super_schedule(self):
+        return SchedulerOutput(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=CachedRequestData(
+                req_ids=[],
+                resumed_req_ids=set(),
+                new_token_ids=[],
+                all_token_ids={},
+                new_block_ids=[],
+                num_computed_tokens=[],
+                num_output_tokens=[],
+            ),
+            num_scheduled_tokens={},
+            total_num_scheduled_tokens=0,
+            scheduled_spec_decode_tokens={},
+            scheduled_encoder_inputs={},
+            num_common_prefix_blocks=[],
+            finished_req_ids=set(),
+            free_encoder_mm_hashes=[],
+            num_invalid_spec_tokens={},
+        )
 
-    # Simulate update_from_output refreshing the latch
-    scheduler._mixin_has_pending_kv_work = connector_output.has_pending_kv_work
+    monkeypatch.setattr(OmniARScheduler.__mro__[2], "schedule", _super_schedule)
 
+    omni_output = OmniConnectorOutput(has_pending_kv_work=True)
+    OmniARScheduler.update_from_output(scheduler, _make_scheduler_output(), _make_runner_output(omni_output))
+
+    assert scheduler._latest_omni_connector_output is omni_output
+    assert scheduler._mixin_has_pending_kv_work is True
+
+    scheduled = OmniARScheduler.schedule(scheduler)
+
+    assert scheduled.finished_requests_needing_kv_transfer == {}
+    assert scheduler._latest_omni_connector_output is None
+    assert scheduler._mixin_has_pending_kv_work is True
     assert scheduler._has_pending_kv_work() is True
-
-    # Now simulate schedule() consuming and clearing the connector output
-    scheduler._mixin_has_pending_kv_work = (
-        scheduler._latest_omni_connector_output is not None
-        and scheduler._latest_omni_connector_output.has_pending_kv_work
-    )
-    scheduler._latest_omni_connector_output = None
-
-    # The latch must survive the clear
-    assert scheduler._has_pending_kv_work() is True, "keepalive signal lost after schedule() cleared connector output"
     assert scheduler.has_unfinished_requests() is True

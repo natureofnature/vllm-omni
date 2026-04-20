@@ -40,7 +40,6 @@ from vllm_ascend.utils import enable_sp, global_stream
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
-from vllm_omni.v1_compat import maybe_get_kv_connector_output_compat
 
 
 class ExecuteModelState(NamedTuple):
@@ -384,10 +383,9 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 max_tokens_across_pcp=0 if self.pcp_size == 1 else self.pcp_manager.max_num_tokens_across_pcp,
                 skip_compiled=has_encoder_input,
             ),
-            maybe_get_kv_connector_output_compat(
-                self,
+            self.maybe_get_kv_connector_output(
                 scheduler_output,
-                clear_metadata=clear_kv_metadata,
+                defer_finalize=not clear_kv_metadata,
             ) as kv_connector_output,
         ):
             hidden_states = self._model_forward(

@@ -190,6 +190,36 @@ def _build_generation_scheduler(request: Any, coordinator: OmniSchedulingCoordin
 # ------------------------------------------------------------------ #
 
 
+def test_load_custom_func_prefers_explicit_full_payload_path():
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_full_payload"
+        ),
+        custom_process_input_func=None,
+    )
+
+    path, func = OmniConnectorModelRunnerMixin._load_custom_func(model_config)
+
+    assert path is not None and path.endswith("thinker2talker_full_payload")
+    assert callable(func)
+
+
+def test_load_custom_func_does_not_guess_full_payload_from_async_sibling():
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+        ),
+        custom_process_input_func=None,
+    )
+
+    path, func = OmniConnectorModelRunnerMixin._load_custom_func(model_config)
+
+    assert path is None
+    assert func is None
+
+
 class TestMixinAsyncChunkSendRecv(unittest.TestCase):
     """Test 2: Async chunk send/recv + bg threads."""
 

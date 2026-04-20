@@ -1243,12 +1243,50 @@ class TestCLIExplicitPrecedence:
         )
         assert async_stages[1].custom_process_input_func is None
 
-        # async_chunk=False → stage 0 has no streaming processor, stage 1's
-        # batch-end processor wires up.
+        # async_chunk=False → stage 0 wires the full-payload handoff, while
+        # stage 1 keeps the batch-end processor.
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
-        assert "custom_process_next_stage_input_func" not in sync_stages[0].yaml_engine_args
+        assert (
+            sync_stages[0]
+            .yaml_engine_args.get("custom_process_next_stage_input_func", "")
+            .endswith("talker2code2wav_full_payload")
+        )
         assert sync_stages[1].custom_process_input_func is not None
         assert sync_stages[1].custom_process_input_func.endswith("talker2code2wav")
+
+    def test_qwen3_omni_dispatches_explicit_sync_and_async_processors(self):
+        import vllm_omni.model_executor.models.qwen3_omni.pipeline  # noqa: F401
+        from vllm_omni.config.stage_config import (
+            _PIPELINE_REGISTRY,
+            DeployConfig,
+            merge_pipeline_deploy,
+        )
+
+        pipeline = _PIPELINE_REGISTRY["qwen3_omni_moe"]
+
+        async_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=True))
+        assert (
+            async_stages[0]
+            .yaml_engine_args.get("custom_process_next_stage_input_func", "")
+            .endswith("thinker2talker_async_chunk")
+        )
+        assert (
+            async_stages[1]
+            .yaml_engine_args.get("custom_process_next_stage_input_func", "")
+            .endswith("talker2code2wav_async_chunk")
+        )
+
+        sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
+        assert (
+            sync_stages[0]
+            .yaml_engine_args.get("custom_process_next_stage_input_func", "")
+            .endswith("thinker2talker_full_payload")
+        )
+        assert (
+            sync_stages[1]
+            .yaml_engine_args.get("custom_process_next_stage_input_func", "")
+            .endswith("talker2code2wav_full_payload")
+        )
 
 
 class TestSamplingConstraintsPrecedence:
