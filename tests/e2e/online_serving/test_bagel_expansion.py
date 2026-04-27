@@ -14,8 +14,6 @@ assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
 """
 
-from pathlib import Path
-
 import pytest
 
 from tests.helpers.mark import hardware_marks
@@ -24,10 +22,8 @@ from tests.helpers.stage_config import modify_stage_config
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
-# This test uses the default Bagel YAML, and CLI does not control devices.We modify yaml file directly.
-_BAGEL_DEFAULT_YAML = str(
-    Path(__file__).resolve().parents[3] / "vllm_omni" / "model_executor" / "stage_configs" / "bagel.yaml"
-)
+# This test uses the Bagel stage-config YAML under model_executor; CLI still carries TP.
+_BAGEL_DEFAULT_YAML = "vllm_omni/model_executor/stage_configs/bagel.yaml"
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
@@ -53,12 +49,11 @@ def _make_tp_cases(model: str, tp_size: int):
                         "stage_args": {
                             1: {
                                 "runtime.devices": devices,
-                                "engine_args.parallel_config.tensor_parallel_size": tp_size,
                             },
                         },
                     },
                 ),
-                server_args=["--cache-backend", "cache_dit"],
+                server_args=["--cache-backend", "cache_dit", "--tensor-parallel-size", str(tp_size)],
             ),
             id=f"parallel_tp_{tp_size}",
             marks=PARALLEL_FEATURE_MARKS,
