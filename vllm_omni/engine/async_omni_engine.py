@@ -117,11 +117,6 @@ _PARENT_ARGS_KEEP: frozenset[str] = frozenset(
         # while stages with explicit YAML values still win because the legacy
         # stage-config loader prefers stage-local engine args.
         "tensor_parallel_size",
-        "pipeline_parallel_size",
-        "data_parallel_size",
-        "data_parallel_size_local",
-        "data_parallel_backend",
-        "distributed_executor_backend",
     }
 )
 
