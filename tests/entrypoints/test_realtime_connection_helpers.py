@@ -56,6 +56,46 @@ class TestRealtimeConnectionTensorAndPcm:
         assert pcm[1] == 32767
         assert pcm[2] == -32767
 
+    def test_update_text_stream_state_resets_on_stage0_segment_boundary(self) -> None:
+        emitted_text_chunks = ["北京是中国的首都。"]
+        sent_text_len = len("北京是中国的首都。")
+        last_prompt_len = 75
+
+        delta, full_text, sent_text_len, last_prompt_len = RealtimeConnection._update_text_stream_state(
+            stage_id=0,
+            cumulative_text="北京是中国的首都。",
+            prompt_token_ids_len=150,
+            sent_text_len=sent_text_len,
+            emitted_text_chunks=emitted_text_chunks,
+            last_prompt_token_ids_len=last_prompt_len,
+        )
+        assert delta == ""
+        assert full_text == ""
+        assert sent_text_len == len("北京是中国的首都。")
+        assert last_prompt_len == 150
+
+        delta, full_text, sent_text_len, last_prompt_len = RealtimeConnection._update_text_stream_state(
+            stage_id=0,
+            cumulative_text="北京是中国的首都。北京",
+            prompt_token_ids_len=150,
+            sent_text_len=sent_text_len,
+            emitted_text_chunks=emitted_text_chunks,
+            last_prompt_token_ids_len=last_prompt_len,
+        )
+        assert delta == "北京"
+        assert full_text == "北京"
+
+        delta, full_text, sent_text_len, last_prompt_len = RealtimeConnection._update_text_stream_state(
+            stage_id=0,
+            cumulative_text="北京是中国的首都。北京是中国的首都。",
+            prompt_token_ids_len=150,
+            sent_text_len=sent_text_len,
+            emitted_text_chunks=emitted_text_chunks,
+            last_prompt_token_ids_len=last_prompt_len,
+        )
+        assert delta == "是中国的首都。"
+        assert full_text == "北京是中国的首都。"
+
 
 class TestAsyncOmniStreamingParamsValidation:
     def test_accepts_streaming_friendly_params(self) -> None:

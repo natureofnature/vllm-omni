@@ -1,10 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# DEPRECATED: This module's try_send_via_connector / try_recv_via_connector
+# helpers are superseded by OmniConnectorModelRunnerMixin
+# (vllm_omni.worker.omni_connector_model_runner_mixin).
+# The Orchestrator and OmniStage will migrate to the mixin-based batch
+# send/recv path in a future phase.  Until then these helpers remain
+# functional for backward compatibility.
+
 import time
 from collections.abc import Callable
 from typing import Any
 
 from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.model_executor.stage_input_processors.qwen3_omni_prompt_utils import (
+    compute_talker_prompt_ids_length,  # noqa: F401
+)
 
 from .utils.logging import get_connector_logger
 
@@ -22,11 +33,10 @@ def try_send_via_connector(
     next_stage_queue_submit_fn: Callable[[dict[str, Any]], None],
     metrics: OrchestratorAggregator,
 ) -> bool:
-    """
-    Attempts to send data via OmniConnector.
-    Returns True if successful, False otherwise.
-    Encapsulates the logic of preparing payload, sending via connector,
-    sending notification, and recording metrics.
+    """Attempts to send data via OmniConnector.
+
+    .. deprecated::
+        Use ``OmniConnectorModelRunnerMixin.send_full_payload_outputs`` instead.
     """
     try:
         t0 = time.time()
@@ -106,9 +116,10 @@ def try_recv_via_connector(
     connectors: dict[Any, Any],
     stage_id: int,
 ) -> tuple[Any, dict[str, Any] | None]:
-    """
-    Attempts to resolve input data from either connector or IPC.
-    Returns (engine_inputs, rx_metrics) or (None, None) if failed/skipped.
+    """Attempts to resolve input data from either connector or IPC.
+
+    .. deprecated::
+        Use ``OmniConnectorModelRunnerMixin.recv_full_payload_inputs`` instead.
     """
     rid = task["request_id"]
 
@@ -181,36 +192,3 @@ def try_recv_via_connector(
             # but for Stage-0 seed it should be there.
             # We'll return None to let caller handle error if strictly required.
             return None, None
-
-
-def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
-    """Compute the length of the talker prompt ids.
-
-    Args:
-        prompt_ids: The prompt ids tensor.
-
-    Returns:
-        The length of the talker prompt ids.
-    """
-    im_start_token_id = 151644
-    system_token_id = 8948
-    user_token_id = 872
-    assistant_token_id = 77091
-    im_start_indexes = [i for i in range(len(prompt_ids)) if prompt_ids[i] == im_start_token_id]
-    im_start_indexes.append(len(prompt_ids))
-    sum_user_len = 0
-    assistant_len = 0
-    for i in range(len(im_start_indexes) - 1):
-        s = im_start_indexes[i]
-        e = im_start_indexes[i + 1]
-        role = prompt_ids[s + 1]
-        if role == system_token_id:
-            continue
-        elif role == user_token_id:
-            sum_user_len += e - s
-        elif role == assistant_token_id and i == len(im_start_indexes) - 2:
-            assistant_len += 9  # 3 + 4 + 1 + 1
-        else:
-            pass
-
-    return sum_user_len + assistant_len

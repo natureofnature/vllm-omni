@@ -11,6 +11,7 @@ model-related operations.
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Iterable
 from contextlib import nullcontext
@@ -73,8 +74,47 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         # Cache for per-request stepwise state.
         self.state_cache: dict[str, DiffusionRequestState] = {}
 
-        # Initialize KV cache manager for connector management
+        # Diffusion may use the mixin's KV receive helpers before the
+        # full connector bootstrap path runs, so seed the delegated KV manager
+        # on both the diffusion runner and the mixin-facing attribute.
         self.kv_transfer_manager = OmniKVTransferManager.from_od_config(od_config)
+        self._kv_transfer_manager = self.kv_transfer_manager
+        self._bootstrap_kv_receive_routing()
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        model_config = getattr(od_config, "model_config", None) or getattr(vllm_config, "model_config", None)
+        if model_config is not None:
+            self.init_omni_connectors(
+                vllm_config=vllm_config,
+                model_config=model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
+            # Diffusion owns its TP topology in od_config.omni_kv_config. The
+            # generic mixin parser falls back to 1:1 when model_config has no
+            # stage_connector_config, so re-apply the diffusion bootstrap.
+            self._bootstrap_kv_receive_routing()
+
+    def _bootstrap_kv_receive_routing(self) -> None:
+        """Seed KV key builders from diffusion config."""
+        omni_kv_cfg = getattr(self.od_config, "omni_kv_config", {}) or {}
+        connector_cfg = omni_kv_cfg.get("connector_config", {}) if isinstance(omni_kv_cfg, dict) else {}
+        if not isinstance(connector_cfg, dict):
+            connector_cfg = {}
+        rank_mapping = connector_cfg.get("rank_mapping", {})
+        if not isinstance(rank_mapping, dict):
+            rank_mapping = {}
+
+        to_tp = getattr(getattr(self.od_config, "parallel_config", None), "tensor_parallel_size", 1) or 1
+        self._from_tp = int(rank_mapping.get("from_tp", 1))
+        self._to_tp = int(rank_mapping.get("to_tp", to_tp))
+        try:
+            self._local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        except (TypeError, ValueError):
+            self._local_rank = 0
+
+        self.kv_transfer_manager.kv_send_key_builder = self.get_rank_aware_kv_send_keys
+        self.kv_transfer_manager.kv_recv_key_builder = self.get_rank_aware_kv_keys
+        self.kv_transfer_manager.kv_payload_merger = self._merge_rank_sharded_kv_payloads
+        self.kv_transfer_manager.kv_payload_slicer = self._slice_rank_sharded_kv_payload
 
     def _compile_transformer(self, attr_name: str) -> None:
         """Compile a transformer attribute on the pipeline with torch.compile."""
@@ -200,7 +240,6 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
 
         Uses max_memory_reserved (CUDA memory pool high-water mark) rather than
         max_memory_allocated so that allocator fragmentation is also visible.
-        See: https://docs.pytorch.org/docs/stable/generated/torch.cuda.memory.max_memory_reserved.html
         """
         peak_reserved_bytes = current_omni_platform.max_memory_reserved()
         peak_allocated_bytes = current_omni_platform.max_memory_allocated()
@@ -242,12 +281,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
         use_hsdp = self.od_config.parallel_config.use_hsdp
         grad_context = torch.no_grad() if use_hsdp else torch.inference_mode()
         with grad_context:
-            # The manager handles the check for need_recv_cache internally
-            self.kv_transfer_manager.receive_multi_kv_cache_distributed(
-                req,
-                cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
-                target_device=getattr(self.pipeline, "device", None),
-            )
+            # Warmup-only diffusion requests do not have upstream KV payloads.
+            if getattr(req.sampling_params, "need_kv_receive", True):
+                self.receive_multi_kv_cache(
+                    req,
+                    cfg_kv_collect_func=getattr(self.od_config, "cfg_kv_collect_func", None),
+                    target_device=getattr(self.pipeline, "device", None),
+                )
 
             if req.sampling_params.generator is None and req.sampling_params.seed is not None:
                 if req.sampling_params.generator_device is not None:

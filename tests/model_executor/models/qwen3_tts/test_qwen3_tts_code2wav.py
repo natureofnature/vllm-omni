@@ -44,7 +44,7 @@ def test_forward_trims_context_on_exact_frame_boundaries():
 
     out = model.forward(
         input_ids=torch.arange(12, dtype=torch.long),
-        runtime_additional_information=[{"left_context_size": 2}],
+        runtime_additional_information=[{"left_context_size": 2, "code_predictor_codes": list(range(12))}],
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
@@ -57,9 +57,22 @@ def test_forward_trims_trailing_padding_without_context():
 
     out = model.forward(
         input_ids=torch.arange(12, dtype=torch.long),
-        runtime_additional_information=[{"left_context_size": 0}],
+        runtime_additional_information=[{"left_context_size": 0, "code_predictor_codes": list(range(12))}],
     )
 
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(24, dtype=torch.float32)
+    torch.testing.assert_close(audio, expected)
+
+
+def test_forward_prefers_runtime_payload_codes_over_scheduler_ids():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        runtime_additional_information=[{"left_context_size": 2, "code_predictor_codes": list(range(12))}],
+    )
+
+    audio = out.multimodal_outputs["model_outputs"][0]
+    expected = torch.arange(8, 24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)

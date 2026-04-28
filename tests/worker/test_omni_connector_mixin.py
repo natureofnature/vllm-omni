@@ -8,6 +8,7 @@ GPU or vLLM runtime.
 
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -16,7 +17,11 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
+from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.core.sched.omni_scheduling_coordinator import OmniSchedulingCoordinator
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -97,9 +102,130 @@ class _FakeTPGroup:
         return self.follower_result
 
 
+class MockWaitingQueue:
+    """Minimal waiting-queue stand-in for coordinator lifecycle tests."""
+
+    def __init__(self, items: list[Any] | None = None):
+        self._items = list(items or [])
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self):
+        return len(self._items)
+
+    def __contains__(self, item: Any) -> bool:
+        return item in self._items
+
+    def add_request(self, request: Any) -> None:
+        self._items.append(request)
+
+    def prepend_requests(self, requests: list[Any]) -> None:
+        self._items = list(requests) + self._items
+
+    def remove(self, request: Any) -> None:
+        self._items.remove(request)
+
+    def peek_request(self):
+        return self._items[0]
+
+    def pop_request(self):
+        return self._items.pop(0)
+
+    def remove_requests(self, requests: list[Any] | set[Any]) -> None:
+        request_ids = {id(req) for req in requests}
+        self._items = [req for req in self._items if id(req) not in request_ids]
+
+
+def _wait_until(predicate, *, timeout_s: float = 3.0, interval_s: float = 0.01, message: str = "condition not met"):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(interval_s)
+    raise AssertionError(message)
+
+
+def _make_scheduler_output() -> SimpleNamespace:
+    return SimpleNamespace(
+        num_scheduled_tokens={},
+        scheduled_spec_decode_tokens={},
+        num_invalid_spec_tokens=0,
+    )
+
+
+def _make_runner_output(omni_output: OmniConnectorOutput) -> SimpleNamespace:
+    return SimpleNamespace(
+        sampled_token_ids=[],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=None,
+        num_nans_in_logits=None,
+        kv_connector_output=None,
+        cudagraph_stats=None,
+        req_ids=[],
+        req_id_to_index={},
+        omni_connector_output=omni_output,
+        kv_extracted_req_ids=None,
+    )
+
+
+def _build_generation_scheduler(request: Any, coordinator: OmniSchedulingCoordinator) -> OmniGenerationScheduler:
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.perf_metrics = None
+    scheduler.connector = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.chunk_coordinator = coordinator
+    scheduler._latest_omni_connector_output = None
+    scheduler._omni_chunk_timeout_s = 300.0
+    scheduler._reqs_with_pooler_history = set()
+    scheduler._deferred_terminal_chunk_req_ids = set()
+    scheduler._deferred_terminal_request_metadata = {}
+    scheduler._deferred_request_metadata = {}
+    scheduler.kv_cache_manager = SimpleNamespace(take_events=lambda: None)
+    scheduler.kv_event_publisher = SimpleNamespace(publish=lambda batch: None)
+    scheduler.make_stats = lambda *args, **kwargs: None
+    scheduler.structured_output_manager = SimpleNamespace(should_advance=lambda req: False)
+    scheduler.running = []
+    scheduler.waiting = MockWaitingQueue()
+    scheduler.skipped_waiting = MockWaitingQueue()
+    scheduler.finished_req_ids_dict = {}
+    return scheduler
+
+
 # ------------------------------------------------------------------ #
 #  Test cases
 # ------------------------------------------------------------------ #
+
+
+def test_load_custom_func_prefers_explicit_full_payload_path():
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_full_payload"
+        ),
+        custom_process_input_func=None,
+    )
+
+    path, func = OmniConnectorModelRunnerMixin._load_custom_func(model_config)
+
+    assert path is not None and path.endswith("thinker2talker_full_payload")
+    assert callable(func)
+
+
+def test_load_custom_func_does_not_guess_full_payload_from_async_sibling():
+    model_config = SimpleNamespace(
+        async_chunk=False,
+        custom_process_next_stage_input_func=(
+            "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+        ),
+        custom_process_input_func=None,
+    )
+
+    path, func = OmniConnectorModelRunnerMixin._load_custom_func(model_config)
+
+    assert path is None
+    assert func is None
 
 
 class TestMixinAsyncChunkSendRecv(unittest.TestCase):
@@ -373,6 +499,20 @@ class TestLoadCustomFuncSelection(unittest.TestCase):
             assert selected_path != func_path
             assert func is None or MixinHost._is_connector_payload_builder(func)
 
+    def test_does_not_guess_full_payload_builder_from_async_next_stage_hook(self):
+        selected_path, func = MixinHost._load_custom_func(
+            SimpleNamespace(
+                async_chunk=False,
+                custom_process_input_func=None,
+                custom_process_next_stage_input_func=(
+                    "vllm_omni.model_executor.stage_input_processors.qwen3_omni.thinker2talker_async_chunk"
+                ),
+            )
+        )
+
+        assert selected_path is None
+        assert func is None
+
 
 class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
     """Test B4: send_full_payload_outputs with full_payload_mode custom process func."""
@@ -441,6 +581,25 @@ class TestFullPayloadSendWithCustomFunc(unittest.TestCase):
         self.assertEqual(call_log[0], "req-1")
 
         time.sleep(0.1)
+        host.shutdown_omni_connectors()
+
+    def test_accumulate_full_payload_model_outputs_replaces_complete_tensor(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(),
+        )
+
+        req = _make_request("req-1")
+        first = torch.tensor([[1.0, 2.0]])
+        second = torch.tensor([[3.0, 4.0]])
+
+        host.accumulate_full_payload_output("req-1", {"model_outputs": first}, req)
+        host.accumulate_full_payload_output("req-1", {"model_outputs": second}, req)
+
+        pending, _ = host._pending_full_payload_send["req-1"]
+        self.assertTrue(torch.equal(pending["model_outputs"], second))
+
         host.shutdown_omni_connectors()
 
 
@@ -774,7 +933,7 @@ class TestSendChunkCachesMapping(unittest.TestCase):
 class TestLocalPayloadCacheLifecycle(unittest.TestCase):
     """Unit tests for the local payload cache API (RFC §2.4)."""
 
-    def _make_host(self) -> MixinHost:
+    def _make_host(self, rank: int = 0) -> MixinHost:
         host = MixinHost()
         host.init_omni_connectors(
             vllm_config=None,
@@ -782,10 +941,11 @@ class TestLocalPayloadCacheLifecycle(unittest.TestCase):
         )
         host._omni_connector = MockConnector(stage_id=0)
         host._stage_id = 0
+        host._local_rank = rank
         return host
 
     def test_put_get_pop(self):
-        host = self._make_host()
+        host = self._make_host(rank=0)
         payload = {"engine_inputs": {"ids": [1, 2, 3]}}
         host.put_local_stage_payload("r1", payload)
 
@@ -951,6 +1111,86 @@ class TestTPAsyncChunkFanout(unittest.TestCase):
         self.assertNotIn("r1", host._pending_load_reqs)
         self.assertIn("r1", host._chunk_stream_completed)
         self.assertEqual(tp_group.broadcast_inputs, [None])
+        host.shutdown_omni_connectors()
+
+    def test_build_scheduling_metadata_accumulates_net_new_generation_prompt_len(self):
+        host = self._make_host(rank=0)
+        host._async_chunk = True
+        host._model_mode = "generation"
+
+        metadata1 = host._build_scheduling_metadata(
+            "r1",
+            {
+                "code_predictor_codes": list(range(10)),
+                "left_context_size": 2,
+                "code_num_quantizers": 2,
+                "finished": False,
+            },
+        )
+        metadata2 = host._build_scheduling_metadata(
+            "r1",
+            {
+                "code_predictor_codes": list(range(10, 20)),
+                "left_context_size": 2,
+                "code_num_quantizers": 2,
+                "finished": True,
+            },
+        )
+
+        self.assertEqual(metadata1, {"left_context_size": 2, "next_stage_prompt_len": 6})
+        self.assertEqual(metadata2, {"left_context_size": 2, "next_stage_prompt_len": 12})
+
+    def test_finished_streaming_generation_codec_recv_defers_chunk_finished(self):
+        host = self._make_host(rank=0)
+        host._async_chunk = True
+        host._model_mode = "generation"
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            {
+                "code_predictor_codes": [10, 11, 12, 13],
+                "left_context_size": 1,
+                "code_num_quantizers": 2,
+                "finished": True,
+            },
+            123,
+        )
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        self.assertIn("r1", host._finished_load_reqs)
+        self.assertNotIn("r1", host._chunk_finished_req_ids)
+        self.assertIn("r1", host._generation_terminal_chunk_pending_req_ids)
+        self.assertNotIn("r1", host._pending_load_reqs)
+
+        req = _make_request("r1", "ext-r1")
+        host.register_chunk_recv(req)
+        self.assertNotIn("r1", host._pending_load_reqs)
+        host.shutdown_omni_connectors()
+
+    def test_finished_non_streaming_generation_codec_recv_still_emits_chunk_finished(self):
+        host = self._make_host(rank=0)
+        host._async_chunk = True
+        host._model_mode = "generation"
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            {
+                "code_predictor_codes": [10, 11, 12, 13],
+                "finished": True,
+            },
+            123,
+        )
+        tp_group = _FakeTPGroup(world_size=2, rank_in_group=0)
+
+        with patch("vllm_omni.worker.omni_connector_model_runner_mixin.get_tp_group", return_value=tp_group):
+            made_progress = host._poll_single_request("r1")
+
+        self.assertTrue(made_progress)
+        self.assertIn("r1", host._chunk_finished_req_ids)
+        self.assertNotIn("r1", host._generation_terminal_chunk_pending_req_ids)
+        self.assertIn("r1", host._chunk_stream_completed)
         host.shutdown_omni_connectors()
 
 
@@ -1413,6 +1653,503 @@ class TestSendRetry(unittest.TestCase):
         success = sender._send_single_request(requeued)
         self.assertTrue(success)
         sender.shutdown_omni_connectors()
+
+
+class TestFullPayloadLifecycleIntegration(unittest.TestCase):
+    """Minimal lifecycle coverage across mixin delivery and scheduler bridge."""
+
+    def _make_host(self, connector: MockConnector, *, stage_id: int, start_recv: bool, start_save: bool) -> MixinHost:
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=stage_id, async_chunk=False),
+        )
+        host._omni_connector = connector
+        host._stage_id = stage_id
+        host._async_chunk = False
+        host._next_stage_id = stage_id + 1
+        host._local_rank = 0
+        if start_recv:
+            host._recv_thread = threading.Thread(target=host._recv_loop, daemon=True, name=f"test-recv-{stage_id}")
+            host._recv_thread.start()
+        if start_save:
+            host._save_thread = threading.Thread(target=host._save_loop, daemon=True, name=f"test-save-{stage_id}")
+            host._save_thread.start()
+        self.addCleanup(host.shutdown_omni_connectors)
+        return host
+
+    @staticmethod
+    def _make_waiting_request(req_id: str) -> SimpleNamespace:
+        return SimpleNamespace(
+            request_id=req_id,
+            external_req_id=f"ext-{req_id}",
+            status=RequestStatus.WAITING,
+            prompt_token_ids=[],
+            num_prompt_tokens=0,
+            num_computed_tokens=0,
+            _all_token_ids=[],
+            _output_token_ids=[],
+            sampling_params=SimpleNamespace(logprobs=None),
+            pooling_params=None,
+            client_index=0,
+            stop_reason=None,
+            trace_headers=None,
+            num_cached_tokens=0,
+            num_external_computed_tokens=0,
+            num_nans_in_logits=0,
+            structured_output_request=None,
+            is_finished=lambda: False,
+            take_events=lambda: [],
+            get_finished_reason=lambda: "finished",
+            _omni_initial_model_buffer=None,
+        )
+
+    def _receive_until(
+        self, receiver: MixinHost, expected_req_ids: set[str], *, timeout_s: float = 5.0
+    ) -> dict[str, Any]:
+        received: dict[str, Any] = {}
+
+        def _all_received() -> bool:
+            batch = receiver.recv_full_payload_inputs(None) or {}
+            received.update(batch)
+            return set(received) == expected_req_ids
+
+        _wait_until(
+            _all_received,
+            timeout_s=timeout_s,
+            message=f"timed out waiting for full payloads: expected={expected_req_ids}, got={set(received)}",
+        )
+        return received
+
+    def test_full_payload_request_reaches_waiting_via_generation_scheduler_bridge(self):
+        connector = MockConnector(stage_id=0)
+        sender = self._make_host(connector, stage_id=0, start_recv=False, start_save=True)
+        receiver = self._make_host(connector, stage_id=1, start_recv=True, start_save=False)
+
+        request = self._make_waiting_request("req-1")
+        request.prompt_token_ids = [9, 9]
+        request.num_prompt_tokens = 2
+        request._all_token_ids = [9, 9]
+        waiting = MockWaitingQueue([request])
+        running: list[Any] = []
+        coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=False)
+
+        coordinator.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+        self.assertEqual(request.status, RequestStatus.WAITING_FOR_INPUT)
+        self.assertEqual(len(waiting), 0)
+        self.assertEqual([req.request_id for req in coordinator.pending_input_registrations], ["req-1"])
+
+        for pending in coordinator.pending_input_registrations:
+            receiver.register_chunk_recv(pending)
+
+        sent_ids = sender.send_full_payload_outputs(
+            scheduler_output=None,
+            outputs={
+                request.request_id: (
+                    {
+                        "engine_inputs": {
+                            "code_predictor_codes": [1, 2, 3],
+                            "left_context_size": 1,
+                            "payload_value": "ready",
+                        }
+                    },
+                    request,
+                )
+            },
+        )
+        self.assertEqual(sent_ids, ["req-1"])
+
+        received = self._receive_until(receiver, {"req-1"})
+        self.assertEqual(received["req-1"]["payload_value"], "ready")
+        self.assertEqual(receiver.get_local_stage_payload("req-1")["payload_value"], "ready")
+
+        omni_output = receiver.get_omni_connector_output()
+        self.assertEqual(omni_output.stage_recv_req_ids, {"req-1"})
+        self.assertEqual(
+            omni_output.request_metadata,
+            {"req-1": {"code_predictor_codes": [1, 2, 3], "left_context_size": 1}},
+        )
+
+        scheduler = _build_generation_scheduler(request, coordinator)
+        result = OmniGenerationScheduler.update_from_output(
+            scheduler,
+            _make_scheduler_output(),
+            _make_runner_output(omni_output),
+        )
+
+        self.assertEqual(result, {})
+        self.assertIs(scheduler._latest_omni_connector_output, omni_output)
+        self.assertEqual(request.prompt_token_ids, [1, 2, 3])
+        self.assertEqual(request.num_computed_tokens, 0)
+        self.assertEqual(request._omni_initial_model_buffer, {"left_context_size": 1})
+
+        coordinator.process_pending_full_payload_inputs(
+            waiting,
+            running,
+            scheduler._latest_omni_connector_output.stage_recv_req_ids,
+        )
+        self.assertEqual(request.status, RequestStatus.WAITING)
+        self.assertIn(request, waiting)
+        self.assertEqual(len(waiting), 1)
+
+    def test_full_payload_concurrent_delivery_does_not_drop_requests(self):
+        connector = MockConnector(stage_id=0)
+        sender = self._make_host(connector, stage_id=0, start_recv=False, start_save=True)
+        receiver = self._make_host(connector, stage_id=1, start_recv=True, start_save=False)
+
+        requests = [self._make_waiting_request(f"req-{idx}") for idx in range(24)]
+        expected_req_ids = {request.request_id for request in requests}
+        waiting = MockWaitingQueue(requests)
+        running: list[Any] = []
+        coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=32, stage_id=1, async_chunk=False)
+
+        coordinator.process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids=set())
+        self.assertEqual(len(waiting), 0)
+        self.assertEqual(len(coordinator.pending_input_registrations), len(requests))
+
+        for pending in coordinator.pending_input_registrations:
+            receiver.register_chunk_recv(pending)
+
+        errors: list[str] = []
+
+        def _enqueue(request: SimpleNamespace, prompt_len: int) -> None:
+            sent = sender.send_full_payload_outputs(
+                scheduler_output=None,
+                outputs={
+                    request.request_id: (
+                        {
+                            "engine_inputs": {
+                                "next_stage_prompt_len": prompt_len,
+                                "payload_value": request.request_id,
+                            }
+                        },
+                        request,
+                    )
+                },
+            )
+            if sent != [request.request_id]:
+                errors.append(f"unexpected sent ids for {request.request_id}: {sent}")
+
+        threads = [
+            threading.Thread(target=_enqueue, args=(request, index + 1), daemon=True)
+            for index, request in enumerate(requests)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        received = self._receive_until(receiver, expected_req_ids, timeout_s=8.0)
+        self.assertEqual(set(received), expected_req_ids)
+        self.assertEqual(len(receiver._local_stage_payload_cache), len(requests))
+
+        omni_output = receiver.get_omni_connector_output()
+        self.assertEqual(omni_output.stage_recv_req_ids, expected_req_ids)
+        self.assertEqual(set(omni_output.request_metadata), expected_req_ids)
+
+        coordinator.process_pending_full_payload_inputs(waiting, running, omni_output.stage_recv_req_ids)
+        self.assertEqual(len(waiting), len(requests))
+        self.assertEqual({request.request_id for request in waiting}, expected_req_ids)
+        self.assertTrue(all(request.status is RequestStatus.WAITING for request in waiting))
+
+    def test_finish_only_terminal_signal_waits_for_terminal_prompt_progress(self):
+        request = self._make_waiting_request("req-finish-only")
+        request.status = RequestStatus.RUNNING
+        request.prompt_token_ids = [11, 12, 13]
+        request._all_token_ids = [11, 12, 13]
+        request.num_prompt_tokens = 3
+        request.num_computed_tokens = 2
+
+        coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+        scheduler = _build_generation_scheduler(request, coordinator)
+        scheduler.running = [request]
+        scheduler._reqs_with_pooler_history.add(request.request_id)
+
+        omni_output = OmniConnectorOutput(
+            chunk_finished_req_ids={request.request_id},
+            request_metadata={request.request_id: {"next_stage_prompt_len": 3}},
+        )
+
+        result = OmniGenerationScheduler.update_from_output(
+            scheduler,
+            _make_scheduler_output(),
+            _make_runner_output(omni_output),
+        )
+
+        self.assertEqual(result, {})
+        self.assertIn(request.request_id, scheduler._deferred_terminal_chunk_req_ids)
+        self.assertEqual(
+            scheduler._deferred_terminal_request_metadata[request.request_id],
+            {"next_stage_prompt_len": 3},
+        )
+        self.assertEqual(request.status, RequestStatus.RUNNING)
+        self.assertIn(request.request_id, scheduler.requests)
+        self.assertIn(request, scheduler.running)
+
+
+def test_generation_update_from_output_defers_request_metadata_until_request_exists():
+    request = SimpleNamespace(
+        request_id="req-late",
+        prompt_token_ids=[],
+        _all_token_ids=[],
+        _output_token_ids=[],
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
+        status=RequestStatus.WAITING,
+        client_index=0,
+        num_cached_tokens=0,
+        stop_reason=None,
+        sampling_params=None,
+        structured_output_request=None,
+    )
+
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    scheduler = _build_generation_scheduler(request, coordinator)
+    scheduler.requests = {}
+
+    omni_output = OmniConnectorOutput(
+        request_metadata={request.request_id: {"next_stage_prompt_len": 3}},
+    )
+
+    result = OmniGenerationScheduler.update_from_output(
+        scheduler,
+        _make_scheduler_output(),
+        _make_runner_output(omni_output),
+    )
+
+    assert result == {}
+    assert scheduler._deferred_request_metadata == {request.request_id: {"next_stage_prompt_len": 3}}
+    assert request.prompt_token_ids == []
+
+    scheduler.requests = {request.request_id: request}
+    result = OmniGenerationScheduler.update_from_output(
+        scheduler,
+        _make_scheduler_output(),
+        _make_runner_output(OmniConnectorOutput()),
+    )
+
+    assert result == {}
+    assert scheduler._deferred_request_metadata == {}
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request.num_prompt_tokens == 3
+
+
+def test_generation_schedule_waiting_partial_request_only_schedules_remaining_tokens():
+    request = SimpleNamespace(
+        request_id="req-partial",
+        prompt_token_ids=list(range(10)),
+        _all_token_ids=list(range(10)),
+        _output_token_ids=[],
+        num_prompt_tokens=10,
+        num_computed_tokens=6,
+        num_cached_tokens=6,
+        status=RequestStatus.WAITING,
+        mm_features=None,
+        sampling_params=None,
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        additional_information=None,
+    )
+
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.max_num_scheduled_tokens = 16
+    scheduler.num_lookahead_tokens = 0
+    scheduler.max_num_running_reqs = 8
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler._gen_sched_log_ctr = 0
+    scheduler.waiting = MockWaitingQueue([request])
+    scheduler.running = []
+    scheduler.requests = {request.request_id: request}
+    scheduler.chunk_coordinator = None
+    scheduler.log_stats = False
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=lambda req, num_new_tokens, num_lookahead_tokens: SimpleNamespace(get_block_ids=lambda: ([0],)),
+        get_num_common_prefix_blocks=lambda req_id: [0],
+        take_new_block_ids=lambda: [],
+        take_events=lambda: None,
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.finished_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
+        req_ids=[request.request_id],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[request.num_computed_tokens],
+        num_output_tokens=[0],
+    )
+
+    scheduled = OmniGenerationScheduler.schedule(scheduler)
+
+    assert scheduled.num_scheduled_tokens == {request.request_id: 4}
+    assert len(scheduled.scheduled_new_reqs) == 0
+    assert scheduled.scheduled_cached_reqs.req_ids == [request.request_id]
+    assert scheduled.scheduled_cached_reqs.prompt_token_ids == {request.request_id: request.prompt_token_ids}
+
+
+def test_generation_schedule_keeps_ready_runtime_payload_schedulable_when_prompt_len_is_caught_up():
+    request = SimpleNamespace(
+        request_id="req-ready-runtime",
+        prompt_token_ids=[11, 12, 13],
+        _all_token_ids=[11, 12, 13],
+        _output_token_ids=[],
+        num_prompt_tokens=3,
+        num_computed_tokens=3,
+        num_cached_tokens=0,
+        client_index=0,
+        status=RequestStatus.RUNNING,
+        stop_reason=None,
+        sampling_params=None,
+        structured_output_request=None,
+        mm_features=None,
+        multimodal_kwargs=None,
+        multi_modal_kwargs=None,
+        data=None,
+        eos_token_id=None,
+        arrival_time=0.0,
+        queue_remaining_tokens=None,
+        prompt=None,
+        prompt_token_ids_history=None,
+        all_token_ids=[11, 12, 13],
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        additional_information=None,
+    )
+
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    coordinator.requests_with_ready_chunks.add(request.request_id)
+
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.max_num_scheduled_tokens = 16
+    scheduler.num_lookahead_tokens = 0
+    scheduler.max_num_running_reqs = 8
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = MockWaitingQueue([])
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    scheduler.chunk_coordinator = coordinator
+    scheduler._latest_omni_connector_output = None
+    scheduler._gen_sched_log_ctr = 0
+    scheduler.log_stats = False
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=lambda req, num_new_tokens, num_lookahead_tokens: SimpleNamespace(get_block_ids=lambda: ([0],)),
+        get_num_common_prefix_blocks=lambda req_id: [0],
+        take_new_block_ids=lambda: [],
+        take_events=lambda: None,
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.finished_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
+        req_ids=[request.request_id],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[request.num_computed_tokens],
+        num_output_tokens=[0],
+        prompt_token_ids={request.request_id: request.prompt_token_ids},
+    )
+
+    scheduled = OmniGenerationScheduler.schedule(scheduler)
+
+    assert scheduled.num_scheduled_tokens == {request.request_id: 1}
+    assert request.prompt_token_ids == [11, 12, 13, 0]
+
+
+def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placeholder():
+    request = SimpleNamespace(
+        request_id="req-finished-empty-tuple",
+        prompt_token_ids=(),
+        _all_token_ids=[],
+        _output_token_ids=[],
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
+        num_cached_tokens=0,
+        client_index=0,
+        status=RequestStatus.WAITING,
+        stop_reason=None,
+        sampling_params=None,
+        structured_output_request=None,
+        mm_features=None,
+        multimodal_kwargs=None,
+        multi_modal_kwargs=None,
+        data=None,
+        eos_token_id=None,
+        arrival_time=0.0,
+        queue_remaining_tokens=None,
+        prompt=None,
+        prompt_token_ids_history=None,
+        all_token_ids=[],
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        additional_information=None,
+    )
+
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    coordinator.finished_requests.add(request.request_id)
+
+    scheduler = _build_generation_scheduler(request, coordinator)
+    scheduler.max_num_scheduled_tokens = 16
+    scheduler.num_lookahead_tokens = 0
+    scheduler.max_num_running_reqs = 8
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler._gen_sched_log_ctr = 0
+    scheduler.waiting = MockWaitingQueue([request])
+    scheduler.running = []
+    scheduler.requests = {request.request_id: request}
+    scheduler.log_stats = False
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=lambda req, num_new_tokens, num_lookahead_tokens: SimpleNamespace(get_block_ids=lambda: ([0],)),
+        get_num_common_prefix_blocks=lambda req_id: [0],
+        take_new_block_ids=lambda: [],
+        take_events=lambda: None,
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.ec_connector = None
+    scheduler.finished_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
+        req_ids=[request.request_id],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[None],
+        num_computed_tokens=[request.num_computed_tokens],
+        num_output_tokens=[0],
+        prompt_token_ids={request.request_id: request.prompt_token_ids},
+    )
+
+    scheduled = OmniGenerationScheduler.schedule(scheduler)
+
+    assert scheduled.num_scheduled_tokens == {request.request_id: 1}
+    assert request.prompt_token_ids == [0]
+    assert request._all_token_ids == [0]
 
 
 if __name__ == "__main__":

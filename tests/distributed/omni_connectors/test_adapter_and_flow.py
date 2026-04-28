@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from unittest.mock import MagicMock
+
 import pytest
-from pytest_mock import MockerFixture
 
 from vllm_omni.distributed.omni_connectors.adapter import try_recv_via_connector, try_send_via_connector
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import SharedMemoryConnector
@@ -13,8 +14,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 @pytest.fixture
-def mock_objects(mocker: MockerFixture):
-    return {"connector": mocker.MagicMock(), "metrics": mocker.MagicMock(), "queue_fn": mocker.MagicMock()}
+def mock_objects():
+    return {"connector": MagicMock(), "metrics": MagicMock(), "queue_fn": MagicMock()}
 
 
 def test_send_success(mock_objects):
@@ -139,7 +140,7 @@ def test_recv_no_connector():
     assert inputs is None
 
 
-def test_shm_connector_flow(mocker: MockerFixture):
+def test_shm_connector_flow():
     """
     Verify the full flow: Send -> Adapter -> Connector -> Adapter -> Recv.
     Using real SharedMemoryConnector (inline mode for simplicity).
@@ -162,7 +163,7 @@ def test_shm_connector_flow(mocker: MockerFixture):
     def mock_submit(payload):
         queue_capture.append(payload)
 
-    mock_metrics = mocker.MagicMock()
+    mock_metrics = MagicMock()
 
     # 3. Send
     success = try_send_via_connector(
@@ -218,7 +219,7 @@ def test_get_connectors_for_stage():
     assert stage_2_config["from_stage_1"]["spec"]["name"] == "C2"
 
 
-def test_recv_with_missing_metadata(mocker: MockerFixture):
+def test_recv_with_missing_metadata():
     """Test recv when queue payload is malformed (missing metadata)."""
     # Connector expects metadata but task doesn't have it
     task = {
@@ -227,7 +228,7 @@ def test_recv_with_missing_metadata(mocker: MockerFixture):
         "from_stage": "0",
         # Missing "connector_metadata"
     }
-    mock_conn = mocker.MagicMock()
+    mock_conn = MagicMock()
     # If get is called with None metadata, connector usually handles it or adapter handles exception
     mock_conn.get.side_effect = Exception("Get failed")
 

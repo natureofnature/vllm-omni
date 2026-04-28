@@ -24,6 +24,16 @@ from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.worker.payload_span import (
+    CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+    CACHED_THINKER_DECODE_TOKEN_END_KEY,
+    CACHED_THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_DECODE_EMBEDDINGS_KEY,
+    THINKER_DECODE_TOKEN_END_KEY,
+    THINKER_DECODE_TOKEN_START_KEY,
+    get_tensor_span,
+    merge_tensor_spans,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -39,8 +49,15 @@ logger = init_logger(__name__)
 
 
 class OmniGPUModelRunner(GPUModelRunner):
+    _GENERATION_CODEC_PAYLOAD_QUEUE_KEY = "__generation_codec_payload_queue"
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        # Per-request runtime payload source of truth.
+        # Data enters here from:
+        # 1. new-request bootstrap via scheduler_output.scheduled_new_reqs
+        # 2. connector-delivered payloads merged by _sync_local_stage_payloads()
+        # 3. model-side state updates written by _update_intermediate_buffer()
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
@@ -149,6 +166,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             if use_audio_in_video_value is not None:
                 use_audio_in_video = bool(use_audio_in_video_value.item())
 
+        if not req_state.prompt_token_ids and req_state.prompt_embeds is not None and not req_state.mm_features:
+            # Some downstream text-only stages are seeded with prompt embeds but no
+            # token ids. They still need linear M-RoPE positions for the prompt.
+            num_prompt_embeds = int(req_state.prompt_embeds.shape[0])
+            req_state.mrope_positions = torch.arange(num_prompt_embeds, dtype=torch.long).expand(3, -1)
+            req_state.mrope_position_delta = 0
+            return
+
         if supports_mrope(self.get_model()):
             # Model implements SupportsMRoPE interface
             # Pass all extracted metadata; models use what they need via **kwargs
@@ -195,6 +220,22 @@ class OmniGPUModelRunner(GPUModelRunner):
         class attribute.  When set, ``get_mrope_input_positions`` is expected
         to return positions covering **both** prefill and decode tokens.
         """
+        from vllm.utils import length_from_prompt_token_ids_or_embeds
+
+        for req_id in self.input_batch.req_ids:
+            req = self.requests[req_id]
+            if req.mrope_positions is None or req.mrope_positions.shape[1] != 0:
+                continue
+
+            prompt_len = length_from_prompt_token_ids_or_embeds(req.prompt_token_ids, req.prompt_embeds)
+            if prompt_len <= 0:
+                continue
+
+            # Some seeded downstream requests still arrive with an empty cached
+            # M-RoPE tensor even though the prompt length is non-zero.
+            req.mrope_positions = torch.arange(prompt_len, dtype=torch.long).expand(3, -1)
+            req.mrope_position_delta = 0
+
         # Run upstream logic (handles prompt positions + linear decode fallback)
         super()._calc_mrope_positions(scheduler_output)
 
@@ -259,8 +300,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         new/resumed/paused/finished request in the batch.
         """
         # Used for prefix cache
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
+        omni_prefix_cache = getattr(self, "omni_prefix_cache", None)
+        if omni_prefix_cache is not None:
+            omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
         # Remove finished requests from the cached states.
         for req_id in scheduler_output.finished_req_ids:
@@ -280,8 +322,9 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         # Zero GPU memory for freshly allocated cache blocks to prevent
         # stale NaN/data from corrupting attention or SSM computation.
-        if scheduler_output.new_block_ids_to_zero:
-            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
+        new_block_ids_to_zero = getattr(scheduler_output, "new_block_ids_to_zero", None)
+        if new_block_ids_to_zero:
+            self._zero_block_ids(new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -327,8 +370,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             # num_computed_tokens > 0 means that we have a hit in prefix
             # caching; mark it so that we can manage the hidden states
             # later on as needed.
-            if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
-                self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
+            omni_prefix_cache = getattr(self, "omni_prefix_cache", None)
+            if omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
+                omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
@@ -365,14 +409,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             if hasattr(self, "late_interaction_runner"):
                 self.late_interaction_runner.register_request(req_id, pooling_params)
 
-            # If prompt embeddings are provided, decode and attach to inter_data
+            ext_id = getattr(new_req_data, "external_req_id", None)
+            if ext_id is not None:
+                req_state.external_req_id = ext_id
+
+            # Decode prompt embeddings once and keep a CPU copy for downstream use.
             try:
-                if getattr(new_req_data, "prompt_embeds", None) is not None:
-                    payload = new_req_data.prompt_embeds
-                    dtype = getattr(np, payload.dtype)
-                    arr = np.frombuffer(payload.data, dtype=dtype)
-                    arr = arr.reshape(payload.shape)
-                    pe_cpu = torch.from_numpy(arr)
+                pe_cpu = self._resolve_prompt_embeds_cpu(getattr(new_req_data, "prompt_embeds", None))
+                if pe_cpu is not None:
                     setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
                     try:
                         new_req_data.prompt_embeds = pe_cpu  # type: ignore[assignment]
@@ -380,23 +424,24 @@ class OmniGPUModelRunner(GPUModelRunner):
                         pass
             except Exception as e:
                 logger.error(f"Error decoding prompt embeds: {e}")
-            # Decode additional_information payloads (dictionary)
+            # Seed model_intermediate_buffer for newly scheduled requests.
             try:
-                if getattr(new_req_data, "additional_information", None) is not None:
-                    logger.warning_once(
-                        "additional_information on request data is deprecated, use model_intermediate_buffer"
-                    )
-                    payload_info = new_req_data.additional_information
-                    info_dict = deserialize_additional_information(payload_info)
-                    if info_dict:
-                        self.model_intermediate_buffer[req_id] = info_dict
-                        setattr(
-                            self.requests[req_id],
-                            "additional_information_cpu",
-                            info_dict,
+                initial_model_buffer = getattr(new_req_data, "initial_model_buffer", None)
+                if initial_model_buffer is None:
+                    legacy_payload = getattr(new_req_data, "additional_information", None)
+                    if legacy_payload is not None:
+                        logger.warning_once(
+                            "additional_information on request data is deprecated, use model_intermediate_buffer"
                         )
+                        initial_model_buffer = self._resolve_initial_model_buffer(legacy_payload)
+                elif not isinstance(initial_model_buffer, dict):
+                    initial_model_buffer = self._resolve_initial_model_buffer(initial_model_buffer)
+                if initial_model_buffer:
+                    existing_model_buffer = self.model_intermediate_buffer.setdefault(req_id, {})
+                    for key, value in dict(initial_model_buffer).items():
+                        existing_model_buffer.setdefault(key, value)
             except Exception as e:
-                logger.error(f"Error decoding additional information: {e}")
+                logger.error(f"Error storing initial model buffer: {e}")
 
             if sampling_params and sampling_params.prompt_logprobs is not None:
                 self.num_prompt_logprobs[req_id] = (
@@ -932,23 +977,15 @@ class OmniGPUModelRunner(GPUModelRunner):
         return hidden_states, hidden_states[logit_indices_device]
 
     # ------------------------------------------------------------------
-    # Payload decoding helpers (torch.Tensor passthrough + legacy
-    # PromptEmbedsPayload / AdditionalInformationPayload support)
+    # Payload decoding helpers (torch.Tensor passthrough + compatibility
+    # decoding for legacy additional_information payloads)
     # ------------------------------------------------------------------
 
     @staticmethod
     def _resolve_prompt_embeds_cpu(
         pe: "torch.Tensor | object | None",
     ) -> torch.Tensor | None:
-        """Convert *prompt_embeds* to a contiguous CPU tensor.
-
-        Accepts:
-        - ``torch.Tensor`` – moved to CPU as-is (the normal path after
-          upstream added ``prompt_embeds`` to ``EngineCoreRequest``).
-        - Legacy ``PromptEmbedsPayload`` (or any duck-typed object with
-          ``.data``, ``.shape``, ``.dtype``) – decoded via numpy.
-        - ``None`` – returns ``None``.
-        """
+        """Convert *prompt_embeds* to a contiguous CPU tensor."""
         if pe is None:
             return None
         try:
@@ -964,34 +1001,35 @@ class OmniGPUModelRunner(GPUModelRunner):
             logger.exception("Failed to decode prompt_embeds payload")
         return None
 
-    def _decode_and_store_request_payloads(
-        self,
-        scheduler_output: "SchedulerOutput",
-    ) -> None:
-        """Decode per-request prompt_embeds and additional_information for
-        newly scheduled requests and store them on CPU in the request state.
-        """
-        new_reqs = getattr(scheduler_output, "scheduled_new_reqs", [])
-        if not new_reqs:
-            return
-        for nr in new_reqs:
-            req_id = getattr(nr, "req_id", None) or getattr(nr, "request_id", None)
-            if req_id is None or req_id not in self.requests:
-                continue
-            pe_cpu = self._resolve_prompt_embeds_cpu(getattr(nr, "prompt_embeds", None))
-            if pe_cpu is not None:
-                setattr(self.requests[req_id], "prompt_embeds_cpu", pe_cpu)
-            info_payload = getattr(nr, "additional_information", None)
-            if info_payload is not None:
-                logger.warning_once(
-                    "additional_information on request data is deprecated, use model_intermediate_buffer"
-                )
-            info_dict = deserialize_additional_information(info_payload)
-            if info_dict:
-                self.model_intermediate_buffer[req_id] = info_dict
-                setattr(self.requests[req_id], "additional_information_cpu", info_dict)
+    @staticmethod
+    def _resolve_initial_model_buffer(
+        payload: "dict | object | None",
+    ) -> dict[str, Any]:
+        """Convert runtime seed payloads to a plain dict."""
+        if payload is None:
+            return {}
+        if isinstance(payload, dict):
+            return dict(payload)
+        try:
+            entries = getattr(payload, "entries", None)
+            if not isinstance(entries, dict):
+                return {}
+            info: dict[str, Any] = {}
+            for k, entry in entries.items():
+                tensor_data = getattr(entry, "tensor_data", None)
+                if tensor_data is not None:
+                    dt = np.dtype(getattr(entry, "tensor_dtype", "float32"))
+                    arr = np.frombuffer(tensor_data, dtype=dt)
+                    arr = arr.reshape(getattr(entry, "tensor_shape", ()))
+                    info[k] = torch.from_numpy(arr.copy())
+                else:
+                    info[k] = getattr(entry, "list_data", None)
+            return info
+        except Exception:
+            logger.exception("Failed to decode initial model buffer payload")
+        return {}
 
-    def _gather_runtime_additional_information(self) -> list[dict]:
+    def _gather_model_intermediate_buffer(self) -> list[dict]:
         """Gather per-request model_intermediate_buffer in batch order."""
         per_req_runtime_info = []
         for req_id in self.input_batch.req_ids:
@@ -1006,8 +1044,49 @@ class OmniGPUModelRunner(GPUModelRunner):
             generated_len = len(req_state.output_token_ids) if req_state is not None else 0
             info = self.model_intermediate_buffer.get(req_id, {})
             if info:
+                if getattr(self, "_model_mode", None) == "generation":
+                    payload_queue = info.get(self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY)
+                    if isinstance(payload_queue, list) and payload_queue:
+                        info = {
+                            key: value for key, value in info.items() if key != self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY
+                        }
+                        info.update(payload_queue[0])
+                if getattr(self, "_model_mode", None) == "generation" and "code_predictor_codes" in info:
+                    info = dict(info)
                 info["generated_len"] = generated_len
                 per_req_runtime_info.append(info)
+                if getattr(self, "_model_mode", None) == "generation" and "code_predictor_codes" in info:
+                    buffered = self.model_intermediate_buffer.get(req_id)
+                    if isinstance(buffered, dict):
+                        payload_queue = buffered.get(self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY)
+                        if isinstance(payload_queue, list) and payload_queue:
+                            payload_queue.pop(0)
+                            if payload_queue:
+                                finished_load_reqs = getattr(self, "_finished_load_reqs", None)
+                                if finished_load_reqs is not None:
+                                    # A burst of async codec chunks can already be queued locally
+                                    # before the scheduler re-enters WAITING_FOR_CHUNK. Re-arm the
+                                    # request so the remaining queued payloads still trigger follow-up
+                                    # decode steps without waiting for another connector recv.
+                                    finished_load_reqs.add(req_id)
+                            else:
+                                if info.get("finished"):
+                                    chunk_finished_req_ids = getattr(self, "_chunk_finished_req_ids", None)
+                                    if chunk_finished_req_ids is not None:
+                                        chunk_finished_req_ids.add(req_id)
+                                    chunk_stream_completed = getattr(self, "_chunk_stream_completed", None)
+                                    if chunk_stream_completed is not None:
+                                        chunk_stream_completed.add(req_id)
+                                    terminal_chunk_pending = getattr(
+                                        self, "_generation_terminal_chunk_pending_req_ids", None
+                                    )
+                                    if terminal_chunk_pending is not None:
+                                        terminal_chunk_pending.discard(req_id)
+                                buffered.pop(self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY, None)
+                        for key in ("code_predictor_codes", "code_num_quantizers", "left_context_size", "finished"):
+                            buffered.pop(key, None)
+                        if not buffered:
+                            self.model_intermediate_buffer.pop(req_id, None)
                 if "thinker_reply_part_per_request" in info:
                     q = info["thinker_reply_part_per_request"]
                     if hasattr(q, "shape"):
@@ -1025,19 +1104,290 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
+    def _drop_inactive_runtime_state(self, req_id: str) -> None:
+        drop_inactive_request_runtime_state = getattr(self, "drop_inactive_request_runtime_state", None)
+        if callable(drop_inactive_request_runtime_state):
+            drop_inactive_request_runtime_state(req_id)
+            return
+
+        request_ids_mapping = getattr(self, "_request_ids_mapping", {})
+        request_payload = getattr(self, "_send_side_request_payload", None)
+        local_request_metadata = getattr(self, "_local_request_metadata", None)
+        pending_load_reqs = getattr(self, "_pending_load_reqs", None)
+        finished_load_reqs = getattr(self, "_finished_load_reqs", None)
+        chunk_ready_req_ids = getattr(self, "_chunk_ready_req_ids", None)
+        chunk_finished_req_ids = getattr(self, "_chunk_finished_req_ids", None)
+        chunk_stream_completed = getattr(self, "_chunk_stream_completed", None)
+        full_payload_pending_broadcast_req_ids = getattr(self, "_full_payload_pending_broadcast_req_ids", None)
+        stage_recv_req_ids = getattr(self, "_stage_recv_req_ids", None)
+        get_req_chunk = getattr(self, "_get_req_chunk", None)
+
+        self.model_intermediate_buffer.pop(req_id, None)
+        if isinstance(request_ids_mapping, dict):
+            ext_req_id = request_ids_mapping.pop(req_id, req_id)
+        else:
+            ext_req_id = req_id
+        if isinstance(request_payload, dict):
+            request_payload.pop(ext_req_id, None)
+            if ext_req_id != req_id:
+                request_payload.pop(req_id, None)
+        if isinstance(local_request_metadata, dict):
+            local_request_metadata.pop(req_id, None)
+        if isinstance(pending_load_reqs, dict):
+            pending_load_reqs.pop(req_id, None)
+        if full_payload_pending_broadcast_req_ids is not None:
+            full_payload_pending_broadcast_req_ids.discard(req_id)
+        if isinstance(get_req_chunk, dict):
+            get_req_chunk.pop(req_id, None)
+        if finished_load_reqs is not None:
+            finished_load_reqs.discard(req_id)
+        if chunk_ready_req_ids is not None:
+            chunk_ready_req_ids.discard(req_id)
+        if chunk_finished_req_ids is not None:
+            chunk_finished_req_ids.discard(req_id)
+        if chunk_stream_completed is not None:
+            chunk_stream_completed.discard(req_id)
+        if stage_recv_req_ids is not None:
+            stage_recv_req_ids.discard(req_id)
+
+    def _sync_local_stage_payloads(self) -> None:
+        """Merge staged recv payloads into `model_intermediate_buffer`.
+
+        Called before _gather_model_intermediate_buffer so that payloads
+        received via the connector become visible to the model without an
+        engine-core round-trip (RFC §2.4).
+
+        The `_local_stage_payload_cache -> _sync_local_stage_payloads()`
+        split is intentional: recv-side code may run off-thread, while
+        `model_intermediate_buffer` is runner-owned runtime state for the
+        current execute step. Do not bypass the staging cache unless the
+        recv/model ownership model is deliberately redesigned.
+        """
+        if not hasattr(self, "_local_stage_payload_cache"):
+            return
+        active_requests = getattr(self, "requests", None)
+        protected_req_ids: set[str] | None = None
+        if active_requests is not None:
+            protected_req_ids = set(active_requests.keys())
+            pending_load_reqs = getattr(self, "_pending_load_reqs", None)
+            if isinstance(pending_load_reqs, dict):
+                protected_req_ids.update(pending_load_reqs.keys())
+            stage_recv_req_ids = getattr(self, "_stage_recv_req_ids", None)
+            if stage_recv_req_ids is not None:
+                protected_req_ids.update(stage_recv_req_ids)
+            local_request_metadata = getattr(self, "_local_request_metadata", None)
+            if isinstance(local_request_metadata, dict):
+                protected_req_ids.update(local_request_metadata.keys())
+            if hasattr(self, "prune_inactive_requests"):
+                self.prune_inactive_requests(protected_req_ids)
+        if hasattr(self, "_lock"):
+            with self._lock:
+                full_payload_pending_broadcast_req_ids = set(
+                    getattr(self, "_full_payload_pending_broadcast_req_ids", set())
+                )
+                if full_payload_pending_broadcast_req_ids:
+                    staged_payloads = {
+                        req_id: payload
+                        for req_id, payload in self._local_stage_payload_cache.items()
+                        if req_id not in full_payload_pending_broadcast_req_ids
+                    }
+                    for req_id in staged_payloads:
+                        self._local_stage_payload_cache.pop(req_id, None)
+                else:
+                    staged_payloads = dict(self._local_stage_payload_cache)
+                    self._local_stage_payload_cache.clear()
+        else:
+            full_payload_pending_broadcast_req_ids = set(
+                getattr(self, "_full_payload_pending_broadcast_req_ids", set())
+            )
+            if full_payload_pending_broadcast_req_ids:
+                staged_payloads = {
+                    req_id: payload
+                    for req_id, payload in self._local_stage_payload_cache.items()
+                    if req_id not in full_payload_pending_broadcast_req_ids
+                }
+                for req_id in staged_payloads:
+                    self._local_stage_payload_cache.pop(req_id, None)
+            else:
+                staged_payloads = dict(self._local_stage_payload_cache)
+                self._local_stage_payload_cache.clear()
+        for req_id, payload in staged_payloads.items():
+            if payload is None:
+                continue
+            if protected_req_ids is not None and req_id not in protected_req_ids:
+                self._drop_inactive_runtime_state(req_id)
+                continue
+            payload_prompt_len = 0
+            effective_payload_prompt_len = 0
+            if isinstance(payload, dict):
+                payload_codes = payload.get("code_predictor_codes")
+                if isinstance(payload_codes, torch.Tensor):
+                    payload_prompt_len = int(payload_codes.numel())
+                elif hasattr(payload_codes, "__len__"):
+                    payload_prompt_len = len(payload_codes)
+                effective_payload_prompt_len = payload_prompt_len
+                payload_left_context = payload.get("left_context_size")
+                if isinstance(payload_left_context, list):
+                    payload_left_context = payload_left_context[0] if payload_left_context else 0
+                if isinstance(payload_left_context, torch.Tensor):
+                    payload_left_context = (
+                        payload_left_context.reshape(-1)[0].item() if payload_left_context.numel() > 0 else 0
+                    )
+                payload_num_quantizers = payload.get("code_num_quantizers")
+                if isinstance(payload_num_quantizers, list):
+                    payload_num_quantizers = payload_num_quantizers[0] if payload_num_quantizers else 0
+                if isinstance(payload_num_quantizers, torch.Tensor):
+                    payload_num_quantizers = (
+                        payload_num_quantizers.reshape(-1)[0].item() if payload_num_quantizers.numel() > 0 else 0
+                    )
+                if payload_left_context and payload_num_quantizers:
+                    effective_payload_prompt_len = max(
+                        0,
+                        payload_prompt_len - int(payload_left_context) * int(payload_num_quantizers),
+                    )
+            req_state = self.requests.get(req_id)
+            current_prompt_len = len(req_state.prompt_token_ids) if req_state and req_state.prompt_token_ids else 0
+            if getattr(self, "_model_mode", None) == "generation":
+                generation_next_stage_prompt_len = getattr(self, "_generation_next_stage_prompt_len", {}).get(req_id, 0)
+                if generation_next_stage_prompt_len > current_prompt_len:
+                    current_prompt_len = generation_next_stage_prompt_len
+            if getattr(self, "_model_mode", None) == "generation" and effective_payload_prompt_len > current_prompt_len:
+                if hasattr(self, "_lock"):
+                    with self._lock:
+                        self._local_stage_payload_cache.setdefault(req_id, payload)
+                else:
+                    self._local_stage_payload_cache.setdefault(req_id, payload)
+                continue
+            request_ids_mapping = getattr(self, "_request_ids_mapping", {})
+            request_payload = getattr(self, "_send_side_request_payload", None)
+            finished_load_reqs = getattr(self, "_finished_load_reqs", None)
+            ext_req_id = request_ids_mapping.get(req_id, req_id)
+            existing = self.model_intermediate_buffer.setdefault(req_id, {})
+            if (
+                getattr(self, "_model_mode", None) == "generation"
+                and isinstance(payload, dict)
+                and "code_predictor_codes" in payload
+                and ("left_context_size" in payload or "code_num_quantizers" in payload)
+            ):
+                payload_queue = existing.setdefault(self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY, [])
+                if not isinstance(payload_queue, list):
+                    payload_queue = []
+                    existing[self._GENERATION_CODEC_PAYLOAD_QUEUE_KEY] = payload_queue
+                payload_queue.append(dict(payload))
+                # Re-arm the scheduler wake-up when a previously staged
+                # generation payload finally becomes admissible. Without this,
+                # a payload that was blocked on prompt-length alignment can sit
+                # in the local cache indefinitely after its original
+                # chunk_ready signal has already been consumed.
+                if finished_load_reqs is not None:
+                    finished_load_reqs.add(req_id)
+                if isinstance(request_payload, dict):
+                    request_payload.pop(ext_req_id, None)
+                    if ext_req_id != req_id:
+                        request_payload.pop(req_id, None)
+                continue
+            drop_decode_span = False
+            decode_span_handled = False
+            for key, value in payload.items():
+                if key == THINKER_DECODE_EMBEDDINGS_KEY:
+                    merged_span = merge_tensor_spans(
+                        get_tensor_span(
+                            existing,
+                            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+                            start_key=THINKER_DECODE_TOKEN_START_KEY,
+                            end_key=THINKER_DECODE_TOKEN_END_KEY,
+                        ),
+                        get_tensor_span(
+                            payload,
+                            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+                            start_key=THINKER_DECODE_TOKEN_START_KEY,
+                            end_key=THINKER_DECODE_TOKEN_END_KEY,
+                        ),
+                    )
+                    if merged_span is not None:
+                        (
+                            existing[key],
+                            existing[THINKER_DECODE_TOKEN_START_KEY],
+                            existing[THINKER_DECODE_TOKEN_END_KEY],
+                        ) = merged_span
+                        decode_span_handled = True
+                        continue
+                    if isinstance(value, torch.Tensor):
+                        incoming_span = get_tensor_span(
+                            payload,
+                            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+                            start_key=THINKER_DECODE_TOKEN_START_KEY,
+                            end_key=THINKER_DECODE_TOKEN_END_KEY,
+                        )
+                        if incoming_span is None and (
+                            THINKER_DECODE_TOKEN_START_KEY in payload or THINKER_DECODE_TOKEN_END_KEY in payload
+                        ):
+                            logger.warning(
+                                "[Stage-%s] req=%s dropping invalid thinker decode span metadata before runtime sync",
+                                self._stage_id,
+                                req_id,
+                            )
+                            drop_decode_span = True
+                        existing_value = existing.get(key)
+                        if isinstance(existing_value, torch.Tensor):
+                            if (
+                                THINKER_DECODE_TOKEN_START_KEY in existing
+                                or THINKER_DECODE_TOKEN_END_KEY in existing
+                                or THINKER_DECODE_TOKEN_START_KEY in payload
+                                or THINKER_DECODE_TOKEN_END_KEY in payload
+                            ):
+                                logger.warning(
+                                    "[Stage-%s] req=%s falling back to legacy runtime "
+                                    "thinker decode merge due to missing/invalid/"
+                                    "non-contiguous span metadata",
+                                    self._stage_id,
+                                    req_id,
+                                )
+                                drop_decode_span = True
+                            existing[key] = torch.cat([existing_value, value], dim=0)
+                        else:
+                            existing[key] = value
+                        continue
+                    existing[key] = value
+                    continue
+                if key in {THINKER_DECODE_TOKEN_START_KEY, THINKER_DECODE_TOKEN_END_KEY}:
+                    if decode_span_handled or drop_decode_span:
+                        continue
+                    existing[key] = value
+                    continue
+                if key == "thinker_output_token_ids":
+                    existing_value = existing.get(key)
+                    if isinstance(existing_value, list) and isinstance(value, list):
+                        existing[key] = value if len(value) > len(existing_value) else existing_value
+                    else:
+                        existing[key] = value
+                    continue
+                existing[key] = value
+
+            if drop_decode_span:
+                existing.pop(THINKER_DECODE_TOKEN_START_KEY, None)
+                existing.pop(THINKER_DECODE_TOKEN_END_KEY, None)
+
+            logger.info(
+                "[Stage-%s] _sync_local_stage_payloads: req=%s keys=%s",
+                getattr(self, "_stage_id", "?"),
+                req_id,
+                sorted(existing.keys()),
+            )
+
+            if isinstance(request_payload, dict):
+                request_payload.pop(ext_req_id, None)
+                if ext_req_id != req_id:
+                    request_payload.pop(req_id, None)
+
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
         model_kwargs_extra: dict[str, object] = {}
         try:
-            buffer_map = self._gather_runtime_additional_information()
+            buffer_map = self._gather_model_intermediate_buffer()
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
-            # Backward compatible: also emit old name
-            model_kwargs_extra["runtime_additional_information"] = buffer_map
         except Exception as e:
-            logger.error(f"[OMNI DEBUG] Error building model_kwargs_extra: {e}")
-            import traceback
-
-            traceback.print_exc()
+            logger.exception("[OMNI DEBUG] Error building model_kwargs_extra: %s", e)
 
         if getattr(self.model_config, "has_sampling_extra_args", False):
             extra_args_list: list[dict] = []
@@ -1046,10 +1396,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 sp = req.sampling_params if req else None
                 extra_args_list.append(sp.extra_args if sp and sp.extra_args else {})
             model_kwargs_extra["sampling_extra_args"] = extra_args_list
-
         return model_kwargs_extra
 
-    def _process_additional_information_updates(
+    def _process_model_intermediate_buffer_updates(
         self,
         hidden_states: torch.Tensor,
         multimodal_outputs: object,
@@ -1089,17 +1438,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                     )
                     self._update_intermediate_buffer(req_id, update_dict)
         except Exception as e:
-            logger.error(f"Error merging for requests:{self.input_batch.req_ids} additional information update: {e}")
-            import traceback
+            logger.exception(
+                f"Error merging for requests:{self.input_batch.req_ids} "
+                f"model_intermediate_buffer update: {e}, with the multimodal_outputs "
+                f"as {multimodal_outputs}"
+            )
 
-            traceback.print_exc()
-
-    def _collect_additional_information_for_prefill(
+    def _overlay_prefill_prompt_embeds(
         self,
         num_scheduled_tokens_np: np.ndarray,
-    ) -> dict[str, dict]:
-        """Overlay per-request prompt_embeds for the prefill portion and collect
-        additional_information slices for this step. Returns a map req_id -> dict."""
+    ) -> None:
+        """Overlay per-request prompt_embeds for the prefill portion."""
         for req_index, req_id in enumerate(self.input_batch.req_ids):
             req_state = self.requests[req_id]
             pe_cpu = getattr(req_state, "prompt_embeds_cpu", None)
@@ -1116,24 +1465,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 )
                 start_offset = int(self.query_start_loc.cpu[req_index])
                 self.inputs_embeds[start_offset : start_offset + overlay_len].copy_(src)
-
-    def _update_additional_information(self, scheduler_output: "SchedulerOutput") -> None:
-        for new_req in scheduler_output.scheduled_new_reqs:
-            payload_info = getattr(new_req, "additional_information", None)
-            if isinstance(payload_info, dict):
-                logger.warning_once(
-                    "additional_information on request data is deprecated, use model_intermediate_buffer"
-                )
-                self._update_intermediate_buffer(new_req.req_id, payload_info)
-
-        if hasattr(scheduler_output.scheduled_cached_reqs, "additional_information"):
-            logger.warning_once(
-                "additional_information on scheduled_cached_reqs is deprecated, use model_intermediate_buffer"
-            )
-            cached_infos = getattr(scheduler_output.scheduled_cached_reqs, "additional_information", {})
-            if isinstance(cached_infos, dict):
-                for req_id, req_infos in cached_infos.items():
-                    self._update_intermediate_buffer(req_id, req_infos)
 
     def _maybe_attach_mimo_audio_req_infos(
         self,
@@ -1164,7 +1495,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         num_input_tokens: int,
         intermediate_tensors: IntermediateTensors | None = None,
     ):
-        """Align with v0.14.0 preprocess and omni's additional information handling."""
+        """Align with v0.14.0 preprocess and omni's runtime payload handoff."""
+        # Sync connector-delivered payloads into the runner-local buffer before
+        # model preprocess so the direct data plane wins over stale metadata.
+        self._sync_local_stage_payloads()
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         is_first_rank = get_pp_group().is_first_rank
         is_encoder_decoder = self.model_config.is_encoder_decoder
@@ -1267,23 +1602,14 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
         self._omni_num_scheduled_tokens_np = num_scheduled_tokens_np
 
-        # Note: only prefill need collect additional_information for now.
-        # Decode don't need per_req_additional_information anymore.
+        # Note: only prefill needs per-request prompt/data overlays at this stage.
         if inputs_embeds is not None:
-            # Prefill: overlay prompt_embeds and collect additional_information
-            self._collect_additional_information_for_prefill(num_scheduled_tokens_np)
-
-        # Keep per-request additional_information in sync for both new and
-        # cached requests. This is required for stages without preprocess
-        # (e.g., code2wav) so runtime_additional_information can be refreshed
-        # from scheduler cached infos on every step.
-        if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
-            if self.vllm_config.model_config.async_chunk:
-                self._update_additional_information(scheduler_output)
+            # Prefill: overlay prompt_embeds and gather request-local runtime info.
+            self._overlay_prefill_prompt_embeds(num_scheduled_tokens_np)
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
-            # Overlay custom prompt_embeds per request for the prompt portion;
-            # collect additional_information (tensor/list) for prefill portion only
+            # Overlay custom prompt_embeds per request for the prompt portion
+            # while reading all runtime payloads from model_intermediate_buffer.
             decode_req_ids = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
@@ -1320,7 +1646,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                     decode_req_ids.append(req_id)
 
                 # TODO(Peiqi): the merge stage could move out from the critical path
-                self._merge_additional_information_update(req_id, update_dict)
+                self._update_intermediate_buffer(req_id, update_dict)
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
@@ -1353,13 +1679,9 @@ class OmniGPUModelRunner(GPUModelRunner):
             use_cascade_attn=False,
         )
         # Force eager for unwrapped code predictors (AR loops / multinomial).
-        # When talker_mtp is not a CUDAGraphWrapper, it manages its own CUDA
-        # graphs internally (code_predictor has its own bucket sizes).
         if not isinstance(self.talker_mtp, CUDAGraphWrapper):
             _cudagraph_mode = CUDAGraphMode.NONE
-            num_tokens_padded = decode_batch_size
-        else:
-            num_tokens_padded = batch_desc.num_tokens
+        num_tokens_padded = batch_desc.num_tokens
         req_input_ids = self.talker_mtp_input_ids.gpu[:num_tokens_padded]
         req_embeds = self.talker_mtp_inputs_embeds.gpu[:num_tokens_padded]
         last_talker_hidden = self.last_talker_hidden.gpu[:num_tokens_padded]
@@ -1380,17 +1702,17 @@ class OmniGPUModelRunner(GPUModelRunner):
                 top_k=subtalker_params.get("top_k"),
                 top_p=subtalker_params.get("top_p"),
             )
-        # code_predictor_codes stays on GPU here; _update_intermediate_buffer
-        # keeps it device-resident when the key is in gpu_resident_buffer_keys.
-        # D2H is deferred to sample_tokens where hidden_states.to("cpu") already
-        # syncs the stream, avoiding a per-step cudaStreamSynchronize.
+        # Keep code predictor outputs on GPU for gpu_resident_buffer_keys such
+        # as Qwen3-TTS audio_codes. D2H is deferred to sample_tokens, which
+        # avoids per-step synchronization and prevents mixing CPU decode chunks
+        # with GPU-prefill placeholders in model_intermediate_buffer.
         out_key = getattr(self.model, "talker_mtp_output_key", "code_predictor_codes")
         for idx, req_id in enumerate(decode_req_ids):
             req_index = self.input_batch.req_ids.index(req_id)
             start_offset = int(self.query_start_loc.cpu[req_index])
             inputs_embeds[start_offset : start_offset + 1] = req_embeds[idx : idx + 1]
             update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
-            self._merge_additional_information_update(req_id, update_dict)
+            self._update_intermediate_buffer(req_id, update_dict)
 
     def _model_forward(
         self,
@@ -1428,7 +1750,65 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self, "model") and hasattr(self.model, "gpu_resident_buffer_keys"):
             gpu_keys = self.model.gpu_resident_buffer_keys
         existing = self.model_intermediate_buffer.setdefault(req_id, {})
+        incoming_cached_span = get_tensor_span(
+            upd,
+            tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+            end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+        )
         for k, v in upd.items():
+            if k == CACHED_THINKER_DECODE_EMBEDDINGS_KEY:
+                existing_cached_span = get_tensor_span(
+                    existing,
+                    tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+                    start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+                    end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+                )
+                if incoming_cached_span is not None:
+                    merged_span = (
+                        incoming_cached_span
+                        if existing_cached_span is None
+                        else merge_tensor_spans(existing_cached_span, incoming_cached_span)
+                    )
+                    if merged_span is not None:
+                        tensor, start, end = merged_span
+                        existing[CACHED_THINKER_DECODE_EMBEDDINGS_KEY] = tensor.detach().to("cpu").contiguous()
+                        existing[CACHED_THINKER_DECODE_TOKEN_START_KEY] = start
+                        existing[CACHED_THINKER_DECODE_TOKEN_END_KEY] = end
+                        continue
+                    if existing_cached_span is not None:
+                        if incoming_cached_span[1] >= existing_cached_span[2]:
+                            logger.warning(
+                                "[Stage-%s] req=%s replacing stale cached thinker decode "
+                                "span due to non-contiguous postprocess update: "
+                                "existing=(%s,%s) incoming=(%s,%s)",
+                                getattr(self, "_stage_id", "?"),
+                                req_id,
+                                existing_cached_span[1],
+                                existing_cached_span[2],
+                                incoming_cached_span[1],
+                                incoming_cached_span[2],
+                            )
+                            tensor, start, end = incoming_cached_span
+                            existing[CACHED_THINKER_DECODE_EMBEDDINGS_KEY] = tensor.detach().to("cpu").contiguous()
+                            existing[CACHED_THINKER_DECODE_TOKEN_START_KEY] = start
+                            existing[CACHED_THINKER_DECODE_TOKEN_END_KEY] = end
+                            continue
+                        logger.warning(
+                            "[Stage-%s] req=%s keeping existing cached thinker decode "
+                            "span due to non-contiguous postprocess update: "
+                            "existing=(%s,%s) incoming=(%s,%s)",
+                            getattr(self, "_stage_id", "?"),
+                            req_id,
+                            existing_cached_span[1],
+                            existing_cached_span[2],
+                            incoming_cached_span[1],
+                            incoming_cached_span[2],
+                        )
+                        continue
+            if k in {CACHED_THINKER_DECODE_TOKEN_START_KEY, CACHED_THINKER_DECODE_TOKEN_END_KEY}:
+                if incoming_cached_span is not None:
+                    continue
             if isinstance(v, torch.Tensor):
                 if k in gpu_keys:
                     existing[k] = v.detach().clone()
@@ -1440,7 +1820,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 ]
             else:
                 existing[k] = v
-        # Backward compatible: mirror to old setattr location
         setattr(req_state, "additional_information_cpu", existing)
 
     def _merge_additional_information_update(self, req_id, upd):
@@ -1448,7 +1827,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         return self._update_intermediate_buffer(req_id, upd)
 
     def _update_streaming_input_additional_info(self, new_req_data, req_id):
-        # For streaming input prefill case only. Update buffer from last segment input
         cached_additional_info = self.model_intermediate_buffer.get(req_id, {})
         if cached_additional_info:
             payload_info = getattr(new_req_data, "additional_information", None)
@@ -1467,8 +1845,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                         else:
                             merged_info[key] = torch.cat((old_tensor, inc_tensor), dim=0)
                         continue
-
-                    # Default for other keys: latest value.
                     merged_info[key] = value
                 merged_info["num_processed_tokens"] = 0
                 self.model_intermediate_buffer[req_id] = merged_info

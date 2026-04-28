@@ -5,6 +5,8 @@ from typing import Any
 import torch
 from vllm.logger import init_logger
 
+from vllm_omni.model_executor.stage_input_processors._common import validate_stage_inputs
+
 logger = init_logger(__name__)
 
 
@@ -31,9 +33,8 @@ def slow_ar_to_dac_decoder(
 ) -> list[Any]:
     """Non-async processor: wait for Slow AR to finish, then pass all codes to DAC decoder."""
     from vllm_omni.inputs.data import OmniTokensPrompt
-    from vllm_omni.model_executor.stage_input_processors.qwen3_omni import _validate_stage_inputs
 
-    slow_ar_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    slow_ar_outputs = validate_stage_inputs(stage_list, engine_input_source)
     dac_inputs: list[OmniTokensPrompt] = []
 
     for output in slow_ar_outputs:

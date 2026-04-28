@@ -46,6 +46,128 @@ from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorMode
 logger = init_logger(__name__)
 
 
+def _strip_trailing_placeholder_tokens(token_ids: list[int] | None) -> list[int]:
+    if not token_ids:
+        return []
+    end = len(token_ids)
+    while end > 0 and int(token_ids[end - 1]) == -1:
+        end -= 1
+    return list(token_ids[:end])
+
+
+class _AsyncChunkRequestAdapter:
+    """Thin adapter that wraps ``CachedRequestState`` to expose the
+    attributes expected by async-chunk processor functions
+    (``external_req_id``, ``all_token_ids``, ``is_finished()``).
+
+    ``CachedRequestState`` uses ``req_id`` whereas
+    ``OmniEngineCoreRequest`` uses ``request_id`` / ``external_req_id``.
+    This adapter bridges the gap without mutating the original object.
+    """
+
+    __slots__ = ("_inner", "_external_req_id", "_finished")
+
+    def __init__(self, cached_state: Any, external_req_id: str, finished: bool):
+        self._inner = cached_state
+        self._external_req_id = external_req_id
+        self._finished = finished
+
+    # ---- attributes expected by process functions ----
+    @property
+    def external_req_id(self) -> str:
+        return self._external_req_id
+
+    @property
+    def request_id(self) -> str:  # for send_chunk
+        return self._inner.req_id
+
+    @property
+    def req_id(self) -> str:
+        return self._inner.req_id
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        prompt = self._inner.prompt_token_ids or []
+        return list(prompt) + self.output_token_ids
+
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        return self._inner.prompt_token_ids
+
+    @property
+    def output_token_ids(self) -> list[int]:
+        return _strip_trailing_placeholder_tokens(self._inner.output_token_ids)
+
+    def is_finished(self) -> bool:
+        return self._finished
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate everything else to the inner CachedRequestState
+        return getattr(self._inner, name)
+
+
+class _FinishSentinelAdapter:
+    """Finish-sentinel adapter that can optionally reuse the last live request snapshot."""
+
+    __slots__ = ("_req_id", "_external_req_id", "_snapshot")
+
+    def __init__(self, req_id: str, external_req_id: str, snapshot: Any | None = None):
+        self._req_id = req_id
+        self._external_req_id = external_req_id
+        self._snapshot = snapshot
+
+    @property
+    def external_req_id(self) -> str:
+        if self._snapshot is not None and hasattr(self._snapshot, "external_req_id"):
+            return str(self._snapshot.external_req_id)
+        return self._external_req_id
+
+    @property
+    def request_id(self) -> str:
+        if self._snapshot is not None and hasattr(self._snapshot, "request_id"):
+            return str(self._snapshot.request_id)
+        return self._req_id
+
+    @property
+    def req_id(self) -> str:
+        if self._snapshot is not None and hasattr(self._snapshot, "req_id"):
+            return str(self._snapshot.req_id)
+        return self._req_id
+
+    @property
+    def all_token_ids(self) -> list[int]:
+        if self._snapshot is not None and hasattr(self._snapshot, "all_token_ids"):
+            return _strip_trailing_placeholder_tokens(self._snapshot.all_token_ids)
+        return []
+
+    @property
+    def prompt_token_ids(self) -> list[int] | None:
+        if self._snapshot is not None and hasattr(self._snapshot, "prompt_token_ids"):
+            prompt = self._snapshot.prompt_token_ids
+            return list(prompt) if prompt is not None else None
+        return []
+
+    @property
+    def output_token_ids(self) -> list[int]:
+        if self._snapshot is not None and hasattr(self._snapshot, "output_token_ids"):
+            return _strip_trailing_placeholder_tokens(self._snapshot.output_token_ids)
+        return []
+
+    @property
+    def additional_information(self) -> Any:
+        if self._snapshot is not None and hasattr(self._snapshot, "additional_information"):
+            return self._snapshot.additional_information
+        return None
+
+    def is_finished(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
+        if self._snapshot is not None:
+            return getattr(self._snapshot, name)
+        raise AttributeError(name)
+
+
 class ExecuteModelState(NamedTuple):
     scheduler_output: SchedulerOutput
     logits: torch.Tensor | None
@@ -62,23 +184,30 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
+class GPUARModelRunner(OmniConnectorModelRunnerMixin, OmniGPUModelRunner):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
-    reuses Omni hooks for additional_information / multimodal outputs. This
+    reuses Omni hooks for model_intermediate_buffer / multimodal outputs. This
     class only overrides sample_tokens to expose hidden states + multimodal
     outputs per request while keeping Async output semantics.
     """
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._ar_log_counter: int = 0
         self.input_ids = self._make_buffer(self.max_num_tokens, dtype=torch.int32)
         # each model stage has their own hidden size
         self.hidden_size = self.model_config.hf_text_config.hidden_size
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        # Initialize unified connector mixin (delegates KV to kv_transfer_manager)
+        self.init_omni_connectors(
+            vllm_config=self.vllm_config,
+            model_config=self.model_config,
+            kv_transfer_manager=self.kv_transfer_manager,
+        )
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -157,7 +286,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         capture_sizes = self.compilation_config.cudagraph_capture_sizes
         num_warmups = self.compilation_config.cudagraph_num_of_warmups
         capture_sizes = sorted(capture_sizes, reverse=True)
-        logger.info("Capturing talker_mtp graphs for sizes %s", capture_sizes)
+        logger.debug("Capturing talker_mtp graphs for sizes %s", capture_sizes)
 
         set_cudagraph_capturing_enabled(True)
         try:
@@ -270,10 +399,46 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         if not getattr(self, "_warmup_state_cleared", False):
             self._warmup_state_cleared = True
-            if hasattr(self.model, "_clear_warmup_state"):
-                self.model._clear_warmup_state()
+            model = getattr(self, "model", None)
+            if model is not None and hasattr(model, "_clear_warmup_state"):
+                model._clear_warmup_state()
 
-        # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
+            self.model_intermediate_buffer.clear()
+            self._omni_last_model_output = None
+            self._local_stage_payload_cache.clear()
+            self._local_request_metadata.clear()
+            self._pending_full_payload_send.clear()
+            self._send_side_request_payload.clear()
+            self._send_side_request_snapshot.clear()
+            self._code_prompt_token_ids.clear()
+            self._request_ids_mapping.clear()
+
+        chunk_registrations = list(getattr(scheduler_output, "pending_chunk_registrations", []))
+        input_registrations = list(getattr(scheduler_output, "pending_input_registrations", []))
+
+        # [Omni] Register requests that need connector-backed recv work.
+        for request in [*chunk_registrations, *input_registrations]:
+            self.register_chunk_recv(request)
+
+        # [Omni] Consume full_payload_mode stage inputs that arrived via bg thread
+        self.recv_full_payload_inputs(scheduler_output)
+
+        self._ar_log_counter += 1
+        _finished = list(getattr(scheduler_output, "finished_req_ids", set()))
+        if _finished or self._ar_log_counter % 5000 == 1:
+            logger.debug(
+                "[Stage-%s AR] execute_model: scheduled=%s, "
+                "pending_full_payload_send=%s, req_count=%s, "
+                "finished_req_ids=%s (call#%s)",
+                getattr(self, "_stage_id", "?"),
+                scheduler_output.total_num_scheduled_tokens,
+                list(self._pending_full_payload_send.keys()),
+                len(self.requests),
+                _finished[:5],
+                self._ar_log_counter,
+            )
+
+        # [Omni] Drive mixin-owned KV lifecycle around the existing transfer manager.
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})
         if finished_reqs and hasattr(self.model, "get_kv_transfer_metadata"):
             for req_id, data in finished_reqs.items():
@@ -292,13 +457,55 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         data["custom_metadata"] = existing
                 except Exception as e:
                     logger.warning(f"Failed to get custom metadata from model for {req_id}: {e}")
-        self.kv_extracted_req_ids = self.kv_transfer_manager.handle_finished_requests_kv_transfer(
-            finished_reqs=finished_reqs,
+        for req_id, kv_meta in finished_reqs.items():
+            self.mark_kv_transfer(
+                req_id,
+                seq_len=kv_meta.get("seq_len", 0),
+                block_ids=kv_meta.get("block_ids", []),
+                custom_metadata=kv_meta.get("custom_metadata"),
+            )
+        self.kv_extracted_req_ids = self.send_kv_cache(
+            finished_reqs=self.drain_pending_kv_transfers(),
             kv_caches=self.kv_caches,
             block_size=self.cache_config.block_size,
             cache_dtype=str(self.cache_config.cache_dtype),
-            request_id_resolver=self._resolve_global_request_id,
+            request_id_resolver=self._resolve_transfer_request_id,
         )
+        if self.kv_extracted_req_ids:
+            self.ack_kv_transfers(self.kv_extracted_req_ids)
+
+        # [Omni] Async-chunk: send a final finished=True sentinel for requests
+        # that completed in the previous engine-core cycle.  The last real
+        # send_chunk call (in sample_tokens) had finished=False because
+        # stop-token detection runs *after* the model runner returns.
+        if self._async_chunk and _finished:
+            self._send_async_chunk_finish_sentinels(_finished)
+
+        # [Omni] Flush accumulated full_payload_mode outputs for requests that finished.
+        # Use both scheduler_output.finished_req_ids (requests freed this cycle)
+        # and any stale entries in _pending_full_payload_send whose request is no
+        # longer tracked by the model runner.
+        if self._pending_full_payload_send:
+            flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+            stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
+            flush_ids.update(stale)
+            if flush_ids:
+                logger.debug(
+                    "[Stage-%s AR] flush_full_payload_outputs: flushing %s (from finished=%s, stale=%s)",
+                    getattr(self, "_stage_id", "?"),
+                    flush_ids,
+                    set(getattr(scheduler_output, "finished_req_ids", set())),
+                    stale,
+                )
+                self.flush_full_payload_outputs(flush_ids)
+
+        # [Omni] Clean up per-request mixin state for finished requests.
+        # Must happen AFTER sentinel sending and batch flushing (which need
+        # _put_req_chunk / _request_ids_mapping), but timing relative to
+        # _update_states doesn't matter since cleanup uses its own dicts.
+        if _finished:
+            for rid in _finished:
+                self.cleanup_finished_request(rid)
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
@@ -308,7 +515,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 logger.error("RoutedExpertsCapturer not initialized.")
 
         if has_kv_transfer_group():
-            kv_connector_metadata = scheduler_output.kv_connector_metadata
+            kv_connector_metadata = getattr(scheduler_output, "kv_connector_metadata", None)
             if kv_connector_metadata is not None:
                 get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
 
@@ -319,10 +526,23 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+            protected_req_ids = set(self.requests.keys())
+            protected_req_ids.update(
+                req_id
+                for req_id in (
+                    getattr(request, "request_id", None) for request in chunk_registrations + input_registrations
+                )
+                if req_id is not None
+            )
+            self.prune_inactive_requests(protected_req_ids)
 
-            # Notify model of finished requests for state cleanup
-            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
-                self.model.on_requests_finished(scheduler_output.finished_req_ids)
+            # [Omni] Post-update stale flush: requests removed by
+            # _update_states are now detectable as stale.
+            if self._pending_full_payload_send:
+                stale = {rid for rid in self._pending_full_payload_send if rid not in self.requests}
+                if stale:
+                    logger.debug("[Stage-%s AR] post-update stale flush: %s", getattr(self, "_stage_id", "?"), stale)
+                    self.flush_full_payload_outputs(stale)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -354,15 +574,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 self.kv_extracted_req_ids = None
 
                 if not has_kv_transfer_group():
-                    output = EMPTY_MODEL_RUNNER_OUTPUT
-                else:
-                    output = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
-
-                if kv_ids:
-                    output = copy(output)
-                    output.kv_extracted_req_ids = kv_ids
-
-                return output
+                    return self._empty_output_with_connector_signals()
+                result = self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                return self.attach_omni_connector_output(result)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -698,7 +912,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return copy(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
@@ -823,7 +1037,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
         if self.speculative_config is not None:
-            self.finalize_kv_connector()
+            if hasattr(self, "clear_kv_connector_metadata"):
+                self.clear_kv_connector_metadata()
 
         with record_function_or_nullcontext("gpu_model_runner: eplb"):
             self.eplb_step()
@@ -856,13 +1071,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if self.omni_prefix_cache is None:
             mm_cpu = build_mm_cpu(multimodal_outputs)
 
-        self._process_additional_information_updates(
-            hidden_states,
-            multimodal_outputs,
-            num_scheduled_tokens_np,
-            scheduler_output,
-            combined_hidden_states,
-            combined_multimodal_outputs,
+        self._process_model_intermediate_buffer_updates(
+            hidden_states, multimodal_outputs, num_scheduled_tokens_np, scheduler_output
         )
 
         pooler_output: list[dict[str, object]] = []
@@ -910,6 +1120,52 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         )
                 payload.update(mm_payload)
             pooler_output.append(payload)
+
+        if self._async_chunk and self._custom_process_func is not None:
+            _chunk_sent = 0
+            _finished_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if req_state is not None and pooler_output[i]:
+                    ext_id = self._resolve_transfer_request_id(rid)
+                    wrapped = _AsyncChunkRequestAdapter(
+                        req_state,
+                        external_req_id=ext_id,
+                        finished=(rid in _finished_ids),
+                    )
+                    self._send_side_request_snapshot[ext_id] = self._snapshot_request_for_send(wrapped, ext_id)
+                    self.send_chunk(request=wrapped, pooling_output=pooler_output[i])
+                    _chunk_sent += 1
+            if _chunk_sent and self._ar_log_counter % 5000 == 1:
+                logger.debug(
+                    "[Stage-%s AR] sample_tokens: sent %s chunks (async_chunk)",
+                    getattr(self, "_stage_id", "?"),
+                    _chunk_sent,
+                )
+        elif self._async_chunk:
+            if self._ar_log_counter == 1:
+                logger.warning(
+                    "[Stage-%s AR] sample_tokens: async_chunk=True but custom_process_func=%s",
+                    getattr(self, "_stage_id", "?"),
+                    self._custom_process_func,
+                )
+
+        if not self._async_chunk and self._custom_process_func is not None:
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if pooler_output[i] and req_state is not None:
+                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+            if self._ar_log_counter % 5000 == 1:
+                logger.debug(
+                    (
+                        "[Stage-%s AR] sample_tokens: accumulated full_payload payloads "
+                        "for %s reqs, pending_full_payload_send=%s"
+                    ),
+                    getattr(self, "_stage_id", "?"),
+                    len(req_ids_output_copy),
+                    list(self._pending_full_payload_send.keys()),
+                )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -930,6 +1186,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output
@@ -952,18 +1209,69 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         return async_output
 
-    def _resolve_global_request_id(self, req_id: str) -> str:
-        """Resolve global request ID from request state."""
-        req_state = self.requests.get(req_id)
-        if not req_state:
-            return req_id
+    def _resolve_transfer_request_id(self, req_id: str) -> str:
+        """Resolve cross-stage request ID from connector mappings or request state."""
+        mapped = self._request_ids_mapping.get(req_id)
+        if mapped is not None:
+            return mapped
 
-        add_info = self.model_intermediate_buffer.get(req_id, {})
-        global_id = add_info.get("global_request_id")
-        if global_id:
-            if isinstance(global_id, list) and global_id:
-                global_id = global_id[0]
-            if isinstance(global_id, bytes):
-                return global_id.decode("utf-8")
-            return str(global_id)
+        req_state = self.requests.get(req_id)
+        if req_state is None:
+            return req_id
+        external_req_id = getattr(req_state, "external_req_id", None)
+        if external_req_id is not None:
+            return str(external_req_id)
         return req_id
+
+    def _send_async_chunk_finish_sentinels(self, finished_req_ids: list[str]) -> None:
+        """Send a final ``finished=True`` sentinel chunk for completed requests.
+
+        In async-chunk mode, ``send_chunk`` is called from ``sample_tokens``
+        where the model runner doesn't yet know whether a stop token was
+        generated (that decision is made by the engine core *after*
+        ``sample_tokens`` returns).  As a result, the last real chunk is
+        always sent with ``finished=False``.
+
+        This helper is called at the start of the *next* ``execute_model``
+        cycle, when ``scheduler_output.finished_req_ids`` lists the requests
+        that completed in the previous cycle.  For each such request that
+        was active in async-chunk sending, we enqueue one final sentinel
+        payload whose ``finished`` flag is ``True`` so the downstream
+        consumer knows the stream is complete.
+
+        The sentinel is constructed using ``_FinishSentinelAdapter`` which
+        does NOT require the ``CachedRequestState`` to still be alive in
+        ``self.requests``.  This is critical because ``_update_states``
+        from the previous cycle may have already freed the request.
+        """
+        if not self._custom_process_func:
+            return
+        for rid in finished_req_ids:
+            # Resolve external ID without depending on self.requests.
+            # Try _request_ids_mapping first (populated by register_chunk_recv),
+            # then fall back to self.requests if still available, then rid itself.
+            ext_id = self._request_ids_mapping.get(rid)
+            if ext_id is None:
+                ext_id = self._resolve_transfer_request_id(rid)
+
+            # Check that we've actually been sending chunks for this request.
+            # _put_req_chunk is keyed by external_req_id (set by send_chunk).
+            if ext_id not in self._put_req_chunk:
+                continue
+
+            snapshot = self._send_side_request_snapshot.get(ext_id)
+            wrapped = _FinishSentinelAdapter(
+                req_id=rid,
+                external_req_id=ext_id,
+                snapshot=snapshot,
+            )
+            # Send the finish sentinel with an empty pooling_output.
+            # The process function should recognise finished=True and
+            # flush/emit accordingly.
+            self.send_chunk(request=wrapped, pooling_output={})
+            logger.debug(
+                "[Stage-%s AR] sent async-chunk finish sentinel for req=%s (ext=%s)",
+                getattr(self, "_stage_id", "?"),
+                rid,
+                ext_id,
+            )

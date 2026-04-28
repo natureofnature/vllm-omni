@@ -45,6 +45,20 @@ from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeThinkerProcessingInfo,
 )
 from vllm_omni.model_executor.models.utils import add_prefix_to_loaded_weights, safe_tensor_reshape
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    extract_speaker_from_runtime_info,
+)
+from vllm_omni.worker.payload_span import (
+    CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+    CACHED_THINKER_DECODE_TOKEN_END_KEY,
+    CACHED_THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_DECODE_EMBEDDINGS_KEY,
+    THINKER_DECODE_TOKEN_END_KEY,
+    THINKER_DECODE_TOKEN_START_KEY,
+    get_tensor_span,
+    get_tensor_span_row,
+    merge_tensor_spans,
+)
 
 # Special token IDs for Qwen3 Omni MoE
 # Reference: https://huggingface.co/Qwen/Qwen3-Omni-30B-A3B-Instruct/blob/main/tokenizer_config.json
@@ -187,7 +201,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             }
 
         elif self.model_stage == "code2wav":
-            self.enable_update_additional_information = True
             self.thinker = None
             self.talker = None
             # Initialize code2wav (codec codes → audio waveform)
@@ -324,7 +337,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         codec: torch.Tensor | None = None,
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
-        runtime_additional_information: list[dict[str, Any]] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """
@@ -394,13 +406,78 @@ class Qwen3OmniMoeForConditionalGeneration(
         # ========== Stage 3: Code2Wav ==========
         elif self.model_stage == "code2wav":
             seq_token_counts: list[int] | None = kwargs.get("seq_token_counts")
+            info_dicts = kwargs.get("model_intermediate_buffer") or []
 
-            # Extract codec codes from input
+            runtime_entries: list[tuple[int, dict[str, Any]]] = []
+            if isinstance(info_dicts, list):
+                for idx, info in enumerate(info_dicts):
+                    if isinstance(info, dict):
+                        code_payload = info.get("code_predictor_codes")
+                        if code_payload is not None and getattr(code_payload, "numel", lambda: len(code_payload))() > 0:
+                            runtime_entries.append((idx, info))
+            else:
+                logger.debug("No model_intermediate_buffer provided to code2wav stage.")
+
+            if runtime_entries:
+                flat_codes: list[torch.Tensor] = []
+                runtime_seq_token_counts: list[int] = []
+                left_context_size: list[int] = []
+                for _, info in runtime_entries:
+                    code_payload = info["code_predictor_codes"]
+                    if not isinstance(code_payload, torch.Tensor):
+                        code_payload = torch.as_tensor(code_payload, dtype=torch.long, device=input_ids.device)
+                    code_payload = code_payload.reshape(-1).to(device=input_ids.device, dtype=input_ids.dtype)
+                    remainder = code_payload.numel() % 16
+                    if remainder:
+                        code_payload = torch.cat(
+                            [
+                                code_payload,
+                                torch.zeros(16 - remainder, dtype=code_payload.dtype, device=code_payload.device),
+                            ]
+                        )
+                    flat_codes.append(code_payload)
+                    runtime_seq_token_counts.append(int(code_payload.numel()))
+                    left_context_size.append(int(info.get("left_context_size", 0) or 0))
+
+                max_seq_len = max(count // 16 for count in runtime_seq_token_counts)
+                codes = torch.zeros(
+                    (len(flat_codes), 16, max_seq_len),
+                    device=input_ids.device,
+                    dtype=input_ids.dtype,
+                )
+                for idx, code_payload in enumerate(flat_codes):
+                    seq_len = code_payload.numel() // 16
+                    codes[idx, :, :seq_len] = code_payload.reshape(16, seq_len)
+
+                audio_tensors = self.generate_audio(
+                    codes,
+                    voice_type,
+                    left_context_size,
+                    runtime_seq_token_counts,
+                )
+
+                if len(runtime_entries) != len(info_dicts):
+                    empty_audio = torch.empty(0, device=input_ids.device)
+                    outputs = [empty_audio for _ in range(len(info_dicts))]
+                    for audio_idx, (batch_idx, _) in enumerate(runtime_entries):
+                        outputs[batch_idx] = audio_tensors[audio_idx]
+                    return outputs
+                return audio_tensors
+
+            # Extract codec codes from input when no runtime codec payload exists.
+            normalized_seq_token_counts = None
+            if seq_token_counts is not None:
+                normalized_seq_token_counts = [int(count) for count in seq_token_counts]
+                has_placeholder_counts = any(count <= 0 or count % 16 != 0 for count in normalized_seq_token_counts)
+                if has_placeholder_counts:
+                    empty_outputs = [torch.empty(0, device=input_ids.device) for _ in normalized_seq_token_counts]
+                    return empty_outputs
+
             if input_ids.shape[0] % 16 == 0:
-                if seq_token_counts is not None:
-                    max_seq_len = max(seq_token_counts) // 16
-                    batch_size = len(seq_token_counts)
-                    split_codes = torch.split(input_ids, seq_token_counts, dim=0)
+                if normalized_seq_token_counts is not None:
+                    max_seq_len = max(normalized_seq_token_counts) // 16
+                    batch_size = len(normalized_seq_token_counts)
+                    split_codes = torch.split(input_ids, normalized_seq_token_counts, dim=0)
                     codes = torch.zeros((batch_size, 16, max_seq_len), device=input_ids.device, dtype=input_ids.dtype)
                     for idx, code in enumerate(split_codes):
                         seq_len = code.shape[0] // 16
@@ -424,16 +501,17 @@ class Qwen3OmniMoeForConditionalGeneration(
                 )
                 codes = input_ids_flatten.reshape(1, 16, -1)
 
-            # Generate audio from codec codes
-            # Get every request's left_context_size from runtime_additional_information (passed via kwargs)
             left_context_size = []
-            if runtime_additional_information is not None:
-                for info in runtime_additional_information:
-                    if "left_context_size" in info:
+            if isinstance(info_dicts, list):
+                for info in info_dicts:
+                    if isinstance(info, dict) and "left_context_size" in info:
                         left_context_size.append(info["left_context_size"])
-            else:
-                logger.debug("No additional_information provided to code2wav stage.")
-            audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
+            audio_tensors = self.generate_audio(
+                codes,
+                voice_type,
+                left_context_size,
+                seq_token_counts,
+            )
 
             return audio_tensors
 
@@ -488,12 +566,7 @@ class Qwen3OmniMoeForConditionalGeneration(
             # preprocess function, the code_predictor_codes are stored in the info_dict list.
             # We need to merge the tensors from different requests into a single tensor.
             # In the future, we may allow user to custom an aggregated function.
-            info_dicts = kwargs.get("model_intermediate_buffer")
-            if info_dicts is None:
-                info_dicts = kwargs.get("runtime_additional_information")
-
-            if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
-                logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
+            info_dicts = kwargs.get("model_intermediate_buffer") or []
             code_predictor_codes = [info.get("code_predictor_codes") for info in info_dicts]
             multimodal_outputs = {"code_predictor_codes": torch.cat(code_predictor_codes, dim=0)}
             span_len = multimodal_outputs["code_predictor_codes"].shape[0]
@@ -513,6 +586,7 @@ class Qwen3OmniMoeForConditionalGeneration(
     def generate_audio(
         self,
         code: torch.Tensor,
+        voice_type: str,
         left_context_size: list[int] | None = None,
         seq_token_counts: list[int] | None = None,
     ) -> list[torch.Tensor]:
@@ -521,6 +595,7 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         Args:
             code: [batch, num_quantizers, T] - RVQ codec codes
+            voice_type: Voice type (not used in Qwen3, kept for compatibility)
             left_context_size: Left context size for streaming decode
             seq_token_counts: Token count for each request in batch
 
@@ -636,6 +711,13 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.tts_text_spk_token_ids[self.default_tts_text_spk_type]
         return self.tts_text_spk_token_ids[voice_type]
 
+    def _resolve_voice_type(self, info_dict: dict[str, Any] | None = None) -> str:
+        """Resolve talker voice type from request-scoped runtime metadata."""
+        speaker = extract_speaker_from_runtime_info([info_dict] if isinstance(info_dict, dict) else None)
+        if speaker:
+            return speaker
+        return self.default_tts_text_spk_type
+
     def talker_postprocess(self, hidden_states: torch.Tensor, **info_dict: object):
         """
         Postprocess the talker hidden states.
@@ -666,9 +748,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         else:
             # decode
             if not info_dict.get("decode_flag", False):
-                # Prefill already consumed the first text token via the
-                # assistant bootstrap path, so decode starts from the
-                # remaining-text boundary rather than cumulative index 0.
                 prefill_consumed_text_tokens = info_dict.get("prefill_consumed_text_tokens")
                 if prefill_consumed_text_tokens is None:
                     raise RuntimeError("Missing prefill_consumed_text_tokens for talker decode handoff.")
@@ -680,7 +759,14 @@ class Qwen3OmniMoeForConditionalGeneration(
             )
             update_dict["mtp_inputs"] = last_talker_hidden, text_step
 
-        update_dict["num_processed_tokens"] = info_dict.get("num_processed_tokens", 0) + span_len
+        advance_num_processed_tokens = update_dict.pop(
+            "_advance_num_processed_tokens", span_len > 1 or not self.vllm_config.model_config.async_chunk
+        )
+        current_num_processed_tokens = info_dict.get("num_processed_tokens", 0)
+        if advance_num_processed_tokens:
+            update_dict["num_processed_tokens"] = current_num_processed_tokens + span_len
+        else:
+            update_dict["num_processed_tokens"] = current_num_processed_tokens
         return input_ids, input_embeds, update_dict
 
     def talker_mtp(
@@ -740,22 +826,20 @@ class Qwen3OmniMoeForConditionalGeneration(
     def talker_preprocess_prefill(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         # Containers to return per-request updates (e.g., code_predictor_hidden_per_request)
         update_dict: dict[str, dict] = {}
-
-        voice_type = info_dict.get("speaker")
-        if voice_type is not None and isinstance(voice_type, (list, tuple)) and len(voice_type) > 0:
-            voice_type = voice_type[0]
-        if not isinstance(voice_type, str) or not voice_type.strip():
-            # Fall back to model default; speaker is per-request.
-            voice_type = self.default_tts_text_spk_type
-        else:
-            voice_type = str(voice_type).lower().strip()
+        voice_type = self._resolve_voice_type(info_dict)
         start_index = info_dict.get("num_processed_tokens", 0)
         end_index = start_index + input_embeds.shape[0]
         # Read thinker outputs for prefill
-        thinker_sequence_embeds = info_dict.get("thinker_prefill_embeddings").to(
+        thinker_sequence_embeds = info_dict.get("thinker_prefill_embeddings")
+        thinker_hidden_states = info_dict.get("thinker_hidden_states")
+        if thinker_sequence_embeds is None or thinker_hidden_states is None:
+            raise ValueError(
+                f"model_intermediate_buffer missing thinker prefill payload; keys={sorted(info_dict.keys())}"
+            )
+        thinker_sequence_embeds = thinker_sequence_embeds.to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [P,H]
-        thinker_hidden_states = info_dict.get("thinker_hidden_states").to(
+        thinker_hidden_states = thinker_hidden_states.to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )  # Tensor [K,H]
         thinker_sequences = (
@@ -778,12 +862,6 @@ class Qwen3OmniMoeForConditionalGeneration(
         tts_pad_thinker = info_dict.get("tts_pad_embed").to(
             device=self._module_device(self.talker), dtype=torch.bfloat16
         )
-
-        if thinker_sequence_embeds is None or thinker_hidden_states is None:
-            raise ValueError(
-                "additional_information_by_req_id must include "
-                "'thinker_prefill_embeddings' and 'thinker_hidden_states' for talker prefill."
-            )
 
         # Normalize to tensors
         if not isinstance(thinker_sequence_embeds, torch.Tensor):
@@ -863,21 +941,79 @@ class Qwen3OmniMoeForConditionalGeneration(
         Cache thinker embeds for decode stage.
         """
         thinker_decode_embeds = info_dict.get("thinker_decode_embeddings", None)
+        start_index = int(info_dict.get("num_processed_tokens", 0))
+        clear_incoming_decode_embed = thinker_decode_embeds is not None
+        incoming_span = get_tensor_span(
+            info_dict,
+            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=THINKER_DECODE_TOKEN_START_KEY,
+            end_key=THINKER_DECODE_TOKEN_END_KEY,
+        )
         if thinker_decode_embeds is not None:
-            cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
-            if cached_thinker_decode_embeds is None:
-                update_dict["cached_thinker_decode_embeddings"] = thinker_decode_embeds
+            cached_span = get_tensor_span(
+                info_dict,
+                tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+                start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+                end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+            )
+            if incoming_span is not None:
+                incoming_span = (
+                    incoming_span[0].to(device=self._module_device(self.talker), dtype=torch.bfloat16),
+                    incoming_span[1],
+                    incoming_span[2],
+                )
+            if cached_span is None:
+                if incoming_span is not None:
+                    (
+                        update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                        update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                        update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                    ) = incoming_span
+                else:
+                    update_dict["cached_thinker_decode_embeddings"] = thinker_decode_embeds
             else:
-                cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
+                cached_span = (
+                    cached_span[0].to(device=self._module_device(self.talker), dtype=torch.bfloat16),
+                    cached_span[1],
+                    cached_span[2],
                 )
-                thinker_decode_embeds = thinker_decode_embeds.to(
-                    device=self._module_device(self.talker), dtype=torch.bfloat16
-                )
-                update_dict["cached_thinker_decode_embeddings"] = torch.cat(
-                    [cached_thinker_decode_embeds, thinker_decode_embeds], dim=0
-                )
-        update_dict["thinker_decode_embeddings"] = None
+                if incoming_span is not None:
+                    merged_span = merge_tensor_spans(cached_span, incoming_span)
+                    if merged_span is not None:
+                        (
+                            update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                        ) = merged_span
+                    elif incoming_span[1] >= cached_span[2] and start_index >= cached_span[2]:
+                        logger.warning(
+                            "Talker decode cache replaced stale non-contiguous thinker span: "
+                            "existing=(%s,%s) incoming=(%s,%s)",
+                            cached_span[1],
+                            cached_span[2],
+                            incoming_span[1],
+                            incoming_span[2],
+                        )
+                        (
+                            update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                            update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+                        ) = incoming_span
+                    else:
+                        clear_incoming_decode_embed = False
+                else:
+                    thinker_decode_embeds = thinker_decode_embeds.to(
+                        device=self._module_device(self.talker), dtype=torch.bfloat16
+                    )
+                    update_dict["cached_thinker_decode_embeddings"] = torch.cat(
+                        [cached_span[0], thinker_decode_embeds], dim=0
+                    )
+                    update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY] = cached_span[1]
+                    update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY] = cached_span[1] + int(
+                        update_dict["cached_thinker_decode_embeddings"].shape[0]
+                    )
+        if clear_incoming_decode_embed:
+            update_dict["thinker_decode_embeddings"] = None
 
     def _thinker_to_talker_prefill(
         self,
@@ -969,33 +1105,151 @@ class Qwen3OmniMoeForConditionalGeneration(
         update_dict,
     ):
         """
-        Project thinker outputs to talker inputs during prefill stage.
+        Project thinker outputs to talker inputs during decode stage.
         Returns:
-            (input_ids, input_embeds) for talker
+            projected embed for one decode step
         """
-        cached_thinker_decode_embeds = info_dict.get("cached_thinker_decode_embeddings", None)
+        cached_span = get_tensor_span(
+            info_dict,
+            tensor_key=CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=CACHED_THINKER_DECODE_TOKEN_START_KEY,
+            end_key=CACHED_THINKER_DECODE_TOKEN_END_KEY,
+        )
         thinker_decode_embed = info_dict.get("thinker_decode_embeddings", None)
+        clear_incoming_decode_embed = thinker_decode_embed is not None
+        incoming_span = get_tensor_span(
+            info_dict,
+            tensor_key=THINKER_DECODE_EMBEDDINGS_KEY,
+            start_key=THINKER_DECODE_TOKEN_START_KEY,
+            end_key=THINKER_DECODE_TOKEN_END_KEY,
+        )
+
+        # Normalize any explicit incoming span into the cached absolute-row view.
+        if incoming_span is not None:
+            start_index = int(info_dict.get("num_processed_tokens", 0))
+            incoming_tensor = incoming_span[0].to(device)
+            incoming_span = (incoming_tensor, incoming_span[1], incoming_span[2])
+            if cached_span is None:
+                cached_span = incoming_span
+            else:
+                cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+                merged_span = merge_tensor_spans(cached_span, incoming_span)
+                if merged_span is not None:
+                    cached_span = merged_span
+                elif incoming_span[1] >= cached_span[2] and start_index >= cached_span[2]:
+                    logger.warning(
+                        "Talker decode replaced stale cached span with newer incoming "
+                        "span: existing=(%s,%s) incoming=(%s,%s)",
+                        cached_span[1],
+                        cached_span[2],
+                        incoming_span[1],
+                        incoming_span[2],
+                    )
+                    cached_span = incoming_span
+                else:
+                    clear_incoming_decode_embed = False
+            (
+                update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+            ) = cached_span
+            if clear_incoming_decode_embed:
+                thinker_decode_embed = None
+                incoming_span = None
+        # Legacy fallback: cache batched decode embeds even when explicit span metadata is absent.
+        elif thinker_decode_embed is not None and thinker_decode_embed.ndim >= 2 and thinker_decode_embed.shape[0] > 1:
+            thinker_decode_embed = thinker_decode_embed.to(device)
+            if cached_span is None:
+                cached_span = (thinker_decode_embed, 0, int(thinker_decode_embed.shape[0]))
+            else:
+                cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+                cached_span = (
+                    torch.cat([cached_span[0], thinker_decode_embed], dim=0),
+                    cached_span[1],
+                    cached_span[2] + int(thinker_decode_embed.shape[0]),
+                )
+            (
+                update_dict[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_START_KEY],
+                update_dict[CACHED_THINKER_DECODE_TOKEN_END_KEY],
+            ) = cached_span
+            thinker_decode_embed = None
+
         start_index = info_dict.get("num_processed_tokens", 0)
         thinker_output_token_ids = info_dict.get("thinker_output_token_ids", [])
-        if start_index >= len(thinker_output_token_ids) - 1:
-            if info_dict.get("finished_flag"):
+        if cached_span is not None:
+            cached_span = (cached_span[0].to(device), cached_span[1], cached_span[2])
+        if incoming_span is not None:
+            incoming_span = (incoming_span[0].to(device), incoming_span[1], incoming_span[2])
+
+        thinker_embed = get_tensor_span_row(cached_span, start_index)
+        if thinker_embed is None:
+            thinker_embed = get_tensor_span_row(incoming_span, start_index)
+
+        if thinker_embed is None and thinker_decode_embed is not None:
+            thinker_decode_embed = thinker_decode_embed.to(device)
+            if thinker_decode_embed.ndim == 1:
+                thinker_embed = thinker_decode_embed
+            elif thinker_decode_embed.shape[0] == 1:
+                thinker_embed = thinker_decode_embed[0]
+
+        available_end = -1
+        if cached_span is not None:
+            available_end = max(available_end, cached_span[2])
+        if incoming_span is not None:
+            available_end = max(available_end, incoming_span[2])
+        if available_end < 0 and thinker_decode_embed is not None:
+            available_end = start_index + 1
+        legacy_decode_end = len(thinker_output_token_ids) - 1
+        if available_end < 0 and legacy_decode_end >= 0:
+            available_end = legacy_decode_end
+        terminal_decode_end = max(available_end, legacy_decode_end)
+
+        if thinker_embed is None:
+            finished = bool(info_dict.get("finished", False))
+            finished_flag = bool(info_dict.get("finished_flag", False))
+            advance_to_terminal = terminal_decode_end >= 0 and start_index < terminal_decode_end
+
+            if finished_flag:
+                update_dict["_advance_num_processed_tokens"] = advance_to_terminal
+                if clear_incoming_decode_embed:
+                    update_dict["thinker_decode_embeddings"] = None
                 return self.tts_pad_embed.to(device)
-            update_dict["finished_flag"] = True
-            return self.tts_eos_embed.to(device)
 
-        if cached_thinker_decode_embeds is not None and start_index < cached_thinker_decode_embeds.shape[0]:
-            cached_thinker_decode_embeds = cached_thinker_decode_embeds.to(device)
-            thinker_embed = cached_thinker_decode_embeds[start_index]
-            if thinker_decode_embed is not None:
-                thinker_decode_embed = thinker_decode_embed.to(device)
-                cached_thinker_decode_embeds = torch.cat([cached_thinker_decode_embeds, thinker_decode_embed], dim=0)
-                update_dict["cached_thinker_decode_embeddings"] = cached_thinker_decode_embeds
-        else:
-            thinker_embed = thinker_decode_embed
-            if thinker_embed.device != device:
-                thinker_embed = thinker_embed.to(device)
-
-        update_dict["thinker_decode_embeddings"] = None
+            if available_end >= 0 and start_index >= available_end:
+                if finished:
+                    update_dict["finished_flag"] = True
+                    update_dict["_advance_num_processed_tokens"] = advance_to_terminal
+                    if clear_incoming_decode_embed:
+                        update_dict["thinker_decode_embeddings"] = None
+                    return self.tts_eos_embed.to(device)
+                logger.warning(
+                    "Talker decode reached available decode boundary: start_index=%s "
+                    "available_end=%s thinker_tokens=%s finished=%s finished_flag=%s",
+                    start_index,
+                    available_end,
+                    len(thinker_output_token_ids),
+                    finished,
+                    finished_flag,
+                )
+            logger.warning_once(
+                "Async-chunk talker decode fell back to tts_pad_embed with no "
+                "cached or incoming thinker decode embed. This should be rare "
+                "and may indicate an unexpected payload visibility gap. "
+                "start_index=%s available_end=%s thinker_tokens=%s finished=%s finished_flag=%s",
+                start_index,
+                available_end,
+                len(thinker_output_token_ids),
+                finished,
+                finished_flag,
+            )
+            update_dict["_advance_num_processed_tokens"] = False
+            if clear_incoming_decode_embed:
+                update_dict["thinker_decode_embeddings"] = None
+            return self.tts_pad_embed.to(device)
+        update_dict["_advance_num_processed_tokens"] = True
+        if clear_incoming_decode_embed:
+            update_dict["thinker_decode_embeddings"] = None
         return self.talker.text_projection(thinker_embed).to(device)
 
     def talker_preprocess_decode(

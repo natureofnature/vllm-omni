@@ -25,6 +25,7 @@ QWEN3_TTS_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             engine_output_type="latent",
+            custom_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_full_payload"),
             async_chunk_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_async_chunk"),
             sampling_constraints={
                 "detokenize": False,

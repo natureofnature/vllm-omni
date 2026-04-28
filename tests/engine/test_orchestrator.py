@@ -419,6 +419,51 @@ async def test_run_llm_to_diffusion(orchestrator_factory) -> None:
 
 
 @pytest.mark.asyncio
+async def test_streaming_finished_stage_forwards_only_terminal_update(orchestrator_factory) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7, 8, 9]}],
+    )
+    processors = [
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-stream", token_ids=[3, 4], finished=True)]),
+        FakeOutputProcessor(request_outputs=[_build_request_output("req-stream", token_ids=[10, 11], finished=True)]),
+    ]
+    orchestrator_fixture = orchestrator_factory([stage0, stage1], output_processors=processors)
+    request = SimpleNamespace(request_id="req-stream", prompt_token_ids=[1, 2, 3], resumable=True)
+
+    try:
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="req-stream",
+            prompt=request,
+            original_prompt={"prompt": "hello stream"},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+        )
+
+        await _wait_for(lambda: len(stage0.add_request_calls) == 1)
+        stage0.push_engine_core_outputs(_engine_core_outputs("stage0-stream", 1.0))
+
+        await _wait_for(lambda: len(stage1.add_request_calls) == 1)
+        stage1_request = stage1.add_request_calls[0][0]
+        assert stage1_request.request_id == "req-stream"
+        assert stage1_request.prompt_token_ids == [7, 8, 9]
+        assert stage1_request.resumable is False
+
+        stage1.push_engine_core_outputs(_engine_core_outputs("stage1-stream", 2.0))
+        output_msg = await _get_output_message(orchestrator_fixture)
+
+        assert output_msg["request_id"] == "req-stream"
+        assert output_msg["stage_id"] == 1
+        assert output_msg["finished"] is True
+        assert "req-stream" not in orchestrator_fixture.orchestrator.request_states
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_run_async_chunk(orchestrator_factory) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)

@@ -233,20 +233,38 @@ class Qwen3OmniMoeCode2Wav(nn.Module):
                 codes. For ``batch_size == 1``, this is a list containing a
                 single tensor with shape ``[1, waveform_len]``.
         """
-        if not (left_context_size and seq_token_counts and len(left_context_size) == len(seq_token_counts)):
+        batch_size = int(codes.shape[0])
+        if left_context_size is None:
             logger.warning(
-                "chunked_decode_streaming: missing/invalid left_context_size or seq_token_counts; "
-                "defaulting to left_context_size=zeros(len=codes.shape[0])."
+                "chunked_decode_streaming: missing left_context_size; "
+                "defaulting to left_context_size=zeros(batch_size=%s).",
+                batch_size,
             )
-            left_context_size = [0] * codes.shape[0]
+            left_context_size = [0] * batch_size
+        elif len(left_context_size) != batch_size:
+            logger.warning(
+                "chunked_decode_streaming: invalid left_context_size length=%s for batch_size=%s; "
+                "padding or truncating per batch entry.",
+                len(left_context_size),
+                batch_size,
+            )
+            left_context_size = (list(left_context_size) + [0] * batch_size)[:batch_size]
+
+        if seq_token_counts is not None and len(seq_token_counts) == batch_size:
+            code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
+        else:
+            if seq_token_counts is not None:
+                logger.warning(
+                    "chunked_decode_streaming: invalid seq_token_counts length=%s for batch_size=%s; "
+                    "falling back to full code length.",
+                    len(seq_token_counts),
+                    batch_size,
+                )
+            code_seq_lens = [codes.shape[-1]] * batch_size
+
         # Decode chunk
         wavs = []
         batch_wav = self(codes)
-        if seq_token_counts is not None:
-            code_seq_lens = [n // self.config.num_quantizers for n in seq_token_counts]
-        else:
-            # Fallback: assume all batch elements share the same sequence length.
-            code_seq_lens = [codes.shape[-1]] * codes.shape[0]
         for idx, code_seq_len in enumerate(code_seq_lens):
             # Remove context from output (left_context_size * total_upsample samples)
             wav_chunk = batch_wav[

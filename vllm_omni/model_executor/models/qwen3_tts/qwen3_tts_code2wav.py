@@ -210,6 +210,11 @@ class Qwen3TTSCode2Wav(nn.Module):
         assert self._num_quantizers is not None
         assert self._total_upsample is not None
 
+        if runtime_additional_information is None:
+            runtime_additional_information = kwargs.get("model_intermediate_buffer") or kwargs.get(
+                "runtime_additional_information"
+            )
+
         decoder = self._decoder
         q = int(self._num_quantizers)
         upsample = int(self._total_upsample)
@@ -224,12 +229,18 @@ class Qwen3TTSCode2Wav(nn.Module):
             )
 
         ids = input_ids.reshape(-1).to(dtype=torch.long)
-        request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
+        if runtime_additional_information is not None:
+            request_ids_list = [torch.empty((0,), device=ids.device, dtype=torch.long)] * len(
+                runtime_additional_information
+            )
+        else:
+            request_ids_list = self._split_request_ids(ids, kwargs.get("seq_token_counts"))
 
         parsed: list[tuple[int, int]] = []
         valid_codes_qf: list[torch.Tensor] = []
         valid_indices: list[int] = []
         left_context_size = [0] * len(request_ids_list)
+        payload_code_ids: list[torch.Tensor | None] = [None] * len(request_ids_list)
         if runtime_additional_information is not None:
             for i, info in enumerate(runtime_additional_information):
                 if i >= len(left_context_size):
@@ -242,12 +253,21 @@ class Qwen3TTSCode2Wav(nn.Module):
                     if isinstance(value, torch.Tensor):
                         value = value.reshape(-1)[0].item() if value.numel() > 0 else 0
                     left_context_size[i] = int(value)
+                if "code_predictor_codes" in info:
+                    codes = info["code_predictor_codes"]
+                    if isinstance(codes, torch.Tensor):
+                        payload_code_ids[i] = codes.reshape(-1).to(device=ids.device, dtype=torch.long)
+                    elif hasattr(codes, "__len__") and len(codes) > 0:
+                        payload_code_ids[i] = torch.as_tensor(codes, device=ids.device, dtype=torch.long).reshape(-1)
         for i, req_ids in enumerate(request_ids_list):
-            if req_ids.numel() < 1:
+            if runtime_additional_information is not None and payload_code_ids[i] is None:
+                parsed.append((0, 0))
+                continue
+            flat = payload_code_ids[i] if payload_code_ids[i] is not None else req_ids
+            if flat.numel() < 1:
                 parsed.append((0, 0))
                 continue
             ctx_frames = left_context_size[i]
-            flat = req_ids
             n = flat.numel()
             if n == 0 or n % q != 0:
                 if n > 0:
@@ -305,7 +325,7 @@ class Qwen3TTSCode2Wav(nn.Module):
         for j, idx in enumerate(valid_indices):
             ctx_frames, actual_frames = parsed[idx]
             wav = wav_tensors[j]
-            # Slice on exact codec-frame boundaries instead of proportionally.
+            # Slice on codec-frame boundaries so async overlap is not replayed in the final audio.
             start = max(0, ctx_frames * upsample)
             end = max(start, actual_frames * upsample)
             if start >= wav.shape[0]:

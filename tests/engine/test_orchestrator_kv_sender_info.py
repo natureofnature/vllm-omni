@@ -1,4 +1,5 @@
 import asyncio
+from queue import SimpleQueue
 from types import SimpleNamespace
 
 import pytest
@@ -206,3 +207,23 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
         0: {"host": "10.0.0.3", "zmq_port": 50151},
     }
     assert req_state.stage_submit_ts[1] > 0
+
+
+def test_dplb_stage_engine_core_client_process_engine_outputs_clears_inflight_and_forwards_finished_only():
+    from vllm_omni.engine.stage_engine_core_client import DPLBStageEngineCoreClient
+
+    client = object.__new__(DPLBStageEngineCoreClient)
+    client.reqs_in_flight = {"req-1": b"engine-a", "req-2": b"engine-b"}
+    client.outputs_queue = SimpleQueue()
+
+    outputs = SimpleNamespace(
+        finished_requests=["req-1"],
+        outputs=[],
+        scheduler_stats=None,
+    )
+
+    asyncio.run(DPLBStageEngineCoreClient.process_engine_outputs(client, outputs))
+
+    assert "req-1" not in client.reqs_in_flight
+    assert client.reqs_in_flight == {"req-2": b"engine-b"}
+    assert client.outputs_queue.get_nowait() is outputs
