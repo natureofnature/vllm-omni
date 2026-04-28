@@ -1368,7 +1368,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                 existing.pop(THINKER_DECODE_TOKEN_START_KEY, None)
                 existing.pop(THINKER_DECODE_TOKEN_END_KEY, None)
 
-            logger.info(
+            logger.debug(
                 "[Stage-%s] _sync_local_stage_payloads: req=%s keys=%s",
                 getattr(self, "_stage_id", "?"),
                 req_id,

@@ -8,13 +8,96 @@ import torch
 from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 from vllm_omni.worker.payload_span import (
     CACHED_THINKER_DECODE_EMBEDDINGS_KEY,
     CACHED_THINKER_DECODE_TOKEN_END_KEY,
     CACHED_THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_DECODE_EMBEDDINGS_KEY,
+    THINKER_DECODE_TOKEN_END_KEY,
+    THINKER_DECODE_TOKEN_START_KEY,
+    THINKER_OUTPUT_TOKEN_IDS_KEY,
+    cache_thinker_decode_span,
+    resolve_thinker_decode_step,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_runner_mro_pins_connector_mixin_before_omni_gpu_runner():
+    assert GPUARModelRunner.__mro__[1] is OmniConnectorModelRunnerMixin
+    assert GPUARModelRunner.__mro__[2] is OmniGPUModelRunner
+    assert GPUGenerationModelRunner.__mro__[1] is OmniConnectorModelRunnerMixin
+    assert GPUGenerationModelRunner.__mro__[2] is OmniGPUModelRunner
+
+
+@pytest.mark.parametrize(
+    ("runner_cls", "worker_type"),
+    [
+        (GPUARModelRunner, "ar"),
+        (GPUGenerationModelRunner, "generation"),
+    ],
+)
+def test_runner_constructor_smoke_preserves_base_init_and_connector_setup(monkeypatch, runner_cls, worker_type):
+    calls = []
+
+    def _fake_base_init(self, *args, **kwargs):
+        calls.append(("base_init", args, kwargs))
+        model_config = SimpleNamespace(
+            async_chunk=True,
+            worker_type=worker_type,
+            stage_id=3,
+            hf_text_config=SimpleNamespace(hidden_size=16),
+        )
+        self.max_num_tokens = 32
+        self.dtype = torch.float16
+        self.model_config = model_config
+        self.vllm_config = SimpleNamespace(model_config=model_config)
+
+    def _fake_init_omni_connectors(self, *, vllm_config, model_config, kv_transfer_manager=None):
+        calls.append(("init_omni_connectors", vllm_config, model_config, kv_transfer_manager))
+        self._test_connector_kv_manager = kv_transfer_manager
+        self._test_connector_stage_id = model_config.stage_id
+
+    monkeypatch.setattr(OmniGPUModelRunner, "__init__", _fake_base_init)
+    monkeypatch.setattr(OmniConnectorModelRunnerMixin, "init_omni_connectors", _fake_init_omni_connectors)
+
+    if runner_cls is GPUARModelRunner:
+        import vllm_omni.worker.gpu_ar_model_runner as ar_mod
+
+        kv_manager = object()
+
+        monkeypatch.setattr(
+            GPUARModelRunner,
+            "_make_buffer",
+            lambda self, *size, dtype, numpy=True: (size, dtype, numpy),
+        )
+        monkeypatch.setattr(
+            ar_mod.OmniKVTransferManager,
+            "from_vllm_config",
+            staticmethod(
+                lambda vllm_config, model_config: calls.append(("build_kv_manager", vllm_config, model_config))
+                or kv_manager
+            ),
+        )
+
+    runner = runner_cls("sentinel", demo=True)
+
+    assert calls[0] == ("base_init", ("sentinel",), {"demo": True})
+    if runner_cls is GPUARModelRunner:
+        assert calls[1][0] == "build_kv_manager"
+    else:
+        assert calls[1][0] == "init_omni_connectors"
+    assert calls[-1][0] == "init_omni_connectors"
+    assert runner._test_connector_stage_id == 3
+
+    if runner_cls is GPUARModelRunner:
+        assert runner.hidden_size == 16
+        assert runner.kv_transfer_manager is runner._test_connector_kv_manager
+        assert runner.input_ids == ((32,), torch.int32, True)
+        assert runner.inputs_embeds == ((32, 16), torch.float16, False)
+    else:
+        assert runner._test_connector_kv_manager is None
 
 
 class DummyBuffer:
@@ -374,6 +457,53 @@ def test_update_intermediate_buffer_replaces_stale_cached_decode_span():
         buf[CACHED_THINKER_DECODE_EMBEDDINGS_KEY].to(torch.float32),
         torch.tensor([[73.0], [74.0]], dtype=torch.float32),
     )
+
+
+def test_cache_thinker_decode_span_merges_incoming_span():
+    payload = {
+        CACHED_THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[10.0], [11.0]], dtype=torch.float32),
+        CACHED_THINKER_DECODE_TOKEN_START_KEY: 0,
+        CACHED_THINKER_DECODE_TOKEN_END_KEY: 2,
+        THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[12.0], [13.0]], dtype=torch.float32),
+        THINKER_DECODE_TOKEN_START_KEY: 2,
+        THINKER_DECODE_TOKEN_END_KEY: 4,
+        "num_processed_tokens": 2,
+    }
+    update = {}
+
+    cache_thinker_decode_span(payload, update, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert update[THINKER_DECODE_EMBEDDINGS_KEY] is None
+    assert update[CACHED_THINKER_DECODE_TOKEN_START_KEY] == 0
+    assert update[CACHED_THINKER_DECODE_TOKEN_END_KEY] == 4
+    assert torch.allclose(
+        update[CACHED_THINKER_DECODE_EMBEDDINGS_KEY],
+        torch.tensor([[10.0], [11.0], [12.0], [13.0]], dtype=torch.float32),
+    )
+
+
+def test_resolve_thinker_decode_step_replaces_stale_cached_span():
+    payload = {
+        CACHED_THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[1.0], [2.0]], dtype=torch.float32),
+        CACHED_THINKER_DECODE_TOKEN_START_KEY: 0,
+        CACHED_THINKER_DECODE_TOKEN_END_KEY: 2,
+        THINKER_DECODE_EMBEDDINGS_KEY: torch.tensor([[73.0], [74.0]], dtype=torch.float32),
+        THINKER_DECODE_TOKEN_START_KEY: 73,
+        THINKER_DECODE_TOKEN_END_KEY: 75,
+        THINKER_OUTPUT_TOKEN_IDS_KEY: list(range(76)),
+        "num_processed_tokens": 73,
+    }
+    update = {}
+
+    step_state = resolve_thinker_decode_step(payload, update, device=torch.device("cpu"), dtype=torch.float32)
+
+    assert torch.allclose(step_state.thinker_embed, torch.tensor([73.0], dtype=torch.float32))
+    assert step_state.start_index == 73
+    assert step_state.available_end == 75
+    assert step_state.legacy_decode_end == 75
+    assert update[THINKER_DECODE_EMBEDDINGS_KEY] is None
+    assert update[CACHED_THINKER_DECODE_TOKEN_START_KEY] == 73
+    assert update[CACHED_THINKER_DECODE_TOKEN_END_KEY] == 75
 
 
 def test_maybe_attach_mimo_audio_req_infos_enriches_dict():

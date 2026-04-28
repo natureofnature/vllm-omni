@@ -46,6 +46,14 @@ from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 logger = init_logger(__name__)
 
 
+def _extend_all_token_ids_if_available(request: Request, padding: int) -> None:
+    if padding <= 0:
+        return
+    all_token_ids = getattr(request, "_all_token_ids", None)
+    if isinstance(all_token_ids, list):
+        all_token_ids.extend([0] * padding)
+
+
 class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -111,10 +119,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
             if missing > 0:
                 request.prompt_token_ids.extend([0] * missing)
                 request.num_prompt_tokens = len(request.prompt_token_ids)
-                try:
-                    request._all_token_ids.extend([0] * missing)  # type: ignore[attr-defined]
-                except Exception:
-                    pass
+                _extend_all_token_ids_if_available(request, missing)
             return len(request.prompt_token_ids) - request.num_computed_tokens
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests

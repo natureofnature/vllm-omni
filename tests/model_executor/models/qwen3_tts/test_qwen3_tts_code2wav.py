@@ -76,3 +76,50 @@ def test_forward_prefers_runtime_payload_codes_over_scheduler_ids():
     audio = out.multimodal_outputs["model_outputs"][0]
     expected = torch.arange(8, 24, dtype=torch.float32)
     torch.testing.assert_close(audio, expected)
+
+
+def test_forward_uses_model_intermediate_buffer_fallback():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        model_intermediate_buffer=[
+            {"left_context_size": torch.tensor([1], dtype=torch.int32), "code_predictor_codes": torch.arange(8)}
+        ],
+    )
+
+    audio = out.multimodal_outputs["model_outputs"][0]
+    expected = torch.arange(4, 16, dtype=torch.float32)
+    torch.testing.assert_close(audio, expected)
+
+
+def test_forward_preserves_request_alignment_when_only_later_request_has_payload():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(4, dtype=torch.long),
+        runtime_additional_information=[
+            {},
+            {"left_context_size": [1], "code_predictor_codes": list(range(8))},
+        ],
+    )
+
+    audio0, audio1 = out.multimodal_outputs["model_outputs"]
+    assert audio0.numel() == 0
+    torch.testing.assert_close(audio1, torch.arange(4, 16, dtype=torch.float32))
+
+
+def test_forward_skips_malformed_payload_without_shifting_sibling_outputs():
+    model = _make_model()
+
+    out = model.forward(
+        input_ids=torch.arange(6, dtype=torch.long),
+        runtime_additional_information=[
+            {"left_context_size": 0, "code_predictor_codes": [1, 2, 3]},
+            {"left_context_size": 0, "code_predictor_codes": list(range(8))},
+        ],
+    )
+
+    audio0, audio1 = out.multimodal_outputs["model_outputs"]
+    assert audio0.numel() == 0
+    torch.testing.assert_close(audio1, torch.arange(16, dtype=torch.float32))

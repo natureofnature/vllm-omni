@@ -9,6 +9,70 @@ processor (qwen3_omni, qwen2_5_omni, qwen3_tts, etc.).
 
 from typing import Any
 
+import torch
+
+QWEN3_TTS_TALKER_GPU_RESIDENT_BUFFER_KEYS = frozenset(
+    {"audio_codes", "last_talker_hidden", "tts_pad_embed", "tailing_text_hidden"}
+)
+
+
+def build_qwen3_tts_talker_multimodal_outputs(
+    info_dicts: list[dict[str, Any]] | None,
+) -> tuple[int, dict[str, Any]]:
+    """Aggregate per-request talker outputs into one multimodal payload."""
+    if not info_dicts:
+        return 0, {}
+
+    audio_codes_list: list[torch.Tensor] = []
+    ref_code_len_list: list[torch.Tensor] = []
+    ref_code_tensor: torch.Tensor | None = None
+    codec_streaming_list: list[torch.Tensor] = []
+
+    for info in info_dicts:
+        if not isinstance(info, dict):
+            continue
+        ac = info.get("audio_codes")
+        if isinstance(ac, torch.Tensor):
+            audio_codes_list.append(ac)
+            cs = info.get("codec_streaming")
+            if isinstance(cs, bool):
+                codec_streaming_list.append(
+                    torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
+                )
+        ref_code = info.get("ref_code")
+        if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
+            ref_code_tensor = ref_code
+        ref_len = info.get("ref_code_len")
+        if ref_len is None:
+            continue
+        if isinstance(ref_len, torch.Tensor):
+            if ref_len.numel() == 0:
+                raise ValueError("ref_code_len is an empty tensor")
+            ref_len_val = int(ref_len.reshape(-1)[-1].item())
+        elif isinstance(ref_len, list):
+            if len(ref_len) != 1:
+                raise ValueError(f"ref_code_len must be scalar or 1-element list, got len={len(ref_len)}")
+            ref_len_val = int(ref_len[0])
+        else:
+            ref_len_val = int(ref_len)
+        if isinstance(ac, torch.Tensor):
+            ref_code_len_list.append(torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device))
+
+    if not audio_codes_list:
+        return 0, {}
+
+    audio_codes = torch.cat(audio_codes_list, dim=0)
+    span_len = int(audio_codes.shape[0])
+    mm: dict[str, Any] = {"audio_codes": audio_codes}
+    if ref_code_len_list:
+        mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
+    if ref_code_tensor is not None:
+        mm["ref_code"] = [ref_code_tensor]
+    if codec_streaming_list:
+        mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
+    return span_len, mm
+
+
 # =============================================================================
 # Speaker helpers
 # =============================================================================
