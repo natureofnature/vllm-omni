@@ -1,4 +1,4 @@
-"""Base worker class for vLLM-Omni with process-scoped GPU memory accounting."""
+"""Base worker class for vLLM-Omni with NVML-backed GPU memory accounting."""
 
 from __future__ import annotations
 
@@ -17,7 +17,6 @@ from vllm_omni.diffusion.data import (
     OmniSleepTask,
     OmniWakeTask,
 )
-from vllm_omni.entrypoints.utils import detect_pid_host
 from vllm_omni.platforms import current_omni_platform
 from vllm_omni.worker.gpu_memory_utils import (
     get_process_gpu_memory,
@@ -28,11 +27,11 @@ logger = init_logger(__name__)
 
 
 class OmniGPUWorkerBase(GPUWorker):
-    """Base GPU worker for vLLM-Omni with process-scoped memory accounting.
+    """Base GPU worker for vLLM-Omni with NVML-backed memory accounting.
 
-    This class overrides determine_available_memory() to use per-process GPU
-    memory tracking via pynvml, allowing multiple stages to initialize
-    concurrently on the same GPU without memory accounting interference.
+    This class overrides determine_available_memory() to use GPU memory
+    tracking via pynvml, allowing multiple stages to initialize concurrently
+    on the same GPU without profiling-fallback interference.
 
     It also replaces vLLM's TorchProfilerWrapper with OmniTorchProfilerWrapper
     for custom trace naming, background gzip, and trace path collection.
@@ -91,14 +90,16 @@ class OmniGPUWorkerBase(GPUWorker):
 
     @torch.inference_mode()
     def determine_available_memory(self) -> int:
-        """Process-scoped GPU memory profiling for concurrent stage initialization.
+        """NVML-backed GPU memory profiling for concurrent stage initialization.
 
         Algorithm:
             1. requested_memory = total_gpu_memory * gpu_memory_utilization
                (computed in init_device from cache_config)
 
-            2. process_memory = memory used by THIS process only (via pynvml)
-               - Uses nvmlDeviceGetComputeRunningProcesses to get per-PID memory
+            2. process_memory = memory reported by pynvml for the current
+               workload on the target device
+               - Direct per-PID match when host and container PIDs align
+               - Device-scoped compute memory fallback when PID namespaces do not
                - Supports CUDA_VISIBLE_DEVICES with indices, UUIDs, or MIG IDs
 
             3. available_kv_cache = requested_memory - process_memory
@@ -122,14 +123,10 @@ class OmniGPUWorkerBase(GPUWorker):
         self.non_torch_memory = profile_result.non_torch_increase
         self.peak_activation_memory = profile_result.torch_peak_increase
 
-        process_memory = (
-            get_process_gpu_memory(self.local_rank)
-            if is_process_scoped_memory_available() and detect_pid_host()
-            else None
-        )
+        process_memory = get_process_gpu_memory(self.local_rank) if is_process_scoped_memory_available() else None
 
         if process_memory is not None:
-            # NVML available: use per-process memory
+            # NVML available: use process-aware device memory accounting
             self.available_kv_cache_memory_bytes = max(0, self.requested_memory - process_memory)
             logger.debug(
                 "Process-scoped memory (PID %d, GPU %d): requested=%s, used=%s, available=%s",

@@ -300,6 +300,26 @@ class OmniBase(PDDisaggregationMixin):
                 raise EngineDeadError(error_text)
             raise RuntimeError(error_text)
 
+        if msg_type == "finished_only":
+            req_id = msg.get("request_id")
+            stage_id = msg.get("stage_id")
+            if req_id is None or stage_id is None:
+                logger.warning(
+                    "[%s] got finished_only message without request_id/stage_id",
+                    self.__class__.__name__,
+                )
+                return True, None, None, None
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                logger.debug(
+                    "[%s] dropping finished_only for unknown req %s",
+                    self.__class__.__name__,
+                    req_id,
+                )
+                return True, None, None, None
+            req_state.stage_id = stage_id
+            return False, req_id, stage_id, req_state
+
         if msg_type != "output":
             logger.warning("[%s] got unexpected msg type: %s", self.__class__.__name__, msg_type)
             return True, None, None, None
@@ -366,15 +386,30 @@ class OmniBase(PDDisaggregationMixin):
     ) -> OmniRequestOutput | None:
         req_id = result.get("request_id")
         engine_outputs = result.get("engine_outputs")
-        stage_durations = getattr(result["engine_outputs"], "stage_durations", {})
-        peak_memory_mb = getattr(result["engine_outputs"], "peak_memory_mb", 0.0)
-        finished = engine_outputs.finished
+        finished = bool(result.get("finished"))
 
         submit_ts = result.get("stage_submit_ts")
         now = time.time()
         if metrics.stage_first_ts[stage_id] is None:
             metrics.stage_first_ts[stage_id] = submit_ts if submit_ts is not None else now
         metrics.stage_last_ts[stage_id] = max(metrics.stage_last_ts[stage_id] or 0.0, now)
+
+        if result.get("type") == "finished_only" or engine_outputs is None:
+            try:
+                rid_key = str(req_id)
+                if stage_id == final_stage_id_for_e2e and rid_key not in metrics.e2e_done and finished:
+                    metrics.on_finalize_request(
+                        stage_id,
+                        req_id,
+                        req_start_ts.get(req_id, wall_start_ts),
+                    )
+            except Exception:
+                logger.exception("[%s] Finalize request handling error", self.__class__.__name__)
+            return None
+
+        stage_durations = getattr(engine_outputs, "stage_durations", {})
+        peak_memory_mb = getattr(engine_outputs, "peak_memory_mb", 0.0)
+        finished = engine_outputs.finished
 
         _m = result.get("metrics")
         if finished and _m is not None:

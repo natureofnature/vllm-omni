@@ -582,9 +582,9 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
         # -------- t2i (AR grid) token constraints --------
-        # Constraint logic depends on per-step sampling_metadata + runtime_additional_information.
+        # Constraint logic depends on per-step sampling_metadata + model_intermediate_buffer.
         # These are passed by the vllm-omni runner via kwargs, so caching them in the model is sufficient.
-        self._last_runtime_additional_information: list[dict[str, Any]] | None = None
+        self._last_model_intermediate_buffer: list[dict[str, Any]] | None = None
 
     def _apply_t2i_token_constraints(self, logits: torch.Tensor) -> torch.Tensor:
         """Applies per-request token constraints.
@@ -598,7 +598,7 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         if logits is None or not isinstance(logits, torch.Tensor):
             return logits
 
-        runtime_infos = self._last_runtime_additional_information
+        runtime_infos = self._last_model_intermediate_buffer
 
         if runtime_infos is None:
             # There is no runtime info in dummy/profile run
@@ -643,11 +643,11 @@ class MammothModa2ARForConditionalGeneration(Qwen2_5_VLForConditionalGeneration)
         inputs_embeds: torch.Tensor | None = None,
         **kwargs: Any,
     ):
-        # vllm-omni runner passes sampling_metadata and runtime_additional_information
+        # vllm-omni runner passes sampling_metadata and model_intermediate_buffer
         # in each forward step. compute_logits is called immediately after
         # forward, so caching here enables step-by-step dynamic token constraints.
-        runtime_infos = kwargs.get("runtime_additional_information")
-        self._last_runtime_additional_information = runtime_infos if isinstance(runtime_infos, list) else None
+        runtime_infos = kwargs.get("model_intermediate_buffer")
+        self._last_model_intermediate_buffer = runtime_infos if isinstance(runtime_infos, list) else None
         hidden_states = super().forward(
             input_ids=input_ids,
             positions=positions,
@@ -768,7 +768,7 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
         if hasattr(self.model, "get_input_embeddings"):
             return self.model.get_input_embeddings(input_ids, multimodal_embeddings=multimodal_embeddings)
         # DiT stage does not consume token embeddings from `input_ids`; it uses
-        # condition embeddings passed via additional_information.
+        # condition embeddings passed via `model_intermediate_buffer`.
         # However, vLLM's generation runner may still request token embeddings
         # to populate `inputs_embeds` buffers, so we provide a dummy tensor.
         if self.model_stage == "dit":
@@ -799,16 +799,14 @@ class MammothModa2ForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             return self.model.compute_logits(hidden_states)
         return None
 
-    def get_dummy_runtime_additional_information(self, num_reqs: int) -> list[dict[str, object]]:
+    def get_dummy_model_intermediate_buffer(self, num_reqs: int) -> list[dict[str, object]]:
         if self.model_stage != "dit":
-            raise RuntimeError(
-                f"get_dummy_runtime_additional_information only valid for dit stage, got {self.model_stage}"
-            )
+            raise RuntimeError(f"get_dummy_model_intermediate_buffer only valid for dit stage, got {self.model_stage}")
         if self.dit is None:
             raise RuntimeError("dit stage model is not initialized")
-        if not hasattr(self.dit, "get_dummy_runtime_additional_information"):
-            raise AttributeError("dit model missing get_dummy_runtime_additional_information")
-        return self.dit.get_dummy_runtime_additional_information(num_reqs)
+        if not hasattr(self.dit, "get_dummy_model_intermediate_buffer"):
+            raise AttributeError("dit model missing get_dummy_model_intermediate_buffer")
+        return self.dit.get_dummy_model_intermediate_buffer(num_reqs)
 
     def load_weights(self, weights):
         if self.model_stage == "ar":

@@ -101,6 +101,37 @@ class RealtimeConnection(VllmRealtimeConnection):
         return chunks, int(sr)
 
     @staticmethod
+    def _update_text_stream_state(
+        *,
+        stage_id: int | None,
+        cumulative_text: str,
+        prompt_token_ids_len: int,
+        sent_text_len: int,
+        emitted_text_chunks: list[str],
+        last_prompt_token_ids_len: int,
+    ) -> tuple[str, str, int, int]:
+        # Stage-0 streaming sessions may roll over to a new segment by folding
+        # the previous segment into prompt_token_ids. Reset transcript assembly
+        # at that boundary so the carried-over prefix is not emitted twice.
+        if stage_id == 0 and prompt_token_ids_len > last_prompt_token_ids_len > 0:
+            emitted_text_chunks.clear()
+            sent_text_len = len(cumulative_text)
+
+        if cumulative_text:
+            if len(cumulative_text) >= sent_text_len:
+                delta_text = cumulative_text[sent_text_len:]
+            else:
+                delta_text = cumulative_text
+            sent_text_len = len(cumulative_text)
+        else:
+            delta_text = ""
+
+        if delta_text:
+            emitted_text_chunks.append(delta_text)
+        full_text = "".join(emitted_text_chunks)
+        return delta_text, full_text, sent_text_len, prompt_token_ids_len
+
+    @staticmethod
     def _pcm16_b64(audio_f32: np.ndarray) -> str:
         clipped = np.clip(audio_f32, -1.0, 1.0)
         pcm16 = (clipped * 32767.0).astype(np.int16)
@@ -119,6 +150,8 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        emitted_text_chunks: list[str] = []
+        last_prompt_token_ids_len = 0
 
         try:
             result_gen = self.serving.engine_client.generate(
@@ -137,15 +170,14 @@ class RealtimeConnection(VllmRealtimeConnection):
                     if not prompt_token_ids_len and output.prompt_token_ids:
                         prompt_token_ids_len = len(output.prompt_token_ids)
                     cumulative_text = output0.text or ""
-                    if cumulative_text:
-                        if len(cumulative_text) >= sent_text_len:
-                            delta_text = cumulative_text[sent_text_len:]
-                        else:
-                            delta_text = cumulative_text
-                        sent_text_len = len(cumulative_text)
-                        full_text = cumulative_text
-                    else:
-                        delta_text = ""
+                    delta_text, full_text, sent_text_len, last_prompt_token_ids_len = self._update_text_stream_state(
+                        stage_id=getattr(output, "stage_id", None),
+                        cumulative_text=cumulative_text,
+                        prompt_token_ids_len=len(output.prompt_token_ids or []),
+                        sent_text_len=sent_text_len,
+                        emitted_text_chunks=emitted_text_chunks,
+                        last_prompt_token_ids_len=last_prompt_token_ids_len,
+                    )
 
                     if delta_text:
                         await self.send(TranscriptionDelta(delta=delta_text))

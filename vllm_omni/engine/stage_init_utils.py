@@ -405,6 +405,24 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
+    if (
+        not engine_args_dict.get("async_chunk", False)
+        and "custom_process_next_stage_input_func" not in engine_args_dict
+    ):
+        input_func = getattr(stage_config, "custom_process_input_func", None)
+        if isinstance(input_func, str) and input_func:
+            try:
+                module_path, func_name = input_func.rsplit(".", 1)
+                if not func_name.endswith("_batch"):
+                    engine_args_dict["custom_process_next_stage_input_func"] = f"{module_path}.{func_name}_batch"
+                else:
+                    engine_args_dict["custom_process_next_stage_input_func"] = input_func
+            except ValueError as exc:
+                logger.warning(
+                    "Failed to derive custom_process_next_stage_input_func from %s: %s",
+                    input_func,
+                    exc,
+                )
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
@@ -629,7 +647,6 @@ def build_diffusion_config(
     metadata: StageMetadata,
 ) -> Any:
     """Build diffusion config for a stage."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)
@@ -677,15 +694,6 @@ def initialize_diffusion_stage(
     """
     from vllm_omni.diffusion.stage_diffusion_client import create_diffusion_client
 
-    engine_args = _to_dict(stage_cfg.engine_args)
-    engine_args.pop("stage_id", None)
-    od_config = OmniDiffusionConfig.from_kwargs(
-        stage_id=stage_id,
-        model=model,
-        **engine_args,
-    )
-    if metadata.cfg_kv_collect_func is not None:
-        od_config.cfg_kv_collect_func = metadata.cfg_kv_collect_func
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
 

@@ -208,14 +208,14 @@ def unwrap_first_value(value: Any, default: Any = None) -> Any:
     return value
 
 
-def normalize_runtime_info(runtime_additional_information: Any) -> dict[str, Any]:
-    if isinstance(runtime_additional_information, list):
-        if not runtime_additional_information:
+def normalize_runtime_info(runtime_info_payload: Any) -> dict[str, Any]:
+    if isinstance(runtime_info_payload, list):
+        if not runtime_info_payload:
             return {}
-        first = runtime_additional_information[0]
+        first = runtime_info_payload[0]
         return first if isinstance(first, dict) else {}
-    if isinstance(runtime_additional_information, dict):
-        return runtime_additional_information
+    if isinstance(runtime_info_payload, dict):
+        return runtime_info_payload
     return {}
 
 

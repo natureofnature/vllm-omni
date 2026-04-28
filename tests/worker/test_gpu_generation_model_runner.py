@@ -1,6 +1,7 @@
 import pytest
 import torch
 
+from vllm_omni.outputs import OmniConnectorOutput, OmniModelRunnerOutput
 from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -78,3 +79,18 @@ def test_sample_tokens_dict_output():
     assert "audio" in output.pooler_output[0]
     assert "unused" not in output.pooler_output[0]
     assert output.pooler_output[0]["audio"].shape == (1, 4)
+
+
+def test_sample_tokens_async_scheduling_keeps_omni_output_contract():
+    multimodal_outputs = torch.randn(1, 2, 3)
+    runner = _make_runner(multimodal_outputs)
+    runner.use_async_scheduling = True
+    expected_connector_output = OmniConnectorOutput(stage_recv_req_ids={"req-1"})
+    runner.get_omni_connector_output = lambda: expected_connector_output
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    assert isinstance(output, OmniModelRunnerOutput)
+    assert output.req_ids == ["req-1"]
+    assert output.omni_connector_output is expected_connector_output
+    assert len(output.pooler_output) == 1

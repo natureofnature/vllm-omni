@@ -1,7 +1,8 @@
-"""NVML-based per-process GPU memory utilities.
+"""NVML-based GPU memory accounting utilities.
 
 Shared across worker types (OmniGPUWorkerBase, DiffusionWorker, etc.)
-for process-scoped GPU memory accounting.
+for process-aware memory accounting, with device-scoped fallback when
+container PID namespaces hide the host PID from NVML.
 """
 
 from __future__ import annotations
@@ -67,12 +68,15 @@ def get_device_handle(device_id: str | int):
 
 
 def get_process_gpu_memory(local_rank: int) -> int | None:
-    """Get GPU memory used by current process via pynvml.
+    """Get GPU memory for the current workload on the target device via pynvml.
 
     Supports CUDA_VISIBLE_DEVICES with integer indices, UUIDs, or MIG IDs.
 
     Returns:
-        Memory in bytes used by this process, or None if NVML unavailable.
+        Memory in bytes attributed to the current process when NVML can match
+        the PID directly. In non-host-PID containers, falls back to the total
+        compute-process memory on the target device. Returns None when NVML is
+        unavailable.
 
     Raises:
         RuntimeError: If device validation fails (invalid index or UUID).
@@ -106,11 +110,25 @@ def get_process_gpu_memory(local_rank: int) -> int | None:
                     f"Invalid GPU device {local_rank}. Only {device_count} GPU(s) available. "
                     f"Check CUDA_VISIBLE_DEVICES or stage config 'devices' setting."
                 )
+            device_id = local_rank
             handle = nvmlDeviceGetHandleByIndex(local_rank)
 
-        for proc in nvmlDeviceGetComputeRunningProcesses(handle):
+        processes = list(nvmlDeviceGetComputeRunningProcesses(handle))
+        for proc in processes:
             if proc.pid == my_pid:
                 return proc.usedGpuMemory
+
+        if processes:
+            device_memory = sum(proc.usedGpuMemory for proc in processes)
+            logger.warning(
+                "NVML PID mismatch for local pid %d on device %r; "
+                "using device-scoped compute memory across %d process(es). "
+                "This commonly happens inside non-host PID containers.",
+                my_pid,
+                device_id,
+                len(processes),
+            )
+            return device_memory
         return 0
     except RuntimeError:
         raise

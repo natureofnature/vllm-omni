@@ -162,3 +162,53 @@ def token2image_to_token2audio(
     requires_multimodal_data: bool = False,
 ):
     return _bridge_tokens(stage_list, engine_input_source, prompt, requires_multimodal_data)
+
+
+def _build_full_payload(pooling_output: dict[str, Any] | None, request: Any) -> dict[str, Any] | None:
+    if not isinstance(pooling_output, dict):
+        return None
+
+    token_ids = _to_token_id_list(pooling_output.get("token_ids"))
+    if not token_ids:
+        token_ids = _to_token_id_list(pooling_output.get("text_tokens"))
+    if not token_ids and request is not None:
+        token_ids = _to_token_id_list(getattr(request, "output_token_ids", None))
+    if not token_ids:
+        return None
+
+    src_additional_info = getattr(request, "additional_information", {}) if request is not None else {}
+    if not isinstance(src_additional_info, dict):
+        src_additional_info = {}
+
+    runtime_bridge_info = _decode_runtime_bridge_info(pooling_output.get("runtime_info_json"))
+    if not runtime_bridge_info:
+        runtime_bridge_info = pooling_output.get("runtime_info", {}) or {}
+
+    payload = _normalize_additional_info(src_additional_info)
+    payload.update(_normalize_additional_info(runtime_bridge_info))
+    payload["detok_id"] = [_to_int(pooling_output.get("detok_id"), default=_to_int(payload.get("detok_id"), default=0))]
+    payload["code_predictor_codes"] = token_ids
+    payload["finished"] = torch.tensor(True, dtype=torch.bool)
+    return payload
+
+
+def token2text_to_token2image_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    del transfer_manager
+    return _build_full_payload(pooling_output, request)
+
+
+def token2image_to_token2audio_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: Any,
+) -> dict[str, Any] | None:
+    del transfer_manager
+    return _build_full_payload(pooling_output, request)
+
+
+token2text_to_token2image_batch = token2text_to_token2image_full_payload
+token2image_to_token2audio_batch = token2image_to_token2audio_full_payload

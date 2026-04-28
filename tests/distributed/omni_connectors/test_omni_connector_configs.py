@@ -6,7 +6,10 @@ from pathlib import Path
 import pytest
 
 # Use the new import path for initialization utilities
-from vllm_omni.distributed.omni_connectors.utils.initialization import load_omni_transfer_config
+from vllm_omni.distributed.omni_connectors.utils.initialization import (
+    build_stage_connectors,
+    load_omni_transfer_config,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -36,6 +39,13 @@ def get_config_files():
 
 # Collect files at module level for parametrization
 config_files = get_config_files()
+
+
+def test_build_stage_connectors_is_deprecated():
+    with pytest.deprecated_call(match="build_stage_connectors is deprecated"):
+        connectors = build_stage_connectors(stage_id=1, connectors_config={})
+
+    assert connectors == {}
 
 
 @pytest.mark.skipif(len(config_files) == 0, reason="No config files found or directory missing")

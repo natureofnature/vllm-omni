@@ -53,7 +53,7 @@ class DyninOmniToken2Image(DyninOmniStageBase):
         del positions, intermediate_tensors, inputs_embeds
         if input_ids is None:
             raise ValueError("token2image stage requires input_ids")
-        runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
+        runtime_info = normalize_runtime_info(kwargs.get("model_intermediate_buffer"))
         detok_id = int(unwrap_first_value(runtime_info.get("detok_id"), 0))
         tokens = coerce_token_ids_1d(input_ids)
 

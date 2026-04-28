@@ -778,7 +778,6 @@ class MiMoAudioForConditionalGeneration(
         sampling_metadata: SamplingMetadata | None = None,
         logits_index: int | None = None,
         sampler=None,
-        additional_information: dict[str, object] | None = None,
         **kwargs: object,
     ) -> torch.Tensor | IntermediateTensors | OmniOutput:
         """

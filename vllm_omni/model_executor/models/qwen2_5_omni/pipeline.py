@@ -29,6 +29,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             owns_tokenizer=True,
             requires_multimodal_data=True,
             engine_output_type="latent",
+            custom_process_next_stage_input_func=(f"{_PROC}.thinker2talker_full_payload"),
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -38,6 +39,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             input_sources=(0,),
             engine_output_type="latent",
             custom_process_input_func=f"{_PROC}.thinker2talker",
+            custom_process_next_stage_input_func=(f"{_PROC}.talker2code2wav_full_payload"),
             sampling_constraints={
                 "detokenize": True,
                 "stop_token_ids": [8294],
@@ -51,6 +53,7 @@ QWEN2_5_OMNI_PIPELINE = PipelineConfig(
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
+            custom_process_input_func=f"{_PROC}.talker2code2wav",
             sampling_constraints={"detokenize": True},
         ),
     ),

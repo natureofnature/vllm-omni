@@ -7,6 +7,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 import vllm_omni.model_executor.stage_input_processors.qwen3_omni as q3
 
@@ -79,3 +80,20 @@ def test_get_streaming_codec_delta_len_increments_and_finishes(_streaming_contex
     assert d3 == 1
     state = q3._get_qwen3_streaming_state("c1", _streaming_context)
     assert state.talker2code2wav_last_seq_len == 0
+
+
+def test_talker2code2wav_flattens_codec_codes_into_prompt_tokens() -> None:
+    output = SimpleNamespace(
+        multimodal_output={
+            "code_predictor_codes": torch.tensor([[1, 2], [3, 4]], dtype=torch.long),
+        },
+        token_ids=[10, 11, 12],
+    )
+    stage = SimpleNamespace(
+        engine_outputs=[SimpleNamespace(outputs=[output], request_id="req-1")],
+    )
+
+    prompts = q3.talker2code2wav(stage_list=[stage], engine_input_source=[0])
+
+    assert len(prompts) == 1
+    assert prompts[0]["prompt_token_ids"] == [1, 3, 2, 4]

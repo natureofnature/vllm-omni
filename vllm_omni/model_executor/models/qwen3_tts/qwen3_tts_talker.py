@@ -27,6 +27,10 @@ from vllm.multimodal.audio import AudioResampler
 from vllm.sequence import IntermediateTensors
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput
+from vllm_omni.model_executor.stage_input_processors.tts_utils import (
+    QWEN3_TTS_TALKER_GPU_RESIDENT_BUFFER_KEYS,
+    build_qwen3_tts_talker_multimodal_outputs,
+)
 from vllm_omni.utils.audio import mel_filter_bank
 from vllm_omni.utils.voice_cache import VoiceEmbeddingCache
 
@@ -334,15 +338,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             )
         self._codec_eos_token_id = int(getattr(self.talker_config, "codec_eos_token_id", -1))
 
-        self._eos_logit_bias: float = 0.0
-
         self.have_multimodal_outputs = True
         self.has_preprocess = True
         self.has_postprocess = True
         # Used by OmniGPUModelRunner for the GPU-side MTP fast-path.
         self.mtp_hidden_size = int(self.talker_config.hidden_size)
         # OmniGPUModelRunner will store talker_mtp output under this key in
-        # per-request additional_information.
+        # the per-request model_intermediate_buffer.
         self.talker_mtp_output_key = "audio_codes"
 
         self.model = Qwen3Model(vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model"))
@@ -402,12 +404,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Keys that should stay on GPU in model_intermediate_buffer to avoid
         # CPU-to-GPU round-trips on every decode step.
-        self.gpu_resident_buffer_keys: set[str] = {
-            "audio_codes",
-            "last_talker_hidden",
-            "tts_pad_embed",
-            "tailing_text_hidden",
-        }
+        self.gpu_resident_buffer_keys = QWEN3_TTS_TALKER_GPU_RESIDENT_BUFFER_KEYS
 
         # Tokenizer for prompt building.
         self._tokenizer = None
@@ -449,11 +446,6 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         # Mask out invalid codec ids using the pre-built constant buffer.
         logits = logits.masked_fill(~self._codec_allowed_mask, float("-inf"))
 
-        if self._eos_logit_bias != 0.0:
-            eos_id = self._codec_eos_token_id
-            if 0 <= eos_id < logits.shape[-1]:
-                logits[:, eos_id] = logits[:, eos_id] + self._eos_logit_bias
-
         return logits
 
     # -------------------- Omni multimodal output plumbing --------------------
@@ -463,61 +455,11 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             return model_outputs
 
         hidden = model_outputs
-        info_dicts = kwargs.get("model_intermediate_buffer")
-        if info_dicts is None:
-            info_dicts = kwargs.get("runtime_additional_information") or []
-        if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
-            logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
-        audio_codes_list: list[torch.Tensor] = []
-        ref_code_len_list: list[torch.Tensor] = []
-        ref_code_tensor: torch.Tensor | None = None
-        codec_streaming_list: list[torch.Tensor] = []
-        for info in info_dicts:
-            if not isinstance(info, dict):
-                continue
-            ac = info.get("audio_codes")
-            if isinstance(ac, torch.Tensor):
-                audio_codes_list.append(ac)
-                cs = info.get("codec_streaming")
-                if isinstance(cs, bool):
-                    codec_streaming_list.append(
-                        torch.full((int(ac.shape[0]),), int(cs), dtype=torch.int8, device=ac.device)
-                    )
-            ref_code = info.get("ref_code")
-            if isinstance(ref_code, torch.Tensor) and ref_code.numel() > 0:
-                ref_code_tensor = ref_code
-            ref_len = info.get("ref_code_len")
-            if ref_len is None:
-                continue
-            if isinstance(ref_len, torch.Tensor):
-                if ref_len.numel() == 0:
-                    raise ValueError("ref_code_len is an empty tensor")
-                ref_len_val = int(ref_len.reshape(-1)[-1].item())
-            elif isinstance(ref_len, list):
-                if len(ref_len) != 1:
-                    raise ValueError(f"ref_code_len must be scalar or 1-element list, got len={len(ref_len)}")
-                ref_len_val = int(ref_len[0])
-            else:
-                ref_len_val = int(ref_len)
-            if isinstance(ac, torch.Tensor):
-                # Emit ref_code_len per-token span for runner slicing (consumer takes the last value).
-                ref_code_len_list.append(
-                    torch.full((int(ac.shape[0]),), ref_len_val, dtype=torch.int32, device=ac.device)
-                )
-
-        if not audio_codes_list:
+        span_len, mm = build_qwen3_tts_talker_multimodal_outputs(kwargs.get("model_intermediate_buffer"))
+        if span_len <= 0:
             return OmniOutput(text_hidden_states=hidden, multimodal_outputs={})
 
-        audio_codes = torch.cat(audio_codes_list, dim=0)
-        span_len = int(audio_codes.shape[0])
         hidden = hidden[:span_len]
-        mm: dict[str, torch.Tensor] = {"audio_codes": audio_codes}
-        if ref_code_len_list:
-            mm["ref_code_len"] = torch.cat(ref_code_len_list, dim=0)[:span_len]
-        if ref_code_tensor is not None:
-            mm["ref_code"] = [ref_code_tensor]
-        if codec_streaming_list:
-            mm["codec_streaming"] = torch.cat(codec_streaming_list, dim=0)[:span_len]
         return OmniOutput(text_hidden_states=hidden, multimodal_outputs=mm)
 
     # -------------------- preprocess / postprocess --------------------
@@ -528,21 +470,13 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         input_embeds: torch.Tensor | None,
         **info_dict: Any,
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
-        # Metadata may be passed flattened or under `additional_information`; normalize to flattened keys.
-        additional_information = info_dict.get("additional_information")
-        if isinstance(additional_information, dict):
-            merged: dict[str, Any] = {k: v for k, v in info_dict.items() if k != "additional_information"}
-            for k, v in additional_information.items():
-                merged.setdefault(k, v)
-            info_dict = merged
-
         span_len = int(input_ids.shape[0])
         if span_len <= 0:
             return input_ids, input_embeds if input_embeds is not None else self.embed_input_ids(input_ids), {}
 
         text_list = info_dict.get("text")
         if not isinstance(text_list, list) or not text_list or not text_list[0]:
-            raise ValueError("Missing additional_information.text for Qwen3-TTS AR talker.")
+            raise ValueError("Missing model_intermediate_buffer.text for Qwen3-TTS AR talker.")
 
         task_type = (info_dict.get("task_type") or ["CustomVoice"])[0]
         codec_streaming_val = info_dict.get("codec_streaming")
@@ -599,7 +533,9 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             else:
                 # Subsequent prefill chunk: slice from stored embeddings at running offset.
                 if tts_pad_embed is None:
-                    raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must initialize it.")
+                    raise RuntimeError(
+                        "Missing `tts_pad_embed` in model_intermediate_buffer; prefill must initialize it."
+                    )
                 offset = int(info_dict.get("talker_prefill_offset", 0) or 0)
                 if offset < 0:
                     offset = 0
@@ -628,11 +564,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
 
         # Decode: span_len == 1
         # Pop one text-step vector from tailing_text_hidden queue.
-        # These tensors stay on GPU via gpu_resident_buffer_keys - .to() is a no-op.
-        tts_pad_embed_buf = info_dict.get("tts_pad_embed")
-        if not isinstance(tts_pad_embed_buf, torch.Tensor):
-            raise RuntimeError("Missing `tts_pad_embed` in additional_information; prefill must run first.")
-        tts_pad_embed = tts_pad_embed_buf.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        tts_pad_embed_cpu = info_dict.get("tts_pad_embed")
+        if not isinstance(tts_pad_embed_cpu, torch.Tensor):
+            raise RuntimeError("Missing `tts_pad_embed` in model_intermediate_buffer; prefill must run first.")
+        tts_pad_embed = tts_pad_embed_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         tail = info_dict.get("tailing_text_hidden")
         if isinstance(tail, torch.Tensor) and tail.ndim == 2 and tail.shape[0] > 0:
@@ -642,10 +577,10 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
             text_step = tts_pad_embed
             new_tail = tail if isinstance(tail, torch.Tensor) else torch.empty((0, tts_pad_embed.shape[-1]))
 
-        last_hidden = info_dict.get("last_talker_hidden")
-        if not isinstance(last_hidden, torch.Tensor):
-            raise RuntimeError("Missing `last_talker_hidden` in additional_information; postprocess must run.")
-        past_hidden = last_hidden.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
+        last_hidden_cpu = info_dict.get("last_talker_hidden")
+        if not isinstance(last_hidden_cpu, torch.Tensor):
+            raise RuntimeError("Missing `last_talker_hidden` in model_intermediate_buffer; postprocess must run.")
+        past_hidden = last_hidden_cpu.to(device=input_ids.device, dtype=torch.bfloat16).reshape(1, -1)
 
         # Use OmniGPUModelRunner talker_mtp fast-path for residual codebooks and per-step inputs_embeds update.
         last_id_hidden = self.embed_input_ids(input_ids.reshape(1, 1).to(torch.long)).to(
@@ -901,7 +836,7 @@ class Qwen3TTSTalkerForConditionalGeneration(nn.Module):
         return np.asarray(audio, dtype=np.float32), int(sr)
 
     def _normalize_ref_audio(self, ref_audio: object) -> tuple[np.ndarray, int]:
-        # NOTE: additional_information may serialize (wav, sr) into (nested) lists across processes; be tolerant.
+        # NOTE: model_intermediate_buffer may serialize (wav, sr) into nested lists across processes.
         if isinstance(ref_audio, str):
             return self._load_audio_to_np(ref_audio)
 

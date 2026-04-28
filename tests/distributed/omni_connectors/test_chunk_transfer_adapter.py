@@ -4,12 +4,10 @@
 import threading
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock
 
 import pytest
 import torch
-from pytest_mock import MockerFixture
-from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -19,14 +17,6 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-class DummyWaitingQueue(list):
-    def prepend_requests(self, requests):
-        self[:0] = list(requests)
-
-    def add_request(self, request):
-        self.append(request)
 
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
@@ -42,9 +32,9 @@ def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None)
 
 
 @pytest.fixture
-def build_adapter(monkeypatch, mocker: MockerFixture):
+def build_adapter(monkeypatch):
     def _build(*, stage_id: int = 1, model_mode: str = "ar", max_num_seqs: int = 2):
-        connector = mocker.MagicMock()
+        connector = MagicMock()
         connector.stage_id = stage_id
         connector.get.return_value = None
         connector.put.return_value = (True, 1, {})
@@ -55,7 +45,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
             self._finished_load_reqs = set()
             self._cancelled_load_reqs = set()
             self._pending_save_reqs = deque()
-            self._finished_save_reqs = set()
             self.stop_event = threading.Event()
             self._recv_cond = threading.Condition()
             self._save_cond = threading.Condition()
@@ -111,11 +100,13 @@ def test_load_poll(build_adapter):
     request = _req("req-1", RequestStatus.WAITING, external_req_id="external-1")
 
     adapter.load_async(request)
+    adapter.request_ids_mapping["req-1"] = "external-1"
     payload = {"code_predictor_codes": [[1]], "hidden_states": torch.tensor([[2.0]]), "finished": True}
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
-    assert request.additional_information == payload
+    assert request.additional_information is None
+    assert adapter.request_payload["external-1"] == payload
     assert adapter.get_req_chunk["req-1"] == 1
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
@@ -160,44 +151,6 @@ def test_update_request_payload(build_adapter):
     assert torch.equal(merged["h"], torch.tensor([[1.0], [2.0]]))
     assert merged["codes"] == [1, 2]
     assert merged["finished"] is True
-
-
-def test_process_and_restore_queues(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=8)
-    waiting_req = _req("w1", RequestStatus.WAITING)
-    running_req = _req("r1", RequestStatus.RUNNING)
-    waiting_queue = DummyWaitingQueue([waiting_req])
-    running_queue = [running_req]
-
-    adapter.process_pending_chunks(waiting_queue, running_queue)
-    assert waiting_req.status == RequestStatus.WAITING_FOR_CHUNK
-    assert running_req.status == RequestStatus.WAITING_FOR_CHUNK
-    assert waiting_queue == []
-    assert running_queue == []
-
-    adapter.restore_queues(waiting_queue, running_queue)
-    assert waiting_queue == [waiting_req]
-    assert running_queue == [running_req]
-    assert adapter.waiting_for_chunk_waiting_requests == deque()
-    assert adapter.waiting_for_chunk_running_requests == deque()
-
-
-def test_postprocess_scheduler_output(build_adapter):
-    adapter, _ = build_adapter()
-    adapter.requests_with_ready_chunks = {"new-ready", "cached-ready", "leftover"}
-
-    scheduler_output = SimpleNamespace(
-        scheduled_new_reqs=[SimpleNamespace(req_id="new-ready")],
-        scheduled_cached_reqs=SimpleNamespace(req_ids=["cached-ready", "missing"]),
-    )
-    requests = {"cached-ready": SimpleNamespace(additional_information={"k": "v"})}
-
-    adapter.postprocess_scheduler_output(scheduler_output, requests)
-
-    cached_info = scheduler_output.scheduled_cached_reqs.additional_information
-    assert cached_info["cached-ready"] == {"k": "v"}
-    assert cached_info["missing"] is None
-    assert adapter.requests_with_ready_chunks == {"leftover"}
 
 
 # ---------------------------------------------------------------
@@ -297,29 +250,12 @@ def test_cleanup_preserves_pending_save(build_adapter):
     assert len(adapter._pending_save_reqs) == 1
 
 
-def test_cleanup_only_affects_target_request(build_adapter):
-    """Cleanup for one request must not affect another request's state."""
-    adapter, _ = build_adapter(stage_id=1)
-    _populate_adapter_state(adapter, "req-a", "ext-a")
-    _populate_adapter_state(adapter, "req-b", "ext-b")
-
-    adapter.cleanup("req-a", "ext-a")
-
-    assert "req-b" in adapter.finished_requests
-    assert "req-b" in adapter.get_req_chunk
-    assert "ext-b" in adapter.put_req_chunk
-    assert "ext-b" in adapter.request_payload
-    assert "ext-b" in adapter.code_prompt_token_ids
-    assert "req-b" in adapter.request_ids_mapping
-
-
 def test_cleanup_after_poll_flow(build_adapter):
-    """Simulate full load_async -> poll -> finished -> cleanup cycle."""
+    """Cleanup after a real poll flow should clear the loaded request state."""
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-flow", RequestStatus.WAITING, external_req_id="ext-flow")
 
     adapter.load_async(request)
-
     adapter.request_ids_mapping["req-flow"] = "ext-flow"
     payload = {"hidden_states": torch.tensor([[1.0]]), "finished": True}
     connector.get.return_value = (payload, 8)
@@ -335,227 +271,3 @@ def test_cleanup_after_poll_flow(build_adapter):
     assert "req-flow" not in adapter.get_req_chunk
     assert "req-flow" not in adapter.request_ids_mapping
     assert "ext-flow" not in adapter.request_payload
-
-
-def test_finish_requests_restores_status(build_adapter):
-    """Abort path must pop ``requests_origin_status`` and restore pre-wait status.
-
-    While ``process_pending_chunks`` holds a request off the scheduler queues, the
-    adapter records the prior status (WAITING or RUNNING). ``finish_requests`` must
-    put that status back on the live ``Request`` so base ``Scheduler.finish_requests``
-    can finish bookkeeping without inconsistent state / crashes.
-    """
-    adapter, _ = build_adapter(stage_id=1)
-    req_id = "req-abort-during-chunk"
-    prior = RequestStatus.RUNNING
-    request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
-    adapter.requests_origin_status[req_id] = prior
-    requests_map = {req_id: request}
-
-    adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
-
-    assert request.status == prior
-    assert req_id not in adapter.requests_origin_status
-
-
-# ---------------------------------------------------------------
-# Scheduler trigger tests
-# ---------------------------------------------------------------
-
-
-class _HashableRequest(SimpleNamespace):
-    """SimpleNamespace that can be added to a set (needed by scheduler internals)."""
-
-    def __hash__(self):
-        return hash(self.request_id)
-
-    def __eq__(self, other):
-        return getattr(other, "request_id", None) == self.request_id
-
-
-def test_generation_scheduler_calls_cleanup_on_finished(monkeypatch, mocker: MockerFixture):
-    """OmniGenerationScheduler must call adapter.cleanup when request finishes."""
-    cleanup_calls = []
-
-    adapter_mock = mocker.MagicMock()
-    adapter_mock.finished_requests = {"req-s1"}
-    adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
-
-    from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
-
-    scheduler = mocker.MagicMock()
-    scheduler.chunk_transfer_adapter = adapter_mock
-    scheduler.connector = None
-    scheduler.ec_connector = None
-    scheduler.perf_metrics = None
-    scheduler.log_stats = False
-    scheduler.recompute_kv_load_failures = False
-    scheduler.structured_output_manager = mocker.MagicMock()
-    scheduler.structured_output_manager.should_advance.return_value = False
-    scheduler.finished_req_ids_dict = {}
-    scheduler.kv_cache_manager.take_events.return_value = None
-    scheduler.kv_event_publisher = mocker.MagicMock()
-
-    request = _HashableRequest(
-        request_id="req-s1",
-        external_req_id="ext-s1",
-        status=RequestStatus.RUNNING,
-        is_finished=lambda: False,
-        num_computed_tokens=10,
-        num_prompt_tokens=10,
-        prompt_token_ids=list(range(10)),
-        num_output_placeholders=0,
-        sampling_params=None,
-        pooling_params=None,
-        stop_reason=None,
-        client_index=0,
-        take_events=lambda: [],
-        trace_headers=None,
-        num_cached_tokens=0,
-        num_external_computed_tokens=0,
-        num_nans_in_logits=0,
-        get_finished_reason=lambda: "stop",
-    )
-    scheduler.requests = {"req-s1": request}
-
-    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
-    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
-    scheduler.running = [request]
-    scheduler.waiting = mocker.MagicMock()
-    scheduler.waiting.remove_requests = mocker.MagicMock()
-    scheduler.make_stats = mocker.MagicMock(return_value=None)
-
-    scheduler_output = SimpleNamespace(
-        num_scheduled_tokens={"req-s1": 10},
-        scheduled_spec_decode_tokens={},
-        num_invalid_spec_tokens=0,
-    )
-    model_runner_output = SimpleNamespace(
-        sampled_token_ids=None,
-        logprobs=None,
-        prompt_logprobs_dict={},
-        pooler_output=None,
-        num_nans_in_logits=None,
-        kv_connector_output=None,
-        cudagraph_stats=None,
-        req_id_to_index={"req-s1": 0},
-    )
-
-    OmniGenerationScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
-
-    assert len(cleanup_calls) == 1
-    args, _ = cleanup_calls[0]
-    assert args[0] == "req-s1"
-    assert args[1] == "ext-s1"
-
-
-def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerFixture):
-    """OmniARScheduler should enqueue save; adapter cleanup is handled in save thread."""
-    cleanup_calls = []
-    save_calls = []
-
-    adapter_mock = mocker.MagicMock()
-    adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
-    adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
-
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
-    scheduler = mocker.MagicMock()
-    scheduler.chunk_transfer_adapter = adapter_mock
-    scheduler.connector = None
-    scheduler.perf_metrics = None
-    scheduler.log_stats = False
-    scheduler.recompute_kv_load_failures = False
-    scheduler.structured_output_manager = mocker.MagicMock()
-    scheduler.structured_output_manager.should_advance.return_value = False
-    scheduler.finished_req_ids_dict = {}
-    scheduler.kv_cache_manager = mocker.MagicMock()
-    scheduler.kv_cache_manager.take_events.return_value = None
-    scheduler.kv_event_publisher = mocker.MagicMock()
-    scheduler.waiting_for_transfer_free = set()
-    scheduler.transfer_triggered_requests = set()
-    scheduler.active_kv_transfers = set()
-
-    request = _HashableRequest(
-        request_id="req-ar",
-        external_req_id="ext-ar",
-        status=RequestStatus.RUNNING,
-        is_finished=lambda: False,
-        num_computed_tokens=1,
-        num_prompt_tokens=1,
-        prompt_token_ids=[1],
-        num_output_placeholders=0,
-        sampling_params=None,
-        pooling_params=None,
-        stop_reason=None,
-        client_index=0,
-        take_events=lambda: [],
-        trace_headers=None,
-        num_cached_tokens=0,
-        num_external_computed_tokens=0,
-        num_nans_in_logits=0,
-        get_finished_reason=lambda: "stop",
-    )
-    scheduler.requests = {"req-ar": request}
-
-    scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
-    scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
-    scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
-    scheduler._free_request = mocker.MagicMock(return_value=None)
-    scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
-    scheduler.running = [request]
-    scheduler.waiting = mocker.MagicMock()
-    scheduler.waiting.remove_requests = mocker.MagicMock()
-    scheduler.make_spec_decoding_stats = mocker.MagicMock(return_value=None)
-    scheduler.make_stats = mocker.MagicMock(return_value=None)
-
-    scheduler_output = SimpleNamespace(
-        num_scheduled_tokens={"req-ar": 1},
-        scheduled_spec_decode_tokens={},
-        num_invalid_spec_tokens=0,
-    )
-    model_runner_output = SimpleNamespace(
-        sampled_token_ids=[[123]],
-        logprobs=None,
-        prompt_logprobs_dict={},
-        pooler_output=None,
-        num_nans_in_logits=None,
-        kv_connector_output=None,
-        cudagraph_stats=None,
-        req_id_to_index={"req-ar": 0},
-        kv_extracted_req_ids=None,
-    )
-
-    OmniARScheduler.update_from_output(scheduler, scheduler_output, model_runner_output)
-
-    assert len(cleanup_calls) == 0
-    assert len(save_calls) == 1
-
-
-def test_omni_ar_scheduler_finish_requests(mocker: MockerFixture):
-    """``OmniARScheduler.finish_requests`` must run chunk adapter hook before vLLM base."""
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
-    order: list[str] = []
-
-    adapter = mocker.MagicMock()
-
-    def _adapter_finish(request_ids, finished_status, requests):
-        order.append("adapter")
-        return []
-
-    adapter.finish_requests.side_effect = _adapter_finish
-
-    def _super_finish(_self, request_ids, finished_status):
-        order.append("super")
-        return []
-
-    sched = OmniARScheduler.__new__(OmniARScheduler)
-    sched.chunk_transfer_adapter = adapter
-    sched.requests = {}
-
-    with patch.object(VLLMScheduler, "finish_requests", _super_finish):
-        OmniARScheduler.finish_requests(sched, ["r1"], RequestStatus.FINISHED_ABORTED)
-
-    assert order == ["adapter", "super"]

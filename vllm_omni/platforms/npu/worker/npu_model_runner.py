@@ -301,7 +301,9 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                     )
                     self.compilation_config.cache_dir = None
                 # ---------------------------------------Omni-new----------------------------------------------
-                # Call self.model() directly (like GPU) to avoid make_omni_output during dummy_run
+                # NOTE: Directly call self.model() instead of self._model_forward() to match
+                # GPU behavior. _model_forward contains Omni-specific logic (make_omni_output)
+                # that expects a valid model_intermediate_buffer, which is empty during dummy run.
                 outputs = self.model(
                     input_ids=input_ids,
                     positions=positions,
@@ -348,7 +350,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
 
         This method:
         1. Accepts num_tokens_padded as required by NPUModelRunner
-        2. Injects omni-specific kwargs (runtime_additional_information)
+        2. Injects omni-specific kwargs (model_intermediate_buffer)
         3. Caches model output for multimodal results
         4. Handles NPU-specific post-forward logic (graph params update, SP all-gather)
         """

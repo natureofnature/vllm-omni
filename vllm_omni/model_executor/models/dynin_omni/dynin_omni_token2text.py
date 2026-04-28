@@ -595,7 +595,7 @@ class DyninOmniToken2Text(DyninOmniStageBase):
         if input_ids is None:
             raise ValueError("token2text stage requires input_ids")
         try:
-            runtime_info = normalize_runtime_info(kwargs.get("runtime_additional_information"))
+            runtime_info = normalize_runtime_info(kwargs.get("model_intermediate_buffer"))
             runtime_info = self._bootstrap_runtime_info_if_needed(
                 input_ids=input_ids,
                 runtime_info=runtime_info,

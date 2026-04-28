@@ -14,6 +14,7 @@ stage_args:
       enforce_eager: true
       enable_prefix_caching: false
       async_scheduling: false
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2text_to_token2image_full_payload
       max_num_batched_tokens: 32768
     output_connectors:
       to_stage_1: mooncake_connector
@@ -35,6 +36,7 @@ stage_args:
       enforce_eager: true
       enable_prefix_caching: false
       async_scheduling: false
+      custom_process_next_stage_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2image_to_token2audio_full_payload
       max_num_batched_tokens: 32768
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.dynin_omni.token2text_to_token2image

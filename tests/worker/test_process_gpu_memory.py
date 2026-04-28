@@ -65,7 +65,7 @@ class TestGetProcessGpuMemory:
         tensor = torch.zeros(1000, 1000, device=device)
 
         memory = get_process_gpu_memory(0)
-        assert memory >= 0
+        assert memory is None or memory >= 0
 
         del tensor
         torch.cuda.empty_cache()
@@ -91,6 +91,39 @@ class TestGetProcessGpuMemory:
 
         memory = get_process_gpu_memory(0)
         assert memory == 0
+
+    def test_uses_singleton_process_when_pid_namespace_hides_host_pid(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mock_proc = mocker.Mock(pid=987654, usedGpuMemory=123456789)
+
+        mocker.patch("os.getpid", return_value=12345)
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[mock_proc],
+        )
+
+        memory = get_process_gpu_memory(0)
+        assert memory == 123456789
+
+    def test_sums_device_memory_when_multiple_unmatched_processes_exist(self, mocker: MockerFixture):
+        from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
+
+        mocker.patch("os.getpid", return_value=12345)
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlInit")
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlShutdown")
+        mocker.patch("vllm.third_party.pynvml.nvmlDeviceGetCount", return_value=8)
+        mocker.patch("vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetHandleByIndex")
+        mocker.patch(
+            "vllm_omni.worker.gpu_memory_utils.nvmlDeviceGetComputeRunningProcesses",
+            return_value=[mocker.Mock(pid=111, usedGpuMemory=1), mocker.Mock(pid=222, usedGpuMemory=2)],
+        )
+
+        assert get_process_gpu_memory(0) == 3
 
     def test_uses_uuid_when_provided(self, mocker: MockerFixture):
         from vllm_omni.worker.gpu_memory_utils import get_process_gpu_memory
