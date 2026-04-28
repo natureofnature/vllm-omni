@@ -96,6 +96,33 @@ def test_flush_on_finish():
     assert len(p["code_predictor_codes"]) == _Q * 24
 
 
+def test_finished_boundary_emits_terminal_marker_without_repeating_audio():
+    tm = _tm(chunk_frames=25, left_context=25)
+    rid = "r-boundary"
+    tm.code_prompt_token_ids[rid] = [_FRAME[:] for _ in range(16)]
+    stream_payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output={"audio_codes": torch.zeros((0,))},
+        request=_req(rid, finished=False),
+        is_finished=False,
+    )
+    assert stream_payload is not None
+    assert len(stream_payload["code_predictor_codes"]) == _Q * 16
+
+    # The connector increments put_req_chunk only after the prior payload is
+    # successfully sent. A later finished sentinel at the same frame boundary
+    # should close the stream, not resend that already emitted tail chunk.
+    tm.put_req_chunk[rid] += 1
+    final_payload = talker2code2wav_async_chunk(
+        transfer_manager=tm,
+        pooling_output=None,
+        request=_req(rid, finished=True),
+        is_finished=True,
+    )
+
+    assert final_payload == {"code_predictor_codes": [], "finished": True}
+
+
 _CASES = [
     # ── IC boundary rule ──────────────────────────────────────────────
     # IC phase: length <= chunk_size  (uses <=, consistent with fish_speech)

@@ -213,6 +213,23 @@ def _extract_last_frame(pooling_output: dict[str, Any]) -> torch.Tensor | None:
     raise ValueError(f"Invalid audio_codes shape for Qwen3-TTS async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _frames_covered_by_sent_chunks(
+    sent_chunks: int,
+    *,
+    chunk_size: int,
+    initial_chunk_size: int,
+) -> int:
+    if sent_chunks <= 0:
+        return 0
+    if 0 < initial_chunk_size < chunk_size:
+        initial_coverage = (chunk_size // initial_chunk_size) * initial_chunk_size
+        initial_chunks = initial_coverage // initial_chunk_size
+        if sent_chunks <= initial_chunks:
+            return sent_chunks * initial_chunk_size
+        return initial_coverage + (sent_chunks - initial_chunks) * chunk_size
+    return sent_chunks * chunk_size
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: dict[str, Any] | None,
@@ -294,6 +311,18 @@ def talker2code2wav_async_chunk(
                 "finished": True,
             }
         return None
+
+    sent_chunks = int(transfer_manager.put_req_chunk.get(request_id, 0))
+    sent_frames = _frames_covered_by_sent_chunks(
+        sent_chunks,
+        chunk_size=chunk_size,
+        initial_chunk_size=initial_chunk_size,
+    )
+    if finished and sent_frames >= length:
+        return {
+            "code_predictor_codes": [],
+            "finished": True,
+        }
 
     in_initial_phase = initial_chunk_size > 0 and initial_chunk_size < chunk_size and length <= chunk_size
 
