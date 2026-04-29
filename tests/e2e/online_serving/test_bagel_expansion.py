@@ -19,12 +19,11 @@ import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
-from tests.helpers.stage_config import modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
-# This test uses the Bagel stage-config YAML under model_executor; CLI still carries TP.
-_BAGEL_DEFAULT_YAML = "vllm_omni/model_executor/stage_configs/bagel.yaml"
+_BAGEL_DEFAULT_YAML = get_deploy_config_path("ci/bagel.yaml")
 
 PROMPT = "A futuristic city skyline at twilight, cyberpunk style, ultra-detailed, high resolution."
 NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
