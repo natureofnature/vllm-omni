@@ -34,6 +34,7 @@ from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.config.stage_config import strip_parent_engine_args
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.diffusion.stage_diffusion_client import StageDiffusionClient
 from vllm_omni.diffusion.stage_diffusion_proc import (
@@ -85,6 +86,8 @@ from vllm_omni.entrypoints.pd_utils import PDDisaggregationMixin
 from vllm_omni.entrypoints.utils import (
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
+    load_stage_configs_from_yaml,
+    resolve_model_config_path,
 )
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
@@ -309,6 +312,7 @@ class AsyncOmniEngine:
                 self._omni_master_port,
             )
 
+        self._explicit_omni_transfer_config: Any | None = None
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
 
         self.num_stages = len(self.stage_configs)
@@ -691,7 +695,9 @@ class AsyncOmniEngine:
         )
 
         prepare_engine_environment()
-        omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
+        omni_transfer_config = getattr(self, "_explicit_omni_transfer_config", None)
+        if omni_transfer_config is None:
+            omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
 
         # ------------------------------------------------------------------ #
         # Single-stage mode: start OmniMasterServer before launching stages.  #
@@ -1376,6 +1382,9 @@ class AsyncOmniEngine:
         stage_configs_path = kwargs.get("stage_configs_path", None)
         deploy_config_path = kwargs.pop("deploy_config", None)
         stage_overrides_json = kwargs.pop("stage_overrides", None)
+        explicit_stages = kwargs.pop("stages", None)
+        explicit_connectors = kwargs.pop("connectors", None)
+        explicit_edges = kwargs.pop("edges", None)
         # Set of CLI keys the user actually typed; ``None`` means we have no
         # parser-level info (e.g. programmatic Omni() call) and the lower
         # layers should treat all kwargs as explicit.
@@ -1386,6 +1395,96 @@ class AsyncOmniEngine:
                 "`stage_configs` is not part of the public API. "
                 "Ignoring it and resolving stages from stage_configs_path/model factory."
             )
+
+        if explicit_stages is not None:
+            if stage_configs_path is not None or deploy_config_path is not None:
+                raise ValueError(
+                    "Programmatic `stages=` cannot be combined with `stage_configs_path` or `deploy_config`."
+                )
+
+            transfer_config_dict: dict[str, Any] = {"stages": explicit_stages}
+            derived_edges = explicit_edges
+            if derived_edges is None and isinstance(explicit_connectors, Sequence):
+                derived_edges = []
+                for connector in explicit_connectors:
+                    if not isinstance(connector, Mapping):
+                        continue
+                    src = connector.get("src_stage_id", connector.get("from"))
+                    dst = connector.get("dst_stage_id", connector.get("to"))
+                    if src is None or dst is None:
+                        continue
+                    derived_edges.append({"from": src, "to": dst})
+            if derived_edges is not None:
+                transfer_config_dict["edges"] = list(derived_edges)
+
+            merged_explicit_stages = explicit_stages
+            default_config_path = resolve_model_config_path(model)
+            if default_config_path and os.path.exists(default_config_path):
+                default_stage_configs = load_stage_configs_from_yaml(default_config_path, base_engine_args=kwargs)
+                default_stage_map = {
+                    str(getattr(stage_cfg, "stage_id", idx)): OmegaConf.to_container(stage_cfg, resolve=True)
+                    for idx, stage_cfg in enumerate(default_stage_configs)
+                }
+                semantic_engine_arg_keys = {
+                    "worker_type",
+                    "scheduler_cls",
+                    "hf_config_name",
+                    "model_arch",
+                    "engine_output_type",
+                    "distributed_executor_backend",
+                    "omni_kv_config",
+                    "enforce_eager",
+                    "enable_prefix_caching",
+                }
+                semantic_stage_keys = {
+                    "custom_process_input_func",
+                    "prompt_expand_func",
+                    "cfg_kv_collect_func",
+                    "engine_input_source",
+                    "final_output",
+                    "final_output_type",
+                    "is_comprehension",
+                }
+                merged_explicit_stages = []
+                for explicit_stage in explicit_stages:
+                    if not isinstance(explicit_stage, Mapping):
+                        merged_explicit_stages.append(explicit_stage)
+                        continue
+
+                    explicit_stage_id = explicit_stage.get("stage_id")
+                    default_stage = (
+                        default_stage_map.get(str(explicit_stage_id)) if explicit_stage_id is not None else None
+                    )
+                    if default_stage is None:
+                        merged_explicit_stages.append(explicit_stage)
+                        continue
+
+                    merged_stage = dict(default_stage)
+                    merged_stage.update(dict(explicit_stage))
+
+                    merged_engine_args = dict(default_stage.get("engine_args", {}))
+                    merged_engine_args.update(dict(explicit_stage.get("engine_args", {})))
+                    explicit_engine_args = dict(explicit_stage.get("engine_args", {}))
+                    merged_stage["engine_args"] = {
+                        key: value
+                        for key, value in merged_engine_args.items()
+                        if key in explicit_engine_args or key in semantic_engine_arg_keys
+                    }
+
+                    explicit_runtime = explicit_stage.get("runtime")
+                    if explicit_runtime is not None:
+                        merged_stage["runtime"] = explicit_runtime
+
+                    for key in semantic_stage_keys:
+                        if key not in explicit_stage and key in default_stage:
+                            merged_stage[key] = default_stage[key]
+
+                    merged_explicit_stages.append(merged_stage)
+
+            from vllm_omni.distributed.omni_connectors import load_omni_transfer_config
+
+            self._explicit_omni_transfer_config = load_omni_transfer_config(config_dict=transfer_config_dict)
+            return None, create_config(merged_explicit_stages)
 
         if stage_configs_path is not None:
             base_kwargs = self._strip_single_engine_args(kwargs)

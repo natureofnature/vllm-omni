@@ -1,10 +1,12 @@
 import importlib
 import os
+import sys
 import threading
 import types
 
 import pytest
 
+from vllm_omni.config.yaml_util import create_config
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -19,6 +21,120 @@ def test_stage_engine_core_client_module_reload_keeps_forward_refs_deferred():
     assert client_mod.StageEngineCoreClientBase.make_async_mp_client.__annotations__["return"] == (
         "StageEngineCoreClient | DPLBStageEngineCoreClient"
     )
+
+
+def test_resolve_stage_configs_honors_programmatic_stages_and_connectors(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine._explicit_omni_transfer_config = None
+
+    monkeypatch.setattr(engine_mod, "resolve_model_config_path", lambda _model: "/tmp/dummy-stage-config.yaml")
+    monkeypatch.setattr(engine_mod.os.path, "exists", lambda path: path == "/tmp/dummy-stage-config.yaml")
+    monkeypatch.setattr(
+        engine_mod,
+        "load_stage_configs_from_yaml",
+        lambda _path, base_engine_args=None: create_config(
+            [
+                {
+                    "stage_id": 0,
+                    "stage_type": "llm",
+                    "runtime": {"process": True, "devices": "9"},
+                    "engine_args": {
+                        "model_stage": "thinker",
+                        "worker_type": "ar",
+                        "scheduler_cls": "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler",
+                        "enforce_eager": True,
+                        "enable_prefix_caching": False,
+                    },
+                },
+                {
+                    "stage_id": 1,
+                    "stage_type": "diffusion",
+                    "runtime": {"process": True, "devices": "8"},
+                    "engine_args": {"model_stage": "base", "omni_kv_config": {"need_recv_cache": True}},
+                },
+            ]
+        ),
+    )
+
+    config_path, stage_configs = engine._resolve_stage_configs(
+        "dummy-model",
+        {
+            "stages": [
+                {
+                    "stage_id": 0,
+                    "stage_type": "llm",
+                    "runtime": {"process": True, "devices": "0"},
+                    "engine_args": {"model_stage": "thinker", "tensor_parallel_size": 1},
+                },
+                {
+                    "stage_id": 1,
+                    "stage_type": "diffusion",
+                    "runtime": {"process": True, "devices": "1"},
+                    "engine_args": {"model_stage": "base"},
+                },
+            ],
+            "connectors": [{"src_stage_id": 0, "dst_stage_id": 1, "connector_type": "queue"}],
+        },
+    )
+
+    assert config_path is None
+    assert stage_configs[0].runtime.devices == "0"
+    assert stage_configs[1].runtime.devices == "1"
+    assert stage_configs[0].engine_args.worker_type == "ar"
+    assert stage_configs[0].engine_args.scheduler_cls == "vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler"
+    assert stage_configs[0].engine_args.enforce_eager is True
+    assert stage_configs[0].engine_args.enable_prefix_caching is False
+    assert stage_configs[1].engine_args.omni_kv_config.need_recv_cache is True
+    assert engine._explicit_omni_transfer_config is not None
+    assert ("0", "1") in engine._explicit_omni_transfer_config.connectors
+
+
+def test_initialize_diffusion_stage_uses_built_config_when_engine_args_include_model(monkeypatch):
+    import vllm_omni.engine.stage_init_utils as stage_init_mod
+
+    od_config = types.SimpleNamespace(name="diffusion-config")
+    metadata = types.SimpleNamespace(cfg_kv_collect_func=None)
+    stage_cfg = types.SimpleNamespace(engine_args={"model": "ByteDance-Seed/BAGEL-7B-MoT", "tensor_parallel_size": 1})
+    captured = {}
+
+    monkeypatch.setattr(stage_init_mod, "build_diffusion_config", lambda *args: od_config)
+
+    fake_client_module = types.SimpleNamespace(
+        create_diffusion_client=lambda model, cfg, md, timeout, batch_size, use_inline: captured.update(
+            {
+                "model": model,
+                "cfg": cfg,
+                "metadata": md,
+                "timeout": timeout,
+                "batch_size": batch_size,
+                "use_inline": use_inline,
+            }
+        )
+        or "diffusion-client"
+    )
+    monkeypatch.setitem(sys.modules, "vllm_omni.diffusion.stage_diffusion_client", fake_client_module)
+
+    client = stage_init_mod.initialize_diffusion_stage(
+        stage_id=1,
+        model="ByteDance-Seed/BAGEL-7B-MoT",
+        stage_cfg=stage_cfg,
+        metadata=metadata,
+        stage_init_timeout=1200,
+        batch_size=3,
+        use_inline=True,
+    )
+
+    assert client == "diffusion-client"
+    assert captured == {
+        "model": "ByteDance-Seed/BAGEL-7B-MoT",
+        "cfg": od_config,
+        "metadata": metadata,
+        "timeout": 1200,
+        "batch_size": 3,
+        "use_inline": True,
+    }
 
 
 def test_initialize_stages_restores_device_visibility_after_diffusion_init(monkeypatch):
