@@ -45,7 +45,7 @@ def _make_tp_cases(model: str, tp_size: int):
         {
             "0": {
                 "tensor_parallel_size": 1,
-                "gpu_memory_utilization": 0.95,
+                "gpu_memory_utilization": 0.75,
             },
             "1": {"devices": devices},
         }
