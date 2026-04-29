@@ -15,11 +15,13 @@ assert_diffusion_response validates successful generation and the expected
 512x512 resolution.
 """
 
+import json
+
 import pytest
 
 from tests.helpers.mark import hardware_marks
 from tests.helpers.runtime import OmniServer, OmniServerParams, OpenAIClientHandler, dummy_messages_from_mix_data
-from tests.helpers.stage_config import get_deploy_config_path, modify_stage_config
+from tests.helpers.stage_config import get_deploy_config_path
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.full_model]
 
@@ -39,24 +41,28 @@ def _make_tp_cases(model: str, tp_size: int):
     # Dit devices start from 0, due to CI GPU usage constraint,
     # for those GPUs that encountered OOM, adjust the offset accordingly.
     devices = ",".join(str(i) for i in range(tp_size))
+    stage_overrides = json.dumps(
+        {
+            "0": {
+                "tensor_parallel_size": 1,
+                "gpu_memory_utilization": 0.95,
+            },
+            "1": {"devices": devices},
+        }
+    )
     return [
         pytest.param(
             OmniServerParams(
                 model=model,
-                stage_config_path=modify_stage_config(
-                    _BAGEL_DEFAULT_YAML,
-                    updates={
-                        "stage_args": {
-                            0: {
-                                "tensor_parallel_size": 1,
-                            },
-                            1: {
-                                "devices": devices,
-                            },
-                        },
-                    },
-                ),
-                server_args=["--cache-backend", "cache_dit", "--tensor-parallel-size", str(tp_size)],
+                stage_config_path=_BAGEL_DEFAULT_YAML,
+                server_args=[
+                    "--stage-overrides",
+                    stage_overrides,
+                    "--cache-backend",
+                    "cache_dit",
+                    "--tensor-parallel-size",
+                    str(tp_size),
+                ],
             ),
             id=f"parallel_tp_{tp_size}",
             marks=PARALLEL_FEATURE_MARKS,
