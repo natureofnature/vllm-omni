@@ -47,6 +47,9 @@ def _make_tp_cases(model: str, tp_size: int):
                     _BAGEL_DEFAULT_YAML,
                     updates={
                         "stage_args": {
+                            0: {
+                                "tensor_parallel_size": 1,
+                            },
                             1: {
                                 "devices": devices,
                             },
