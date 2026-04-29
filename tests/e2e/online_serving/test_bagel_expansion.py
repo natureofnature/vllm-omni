@@ -48,7 +48,7 @@ def _make_tp_cases(model: str, tp_size: int):
                     updates={
                         "stage_args": {
                             1: {
-                                "runtime.devices": devices,
+                                "devices": devices,
                             },
                         },
                     },
