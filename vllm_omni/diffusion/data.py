@@ -781,8 +781,11 @@ class OmniDiffusionConfig:
         par = kwargs.get("parallel_config", {})
         if isinstance(par, Mapping):
             par = dict(par)
-            if "tensor_parallel_size" in kwargs and "tensor_parallel_size" not in par:
-                par["tensor_parallel_size"] = kwargs["tensor_parallel_size"]
+            if par.get("tensor_parallel_size") is None:
+                par.pop("tensor_parallel_size", None)
+            tensor_parallel_size = kwargs.get("tensor_parallel_size")
+            if tensor_parallel_size is not None and "tensor_parallel_size" not in par:
+                par["tensor_parallel_size"] = tensor_parallel_size
             kwargs["parallel_config"] = par
 
         # Filter kwargs to only include valid fields
