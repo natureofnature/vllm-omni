@@ -32,21 +32,19 @@ NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=2)
+TP_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=3)
 
 
 def _make_tp_cases(model: str, tp_size: int):
     """Build Bagel TP test cases with devices auto-derived from tp_size.
     Devices can not be set through CLI args, so we set them in the YAML.
     """
-    # Dit devices start from 0, due to CI GPU usage constraint,
-    # for those GPUs that encountered OOM, adjust the offset accordingly.
-    devices = ",".join(str(i) for i in range(tp_size))
+    # Stage 0 uses GPU 0, so place DiT TP ranks on GPU 1..N to
+    # avoid AR/DiT memory contention on one device.
+    devices = ",".join(str(i + 1) for i in range(tp_size))
     stage_overrides = json.dumps(
         {
-            "0": {
-                "tensor_parallel_size": 1,
-                "gpu_memory_utilization": 0.75,
-            },
+            "0": {"tensor_parallel_size": 1},
             "1": {"devices": devices},
         }
     )
@@ -65,7 +63,7 @@ def _make_tp_cases(model: str, tp_size: int):
                 ],
             ),
             id=f"parallel_tp_{tp_size}",
-            marks=PARALLEL_FEATURE_MARKS,
+            marks=TP_FEATURE_MARKS,
         ),
     ]
 
