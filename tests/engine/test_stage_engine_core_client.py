@@ -8,6 +8,8 @@ touches self.resources, self.stage_id, and self._proc.
 
 from __future__ import annotations
 
+import asyncio
+from queue import Empty, SimpleQueue
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -44,3 +46,33 @@ def test_check_health_raises_when_proc_not_alive():
         client.check_health()
     # Verify it set resources.engine_dead as a side effect
     assert client.resources.engine_dead is True
+
+
+def test_process_engine_outputs_leaves_normal_outputs_for_outer_output_loop():
+    client = object.__new__(StageEngineCoreClient)
+    client.outputs_queue = SimpleQueue()
+
+    outputs = SimpleNamespace(
+        finished_requests=[],
+        outputs=[SimpleNamespace(request_id="req-1")],
+        scheduler_stats=None,
+    )
+
+    asyncio.run(StageEngineCoreClient.process_engine_outputs(client, outputs))
+
+    with pytest.raises(Empty):
+        client.outputs_queue.get_nowait()
+
+
+def test_process_engine_outputs_forwards_finished_only_without_normal_outputs():
+    client = object.__new__(StageEngineCoreClient)
+    client.outputs_queue = SimpleQueue()
+    outputs = SimpleNamespace(
+        finished_requests=["req-1"],
+        outputs=[],
+        scheduler_stats=None,
+    )
+
+    asyncio.run(StageEngineCoreClient.process_engine_outputs(client, outputs))
+
+    assert client.outputs_queue.get_nowait() is outputs

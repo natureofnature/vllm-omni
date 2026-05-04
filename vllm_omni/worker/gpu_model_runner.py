@@ -1386,6 +1386,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         try:
             buffer_map = self._gather_model_intermediate_buffer()
             model_kwargs_extra["model_intermediate_buffer"] = buffer_map
+            # Preserve the legacy alias until all model stages migrate to the
+            # runner-owned model_intermediate_buffer contract.
+            model_kwargs_extra["runtime_additional_information"] = buffer_map
         except Exception as e:
             logger.exception("[OMNI DEBUG] Error building model_kwargs_extra: %s", e)
 

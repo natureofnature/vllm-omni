@@ -327,9 +327,19 @@ class OmniVoiceModel(
         else:
             raise ValueError(f"Unsupported model_stage: {self.model_stage}")
 
+    @staticmethod
+    def _get_runtime_info(kwargs: Mapping[str, object]) -> list[dict[str, object]]:
+        runtime_info = kwargs.get("model_intermediate_buffer")
+        if runtime_info:
+            return runtime_info  # type: ignore[return-value]
+        runtime_info = kwargs.get("runtime_additional_information")
+        if runtime_info:
+            return runtime_info  # type: ignore[return-value]
+        return []
+
     def _forward_generator(self, input_ids: torch.Tensor, kwargs: dict) -> OmniOutput:
         """Run generator stage: text → 8-codebook audio tokens."""
-        runtime_info = kwargs.get("runtime_additional_information", [])
+        runtime_info = self._get_runtime_info(kwargs)
 
         if not runtime_info:
             # Profiling / dummy run — return a plain tensor (not OmniOutput)
@@ -445,7 +455,7 @@ class OmniVoiceModel(
 
     def _forward_decoder(self, input_ids: torch.Tensor, kwargs: dict) -> OmniOutput:
         """Run decoder stage: 8-codebook tokens → audio waveform."""
-        runtime_info = kwargs.get("runtime_additional_information", [])
+        runtime_info = self._get_runtime_info(kwargs)
 
         if not runtime_info:
             # Profiling / dummy run — return plain tensor for v1 runner compat

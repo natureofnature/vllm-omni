@@ -1030,6 +1030,18 @@ def test_gather_model_intermediate_buffer_pops_generation_codec_queue_one_payloa
     assert runner._generation_terminal_chunk_pending_req_ids == set()
 
 
+def test_build_model_kwargs_extra_preserves_legacy_runtime_info_alias():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    payload = [{"speaker": "alice"}]
+    runner._gather_model_intermediate_buffer = lambda: payload
+    runner.model_config = SimpleNamespace(has_sampling_extra_args=False)
+
+    model_kwargs = OmniGPUModelRunner._build_model_kwargs_extra(runner)
+
+    assert model_kwargs["model_intermediate_buffer"] is payload
+    assert model_kwargs["runtime_additional_information"] is payload
+
+
 def test_generation_execute_model_idle_path_keeps_connector_signals(monkeypatch):
     import vllm_omni.worker.gpu_generation_model_runner as mod
 
