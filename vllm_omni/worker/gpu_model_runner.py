@@ -1714,6 +1714,40 @@ class OmniGPUModelRunner(GPUModelRunner):
             update_dict = {out_key: code_predictor_codes[idx : idx + 1]}
             self._update_intermediate_buffer(req_id, update_dict)
 
+    @staticmethod
+    def _code_predictor_codes_len(payload: dict) -> int | None:
+        payload_codes = payload.get("code_predictor_codes")
+        if isinstance(payload_codes, torch.Tensor):
+            return int(payload_codes.numel())
+        if hasattr(payload_codes, "__len__"):
+            return len(payload_codes)
+        return None
+
+    def _should_defer_generation_payload_until_prompt_catches_up(self, req_state, upd: dict) -> bool:
+        if getattr(self, "_model_mode", None) != "generation":
+            return False
+        if "code_predictor_codes" not in upd:
+            return False
+
+        payload_len = self._code_predictor_codes_len(upd)
+        if payload_len is None:
+            return False
+
+        prompt_token_ids = getattr(req_state, "prompt_token_ids", None)
+        current_prompt_len = len(prompt_token_ids) if prompt_token_ids else 0
+        if payload_len <= current_prompt_len:
+            return False
+
+        logger.debug(
+            "[Stage-%s] deferring generation payload for req=%s until prompt catches up: "
+            "code_predictor_codes_len=%s prompt_len=%s",
+            getattr(self, "_stage_id", "?"),
+            getattr(req_state, "req_id", "?"),
+            payload_len,
+            current_prompt_len,
+        )
+        return True
+
     def _model_forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -1744,6 +1778,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
         req_state = self.requests.get(req_id)
         if req_state is None:
+            return
+        if self._should_defer_generation_payload_until_prompt_catches_up(req_state, upd):
             return
         # Check if the model declares keys that should stay on GPU
         gpu_keys: set[str] = set()

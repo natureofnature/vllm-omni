@@ -646,6 +646,7 @@ def talker2code2wav_async_chunk(
             return {
                 "code_predictor_codes": (torch.tensor(accumulated[-end_index:]).transpose(0, 1).reshape(-1).tolist()),
                 "left_context_size": left_context_size,
+                "code_num_quantizers": len(accumulated[-1]),
                 "finished": torch.tensor(True, dtype=torch.bool),
             }
         return {
@@ -686,6 +687,7 @@ def talker2code2wav_async_chunk(
     info = {
         "code_predictor_codes": codes,
         "left_context_size": left_context_size,
+        "code_num_quantizers": len(frame),
         "finished": torch.tensor(effective_finished, dtype=torch.bool),
     }
     return info

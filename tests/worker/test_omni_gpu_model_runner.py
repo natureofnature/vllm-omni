@@ -432,6 +432,35 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_intermediate_buffer_generation_defers_codec_payload_ahead_of_prompt():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner._model_mode = "generation"
+    runner.requests["r1"].prompt_token_ids = [1, 2]
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {"code_predictor_codes": [10, 11, 12], "finished": True},
+    )
+
+    assert runner.model_intermediate_buffer == {}
+
+
+def test_update_intermediate_buffer_generation_merges_codec_payload_after_prompt_catches_up():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner._model_mode = "generation"
+    payload = {"code_predictor_codes": [10, 11, 12], "finished": True}
+    runner.requests["r1"].prompt_token_ids = [1, 2]
+
+    OmniGPUModelRunner._update_intermediate_buffer(runner, "r1", payload)
+    assert runner.model_intermediate_buffer == {}
+
+    runner.requests["r1"].prompt_token_ids = [1, 2, 3]
+    OmniGPUModelRunner._update_intermediate_buffer(runner, "r1", payload)
+
+    assert runner.model_intermediate_buffer["r1"] == payload
+
+
 def test_update_intermediate_buffer_replaces_stale_cached_decode_span():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.model_intermediate_buffer["r1"] = {
