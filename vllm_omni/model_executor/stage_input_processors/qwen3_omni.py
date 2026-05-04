@@ -76,6 +76,14 @@ _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
+def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
+    try:
+        token_id = int(token_id)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= token_id < _QWEN3_CODEC_CODEBOOK_SIZE
+
+
 def _request_finished(request: Any) -> bool:
     finished_fn = getattr(request, "is_finished", None)
     if callable(finished_fn):
@@ -108,10 +116,24 @@ def _extract_last_valid_qwen3_codec_frame(code_predictor_codes: Any) -> list[int
     return code_frames[valid_mask][-1].reshape(-1).tolist()
 
 
-def _get_qwen3_full_payload_codec_seq_len(output_token_ids: list[int]) -> tuple[int, int, int]:
-    """Return the expected codec frame count for Qwen3 full-payload flushes."""
-    if not output_token_ids:
-        return 0, 0, 0
+def _extract_qwen3_full_payload_codec_rows(
+    code_predictor_codes: torch.Tensor,
+    output_token_ids: list[int],
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Return the codec rows that should reach Stage 2 on the full-payload path.
+
+    The talker can emit bookkeeping rows for terminal codec specials and
+    unresolved trailing placeholders. Those rows must not be decoded as audio.
+    Treat the position-preserving filter keyed by ``output_token_ids`` as a
+    hard constraint so fallback logic cannot decode EOS/placeholder rows.
+    """
+    if code_predictor_codes.ndim != 2 or code_predictor_codes.numel() == 0:
+        return code_predictor_codes, {
+            "raw_rows": int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 0 else 0,
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": 0,
+        }
 
     trailing_placeholder_count = 0
     while (
@@ -119,15 +141,39 @@ def _get_qwen3_full_payload_codec_seq_len(output_token_ids: list[int]) -> tuple[
     ):
         trailing_placeholder_count += 1
 
-    effective_output_ids = (
-        output_token_ids[:-trailing_placeholder_count] if trailing_placeholder_count > 0 else output_token_ids
-    )
-    if effective_output_ids and effective_output_ids[-1] == _QWEN3_CODEC_EOS_TOKEN_ID:
-        effective_output_ids = effective_output_ids[:-1]
+    aligned_len = min(int(code_predictor_codes.shape[0]), len(output_token_ids))
+    if aligned_len <= 0:
+        return code_predictor_codes[:0], {
+            "raw_rows": int(code_predictor_codes.shape[0]),
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": trailing_placeholder_count,
+        }
 
-    valid_codec_len = sum(1 for tid in effective_output_ids if 0 <= tid < _QWEN3_CODEC_CODEBOOK_SIZE)
-    seq_len = valid_codec_len + (trailing_placeholder_count if valid_codec_len > 0 else 0)
-    return seq_len, trailing_placeholder_count, valid_codec_len
+    aligned_rows = code_predictor_codes[-aligned_len:]
+    aligned_token_ids = output_token_ids[-aligned_len:]
+    aligned_token_mask = torch.tensor(
+        [_is_valid_qwen3_codec_token_id(token_id) for token_id in aligned_token_ids],
+        dtype=torch.bool,
+        device=aligned_rows.device,
+    )
+    row_valid_mask = (
+        aligned_rows.any(dim=1)
+        & (aligned_rows.max(dim=1).values < _QWEN3_CODEC_CODEBOOK_SIZE)
+        & (aligned_rows.min(dim=1).values >= 0)
+    )
+    valid_mask = aligned_token_mask & row_valid_mask
+    filtered_rows = aligned_rows[valid_mask]
+
+    if filtered_rows.numel() == 0:
+        filtered_rows = aligned_rows[:0]
+
+    return filtered_rows, {
+        "raw_rows": int(code_predictor_codes.shape[0]),
+        "aligned_rows": aligned_len,
+        "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
+        "trailing_placeholder_count": trailing_placeholder_count,
+    }
 
 
 # =========================
@@ -717,11 +763,7 @@ def talker2code2wav_full_payload(
 
     output_token_ids = ensure_list(getattr(request, "output_token_ids", []) or [])
     raw_shape = tuple(code_predictor_codes.shape)
-    seq_len, trailing_placeholder_count, valid_codec_len = _get_qwen3_full_payload_codec_seq_len(output_token_ids)
-    if code_predictor_codes.ndim > 0:
-        seq_len = min(seq_len, int(code_predictor_codes.shape[0]))
-    if seq_len > 0:
-        code_predictor_codes = code_predictor_codes[-seq_len:]
+    code_predictor_codes, codec_stats = _extract_qwen3_full_payload_codec_rows(code_predictor_codes, output_token_ids)
     if code_predictor_codes.numel() == 0:
         return None
 
@@ -735,9 +777,9 @@ def talker2code2wav_full_payload(
         "pad4196=%s bos4197=%s eos4198=%s",
         raw_shape,
         len(output_token_ids),
-        seq_len,
-        valid_codec_len,
-        trailing_placeholder_count,
+        codec_stats["aligned_rows"],
+        codec_stats["valid_rows"],
+        codec_stats["trailing_placeholder_count"],
         len(codec_codes),
         codec_codes[:16],
         output_token_ids[-16:],

@@ -330,6 +330,7 @@ class OmniSchedulingCoordinator:
         requests: dict[str, Request],
         request_metadata: dict[str, dict[str, Any]],
         model_mode: str = "ar",
+        max_model_len: int | None = None,
     ) -> None:
         """Apply received scheduling metadata to request objects.
 
@@ -339,6 +340,8 @@ class OmniSchedulingCoordinator:
         Additionally, if the payload contains ``next_stage_prompt_len``,
         updates the request's ``prompt_token_ids`` to the correct length.
         """
+        max_prompt_len = max_model_len if isinstance(max_model_len, int) and max_model_len > 0 else None
+
         for req_id, metadata in request_metadata.items():
             request = requests.get(req_id)
             if request is None:
@@ -346,6 +349,16 @@ class OmniSchedulingCoordinator:
 
             if model_mode != "ar" and "code_predictor_codes" in metadata:
                 code_prompt_ids = self._normalise_code_prompt_ids(metadata["code_predictor_codes"])
+                if max_prompt_len is not None and len(code_prompt_ids) > max_prompt_len:
+                    logger.warning(
+                        "[Coordinator stage-%s] Clamping code_prompt_ids for req %s from %s to max_model_len=%s",
+                        self._stage_id,
+                        req_id,
+                        len(code_prompt_ids),
+                        max_prompt_len,
+                    )
+                    code_prompt_ids = code_prompt_ids[:max_prompt_len]
+                    setattr(request, "_omni_length_capped", True)
                 if code_prompt_ids:
                     request.prompt_token_ids = code_prompt_ids
                     request.num_prompt_tokens = len(code_prompt_ids)
@@ -360,6 +373,17 @@ class OmniSchedulingCoordinator:
             if "next_stage_prompt_len" in metadata:
                 next_len = metadata["next_stage_prompt_len"]
                 if isinstance(next_len, int) and next_len > 0:
+                    if max_prompt_len is not None and next_len > max_prompt_len:
+                        logger.warning(
+                            "[Coordinator stage-%s] Clamping next_stage_prompt_len "
+                            "for req %s from %s to max_model_len=%s",
+                            self._stage_id,
+                            req_id,
+                            next_len,
+                            max_prompt_len,
+                        )
+                        next_len = max_prompt_len
+                        setattr(request, "_omni_length_capped", True)
                     current_prompt_ids = list(getattr(request, "prompt_token_ids", []) or [])
                     current_prompt_len = len(current_prompt_ids)
                     if model_mode == "ar":

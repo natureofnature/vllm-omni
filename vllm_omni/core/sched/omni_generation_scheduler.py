@@ -115,12 +115,25 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 request.prompt_token_ids = list(request.prompt_token_ids)
             current_len = len(request.prompt_token_ids)
             target_len = max(current_len, request.num_computed_tokens + 1)
+            max_model_len = getattr(self, "max_model_len", None)
+            if isinstance(max_model_len, int) and max_model_len > 0:
+                target_len = min(target_len, max_model_len)
             missing = target_len - current_len
             if missing > 0:
                 request.prompt_token_ids.extend([0] * missing)
                 request.num_prompt_tokens = len(request.prompt_token_ids)
                 _extend_all_token_ids_if_available(request, missing)
-            return len(request.prompt_token_ids) - request.num_computed_tokens
+            return max(0, len(request.prompt_token_ids) - request.num_computed_tokens)
+
+        def _finish_terminal_request_without_scheduling(request: Request, stop_reason: str | None = None) -> None:
+            request.status = RequestStatus.FINISHED_STOPPED
+            if stop_reason is not None:
+                request.stop_reason = stop_reason
+            finished = self._handle_stopped_request(request)
+            if finished:
+                self._free_request(request)
+                if self.chunk_coordinator is not None:
+                    self.chunk_coordinator.free_finished_request(request.request_id)
 
         # Temporary queue: preserve waiting order, do not disturb non-diffusion requests
         skipped_waiting_requests = create_request_queue(self.policy)
@@ -170,6 +183,11 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             num_computed_tokens = request.num_computed_tokens
             required_tokens = len(request.prompt_token_ids) - num_computed_tokens
+            if required_tokens <= 0 and getattr(request, "_omni_length_capped", False):
+                _finish_terminal_request_without_scheduling(request, stop_reason="length")
+                already_finished_reqs.add(request)
+                req_index += 1
+                continue
             # async_chunk: don't schedule placeholder tokens when no new chunk is available.
             if required_tokens <= 0:
                 if self.chunk_coordinator is not None and (
@@ -181,6 +199,14 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                     # Schedule a one-token placeholder step so Stage-1 can drain the
                     # ready payload instead of stranding it behind required_tokens == 0.
                     required_tokens = _ensure_terminal_placeholder(request)
+                    if required_tokens <= 0:
+                        stop_reason = (
+                            None if request.request_id in self.chunk_coordinator.finished_requests else "length"
+                        )
+                        _finish_terminal_request_without_scheduling(request, stop_reason=stop_reason)
+                        already_finished_reqs.add(request)
+                        req_index += 1
+                        continue
                 else:
                     req_index += 1
                     continue
@@ -245,11 +271,22 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             remaining_tokens = len(request.prompt_token_ids) - request.num_computed_tokens
             if remaining_tokens <= 0:
-                if (
-                    self.chunk_coordinator is not None
-                    and request.request_id in self.chunk_coordinator.finished_requests
+                if getattr(request, "_omni_length_capped", False):
+                    request = self.waiting.pop_request()
+                    _finish_terminal_request_without_scheduling(request, stop_reason="length")
+                    continue
+                if self.chunk_coordinator is not None and (
+                    request.request_id in self.chunk_coordinator.finished_requests
+                    or request.request_id in self.chunk_coordinator.requests_with_ready_chunks
                 ):
                     remaining_tokens = _ensure_terminal_placeholder(request)
+                    if remaining_tokens <= 0:
+                        request = self.waiting.pop_request()
+                        stop_reason = (
+                            None if request.request_id in self.chunk_coordinator.finished_requests else "length"
+                        )
+                        _finish_terminal_request_without_scheduling(request, stop_reason=stop_reason)
+                        continue
                 else:
                     self.waiting.pop_request()
                     skipped_waiting_requests.prepend_request(request)
@@ -792,6 +829,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                             self.requests,
                             ready_request_metadata,
                             model_mode="generation",
+                            max_model_len=getattr(self, "max_model_len", None),
                         )
             # WAITING_FOR_INPUT → WAITING transitions are handled by
             # chunk_coordinator.process_pending_full_payload_inputs() during

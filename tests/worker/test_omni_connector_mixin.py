@@ -2076,6 +2076,143 @@ def test_generation_schedule_keeps_ready_runtime_payload_schedulable_when_prompt
     assert request.prompt_token_ids == [11, 12, 13, 0]
 
 
+def test_generation_schedule_finishes_ready_request_at_max_model_len_without_placeholder():
+    request = SimpleNamespace(
+        request_id="req-ready-at-cap",
+        prompt_token_ids=[0, 1, 2, 3, 4],
+        _all_token_ids=[0, 1, 2, 3, 4],
+        _output_token_ids=[],
+        num_prompt_tokens=5,
+        num_computed_tokens=5,
+        num_cached_tokens=0,
+        client_index=0,
+        status=RequestStatus.RUNNING,
+        stop_reason=None,
+        sampling_params=None,
+        structured_output_request=None,
+        mm_features=None,
+        multimodal_kwargs=None,
+        multi_modal_kwargs=None,
+        data=None,
+        eos_token_id=None,
+        arrival_time=0.0,
+        queue_remaining_tokens=None,
+        prompt=None,
+        prompt_token_ids_history=None,
+        all_token_ids=[0, 1, 2, 3, 4],
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        additional_information=None,
+    )
+
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    coordinator.requests_with_ready_chunks.add(request.request_id)
+
+    def _fail_allocate_slots(*args, **kwargs):
+        raise AssertionError("request at max_model_len should not schedule a placeholder")
+
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.max_num_scheduled_tokens = 16
+    scheduler.max_model_len = 5
+    scheduler.num_lookahead_tokens = 0
+    scheduler.max_num_running_reqs = 8
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = MockWaitingQueue([])
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    scheduler.chunk_coordinator = coordinator
+    scheduler._latest_omni_connector_output = None
+    scheduler._gen_sched_log_ctr = 0
+    scheduler.log_stats = False
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=_fail_allocate_slots,
+        get_num_common_prefix_blocks=lambda req_id: [0],
+        take_new_block_ids=lambda: [],
+        take_events=lambda: None,
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.finished_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._handle_stopped_request = lambda req: True
+    scheduler._free_request = lambda req: scheduler.finished_req_ids.add(req.request_id)
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
+        req_ids=[],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[],
+        num_computed_tokens=[],
+        num_output_tokens=[],
+    )
+
+    scheduled = OmniGenerationScheduler.schedule(scheduler)
+
+    assert scheduled.num_scheduled_tokens == {}
+    assert scheduled.finished_req_ids == {request.request_id}
+    assert request.stop_reason == "length"
+    assert request.prompt_token_ids == [0, 1, 2, 3, 4]
+    assert request._all_token_ids == [0, 1, 2, 3, 4]
+    assert request.request_id not in coordinator.requests_with_ready_chunks
+    assert request.request_id not in coordinator.finished_requests
+
+
+def test_generation_update_request_metadata_clamps_next_stage_prompt_len_to_max_model_len():
+    request = SimpleNamespace(
+        request_id="req-clamp-metadata",
+        prompt_token_ids=[0, 1, 2, 3, 4],
+        _all_token_ids=[0, 1, 2, 3, 4],
+        _output_token_ids=[],
+        num_prompt_tokens=5,
+        num_computed_tokens=5,
+    )
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+
+    coordinator.update_request_metadata(
+        {request.request_id: request},
+        {request.request_id: {"next_stage_prompt_len": 6}},
+        model_mode="generation",
+        max_model_len=5,
+    )
+
+    assert request.prompt_token_ids == [0, 1, 2, 3, 4]
+    assert request.num_prompt_tokens == 5
+    assert request._all_token_ids == [0, 1, 2, 3, 4]
+    assert getattr(request, "_omni_length_capped") is True
+
+
+def test_generation_update_request_metadata_clamps_code_prompt_ids_to_max_model_len():
+    request = SimpleNamespace(
+        request_id="req-clamp-code-prompt",
+        prompt_token_ids=[],
+        _all_token_ids=[],
+        _output_token_ids=[],
+        num_prompt_tokens=0,
+        num_computed_tokens=0,
+    )
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+
+    coordinator.update_request_metadata(
+        {request.request_id: request},
+        {request.request_id: {"code_predictor_codes": list(range(7))}},
+        model_mode="generation",
+        max_model_len=5,
+    )
+
+    assert request.prompt_token_ids == [0, 1, 2, 3, 4]
+    assert request.num_prompt_tokens == 5
+    assert request.num_computed_tokens == 0
+    assert request._all_token_ids == [0, 1, 2, 3, 4]
+    assert getattr(request, "_omni_length_capped") is True
+
+
 def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placeholder():
     request = SimpleNamespace(
         request_id="req-finished-empty-tuple",
