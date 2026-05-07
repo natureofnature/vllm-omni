@@ -88,6 +88,10 @@ class MixinHost(OmniConnectorModelRunnerMixin):
     pass
 
 
+class HashableRequest(SimpleNamespace):
+    __hash__ = object.__hash__
+
+
 class _FakeTPGroup:
     def __init__(self, *, world_size: int, rank_in_group: int, follower_result: Any = None):
         self.world_size = world_size
@@ -1349,6 +1353,30 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
+    def test_generation_finish_only_sentinel_does_not_emit_ready_without_payload(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=2, async_chunk=True, worker_type="generation"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 2
+        host._async_chunk = True
+        host._model_mode = "generation"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._omni_connector.get.return_value = ({"finished": torch.tensor(True)}, 1)
+
+        made_progress = host._poll_single_request("r1")
+        output = host.get_omni_connector_output()
+
+        self.assertTrue(made_progress)
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(output.chunk_ready_req_ids, set())
+        self.assertEqual(host._finished_load_reqs, set())
+
+        host.shutdown_omni_connectors()
+
     def test_non_ar_recv_does_not_overwrite_unconsumed_staged_chunk(self):
         host = MixinHost()
         host.init_omni_connectors(
@@ -1888,6 +1916,32 @@ class TestFullPayloadLifecycleIntegration(unittest.TestCase):
         self.assertIn(request, scheduler.running)
 
 
+def test_coordinator_wakes_waiting_for_chunk_request_on_finished_only_signal():
+    request = SimpleNamespace(
+        request_id="req-finished-only-waiting",
+        status=RequestStatus.WAITING_FOR_CHUNK,
+    )
+    waiting = MockWaitingQueue([])
+    running = [request]
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    coordinator._waiting_since[request.request_id] = time.monotonic()
+
+    coordinator.process_pending_chunks(
+        waiting,
+        running,
+        chunk_ready_req_ids=set(),
+        chunk_finished_req_ids={request.request_id},
+    )
+
+    assert request.status is RequestStatus.RUNNING
+    assert running == [request]
+    assert list(waiting) == []
+    assert request.request_id in coordinator.finished_requests
+    assert request.request_id in coordinator.requests_with_ready_chunks
+    assert request.request_id not in coordinator._waiting_since
+    assert list(coordinator._waiting_for_chunk_running) == []
+
+
 def test_generation_update_from_output_defers_request_metadata_until_request_exists():
     request = SimpleNamespace(
         request_id="req-late",
@@ -2077,7 +2131,7 @@ def test_generation_schedule_keeps_ready_runtime_payload_schedulable_when_prompt
 
 
 def test_generation_schedule_finishes_ready_request_at_max_model_len_without_placeholder():
-    request = SimpleNamespace(
+    request = HashableRequest(
         request_id="req-ready-at-cap",
         prompt_token_ids=[0, 1, 2, 3, 4],
         _all_token_ids=[0, 1, 2, 3, 4],
@@ -2164,6 +2218,93 @@ def test_generation_schedule_finishes_ready_request_at_max_model_len_without_pla
     assert request.request_id not in coordinator.finished_requests
 
 
+def test_generation_schedule_finishes_finished_only_request_without_placeholder():
+    request = HashableRequest(
+        request_id="req-finished-only",
+        prompt_token_ids=[0, 1, 2],
+        _all_token_ids=[0, 1, 2],
+        _output_token_ids=[],
+        num_prompt_tokens=3,
+        num_computed_tokens=3,
+        num_cached_tokens=0,
+        client_index=0,
+        status=RequestStatus.RUNNING,
+        stop_reason=None,
+        sampling_params=None,
+        structured_output_request=None,
+        mm_features=None,
+        multimodal_kwargs=None,
+        multi_modal_kwargs=None,
+        data=None,
+        eos_token_id=None,
+        arrival_time=0.0,
+        queue_remaining_tokens=None,
+        prompt=None,
+        prompt_token_ids_history=None,
+        all_token_ids=[0, 1, 2],
+        pooling_params=None,
+        lora_request=None,
+        prompt_embeds=None,
+        additional_information=None,
+    )
+
+    coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
+    coordinator.finished_requests.add(request.request_id)
+
+    def _fail_allocate_slots(*args, **kwargs):
+        raise AssertionError("finished-only request should not schedule a placeholder")
+
+    scheduler = object.__new__(OmniGenerationScheduler)
+    scheduler.max_num_scheduled_tokens = 16
+    scheduler.max_model_len = 8
+    scheduler.num_lookahead_tokens = 0
+    scheduler.max_num_running_reqs = 8
+    scheduler.policy = SchedulingPolicy.FCFS
+    scheduler.waiting = MockWaitingQueue([])
+    scheduler.running = [request]
+    scheduler.requests = {request.request_id: request}
+    scheduler.chunk_coordinator = coordinator
+    scheduler._latest_omni_connector_output = None
+    scheduler._gen_sched_log_ctr = 0
+    scheduler.log_stats = False
+    scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+    scheduler.kv_cache_manager = SimpleNamespace(
+        new_step_starts=lambda: None,
+        allocate_slots=_fail_allocate_slots,
+        get_num_common_prefix_blocks=lambda req_id: [0],
+        take_new_block_ids=lambda: [],
+        take_events=lambda: None,
+    )
+    scheduler.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+    scheduler.use_v2_model_runner = False
+    scheduler.needs_kv_cache_zeroing = False
+    scheduler.connector = None
+    scheduler.ec_connector = None
+    scheduler.finished_req_ids = set()
+    scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._handle_stopped_request = lambda req: True
+    scheduler._free_request = lambda req: scheduler.finished_req_ids.add(req.request_id)
+    scheduler._update_after_schedule = lambda output: None
+    scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
+        req_ids=[],
+        resumed_req_ids=set(),
+        new_token_ids=[],
+        all_token_ids={},
+        new_block_ids=[],
+        num_computed_tokens=[],
+        num_output_tokens=[],
+    )
+
+    scheduled = OmniGenerationScheduler.schedule(scheduler)
+
+    assert scheduled.num_scheduled_tokens == {}
+    assert scheduled.finished_req_ids == {request.request_id}
+    assert request.prompt_token_ids == [0, 1, 2]
+    assert request._all_token_ids == [0, 1, 2]
+    assert request.request_id not in coordinator.finished_requests
+    assert request.request_id not in coordinator.requests_with_ready_chunks
+
+
 def test_generation_update_request_metadata_clamps_next_stage_prompt_len_to_max_model_len():
     request = SimpleNamespace(
         request_id="req-clamp-metadata",
@@ -2213,7 +2354,7 @@ def test_generation_update_request_metadata_clamps_code_prompt_ids_to_max_model_
     assert getattr(request, "_omni_length_capped") is True
 
 
-def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placeholder():
+def test_generation_schedule_finished_empty_tuple_prompt_finishes_without_placeholder():
     request = SimpleNamespace(
         request_id="req-finished-empty-tuple",
         prompt_token_ids=(),
@@ -2246,6 +2387,9 @@ def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placehold
     coordinator = OmniSchedulingCoordinator(scheduler_max_num_seqs=8, stage_id=1, async_chunk=True)
     coordinator.finished_requests.add(request.request_id)
 
+    def _fail_allocate_slots(*args, **kwargs):
+        raise AssertionError("finished-only request should not schedule a placeholder")
+
     scheduler = _build_generation_scheduler(request, coordinator)
     scheduler.max_num_scheduled_tokens = 16
     scheduler.num_lookahead_tokens = 0
@@ -2259,7 +2403,7 @@ def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placehold
     scheduler.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
     scheduler.kv_cache_manager = SimpleNamespace(
         new_step_starts=lambda: None,
-        allocate_slots=lambda req, num_new_tokens, num_lookahead_tokens: SimpleNamespace(get_block_ids=lambda: ([0],)),
+        allocate_slots=_fail_allocate_slots,
         get_num_common_prefix_blocks=lambda req_id: [0],
         take_new_block_ids=lambda: [],
         take_events=lambda: None,
@@ -2270,23 +2414,27 @@ def test_generation_schedule_finished_empty_tuple_prompt_uses_terminal_placehold
     scheduler.ec_connector = None
     scheduler.finished_req_ids = set()
     scheduler.prev_step_scheduled_req_ids = set()
+    scheduler._handle_stopped_request = lambda req: True
+    scheduler._free_request = lambda req: scheduler.finished_req_ids.add(req.request_id)
     scheduler._update_after_schedule = lambda output: None
     scheduler._make_cached_request_data = lambda **_: SimpleNamespace(
-        req_ids=[request.request_id],
+        req_ids=[],
         resumed_req_ids=set(),
         new_token_ids=[],
         all_token_ids={},
-        new_block_ids=[None],
-        num_computed_tokens=[request.num_computed_tokens],
-        num_output_tokens=[0],
-        prompt_token_ids={request.request_id: request.prompt_token_ids},
+        new_block_ids=[],
+        num_computed_tokens=[],
+        num_output_tokens=[],
+        prompt_token_ids={},
     )
 
     scheduled = OmniGenerationScheduler.schedule(scheduler)
 
-    assert scheduled.num_scheduled_tokens == {request.request_id: 1}
-    assert request.prompt_token_ids == [0]
-    assert request._all_token_ids == [0]
+    assert scheduled.num_scheduled_tokens == {}
+    assert scheduled.finished_req_ids == {request.request_id}
+    assert request.prompt_token_ids == ()
+    assert request._all_token_ids == []
+    assert request.request_id not in coordinator.finished_requests
 
 
 if __name__ == "__main__":

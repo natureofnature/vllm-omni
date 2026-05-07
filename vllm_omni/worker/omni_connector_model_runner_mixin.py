@@ -1650,11 +1650,11 @@ class OmniConnectorModelRunnerMixin:
                 staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
                 self.put_local_request_metadata(req_id, self._build_scheduling_metadata(req_id, staged_payload))
-                # A finish-only sentinel still needs one terminal wake-up so
-                # the downstream stage can sync the merged local payload and
-                # flush/finish even when the last recv carries no new
-                # consumable chunk bytes.
-                if payload_consumable or is_finished:
+                staged_payload_consumable = self._payload_is_consumable(staged_payload)
+                # A finish-only sentinel should only wake the scheduler when
+                # there is still a merged local payload to drain. Empty
+                # generation sentinels are terminal state, not decode work.
+                if payload_consumable or (is_finished and staged_payload_consumable):
                     self._finished_load_reqs.add(req_id)
                 if is_finished and not payload_consumable:
                     logger.debug(

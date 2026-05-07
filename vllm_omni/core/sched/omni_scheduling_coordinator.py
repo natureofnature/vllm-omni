@@ -464,7 +464,7 @@ class OmniSchedulingCoordinator:
                 request.status = RequestStatus.WAITING_FOR_CHUNK
                 self._waiting_since.setdefault(request.request_id, time.monotonic())
             else:
-                if request.request_id in chunk_ready_req_ids:
+                if request.request_id in chunk_ready_req_ids or request.request_id in self.finished_requests:
                     request.status = target_status
                     self.requests_with_ready_chunks.add(request.request_id)
                     self._waiting_since.pop(request.request_id, None)
