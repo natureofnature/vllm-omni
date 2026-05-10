@@ -81,6 +81,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
+        self.init_omni_connectors(
+            vllm_config=self.vllm_config,
+            model_config=self.model_config,
+            kv_transfer_manager=self.kv_transfer_manager,
+        )
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -337,6 +342,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             request_id_resolver=self._resolve_global_request_id,
         )
 
+        for request in getattr(scheduler_output, "pending_input_registrations", []):
+            self.register_chunk_recv(request)
+        self.recv_full_payload_inputs(scheduler_output)
+        if self._pending_full_payload_send:
+            flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+            flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+            if flush_ids:
+                self.flush_full_payload_outputs(flush_ids)
+
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
             if capturer is not None:
@@ -375,7 +389,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     if kv_ids:
                         output = copy(output)
                         output.kv_extracted_req_ids = kv_ids
-                    return output
+                    return self.attach_omni_connector_output(output)
 
             if not num_scheduled_tokens:
                 if (
@@ -399,7 +413,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     output = copy(output)
                     output.kv_extracted_req_ids = kv_ids
 
-                return output
+                return self.attach_omni_connector_output(output)
 
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
@@ -735,11 +749,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if kv_connector_output.is_empty():
-                return EMPTY_MODEL_RUNNER_OUTPUT
+                return self.attach_omni_connector_output(EMPTY_MODEL_RUNNER_OUTPUT)
 
             output = copy(EMPTY_MODEL_RUNNER_OUTPUT)
             output.kv_connector_output = kv_connector_output
-            return output
+            return self.attach_omni_connector_output(output)
 
         # Unpack ephemeral state.
         (
@@ -979,6 +993,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
+
+        if pooler_output and self._should_accumulate_full_payload_output():
+            for i, rid in enumerate(req_ids_output_copy):
+                req_state = self.requests.get(rid)
+                if req_state is not None and pooler_output[i]:
+                    self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             if self.routed_experts_initialized:
                 capturer = RoutedExpertsCapturer.get_instance()
@@ -999,6 +1020,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
+            output.omni_connector_output = self.get_omni_connector_output()
 
         if not self.use_async_scheduling:
             return output

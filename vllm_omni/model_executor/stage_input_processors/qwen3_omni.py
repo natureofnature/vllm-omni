@@ -26,6 +26,10 @@ logger = logging.getLogger(__name__)
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
+_QWEN3_CODEC_CODEBOOK_SIZE = 2048
+_QWEN3_CODEC_PAD_TOKEN_ID = 4196
+_QWEN3_CODEC_BOS_TOKEN_ID = 4197
+_QWEN3_CODEC_EOS_TOKEN_ID = 4198
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
@@ -88,6 +92,123 @@ def _ensure_list(x):
     elif not isinstance(x, list):
         return x
     return list(x)
+
+
+def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+        return value[0].detach().cpu()
+    return None
+
+
+def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
+    try:
+        token_id = int(token_id)
+    except (TypeError, ValueError):
+        return False
+    return 0 <= token_id < _QWEN3_CODEC_CODEBOOK_SIZE
+
+
+def should_accumulate_qwen3_omni_full_payload_output(
+    model_config: Any,
+    custom_process_func: Any,
+) -> bool:
+    """Return whether Qwen3-Omni should accumulate full-payload outputs."""
+    return (
+        custom_process_func is not None
+        and not getattr(model_config, "async_chunk", False)
+        and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
+        and getattr(model_config, "model_stage", None) in {"thinker", "talker"}
+    )
+
+
+def _qwen3_full_payload_valid_codec_output_count(request: Any) -> int:
+    output_token_ids = getattr(request, "output_token_ids", None)
+    if output_token_ids is None:
+        output_token_ids = getattr(request, "_output_token_ids", None)
+    if output_token_ids is None:
+        return 0
+    return sum(1 for token_id in output_token_ids if _is_valid_qwen3_codec_token_id(token_id))
+
+
+def _qwen3_full_payload_codec_tensor_rows(value: Any) -> int | None:
+    if not isinstance(value, torch.Tensor) or value.ndim != 2:
+        return None
+    return int(value.shape[0])
+
+
+def should_keep_qwen3_omni_all_zero_full_payload_tensor(
+    key: str,
+    value: Any,
+    request: Any,
+    existing_output: dict[str, Any] | None,
+    model_config: Any,
+    custom_process_func: Any,
+) -> bool:
+    """Return whether a Qwen3-Omni all-zero codec tensor is real output."""
+    if (
+        not should_accumulate_qwen3_omni_full_payload_output(model_config, custom_process_func)
+        or getattr(model_config, "model_stage", None) != "talker"
+        or key not in {"codes.audio", "code_predictor_codes"}
+    ):
+        return False
+    rows = _qwen3_full_payload_codec_tensor_rows(value)
+    if rows is None or rows <= 0:
+        return False
+    previous_rows = 0
+    if isinstance(existing_output, dict):
+        previous_rows = _qwen3_full_payload_codec_tensor_rows(existing_output.get(key)) or 0
+    return previous_rows + rows == _qwen3_full_payload_valid_codec_output_count(request)
+
+
+def _extract_qwen3_full_payload_codec_rows(
+    code_predictor_codes: torch.Tensor,
+    output_token_ids: list[int],
+) -> tuple[torch.Tensor, dict[str, int]]:
+    """Filter full-payload codec rows by the authoritative output ids."""
+    if code_predictor_codes.ndim != 2 or code_predictor_codes.numel() == 0:
+        return code_predictor_codes, {
+            "raw_rows": int(code_predictor_codes.shape[0]) if code_predictor_codes.ndim > 0 else 0,
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": 0,
+        }
+
+    trailing_placeholder_count = 0
+    while (
+        trailing_placeholder_count < len(output_token_ids) and output_token_ids[-1 - trailing_placeholder_count] == -1
+    ):
+        trailing_placeholder_count += 1
+
+    aligned_len = min(int(code_predictor_codes.shape[0]), len(output_token_ids))
+    if aligned_len <= 0:
+        return code_predictor_codes[:0], {
+            "raw_rows": int(code_predictor_codes.shape[0]),
+            "aligned_rows": 0,
+            "valid_rows": 0,
+            "trailing_placeholder_count": trailing_placeholder_count,
+        }
+
+    aligned_rows = code_predictor_codes[-aligned_len:]
+    aligned_token_ids = output_token_ids[-aligned_len:]
+    aligned_token_mask = torch.tensor(
+        [_is_valid_qwen3_codec_token_id(token_id) for token_id in aligned_token_ids],
+        dtype=torch.bool,
+        device=aligned_rows.device,
+    )
+    row_valid_mask = (aligned_rows.max(dim=1).values < _QWEN3_CODEC_CODEBOOK_SIZE) & (
+        aligned_rows.min(dim=1).values >= 0
+    )
+    filtered_rows = aligned_rows[aligned_token_mask & row_valid_mask]
+    if filtered_rows.numel() == 0:
+        filtered_rows = aligned_rows[:0]
+    return filtered_rows, {
+        "raw_rows": int(code_predictor_codes.shape[0]),
+        "aligned_rows": aligned_len,
+        "valid_rows": int(filtered_rows.shape[0]) if filtered_rows.ndim > 0 else 0,
+        "trailing_placeholder_count": trailing_placeholder_count,
+    }
 
 
 # =========================
@@ -383,6 +504,60 @@ def thinker2talker_async_chunk(
     return talker_additional_info
 
 
+def thinker2talker_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Pack complete thinker output for the non-async connector path."""
+    if not isinstance(pooling_output, dict):
+        return None
+
+    layers = {
+        0: pooling_output.get("hidden_states.layer_0"),
+        24: pooling_output.get("hidden_states.layer_24"),
+    }
+    thinker_emb = _layer_tensor(layers, _EMBED_LAYER_KEY)
+    thinker_hid = _layer_tensor(layers, _HIDDEN_LAYER_KEY)
+    if thinker_emb is None:
+        hidden = pooling_output.get("hidden")
+        thinker_emb = hidden if isinstance(hidden, torch.Tensor) else None
+    if thinker_emb is None or thinker_hid is None:
+        logger.debug(
+            "thinker2talker_full_payload: missing thinker tensors for req=%s (embed=%s hidden=%s)",
+            getattr(request, "request_id", None),
+            thinker_emb is not None,
+            thinker_hid is not None,
+        )
+        return None
+
+    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    if not all_token_ids:
+        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        all_token_ids = list(prompt_token_ids) + list(output_token_ids)
+
+    payload: OmniPayload = {
+        "embed": {
+            "prefill": thinker_emb.detach().cpu(),
+            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
+            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
+            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
+        },
+        "hidden_states": {"output": thinker_hid.detach().cpu()},
+        "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }
+    payload["next_stage_prompt_len"] = _compute_talker_prompt_ids_length(payload, device="cpu")
+    speaker = extract_speaker_from_request(request)
+    if speaker is not None:
+        payload["speaker"] = speaker
+    language = extract_language_from_request(request)
+    if language is not None:
+        payload["language"] = language
+    return payload
+
+
 def thinker2talker(
     source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
@@ -575,6 +750,56 @@ def talker2code2wav_async_chunk(
     return {
         "codes": {"audio": codes},
         "meta": {"left_context_size": left_context_size, "finished": torch.tensor(is_finished, dtype=torch.bool)},
+    }
+
+
+def talker2code2wav_full_payload(
+    transfer_manager: Any,
+    pooling_output: dict[str, Any],
+    request: OmniEngineCoreRequest,
+) -> dict[str, Any] | None:
+    """Pack complete talker codec output for the non-async connector path."""
+    if not isinstance(pooling_output, dict):
+        return None
+    code_predictor_codes = pooling_output.get("codes.audio")
+    if code_predictor_codes is None:
+        codes = pooling_output.get("codes")
+        if isinstance(codes, dict):
+            code_predictor_codes = codes.get("audio")
+    if code_predictor_codes is None:
+        return None
+    if not isinstance(code_predictor_codes, torch.Tensor):
+        code_predictor_codes = torch.as_tensor(code_predictor_codes)
+    if code_predictor_codes.numel() == 0:
+        return None
+
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+    raw_shape = tuple(code_predictor_codes.shape)
+    code_predictor_codes, codec_stats = _extract_qwen3_full_payload_codec_rows(
+        code_predictor_codes.to(torch.long),
+        list(output_token_ids),
+    )
+    if code_predictor_codes.numel() == 0:
+        return None
+
+    codec_codes = code_predictor_codes.transpose(0, 1).cpu().reshape(-1).tolist()
+    logger.debug(
+        "talker2code2wav_full_payload: raw_shape=%s output_ids_len=%s aligned_rows=%s "
+        "valid_rows=%s placeholders=%s flattened_len=%s pad4196=%s bos4197=%s eos4198=%s",
+        raw_shape,
+        len(output_token_ids),
+        codec_stats["aligned_rows"],
+        codec_stats["valid_rows"],
+        codec_stats["trailing_placeholder_count"],
+        len(codec_codes),
+        sum(1 for tid in output_token_ids if tid == _QWEN3_CODEC_PAD_TOKEN_ID),
+        sum(1 for tid in output_token_ids if tid == _QWEN3_CODEC_BOS_TOKEN_ID),
+        sum(1 for tid in output_token_ids if tid == _QWEN3_CODEC_EOS_TOKEN_ID),
+    )
+    return {
+        "codes": {"audio": codec_codes},
+        "code_predictor_codes": codec_codes,
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
 
 

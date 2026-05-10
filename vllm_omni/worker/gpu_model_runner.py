@@ -1033,8 +1033,38 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
+    def _sync_local_stage_payloads(self) -> None:
+        """Move received full-payload stage inputs into model_intermediate_buffer."""
+        if not hasattr(self, "_local_stage_payload_cache"):
+            return
+        lock = getattr(self, "_lock", None)
+        active_req_ids = set(getattr(self, "requests", {}))
+        if lock is None:
+            pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
+            staged = {
+                req_id: payload
+                for req_id, payload in self._local_stage_payload_cache.items()
+                if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+            }
+            for req_id in staged:
+                self._local_stage_payload_cache.pop(req_id, None)
+        else:
+            with lock:
+                active_req_ids = set(getattr(self, "requests", {}))
+                pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
+                staged = {
+                    req_id: payload
+                    for req_id, payload in self._local_stage_payload_cache.items()
+                    if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+                }
+                for req_id in staged:
+                    self._local_stage_payload_cache.pop(req_id, None)
+        for req_id, payload in staged.items():
+            self._update_intermediate_buffer(req_id, payload)
+
     def _build_model_kwargs_extra(self) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
+        self._sync_local_stage_payloads()
         model_kwargs_extra: dict[str, object] = {}
         try:
             buffer_map = self._gather_runtime_additional_information()

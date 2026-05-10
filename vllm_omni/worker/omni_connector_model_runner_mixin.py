@@ -635,6 +635,53 @@ class OmniConnectorModelRunnerMixin:
         """Return True if *t* is a torch.Tensor whose elements are all zero."""
         return isinstance(t, torch.Tensor) and t.numel() > 0 and not t.any()
 
+    def _get_model_config(self) -> Any:
+        model_config = getattr(self, "model_config", None)
+        if model_config is not None:
+            return model_config
+        return getattr(getattr(self, "vllm_config", None), "model_config", None)
+
+    def _should_accumulate_full_payload_output(self) -> bool:
+        """Gate send-side full-payload output accumulation only."""
+        model_config = self._get_model_config()
+        if model_config is None:
+            return False
+        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                should_accumulate_qwen3_omni_full_payload_output,
+            )
+
+            return should_accumulate_qwen3_omni_full_payload_output(
+                model_config,
+                getattr(self, "_custom_process_func", None),
+            )
+        return False
+
+    def _should_keep_all_zero_full_payload_tensor(
+        self,
+        key: str,
+        value: Any,
+        request: Any,
+        existing_output: dict[str, Any] | None,
+    ) -> bool:
+        model_config = self._get_model_config()
+        if model_config is None:
+            return False
+        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
+                should_keep_qwen3_omni_all_zero_full_payload_tensor,
+            )
+
+            return should_keep_qwen3_omni_all_zero_full_payload_tensor(
+                key,
+                value,
+                request,
+                existing_output,
+                model_config,
+                getattr(self, "_custom_process_func", None),
+            )
+        return False
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
@@ -655,10 +702,14 @@ class OmniConnectorModelRunnerMixin:
         with the finished request IDs from the next scheduler cycle.
         """
         # ---- Filter out all-zero tensors from the incoming pooler_output ----
+        existing = self._pending_full_payload_send.get(req_id)
+        existing_output = existing[0] if existing is not None else None
         filtered: dict[str, Any] = {}
         dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
         for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v):
+            if self._is_all_zero_tensor(v) and not self._should_keep_all_zero_full_payload_tensor(
+                k, v, request, existing_output
+            ):
                 dropped_zero_keys.append((k, tuple(v.shape)))
                 continue  # skip prefill zero-filled placeholders
             filtered[k] = v
@@ -671,7 +722,6 @@ class OmniConnectorModelRunnerMixin:
             )
         pooler_output = filtered
 
-        existing = self._pending_full_payload_send.get(req_id)
         if existing is None:
             self._pending_full_payload_send[req_id] = (pooler_output, request)
             return
