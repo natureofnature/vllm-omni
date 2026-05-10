@@ -1329,6 +1329,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         if hasattr(self.model, "has_preprocess") or hasattr(self.model, "enable_update_additional_information"):
             if self.vllm_config.model_config.async_chunk:
                 self._update_additional_information(scheduler_output)
+            else:
+                # In full-payload (non-async-chunk) mode, connector-delivered
+                # stage payloads must override any earlier engine-level
+                # additional_information written by the legacy
+                # custom_process_input_func codec, so talker_preprocess reads
+                # the full thinker payload.
+                self._sync_local_stage_payloads()
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             # Overlay custom prompt_embeds per request for the prompt portion;

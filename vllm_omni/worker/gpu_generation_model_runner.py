@@ -55,10 +55,14 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.init_omni_connectors(
-            vllm_config=self.vllm_config,
-            model_config=self.model_config,
-        )
+        # Scope full-payload connector init to Qwen3-Omni: other generation
+        # models (e.g. Bagel DiT) retain their pre-existing runner setup
+        # so this refactor does not perturb them.
+        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            self.init_omni_connectors(
+                vllm_config=self.vllm_config,
+                model_config=self.model_config,
+            )
 
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
@@ -96,14 +100,15 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if self.execute_model_state is not None:
             raise RuntimeError("State error: sample_tokens() must be called after execute_model() returns None.")
 
-        for request in getattr(scheduler_output, "pending_input_registrations", []):
-            self.register_chunk_recv(request)
-        self.recv_full_payload_inputs(scheduler_output)
-        if self._pending_full_payload_send:
-            flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
-            flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
-            if flush_ids:
-                self.flush_full_payload_outputs(flush_ids)
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()

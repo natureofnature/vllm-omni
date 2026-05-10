@@ -613,7 +613,8 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         finished = super().finish_requests(request_ids, finished_status)
-        if self.input_coordinator is not None:
+        input_coordinator = getattr(self, "input_coordinator", None)
+        if input_coordinator is not None:
             for request_id, _ in finished:
                 self._free_input_coordinator_request(request_id)
         return finished

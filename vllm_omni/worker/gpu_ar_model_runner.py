@@ -81,11 +81,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
-        self.init_omni_connectors(
-            vllm_config=self.vllm_config,
-            model_config=self.model_config,
-            kv_transfer_manager=self.kv_transfer_manager,
-        )
+        # Only Qwen3-Omni currently consumes the connector-based full-payload
+        # handoff added in this PR. Other model architectures (e.g. Bagel
+        # diffusion) retain their pre-existing runner behavior so this PR
+        # does not perturb them.
+        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+            self.init_omni_connectors(
+                vllm_config=self.vllm_config,
+                model_config=self.model_config,
+                kv_transfer_manager=self.kv_transfer_manager,
+            )
         self._downstream_payload_cache: dict[str, bool] = {}
 
     def _make_buffer(self, *size, dtype, numpy=True):
@@ -342,14 +347,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             request_id_resolver=self._resolve_global_request_id,
         )
 
-        for request in getattr(scheduler_output, "pending_input_registrations", []):
-            self.register_chunk_recv(request)
-        self.recv_full_payload_inputs(scheduler_output)
-        if self._pending_full_payload_send:
-            flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
-            flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
-            if flush_ids:
-                self.flush_full_payload_outputs(flush_ids)
+        if hasattr(self, "_omni_connector"):
+            for request in getattr(scheduler_output, "pending_input_registrations", []):
+                self.register_chunk_recv(request)
+            self.recv_full_payload_inputs(scheduler_output)
+            if self._pending_full_payload_send:
+                flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
+                flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
+                if flush_ids:
+                    self.flush_full_payload_outputs(flush_ids)
 
         if self.routed_experts_initialized:
             capturer = RoutedExpertsCapturer.get_instance()
