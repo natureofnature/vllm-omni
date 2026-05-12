@@ -628,6 +628,16 @@ class OmniConnectorModelRunnerMixin:
         that has arrived, or ``None`` if nothing is ready.  Stores full
         payloads in the local cache and extracts scheduling metadata.
         """
+        # Fast path: when TP is trivial (no peer ranks waiting on a broadcast)
+        # and the bg recv thread has not staged anything, skip the lock + TP
+        # broadcast cycle entirely. _broadcast_tp_payload_packet already
+        # returns its input unchanged under the same world_size<=1 condition,
+        # so the original code path was a no-op here on every empty step.
+        tp_group = self._get_local_tp_group()
+        if (
+            tp_group is None or getattr(tp_group, "world_size", 1) <= 1
+        ) and not self._full_payload_pending_broadcast_req_ids:
+            return None
         with self._lock:
             results = self._collect_full_payload_results_locked() if self.is_data_transfer_rank() else None
         results = self._broadcast_tp_payload_packet(results)
