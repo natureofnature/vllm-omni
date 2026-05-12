@@ -265,6 +265,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
         # Remove finished requests from the cached states.
+        cleanup_finished_request = getattr(self, "cleanup_finished_request", None)
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
@@ -273,6 +274,8 @@ class OmniGPUModelRunner(GPUModelRunner):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
                 self._talker_mtp_generators.pop(req_id, None)
+            if cleanup_finished_request is not None:
+                cleanup_finished_request(req_id)
 
         if hasattr(self, "late_interaction_runner"):
             self.late_interaction_runner.on_requests_finished(scheduler_output.finished_req_ids)
