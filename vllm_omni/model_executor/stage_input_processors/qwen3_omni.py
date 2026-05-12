@@ -527,14 +527,31 @@ def thinker2talker_full_payload(
         output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
+    # Match legacy thinker2talker convention: slice last (total-1) rows.
+    # Talker's _thinker_to_talker_prefill computes the last assistant segment
+    # boundary as target_len = len(ids.all); embed.prefill / hidden_states.output
+    # must be 1 row shorter so slicing [im_start:target_len] clips to the
+    # assistant segment exactly as base 4a24a517 does. Otherwise the assistant
+    # segment grabs an extra (output-token) row, trailing_text becomes [2,1024]
+    # instead of [1,1024], and talker over-generates codec frames.
+    new_seq_length = max(0, len(all_token_ids) - 1)
+    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] >= new_seq_length and new_seq_length > 0:
+        thinker_emb_prefill = thinker_emb[-new_seq_length:]
+    else:
+        thinker_emb_prefill = thinker_emb
+    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] >= new_seq_length and new_seq_length > 0:
+        thinker_hid_prefill = thinker_hid[-new_seq_length:]
+    else:
+        thinker_hid_prefill = thinker_hid
+
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb.detach().cpu(),
+            "prefill": thinker_emb_prefill.detach().cpu(),
             "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
             "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
             "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
         },
-        "hidden_states": {"output": thinker_hid.detach().cpu()},
+        "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
