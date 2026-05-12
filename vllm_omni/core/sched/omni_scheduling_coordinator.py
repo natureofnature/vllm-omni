@@ -175,8 +175,10 @@ class OmniSchedulingCoordinator:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
                         self.pending_input_registrations.append(request)
-            for request in to_remove:
-                waiting_queue.remove(request)
+            if to_remove:
+                # Use the O(N) bulk helper instead of N x O(N) single removes:
+                # RequestQueue.remove_requests() does one clear()+extend() pass.
+                waiting_queue.remove_requests(to_remove)
 
     def process_pending_full_payload_inputs_legacy(
         self,
