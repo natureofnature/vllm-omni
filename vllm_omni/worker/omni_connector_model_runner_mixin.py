@@ -153,7 +153,7 @@ class OmniConnectorModelRunnerMixin:
 
         # -- full_payload_mode: accumulate latest pooler_output per request,
         #    send only when the request finishes (next-cycle flush) --
-        self._pending_full_payload_send: dict[str, tuple[Any, Any]] = {}
+        self._pending_full_payload_send: dict[str, tuple[Any, ...]] = {}
 
         # -- KV sent accumulator --
         self._kv_sent_req_ids: list[str] = []
@@ -682,6 +682,49 @@ class OmniConnectorModelRunnerMixin:
             )
         return False
 
+    @staticmethod
+    def _new_full_payload_accumulator(output: dict[str, Any]):
+        chunks: dict[str, list[torch.Tensor]] = {}
+        latest: dict[str, Any] = {}
+        rows: dict[str, int] = {}
+        for k, v in output.items():
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                chunks[k] = [v]
+                rows[k] = int(v.shape[0])
+            else:
+                latest[k] = v
+        return chunks, latest, rows
+
+    @staticmethod
+    def _full_payload_existing_output_view(entry):
+        if entry is None:
+            return None
+        if len(entry) == 2:
+            return entry[0]
+        chunks, latest, rows, _request = entry
+        view = dict(latest)
+        for k, tensors in chunks.items():
+            if not tensors:
+                continue
+            first = tensors[0]
+            view[k] = torch.empty(
+                (rows.get(k, 0), *first.shape[1:]),
+                dtype=first.dtype,
+                device="meta",
+            )
+        return view
+
+    @staticmethod
+    def _materialize_full_payload_entry(entry):
+        if len(entry) == 2:
+            return entry
+        chunks, latest, _rows, request = entry
+        output = dict(latest)
+        for k, tensors in chunks.items():
+            if tensors:
+                output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
+        return output, request
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
@@ -703,7 +746,7 @@ class OmniConnectorModelRunnerMixin:
         """
         # ---- Filter out all-zero tensors from the incoming pooler_output ----
         existing = self._pending_full_payload_send.get(req_id)
-        existing_output = existing[0] if existing is not None else None
+        existing_output = self._full_payload_existing_output_view(existing)
         filtered: dict[str, Any] = {}
         dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
         for k, v in pooler_output.items():
@@ -723,29 +766,32 @@ class OmniConnectorModelRunnerMixin:
         pooler_output = filtered
 
         if existing is None:
-            self._pending_full_payload_send[req_id] = (pooler_output, request)
+            chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
+            self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
             return
 
-        prev_output, _ = existing
-        merged: dict[str, Any] = {}
-        for k in set(prev_output) | set(pooler_output):
-            v_new = pooler_output.get(k)
-            v_old = prev_output.get(k)
-            if v_new is None:
-                merged[k] = v_old
-            elif v_old is None:
-                merged[k] = v_new
-            elif (
-                isinstance(v_new, torch.Tensor)
-                and isinstance(v_old, torch.Tensor)
-                and v_new.dim() >= 2
-                and v_old.dim() >= 2
-                and v_new.shape[1:] == v_old.shape[1:]
-            ):
-                merged[k] = torch.cat([v_old, v_new], dim=0)
+        if len(existing) == 2:
+            chunks, latest, rows = self._new_full_payload_accumulator(existing[0])
+        else:
+            chunks, latest, rows, _ = existing
+
+        for k, v in pooler_output.items():
+            if v is None:
+                continue
+            if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
+                    chunks[k].append(v)
+                    rows[k] += int(v.shape[0])
+                else:
+                    latest.pop(k, None)
+                    chunks[k] = [v]
+                    rows[k] = int(v.shape[0])
             else:
-                merged[k] = v_new
-        self._pending_full_payload_send[req_id] = (merged, request)
+                chunks.pop(k, None)
+                rows.pop(k, None)
+                latest[k] = v
+
+        self._pending_full_payload_send[req_id] = (chunks, latest, rows, request)
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
@@ -759,7 +805,7 @@ class OmniConnectorModelRunnerMixin:
         for req_id in finished_req_ids:
             entry = self._pending_full_payload_send.pop(req_id, None)
             if entry is not None:
-                to_send[req_id] = entry
+                to_send[req_id] = self._materialize_full_payload_entry(entry)
         logger.info("[Stage-%s] flush_full_payload_outputs: to_send=%s", self._stage_id, list(to_send.keys()))
         if to_send:
             self.send_full_payload_outputs(scheduler_output=None, outputs=to_send)
