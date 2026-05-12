@@ -355,19 +355,24 @@ def test_accumulate_full_payload_output_preserves_aligned_all_zero_qwen3_omni_co
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = runner._pending_full_payload_send["r1"]
+    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert torch.equal(stored["codes.audio"], codes)
 
 
-def test_accumulate_full_payload_output_drops_misaligned_all_zero_qwen3_omni_codec_rows():
+def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_codec_rows():
+    # After removing the sender-side zero filter, the accumulator keeps every
+    # codec row including misaligned all-zero rows. The downstream consumer
+    # (_extract_qwen3_full_payload_codec_rows) is the authoritative crop and
+    # filters by output_token_ids.
     runner = _make_full_payload_accumulation_runner()
     request = SimpleNamespace(output_token_ids=[0, 1])
     codes = torch.zeros((1, 3), dtype=torch.long)
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = runner._pending_full_payload_send["r1"]
-    assert "codes.audio" not in stored
+    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert "codes.audio" in stored
+    assert torch.equal(stored["codes.audio"], codes)
 
 
 def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_qwen3_omni_codec_rows():
@@ -381,20 +386,24 @@ def test_accumulate_full_payload_output_preserves_incremental_aligned_all_zero_q
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = runner._pending_full_payload_send["r1"]
+    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
     assert stored["codes.audio"].shape == (2, 3)
     assert torch.equal(stored["codes.audio"][1], torch.zeros(3, dtype=torch.long))
 
 
-def test_accumulate_full_payload_output_drops_all_zero_qwen3_omni_prefill_placeholder():
+def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeholder():
+    # Prefill placeholder rows (output_token_ids empty) are no longer dropped
+    # at the sender. The consumer-side crop trims them off using
+    # output_token_ids, so the end-to-end semantics are unchanged.
     runner = _make_full_payload_accumulation_runner()
     request = SimpleNamespace(output_token_ids=[])
     codes = torch.zeros((2, 3), dtype=torch.long)
 
     OmniConnectorModelRunnerMixin.accumulate_full_payload_output(runner, "r1", {"codes.audio": codes}, request)
 
-    stored, _ = runner._pending_full_payload_send["r1"]
-    assert "codes.audio" not in stored
+    stored, _ = OmniConnectorModelRunnerMixin._materialize_full_payload_entry(runner._pending_full_payload_send["r1"])
+    assert "codes.audio" in stored
+    assert torch.equal(stored["codes.audio"], codes)
 
 
 def test_full_payload_output_accumulation_hook_matrix():

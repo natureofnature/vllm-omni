@@ -132,45 +132,6 @@ def should_accumulate_qwen3_omni_full_payload_output(
     )
 
 
-def _qwen3_full_payload_valid_codec_output_count(request: Any) -> int:
-    output_token_ids = getattr(request, "output_token_ids", None)
-    if output_token_ids is None:
-        output_token_ids = getattr(request, "_output_token_ids", None)
-    if output_token_ids is None:
-        return 0
-    return sum(1 for token_id in output_token_ids if _is_valid_qwen3_codec_token_id(token_id))
-
-
-def _qwen3_full_payload_codec_tensor_rows(value: Any) -> int | None:
-    if not isinstance(value, torch.Tensor) or value.ndim != 2:
-        return None
-    return int(value.shape[0])
-
-
-def should_keep_qwen3_omni_all_zero_full_payload_tensor(
-    key: str,
-    value: Any,
-    request: Any,
-    existing_output: dict[str, Any] | None,
-    model_config: Any,
-    custom_process_func: Any,
-) -> bool:
-    """Return whether a Qwen3-Omni all-zero codec tensor is real output."""
-    if (
-        not should_accumulate_qwen3_omni_full_payload_output(model_config, custom_process_func)
-        or getattr(model_config, "model_stage", None) != "talker"
-        or key not in {"codes.audio", "code_predictor_codes"}
-    ):
-        return False
-    rows = _qwen3_full_payload_codec_tensor_rows(value)
-    if rows is None or rows <= 0:
-        return False
-    previous_rows = 0
-    if isinstance(existing_output, dict):
-        previous_rows = _qwen3_full_payload_codec_tensor_rows(existing_output.get(key)) or 0
-    return previous_rows + rows == _qwen3_full_payload_valid_codec_output_count(request)
-
-
 def _extract_qwen3_full_payload_codec_rows(
     code_predictor_codes: torch.Tensor,
     output_token_ids: list[int],
