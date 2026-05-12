@@ -630,11 +630,6 @@ class OmniConnectorModelRunnerMixin:
         )
         return results
 
-    @staticmethod
-    def _is_all_zero_tensor(t: Any) -> bool:
-        """Return True if *t* is a torch.Tensor whose elements are all zero."""
-        return isinstance(t, torch.Tensor) and t.numel() > 0 and not t.any()
-
     def _get_model_config(self) -> Any:
         model_config = getattr(self, "model_config", None)
         if model_config is not None:
@@ -669,31 +664,6 @@ class OmniConnectorModelRunnerMixin:
         self._should_accumulate_full_payload_output_cached = False
         return False
 
-    def _should_keep_all_zero_full_payload_tensor(
-        self,
-        key: str,
-        value: Any,
-        request: Any,
-        existing_output: dict[str, Any] | None,
-    ) -> bool:
-        model_config = self._get_model_config()
-        if model_config is None:
-            return False
-        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
-            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
-                should_keep_qwen3_omni_all_zero_full_payload_tensor,
-            )
-
-            return should_keep_qwen3_omni_all_zero_full_payload_tensor(
-                key,
-                value,
-                request,
-                existing_output,
-                model_config,
-                getattr(self, "_custom_process_func", None),
-            )
-        return False
-
     @staticmethod
     def _new_full_payload_accumulator(output: dict[str, Any]):
         chunks: dict[str, list[torch.Tensor]] = {}
@@ -706,25 +676,6 @@ class OmniConnectorModelRunnerMixin:
             else:
                 latest[k] = v
         return chunks, latest, rows
-
-    @staticmethod
-    def _full_payload_existing_output_view(entry):
-        if entry is None:
-            return None
-        if len(entry) == 2:
-            return entry[0]
-        chunks, latest, rows, _request = entry
-        view = dict(latest)
-        for k, tensors in chunks.items():
-            if not tensors:
-                continue
-            first = tensors[0]
-            view[k] = torch.empty(
-                (rows.get(k, 0), *first.shape[1:]),
-                dtype=first.dtype,
-                device="meta",
-            )
-        return view
 
     @staticmethod
     def _materialize_full_payload_entry(entry):
@@ -749,34 +700,17 @@ class OmniConnectorModelRunnerMixin:
         along dim-0.  Scalar / global tensors (1-D or 0-D) are replaced
         with the latest value.
 
-        All-zero tensors (e.g. ``code_predictor_codes`` emitted during
-        prefill) are dropped so that they do not pollute downstream stages
-        with garbage / noise frames.
+        Note: codec rows are NOT filtered for zero placeholders here. The
+        downstream consumer ``_extract_qwen3_full_payload_codec_rows`` crops
+        codec rows using ``output_token_ids`` as the authoritative source,
+        which makes any sender-side zero filtering redundant. Skipping the
+        sender-side ``t.any()`` scan also avoids a per-tensor GPU->CPU device
+        sync that stalled the decode pipeline.
 
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
-        # ---- Filter out all-zero tensors from the incoming pooler_output ----
         existing = self._pending_full_payload_send.get(req_id)
-        existing_output = None  # built lazily; most steps emit non-zero rows
-        filtered: dict[str, Any] = {}
-        dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
-        for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v):
-                if existing_output is None:
-                    existing_output = self._full_payload_existing_output_view(existing)
-                if not self._should_keep_all_zero_full_payload_tensor(k, v, request, existing_output):
-                    dropped_zero_keys.append((k, tuple(v.shape)))
-                    continue  # skip prefill zero-filled placeholders
-            filtered[k] = v
-        if dropped_zero_keys:
-            logger.info(
-                "[Stage-%s] accumulate_full_payload_output: req=%s dropped_zero_keys=%s",
-                self._stage_id,
-                req_id,
-                dropped_zero_keys,
-            )
-        pooler_output = filtered
 
         if existing is None:
             chunks, latest, rows = self._new_full_payload_accumulator(pooler_output)
