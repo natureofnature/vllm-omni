@@ -642,19 +642,31 @@ class OmniConnectorModelRunnerMixin:
         return getattr(getattr(self, "vllm_config", None), "model_config", None)
 
     def _should_accumulate_full_payload_output(self) -> bool:
-        """Gate send-side full-payload output accumulation only."""
+        """Gate send-side full-payload output accumulation only.
+
+        Cached per instance: the result depends only on model_config /
+        _custom_process_func, both of which are set at init time. Avoid
+        the per-step dynamic import inside the model decode loop.
+        """
+        cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
+        if cached is not None:
+            return cached
         model_config = self._get_model_config()
         if model_config is None:
+            self._should_accumulate_full_payload_output_cached = False
             return False
         if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
             from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
                 should_accumulate_qwen3_omni_full_payload_output,
             )
 
-            return should_accumulate_qwen3_omni_full_payload_output(
+            result = should_accumulate_qwen3_omni_full_payload_output(
                 model_config,
                 getattr(self, "_custom_process_func", None),
             )
+            self._should_accumulate_full_payload_output_cached = result
+            return result
+        self._should_accumulate_full_payload_output_cached = False
         return False
 
     def _should_keep_all_zero_full_payload_tensor(
@@ -746,15 +758,16 @@ class OmniConnectorModelRunnerMixin:
         """
         # ---- Filter out all-zero tensors from the incoming pooler_output ----
         existing = self._pending_full_payload_send.get(req_id)
-        existing_output = self._full_payload_existing_output_view(existing)
+        existing_output = None  # built lazily; most steps emit non-zero rows
         filtered: dict[str, Any] = {}
         dropped_zero_keys: list[tuple[str, tuple[int, ...]]] = []
         for k, v in pooler_output.items():
-            if self._is_all_zero_tensor(v) and not self._should_keep_all_zero_full_payload_tensor(
-                k, v, request, existing_output
-            ):
-                dropped_zero_keys.append((k, tuple(v.shape)))
-                continue  # skip prefill zero-filled placeholders
+            if self._is_all_zero_tensor(v):
+                if existing_output is None:
+                    existing_output = self._full_payload_existing_output_view(existing)
+                if not self._should_keep_all_zero_full_payload_tensor(k, v, request, existing_output):
+                    dropped_zero_keys.append((k, tuple(v.shape)))
+                    continue  # skip prefill zero-filled placeholders
             filtered[k] = v
         if dropped_zero_keys:
             logger.info(
