@@ -206,21 +206,33 @@ class OmniConnectorModelRunnerMixin:
         """Clean up per-request state after a request is fully finished.
 
         Call this when a request is freed from the model runner to prevent
-        memory leaks in the mixin's tracking dicts/sets.  The external
-        request ID is resolved before cleaning up ``_put_req_chunk`` which
-        is keyed by external ID.
+        memory leaks in the mixin's tracking dicts/sets.
+
+        Two senders use different keys: ``send_chunk`` keys per-request
+        state under the EXTERNAL id (after mapping resolution), while
+        ``send_full_payload_outputs`` keys under the INTERNAL id. To cover
+        both modes (and forward compat with id-rename scenarios) we attempt
+        cleanup against both keys; the entry that doesn't exist for the
+        active mode is a no-op pop.  Only the key that actually has pending
+        saves is added to ``_deferred_send_cleanup`` so the bg save's
+        decrement path drains it without leaving orphans.
         """
         ext_id = self._request_ids_mapping.pop(req_id, None)
-        send_req_id = ext_id if ext_id is not None else req_id
+        keys_to_clean: list[str] = [req_id]
+        if ext_id is not None and ext_id != req_id:
+            keys_to_clean.append(ext_id)
 
         with self._lock:
-            if self._pending_save_counts.get(send_req_id, 0):
-                self._deferred_send_cleanup.add(send_req_id)
-            else:
-                self._put_req_chunk.pop(send_req_id, None)
-                self._send_side_request_payload.pop(send_req_id, None)
-                self._code_prompt_token_ids.pop(send_req_id, None)
-                self._cached_ic.pop(send_req_id, None)
+            keys_pending = [k for k in keys_to_clean if self._pending_save_counts.get(k, 0)]
+            for k in keys_pending:
+                self._deferred_send_cleanup.add(k)
+            for k in keys_to_clean:
+                if k in keys_pending:
+                    continue
+                self._put_req_chunk.pop(k, None)
+                self._send_side_request_payload.pop(k, None)
+                self._code_prompt_token_ids.pop(k, None)
+                self._cached_ic.pop(k, None)
             self._kv_pending_transfers.pop(req_id, None)
             self._kv_active_transfers.discard(req_id)
             self._kv_completed_transfers.discard(req_id)
