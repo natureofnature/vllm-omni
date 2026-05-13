@@ -1529,7 +1529,7 @@ class OmniConnectorModelRunnerMixin:
                     logger.warning("Error receiving data for %s", req_id, exc_info=True)
 
             if not made_progress and not self._stop_event.is_set():
-                self._work_available.wait(timeout=0.001)
+                self._work_available.wait(timeout=0.005)
                 self._work_available.clear()
 
     _MAX_SEND_RETRIES = 3
