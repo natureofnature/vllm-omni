@@ -413,7 +413,3 @@ class OmniSchedulingCoordinator:
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
                 self.requests_with_ready_chunks.discard(req_id)
-
-
-# Backward-compatible alias
-ChunkSchedulingCoordinator = OmniSchedulingCoordinator
