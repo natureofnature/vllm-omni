@@ -265,7 +265,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
 
         # Remove finished requests from the cached states.
-        cleanup_finished_request = getattr(self, "cleanup_finished_request", None)
+        # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
+        # is only safe to call when init_omni_connectors() has populated the
+        # mixin state (Qwen3-Omni path). Other archs inherit the method via
+        # MRO but never run that init, so check a mixin-owned attribute as a
+        # proxy for "state initialized".
+        cleanup_finished_request = (
+            getattr(self, "cleanup_finished_request", None) if hasattr(self, "_request_ids_mapping") else None
+        )
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
