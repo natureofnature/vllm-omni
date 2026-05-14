@@ -488,20 +488,22 @@ def thinker2talker_full_payload(
         output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
-    # Match legacy thinker2talker convention: slice last (total-1) rows.
-    # Talker's _thinker_to_talker_prefill computes the last assistant segment
-    # boundary as target_len = len(ids.all); embed.prefill / hidden_states.output
-    # must be 1 row shorter so slicing [im_start:target_len] clips to the
-    # assistant segment exactly as base 4a24a517 does. Otherwise the assistant
-    # segment grabs an extra (output-token) row, trailing_text becomes [2,1024]
-    # instead of [1,1024], and talker over-generates codec frames.
-    new_seq_length = max(0, len(all_token_ids) - 1)
-    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] >= new_seq_length and new_seq_length > 0:
-        thinker_emb_prefill = thinker_emb[-new_seq_length:]
+    # Trim the trailing stop-token row from the accumulated thinker output.
+    # The accumulator captures one hidden-state row per executed thinker
+    # forward (prefill + every decode step including the one that emitted
+    # the stop_token), so for a finished request thinker_emb has exactly one
+    # row more than the rows the talker should consume.  async_chunk's
+    # chunk-0 path naturally captures only the prefill / non-stop portion,
+    # which is why the [async_chunk] parametrization passes while [default]
+    # over-generates one codec frame on short outputs (e.g.
+    # test_one_word_prompt_001[default]: audio extends "London" with
+    # spurious phonemes).
+    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 0:
+        thinker_emb_prefill = thinker_emb[:-1]
     else:
         thinker_emb_prefill = thinker_emb
-    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] >= new_seq_length and new_seq_length > 0:
-        thinker_hid_prefill = thinker_hid[-new_seq_length:]
+    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 0:
+        thinker_hid_prefill = thinker_hid[:-1]
     else:
         thinker_hid_prefill = thinker_hid
 
