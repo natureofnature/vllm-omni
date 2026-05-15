@@ -483,29 +483,59 @@ def thinker2talker_full_payload(
         return None
 
     prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
     all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
-        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
-    # Trim the trailing stop-token row from the accumulated thinker output.
-    # The accumulator captures one hidden-state row per executed thinker
-    # forward (prefill + every decode step including the one that emitted
-    # the stop_token), so for a finished request thinker_emb has exactly one
-    # row more than the rows the talker should consume.  async_chunk's
-    # chunk-0 path naturally captures only the prefill / non-stop portion,
-    # which is why the [async_chunk] parametrization passes while [default]
-    # over-generates one codec frame on short outputs (e.g.
-    # test_one_word_prompt_001[default]: audio extends "London" with
-    # spurious phonemes).
-    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 0:
-        thinker_emb_prefill = thinker_emb[:-1]
-    else:
-        thinker_emb_prefill = thinker_emb
-    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 0:
-        thinker_hid_prefill = thinker_hid[:-1]
-    else:
-        thinker_hid_prefill = thinker_hid
+    # Length-aware trim of the accumulated thinker output.
+    # The accumulator emits P rows during the prefill forward (one per
+    # prompt token) and 1 row per decode forward step.  When the request
+    # finishes by stop_token, the final emission step adds one extra row;
+    # when it finishes by max_tokens (FINISHED_LENGTH_CAPPED), vLLM does
+    # not run another forward, so there is no extra row.  The previous
+    # unconditional `[:-1]` correctly trimmed the stop-token row but
+    # over-trimmed in the max_tokens path -- the talker then ran out of
+    # conditioning before its codec finished, causing long-output drift
+    # (e.g. test_mix_to_text_audio_001 long-repeat regression on BK 9702).
+    # Target the talker's actual prefill consumption length -- the
+    # downstream `_thinker_to_talker_prefill` indexes by
+    # `len(ids["all"])`, which equals `prompt + output` in the standard
+    # contract but can diverge under streaming / PD-disagg paths.  Using
+    # `len(all_token_ids)` keeps the trim aligned with the consumer.
+    target_rows = len(all_token_ids)
+
+    def _trim_to_target(t):
+        if not isinstance(t, torch.Tensor) or t.dim() < 1 or t.shape[0] == 0:
+            return t
+        if target_rows <= 0:
+            # Defensive: an empty prompt+output should not reach this
+            # builder (the pooler short-circuits upstream), but guard
+            # against slicing valid rows to zero if some future caller
+            # ever invokes us in that state.
+            return t
+        if t.shape[0] > target_rows + 1:
+            logger.warning(
+                "thinker2talker_full_payload: unexpected excess rows "
+                "(got %d, target %d) for req=%s; trimming to target",
+                int(t.shape[0]),
+                target_rows,
+                getattr(request, "request_id", None),
+            )
+        if t.shape[0] > target_rows:
+            return t[:target_rows]
+        if t.shape[0] < target_rows:
+            logger.debug(
+                "thinker2talker_full_payload: under-captured rows "
+                "(got %d, target %d) for req=%s; talker may index past end",
+                int(t.shape[0]),
+                target_rows,
+                getattr(request, "request_id", None),
+            )
+        return t
+
+    thinker_emb_prefill = _trim_to_target(thinker_emb)
+    thinker_hid_prefill = _trim_to_target(thinker_hid)
 
     payload: OmniPayload = {
         "embed": {

@@ -168,6 +168,7 @@ def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
+    """Standard max_tokens finish path: rows == target → no trim."""
     request = SimpleNamespace(
         request_id="thinker",
         prompt_token_ids=[151644, 872],
@@ -187,3 +188,48 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["embed"]["prefill"].device.type == "cpu"
     assert payload["hidden_states"]["output"].device.type == "cpu"
     assert payload["next_stage_prompt_len"] > 0
+    # Lock down the no-trim invariant for rows == target.
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_trims_excess_stop_token_row() -> None:
+    """Stop_token finish path: rows == target + 1 → trim trailing row."""
+    request = SimpleNamespace(
+        request_id="thinker-stop",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_preserves_under_capture() -> None:
+    """Under-capture path: rows < target → no trim, safe degrade."""
+    request = SimpleNamespace(
+        request_id="thinker-undercap",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(2, 2),
+        "hidden_states.layer_24": torch.full((2, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 2
+    assert payload["hidden_states"]["output"].shape[0] == 2
