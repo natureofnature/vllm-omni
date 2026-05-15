@@ -189,6 +189,13 @@ class OmniConnectorModelRunnerMixin:
             )
             self._save_thread.start()
 
+        # Explicit "fully initialised" marker so other parts of the runner
+        # (e.g. _update_states cleanup) can branch on a stable contract
+        # instead of probing for private mixin attribute names.  Must be set
+        # only after every field above has been bound, so a partially
+        # constructed mixin is never observable as initialised.
+        self._omni_connector_initialized = True
+
     def shutdown_omni_connectors(self) -> None:
         """Stop background threads and release connector resources."""
         self._stop_event.set()

@@ -19,6 +19,8 @@ from typing import Any
 from vllm.logger import init_logger
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_omni.core.sched.output import OmniInputRegistration
+
 logger = init_logger(__name__)
 
 
@@ -59,7 +61,11 @@ class OmniSchedulingCoordinator:
 
         # Requests waiting for full_payload stage input (WAITING_FOR_INPUT).
         self._waiting_for_input: deque[Any] = deque()
-        self.pending_input_registrations: list[Any] = []
+        # Per-cycle list of minimal handles to ship to the model runner so it
+        # can call register_chunk_recv().  Typed concretely (not list[Any]) so
+        # the surrounding OmniSchedulerOutput stays msgspec-friendly across
+        # default, PD-disagg, and multi-node executor IPC paths.
+        self.pending_input_registrations: list[OmniInputRegistration] = []
 
         # Monotonic timestamp recording when each request first entered
         # WAITING_FOR_CHUNK or WAITING_FOR_INPUT.  Used by
@@ -166,7 +172,12 @@ class OmniSchedulingCoordinator:
                     self._waiting_since.setdefault(request.request_id, time.monotonic())
                     to_remove.append(request)
                     self._waiting_for_input.append(request)
-                    self.pending_input_registrations.append(request)
+                    self.pending_input_registrations.append(
+                        OmniInputRegistration(
+                            request_id=request.request_id,
+                            external_req_id=getattr(request, "external_req_id", None),
+                        )
+                    )
                 elif request.status == RequestStatus.WAITING_FOR_INPUT:
                     if request.request_id in stage_recv_req_ids:
                         request.status = RequestStatus.WAITING
@@ -174,7 +185,12 @@ class OmniSchedulingCoordinator:
                     else:
                         to_remove.append(request)
                         self._waiting_for_input.append(request)
-                        self.pending_input_registrations.append(request)
+                        self.pending_input_registrations.append(
+                            OmniInputRegistration(
+                                request_id=request.request_id,
+                                external_req_id=getattr(request, "external_req_id", None),
+                            )
+                        )
             if to_remove:
                 # Use the bulk-remove helper: one O(N) sweep instead of N
                 # repeated O(N) removes from a list-backed queue.
