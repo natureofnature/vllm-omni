@@ -194,12 +194,14 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
 
 
 def test_thinker2talker_full_payload_trims_excess_stop_token_row() -> None:
-    """Stop_token finish path: rows == target + 1 → trim trailing row."""
+    """Excess-rows path: rows == target + 1 → trim trailing row."""
     request = SimpleNamespace(
-        request_id="thinker-stop",
+        request_id="thinker-excess",
         prompt_token_ids=[151644, 872],
         output_token_ids=[3],
         all_token_ids=[151644, 872, 3],
+        sampling_params=None,
+        status=None,
     )
     pooling_output = {
         "hidden_states.layer_0": torch.ones(4, 2),
@@ -212,6 +214,211 @@ def test_thinker2talker_full_payload_trims_excess_stop_token_row() -> None:
     assert payload is not None
     assert payload["embed"]["prefill"].shape[0] == 3
     assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_drops_stop_emission_row_when_finished_stopped() -> None:
+    """FINISHED_STOPPED: drop 1 extra row even when rows == target.
+
+    vLLM appends the stop-token to output_token_ids before check_stop, so
+    len(all_token_ids) includes the stop slot AND the accumulator has the
+    stop emission's forward row.  Both counts equal P+O (here 3).  Talker
+    target should be P+O-1 (=2), not P+O.  Without the extra drop the
+    stop emission's hidden state leaks into talker prefill (fba23325
+    spurious-phoneme regression).
+    """
+    request = SimpleNamespace(
+        request_id="thinker-stop-finished",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+        sampling_params=None,
+        status=SimpleNamespace(name="FINISHED_STOPPED"),
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_24": torch.full((3, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 2
+    assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_full_payload_drops_stop_emission_via_eos_fallback() -> None:
+    """Stop-detection fallback: last token in sampling_params.eos_token_id."""
+    EOS = 151645
+    request = SimpleNamespace(
+        request_id="thinker-stop-fallback",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, EOS],
+        all_token_ids=[151644, 872, 3, EOS],
+        sampling_params=SimpleNamespace(eos_token_id=EOS, stop_token_ids=None),
+        status=None,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_no_drop_when_finished_length_capped() -> None:
+    """FINISHED_LENGTH_CAPPED (max_tokens): no extra drop; BK 9702 regression guard."""
+    request = SimpleNamespace(
+        request_id="thinker-length-capped",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+        sampling_params=SimpleNamespace(eos_token_id=999, stop_token_ids=None),
+        status=SimpleNamespace(name="FINISHED_LENGTH_CAPPED"),
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_24": torch.full((3, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_drops_via_private_eos_field() -> None:
+    """Worker-side sampling_params where the public `eos_token_id` property is
+    None but the private `_eos_token_id` / `_all_stop_token_ids` carry the
+    primary EOS (the msgspec-deserialization shape on the worker boundary).
+
+    The fallback must read the private fields to detect the stop.
+    """
+    EOS = 151643
+    request = SimpleNamespace(
+        request_id="thinker-private-eos",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, EOS],
+        all_token_ids=[151644, 872, 3, EOS],
+        # Public `eos_token_id` looks empty; only the private fields carry it.
+        sampling_params=SimpleNamespace(
+            eos_token_id=None,
+            stop_token_ids=None,
+            ignore_eos=False,
+            _eos_token_id=EOS,
+            _all_stop_token_ids={EOS},
+        ),
+        status=None,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_drops_via_all_stop_token_ids() -> None:
+    """Secondary EOS only in `_all_stop_token_ids` (not in `_eos_token_id`):
+    multi-EOS Qwen3 case where the model finished on a secondary EOS.
+    """
+    SECONDARY_EOS = 151645
+    request = SimpleNamespace(
+        request_id="thinker-secondary-eos",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, SECONDARY_EOS],
+        all_token_ids=[151644, 872, 3, SECONDARY_EOS],
+        sampling_params=SimpleNamespace(
+            eos_token_id=151643,  # primary, not the one we hit
+            stop_token_ids=None,
+            ignore_eos=False,
+            _eos_token_id=151643,
+            _all_stop_token_ids={151643, SECONDARY_EOS},
+        ),
+        status=None,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 3
+    assert payload["hidden_states"]["output"].shape[0] == 3
+
+
+def test_thinker2talker_full_payload_no_drop_when_ignore_eos_and_trailing_eos() -> None:
+    """ignore_eos=True + length-capped + last token == EOS: no drop.
+
+    Production worker uses CachedRequestState (no `.status` field), so
+    the status path doesn't catch this case; we rely on the
+    `sampling_params.ignore_eos` flag in the fallback to suppress the
+    EOS-as-stop heuristic.
+    """
+    EOS = 151645
+    request = SimpleNamespace(
+        request_id="thinker-ignore-eos-trailing-eos",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, EOS],
+        all_token_ids=[151644, 872, 3, EOS],
+        sampling_params=SimpleNamespace(eos_token_id=EOS, stop_token_ids=None, ignore_eos=True),
+        status=None,  # production worker state has no status
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 4
+    assert payload["hidden_states"]["output"].shape[0] == 4
+
+
+def test_thinker2talker_full_payload_no_drop_when_length_capped_with_trailing_eos() -> None:
+    """FINISHED_LENGTH_CAPPED + last token == EOS coincidence: no drop.
+
+    Status path takes precedence over last-token heuristic.  Without
+    this guard the fallback would incorrectly drop a row when a length-capped
+    request happens to end on the EOS token id.
+    """
+    EOS = 151645
+    request = SimpleNamespace(
+        request_id="thinker-len-cap-trailing-eos",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, EOS],
+        all_token_ids=[151644, 872, 3, EOS],
+        sampling_params=SimpleNamespace(eos_token_id=EOS, stop_token_ids=None),
+        status=SimpleNamespace(name="FINISHED_LENGTH_CAPPED"),
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(4, 2),
+        "hidden_states.layer_24": torch.full((4, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 4
+    assert payload["hidden_states"]["output"].shape[0] == 4
 
 
 def test_thinker2talker_full_payload_preserves_under_capture() -> None:

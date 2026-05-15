@@ -483,43 +483,83 @@ def thinker2talker_full_payload(
         return None
 
     prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
     all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
-        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
-    # Length-aware trim of the accumulated thinker output.
-    # The accumulator emits P rows during the prefill forward (one per
-    # prompt token) and 1 row per decode forward step.  When the request
-    # finishes by stop_token, the final emission step adds one extra row;
-    # when it finishes by max_tokens (FINISHED_LENGTH_CAPPED), vLLM does
-    # not run another forward, so there is no extra row.  The previous
-    # unconditional `[:-1]` correctly trimmed the stop-token row but
-    # over-trimmed in the max_tokens path -- the talker then ran out of
-    # conditioning before its codec finished, causing long-output drift
-    # (e.g. test_mix_to_text_audio_001 long-repeat regression on BK 9702).
-    # Target the talker's actual prefill consumption length -- the
-    # downstream `_thinker_to_talker_prefill` indexes by
-    # `len(ids["all"])`, which equals `prompt + output` in the standard
-    # contract but can diverge under streaming / PD-disagg paths.  Using
-    # `len(all_token_ids)` keeps the trim aligned with the consumer.
-    target_rows = len(all_token_ids)
+    # Length-aware trim of accumulated thinker output, finish-reason-aware.
+    # vLLM appends the sampled token to `output_token_ids` BEFORE
+    # `check_stop` (scheduler.py:1641-1651), so a stop-finished request
+    # has accumulator_rows == len(all_token_ids) including the stop
+    # emission row -- the talker must NOT consume that row (fba23325
+    # spurious-phoneme regression).  Max-token finishes do not append
+    # an extra forward, so no drop is needed (BK 9702 long-output
+    # regression).  Primary: distinguish via `request.status`. Fallback
+    # only when status is absent: last-token-in-stop-id heuristic.
+    status = getattr(request, "status", None)
+    status_name = getattr(status, "name", None) or ""
+    if not status_name and status is not None:
+        status_name = str(status).rsplit(".", 1)[-1]
+    stop_emission_drop = 1 if status_name == "FINISHED_STOPPED" else 0
+    if stop_emission_drop == 0 and not status_name and output_token_ids:
+        # Worker-side CachedRequestState has no `.status` field in vLLM
+        # v1, so this fallback runs for every production request.  When
+        # `sampling_params.ignore_eos=True` vLLM continues past EOS, so
+        # a length-capped finish whose last sampled token coincidentally
+        # equals EOS must NOT be trimmed -- skip EOS from the stop set
+        # in that case.  Custom `stop_token_ids` are still treated as
+        # stops; vLLM's `check_stop` runs stop-id matching before the
+        # length cap and ignores `ignore_eos` for `stop_token_ids`, so
+        # a last-token match there is unambiguously a stop finish.
+        sampling_params = getattr(request, "sampling_params", None)
+        if sampling_params is not None:
+            stop_ids: set[int] = set()
+            ignore_eos = bool(getattr(sampling_params, "ignore_eos", False))
+            # Custom stop_token_ids always trigger stop in vLLM, regardless
+            # of ignore_eos (vLLM v1: `update_from_generation_config` writes
+            # secondary EOSes here too).  Read the public list.
+            for sid in getattr(sampling_params, "stop_token_ids", None) or ():
+                if isinstance(sid, int):
+                    stop_ids.add(sid)
+            # EOS sources are only stops when ignore_eos=False. Read both
+            # the public @property (`eos_token_id`, `all_stop_token_ids`)
+            # AND the private fields (`_eos_token_id`, `_all_stop_token_ids`)
+            # because property behavior can vary across msgspec serialization
+            # boundaries while the private fields are always serialized.
+            if not ignore_eos:
+                for eos in (
+                    getattr(sampling_params, "eos_token_id", None),
+                    getattr(sampling_params, "_eos_token_id", None),
+                ):
+                    if isinstance(eos, int):
+                        stop_ids.add(eos)
+                for sid in (
+                    getattr(sampling_params, "all_stop_token_ids", None)
+                    or getattr(sampling_params, "_all_stop_token_ids", None)
+                    or ()
+                ):
+                    if isinstance(sid, int):
+                        stop_ids.add(sid)
+            if stop_ids and output_token_ids[-1] in stop_ids:
+                stop_emission_drop = 1
+    target_rows = max(0, len(all_token_ids) - stop_emission_drop)
 
     def _trim_to_target(t):
         if not isinstance(t, torch.Tensor) or t.dim() < 1 or t.shape[0] == 0:
             return t
         if target_rows <= 0:
-            # Defensive: an empty prompt+output should not reach this
-            # builder (the pooler short-circuits upstream), but guard
-            # against slicing valid rows to zero if some future caller
-            # ever invokes us in that state.
+            # Defensive: empty prompt+output (or stop-only output) should
+            # not reach this builder; keep all rows rather than slicing
+            # to zero.
             return t
         if t.shape[0] > target_rows + 1:
             logger.warning(
                 "thinker2talker_full_payload: unexpected excess rows "
-                "(got %d, target %d) for req=%s; trimming to target",
+                "(got %d, target %d, stop_drop %d) for req=%s; trimming to target",
                 int(t.shape[0]),
                 target_rows,
+                stop_emission_drop,
                 getattr(request, "request_id", None),
             )
         if t.shape[0] > target_rows:
@@ -527,9 +567,10 @@ def thinker2talker_full_payload(
         if t.shape[0] < target_rows:
             logger.debug(
                 "thinker2talker_full_payload: under-captured rows "
-                "(got %d, target %d) for req=%s; talker may index past end",
+                "(got %d, target %d, stop_drop %d) for req=%s; talker may index past end",
                 int(t.shape[0]),
                 target_rows,
+                stop_emission_drop,
                 getattr(request, "request_id", None),
             )
         return t
