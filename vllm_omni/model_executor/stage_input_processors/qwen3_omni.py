@@ -483,9 +483,9 @@ def thinker2talker_full_payload(
         return None
 
     prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
     all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
     if not all_token_ids:
+        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
     # Length-aware trim of the accumulated thinker output.
