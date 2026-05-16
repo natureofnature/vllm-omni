@@ -497,3 +497,500 @@ def test_accumulator_concat_default_when_no_replace_keys() -> None:
     )
     output, _ = stub._materialize_full_payload_entry(stub._pending_full_payload_send["req1"])
     assert torch.equal(output["embed.prefill"], torch.tensor([[1.0], [2.0]]))
+
+
+def test_covo_audio_llm2code2wav_token_only_smoke() -> None:
+    """Smoke: covo_audio token-only builder marks `_is_sync_input`
+    and returns placeholder prompts sized to audio_codes count."""
+    from vllm_omni.model_executor.stage_input_processors.covo_audio import (
+        llm2code2wav_token_only,
+    )
+
+    assert getattr(llm2code2wav_token_only, "_is_sync_input", False) is True
+
+    # source_outputs is a list of objects with .outputs[0].token_ids
+    from vllm_omni.model_executor.models.covo_audio.config_covo_audio import COVO_AUDIO_TOKEN_INDEX
+
+    class _Out:
+        def __init__(self, tids):
+            self.token_ids = tids
+
+    class _Wrapper:
+        def __init__(self, tids):
+            self.outputs = [_Out(tids)]
+
+    # 3 codec tokens + 2 non-codec
+    src = [_Wrapper([COVO_AUDIO_TOKEN_INDEX + 0, COVO_AUDIO_TOKEN_INDEX + 1, COVO_AUDIO_TOKEN_INDEX + 2, 100, 200])]
+    out = llm2code2wav_token_only(src)
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 3
+    assert out[0]["additional_information"] is None
+
+
+def test_covo_audio_llm2code2wav_full_payload_smoke() -> None:
+    """Smoke: covo_audio producer-side packer returns audio_codes + finished."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.models.covo_audio.config_covo_audio import COVO_AUDIO_TOKEN_INDEX
+    from vllm_omni.model_executor.stage_input_processors.covo_audio import (
+        llm2code2wav_full_payload,
+    )
+
+    req = SimpleNamespace(
+        output_token_ids=[COVO_AUDIO_TOKEN_INDEX + 5, COVO_AUDIO_TOKEN_INDEX + 6, 99],
+    )
+    payload = llm2code2wav_full_payload(None, {}, req)
+    assert payload is not None
+    assert payload["codes"]["audio"] == [5, 6]
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_dynin_omni_token_only_smoke() -> None:
+    """Smoke: dynin_omni token-only builders mark _is_sync_input and return placeholders."""
+    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
+        token2image_to_token2audio_token_only,
+        token2text_to_token2image_token_only,
+    )
+
+    assert getattr(token2text_to_token2image_token_only, "_is_sync_input", False) is True
+    assert getattr(token2image_to_token2audio_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, tids, mm=None):
+            self.token_ids = tids
+            self.multimodal_output = mm
+
+    class _Wrapper:
+        def __init__(self, tids, mm=None):
+            self.outputs = [_Out(tids, mm)]
+            self.request_id = "r0"
+
+    class _Stage:
+        def __init__(self, outs):
+            self.engine_outputs = outs
+
+    src = [_Wrapper([10, 11, 12])]
+    out = token2text_to_token2image_token_only([_Stage(src)], [0])
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 3
+    assert out[0]["additional_information"] is None
+
+
+def test_dynin_omni_full_payload_smoke() -> None:
+    """Smoke: dynin_omni producer-side packer returns token_ids + finished."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
+        token2text_to_token2image_full_payload,
+    )
+
+    pooling = {"token_ids": [1, 2, 3]}
+    req = SimpleNamespace(output_token_ids=[], additional_information={"speaker": ["alice"]})
+    payload = token2text_to_token2image_full_payload(None, pooling, req)
+    assert payload is not None
+    assert payload["code_predictor_codes"] == [1, 2, 3]
+    assert payload["finished"].item() is True
+    # additional_information carried forward as list-wrapped (speaker)
+    assert payload.get("speaker") == ["alice"]
+
+
+def test_qwen2_5_omni_talker2code2wav_token_only_smoke() -> None:
+    """Smoke: qwen2_5_omni talker→code2wav token_only marker + boundary strip."""
+    from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
+        TALKER_CODEC_END_TOKEN_ID,
+        TALKER_CODEC_START_TOKEN_ID,
+        talker2code2wav_token_only,
+    )
+
+    assert getattr(talker2code2wav_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, tids):
+            self.cumulative_token_ids = tids
+
+    class _Wrap:
+        def __init__(self, tids):
+            self.outputs = [_Out(tids)]
+
+    # 3 inner codes wrapped by START + END
+    src = [_Wrap([TALKER_CODEC_START_TOKEN_ID, 10, 11, 12, TALKER_CODEC_END_TOKEN_ID])]
+    out = talker2code2wav_token_only(src)
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 3
+    assert out[0]["additional_information"] is None
+
+
+def test_qwen2_5_omni_talker2code2wav_full_payload_smoke() -> None:
+    """Smoke: qwen2_5_omni producer-side packer strips boundaries."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
+        TALKER_CODEC_END_TOKEN_ID,
+        TALKER_CODEC_START_TOKEN_ID,
+        talker2code2wav_full_payload,
+    )
+
+    req = SimpleNamespace(
+        output_token_ids=[TALKER_CODEC_START_TOKEN_ID, 5, 6, 7, TALKER_CODEC_END_TOKEN_ID],
+    )
+    payload = talker2code2wav_full_payload(None, {}, req)
+    assert payload is not None
+    assert payload["codes"]["audio"] == [5, 6, 7]
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_mimo_audio_llm2code2wav_token_only_smoke() -> None:
+    """Smoke: mimo_audio token-only builder marks _is_sync_input + sizes prompt."""
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.mimo_audio import (
+        llm2code2wav_token_only,
+    )
+
+    assert getattr(llm2code2wav_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, mm):
+            self.multimodal_output = mm
+
+    class _Wrap:
+        def __init__(self, mm):
+            self.outputs = [_Out(mm)]
+
+    # 3 batch rows of [1, 8, 4]: prepend_and_flatten_colmajor → 3*1*4*9 = 108
+    codes = torch.arange(96, dtype=torch.long).reshape(3, 1, 8, 4)
+    codes = codes.clamp(min=1)  # ensure nonzero so zero-row filter doesn't drop them
+    src = [_Wrap({"codes": {"audio": codes}})]
+    out = llm2code2wav_token_only(src)
+    assert len(out) == 1
+    assert len(out[0]["prompt_token_ids"]) == 108
+    assert out[0]["additional_information"] is None
+
+
+def test_mimo_audio_llm2code2wav_full_payload_smoke() -> None:
+    """Smoke: mimo_audio producer-side packer reads flat codes.audio + flattens."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.mimo_audio import (
+        TALKER_CODEC_PAD_TOKEN_ID,
+        llm2code2wav_full_payload,
+    )
+
+    # Simulate accumulator output: 2 steps of [1, 1, 8, 4] CONCAT'd → [2, 1, 8, 4]
+    audio = torch.arange(2 * 1 * 8 * 4, dtype=torch.long).reshape(2, 1, 8, 4)
+    audio = audio.clamp(min=1)  # avoid zero-row drop
+    pooling_output = {"codes.audio": audio}
+    req = SimpleNamespace(output_token_ids=[])
+    payload = llm2code2wav_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert "codes" in payload and "audio" in payload["codes"]
+    # Flattened length = numel + B*4 (per-batch pad_vec prepended by prepend_and_flatten_colmajor)
+    batch_size = int(audio.shape[0])
+    assert len(payload["codes"]["audio"]) == audio.numel() + batch_size * 4
+    # prepend_and_flatten_colmajor: PAD appears at column start in col-major flatten.
+    # For shape [B=2, 1, 9, 4], each column has 1 PAD then 8 codec vals → PAD at indices 0, 9, 18, 27.
+    out = payload["codes"]["audio"]
+    assert out[0] == TALKER_CODEC_PAD_TOKEN_ID
+    assert out[9] == TALKER_CODEC_PAD_TOKEN_ID
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_mimo_audio_full_payload_nested_fallback() -> None:
+    """Back-compat: full_payload still works if runtime returns nested codes.audio."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.mimo_audio import (
+        llm2code2wav_full_payload,
+    )
+
+    audio = torch.arange(1 * 1 * 8 * 4, dtype=torch.long).reshape(1, 1, 8, 4)
+    audio = audio.clamp(min=1)
+    pooling_output = {"codes": {"audio": audio}}  # nested, not flat
+    req = SimpleNamespace(output_token_ids=[])
+    payload = llm2code2wav_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert len(payload["codes"]["audio"]) == audio.numel() + int(audio.shape[0]) * 4
+
+
+def test_qwen3_tts_talker2code2wav_token_only_smoke() -> None:
+    """Smoke: qwen3_tts token-only marks _is_sync_input + sizes placeholder."""
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_token_only,
+    )
+
+    assert getattr(talker2code2wav_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, mm, tids):
+            self.multimodal_output = mm
+            self.cumulative_token_ids = tids
+
+    class _Wrap:
+        def __init__(self, mm, tids):
+            self.outputs = [_Out(mm, tids)]
+            self.finished = True
+
+    # 3 valid codec frames Q=16; non-zero & under codebook size
+    audio = torch.arange(3 * 16, dtype=torch.long).reshape(3, 16) + 1
+    mm = {"codes": {"audio": audio}}
+    src = [_Wrap(mm, list(range(10)))]  # seq_len = 9; 3 < 9, no trim
+    out = talker2code2wav_token_only(src)
+    assert len(out) == 1
+    # Codebook-major flat: 16 * 3 = 48
+    assert len(out[0]["prompt_token_ids"]) == 48
+
+
+def test_qwen3_tts_talker2code2wav_full_payload_smoke() -> None:
+    """Smoke: qwen3_tts full_payload reads flat codes.audio + flattens col-major."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_full_payload,
+    )
+
+    # 3 valid codec frames [3, 16] CONCAT'd from per-step emits via flatten
+    audio = torch.arange(3 * 16, dtype=torch.long).reshape(3, 16) + 1
+    pooling_output = {"codes.audio": audio}
+    req = SimpleNamespace(output_token_ids=list(range(10)))  # seq_len = 9
+    payload = talker2code2wav_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert "codes" in payload and "audio" in payload["codes"]
+    # codebook-major: shape [3, 16] -> [16, 3] -> flatten = 48 entries
+    assert len(payload["codes"]["audio"]) == 48
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_qwen3_tts_full_payload_with_ref_code() -> None:
+    """Smoke: ref_code prepended via codes.ref + meta.ref_code_len from flat path."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_full_payload,
+    )
+
+    # Audio: 3 frames [3, 16]
+    audio = torch.arange(3 * 16, dtype=torch.long).reshape(3, 16) + 1
+    # Ref code: 2 frames [2, 16] (already 2-D)
+    ref = torch.arange(2 * 16, dtype=torch.long).reshape(2, 16) + 100
+    pooling_output = {
+        "codes.audio": audio,
+        "codes.ref": [ref],
+        "meta.ref_code_len": torch.tensor([2], dtype=torch.int32),
+    }
+    req = SimpleNamespace(output_token_ids=list(range(10)))
+    payload = talker2code2wav_full_payload(None, pooling_output, req)
+    assert payload is not None
+    # Total frames = 2 (ref) + 3 (audio) = 5; codebook-major: 16 * 5 = 80
+    assert len(payload["codes"]["audio"]) == 80
+
+
+def test_qwen3_tts_full_payload_nested_fallback() -> None:
+    """Back-compat: full_payload works if pooler returns un-flattened nested dict."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.qwen3_tts import (
+        talker2code2wav_full_payload,
+    )
+
+    audio = torch.arange(2 * 16, dtype=torch.long).reshape(2, 16) + 1
+    pooling_output = {"codes": {"audio": audio}}  # nested, not flat
+    req = SimpleNamespace(output_token_ids=list(range(10)))
+    payload = talker2code2wav_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert len(payload["codes"]["audio"]) == 32  # 16 * 2
+
+
+def test_cosyvoice3_text2flow_token_only_smoke() -> None:
+    """Smoke: cosyvoice3 token-only marks _is_sync_input + carries ids.prompt only."""
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+        text2flow_token_only,
+    )
+
+    assert getattr(text2flow_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, tids):
+            self.cumulative_token_ids = tids
+            self.multimodal_output = {}
+
+    class _Wrap:
+        def __init__(self, output_tids, prompt_tids):
+            self.outputs = [_Out(output_tids)]
+            self.prompt_token_ids = prompt_tids
+            self.finished = True
+
+    # multimodal_output has embed.* + we expect token_only to preserve it (Phase 4 #90 follow-up).
+    import torch
+
+    embed = {"speech_token": torch.zeros(2, 4)}
+    src = [_Wrap(output_tids=[10, 20, 30], prompt_tids=[1, 2, 3, 4])]
+    src[0].outputs[0].multimodal_output = {"embed": embed}
+    out = text2flow_token_only(src)
+    assert len(out) == 1
+    # prompt_token_ids is the talker's cumulative_token_ids (real codec tokens, not zeros).
+    assert out[0]["prompt_token_ids"] == [10, 20, 30]
+    # additional_information carries ids.prompt PLUS the original multimodal_output (embed.* still inline).
+    # Heavy embed.* removal pending the model_intermediate_buffer plumbing on the code2wav side.
+    assert out[0]["additional_information"]["ids"]["prompt"] == [1, 2, 3, 4]
+    assert "embed" in out[0]["additional_information"]
+
+
+def test_cosyvoice3_text2flow_full_payload_smoke() -> None:
+    """Smoke: cosyvoice3 producer-side reads flat embed.* keys."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+        text2flow_full_payload,
+    )
+
+    speech_token = torch.randn(4, 8)
+    speech_feat = torch.randn(4, 16)
+    embedding = torch.randn(1, 32)
+    pooling_output = {
+        "embed.speech_token": speech_token,
+        "embed.speech_feat": speech_feat,
+        "embed.embedding": embedding,
+    }
+    req = SimpleNamespace(external_req_id="r-1")
+    payload = text2flow_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert "embed" in payload
+    assert torch.equal(payload["embed"]["speech_token"], speech_token)
+    assert torch.equal(payload["embed"]["speech_feat"], speech_feat)
+    assert torch.equal(payload["embed"]["embedding"], embedding)
+    assert payload["meta"]["finished"].item() is True
+
+
+def test_cosyvoice3_text2flow_full_payload_nested_fallback() -> None:
+    """Back-compat: full_payload works if pooler returns un-flattened nested embed."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+        text2flow_full_payload,
+    )
+
+    speech_token = torch.randn(3, 8)
+    pooling_output = {"embed": {"speech_token": speech_token}}  # nested, not flat
+    req = SimpleNamespace(external_req_id="r-2")
+    payload = text2flow_full_payload(None, pooling_output, req)
+    assert payload is not None
+    assert "speech_token" in payload["embed"]
+    assert torch.equal(payload["embed"]["speech_token"], speech_token)
+
+
+def test_cosyvoice3_full_payload_replace_keys_present() -> None:
+    """Confirm _FULL_PAYLOAD_REPLACE_KEYS lists the three embed.* keys."""
+    from vllm_omni.model_executor.stage_input_processors.cosyvoice3 import (
+        _FULL_PAYLOAD_REPLACE_KEYS,
+    )
+
+    assert _FULL_PAYLOAD_REPLACE_KEYS == frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+
+
+def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
+    """Smoke: ming_flash_omni token-only marks _is_sync_input + carries voice metadata."""
+    from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
+        thinker2talker_token_only,
+    )
+
+    assert getattr(thinker2talker_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, text):
+            self.text = text
+
+    class _Wrap:
+        def __init__(self, text):
+            self.outputs = [_Out(text)]
+
+    class _Prompt:
+        def __init__(self, info):
+            self.additional_information = info
+
+    src = [_Wrap("hello world")]
+    prompt = _Prompt({"voice_name": "ZH_FEMALE", "prompt_text": "ref text"})
+    out = thinker2talker_token_only(src, prompt=prompt)
+    assert len(out) == 1
+    assert out[0]["prompt_token_ids"] == [0]  # talker self-tokenizes; dummy id
+    info = out[0]["additional_information"]
+    assert info["text"] == "hello world"
+    assert info["voice_name"] == "ZH_FEMALE"
+    assert info["prompt_text"] == "ref text"
+    assert info["ming_task"] == "omni"
+
+
+def test_ming_flash_omni_thinker2talker_full_payload_noop() -> None:
+    """thinker2talker_full_payload returns None — no heavy tensor migration."""
+    from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
+        thinker2talker_full_payload,
+    )
+
+    payload = thinker2talker_full_payload(None, {"anything": "ignored"}, None)
+    assert payload is None
+
+
+def test_qwen2_5_omni_thinker2talker_token_only_smoke() -> None:
+    """Smoke: qwen2_5_omni thinker token-only marks _is_sync_input + ports legacy body."""
+    import torch
+
+    from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
+        TALKER_CODEC_END_TOKEN_ID,
+        TALKER_CODEC_PAD_TOKEN_ID,
+        TALKER_CODEC_START_TOKEN_ID,
+        thinker2talker_token_only,
+    )
+
+    assert getattr(thinker2talker_token_only, "_is_sync_input", False) is True
+
+    class _Out:
+        def __init__(self, ctids, mm):
+            self.cumulative_token_ids = ctids
+            self.multimodal_output = mm
+
+    class _Wrap:
+        def __init__(self, prompt_tids, ctids, mm, rid):
+            self.outputs = [_Out(ctids, mm)]
+            self.prompt_token_ids = prompt_tids
+            self.request_id = rid
+
+    class _Prompt(dict):
+        pass
+
+    # Latent shaped [prompt_len + decode_len, hidden] = [5 + 3, 8]
+    latent = torch.randn(8, 8)
+    src = [_Wrap(prompt_tids=[1, 2, 3, 4, 5], ctids=[10, 20, 30], mm={"latent": latent}, rid="r-1")]
+    prompt = [_Prompt(multi_modal_data=None)]
+    out = thinker2talker_token_only(src, prompt=prompt)
+    assert len(out) == 1
+    # Talker prompt = START + PAD*prompt_len + END
+    expected_prompt_len = 1 + len([1, 2, 3, 4, 5]) + 1
+    assert len(out[0]["prompt_token_ids"]) == expected_prompt_len
+    assert out[0]["prompt_token_ids"][0] == TALKER_CODEC_START_TOKEN_ID
+    assert out[0]["prompt_token_ids"][-1] == TALKER_CODEC_END_TOKEN_ID
+    assert all(t == TALKER_CODEC_PAD_TOKEN_ID for t in out[0]["prompt_token_ids"][1:-1])
+
+
+def test_qwen2_5_omni_thinker2talker_full_payload_noop() -> None:
+    """thinker2talker_full_payload returns None — no heavy tensor migration today."""
+    from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
+        thinker2talker_full_payload,
+    )
+
+    payload = thinker2talker_full_payload(None, {"any": "thing"}, None)
+    assert payload is None

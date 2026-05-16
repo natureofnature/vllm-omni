@@ -16,7 +16,7 @@ import torch
 import vllm_omni.core.sched.omni_scheduling_coordinator as coord_mod
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
-    uses_qwen3_omni_full_payload_input_coordinator,
+    uses_full_payload_input_coordinator,
 )
 
 # ------------------------------------------------------------------ #
@@ -92,7 +92,16 @@ class MockQueue:
 
 
 class TestFullPayloadCoordinatorSelection(unittest.TestCase):
-    def test_qwen3_omni_talker_and_code2wav_use_full_payload_input_coordinator(self):
+    """Tests for the (model_arch, model_stage) whitelist gate.
+
+    The gate scope must stay aligned with init_omni_connectors arch scope in
+    gpu_ar_model_runner.py / gpu_generation_model_runner.py.  Until those init
+    sites are generalised (planned for a later PR matching the tmp/trim_refactor
+    branch shape), only Qwen3-Omni talker / code2wav route full_payload stage
+    input through the worker connector.
+    """
+
+    def test_qwen3_omni_talker_and_code2wav_fire_gate(self):
         for model_stage in ("talker", "code2wav"):
             model_config = SimpleNamespace(
                 stage_id=1,
@@ -100,39 +109,44 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_stage=model_stage,
             )
+            self.assertTrue(
+                uses_full_payload_input_coordinator(model_config),
+                msg=f"expected gate to fire for Qwen3Omni/{model_stage}",
+            )
 
-            self.assertTrue(uses_qwen3_omni_full_payload_input_coordinator(model_config))
-
-    def test_async_chunk_and_non_qwen3_omni_do_not_use_full_payload_input_coordinator(self):
+    def test_other_arch_or_stage_or_mode_does_not_fire(self):
         cases = [
             SimpleNamespace(
-                stage_id=1,
-                async_chunk=True,
-                model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="talker",
+                stage_id=1, async_chunk=True, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="talker"
+            ),
+            SimpleNamespace(
+                stage_id=0, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage="thinker"
             ),
             SimpleNamespace(
                 stage_id=1,
-                async_chunk=False,
-                model_arch="Qwen3TTSForConditionalGeneration",
-                model_stage="code2wav",
-            ),
-            SimpleNamespace(
-                stage_id=1,
-                async_chunk=False,
-                model_arch="Qwen2_5OmniForConditionalGeneration",
-                model_stage="talker",
-            ),
-            SimpleNamespace(
-                stage_id=0,
                 async_chunk=False,
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="thinker",
+                model_stage="some_future_stage",
+            ),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="Qwen2_5OmniForConditionalGeneration", model_stage="talker"
+            ),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="Qwen3TTSForConditionalGeneration", model_stage="code2wav"
+            ),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="MingFlashOmniForConditionalGeneration", model_stage="talker"
+            ),
+            SimpleNamespace(stage_id=1, async_chunk=False, model_arch=None, model_stage="talker"),
+            SimpleNamespace(
+                stage_id=1, async_chunk=False, model_arch="Qwen3OmniMoeForConditionalGeneration", model_stage=None
             ),
         ]
-
         for model_config in cases:
-            self.assertFalse(uses_qwen3_omni_full_payload_input_coordinator(model_config))
+            self.assertFalse(
+                uses_full_payload_input_coordinator(model_config),
+                msg=f"expected gate OFF for {model_config}",
+            )
 
 
 class TestChunkCoordinatorStateTransition(unittest.TestCase):
