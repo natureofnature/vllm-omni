@@ -472,18 +472,40 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 
 
 def test_full_payload_output_accumulation_hook_matrix():
+    """Producer-side gate: fires iff custom_process_func is loaded and not async_chunk.
+
+    Phase 2a generalized the gate from an arch + stage whitelist to a structural
+    check on the loaded packer.  `_custom_process_func is None` short-circuits;
+    that maps to terminal stages (e.g. code2wav, qwen3_tts code2wav, qwen2_5
+    code2wav) whose stage_config has no `custom_process_next_stage_input_func`
+    and no `*_full_payload` derivative of `custom_process_input_func`.
+    """
+    # Thinker / talker producer stages: packer loaded -> gate fires.
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(model_stage="code2wav")._should_accumulate_full_payload_output()
+
+    # Terminal stage: emulate `_load_custom_func` returning None (no downstream).
+    runner = _make_full_payload_accumulation_runner(model_stage="code2wav")
+    runner._custom_process_func = None
+    runner._should_accumulate_full_payload_output_cached = None
+    assert not runner._should_accumulate_full_payload_output()
+
+    # async_chunk mode -> gate off.
     assert not _make_full_payload_accumulation_runner(
         model_stage="talker", async_chunk=True
     )._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_arch="Qwen3TTSForConditionalGeneration"
-    )._should_accumulate_full_payload_output()
-    assert not _make_full_payload_accumulation_runner(
-        model_arch="Qwen2_5OmniForConditionalGeneration"
-    )._should_accumulate_full_payload_output()
+
+    # Non-qwen3 arches: gate is now arch-agnostic, but if the fixture's arch
+    # has no PR3 wire its runtime `_custom_process_func` would be None.
+    # Emulate that.
+    runner = _make_full_payload_accumulation_runner(model_arch="Qwen3TTSForConditionalGeneration")
+    runner._custom_process_func = None
+    runner._should_accumulate_full_payload_output_cached = None
+    assert not runner._should_accumulate_full_payload_output()
+    runner = _make_full_payload_accumulation_runner(model_arch="Qwen2_5OmniForConditionalGeneration")
+    runner._custom_process_func = None
+    runner._should_accumulate_full_payload_output_cached = None
+    assert not runner._should_accumulate_full_payload_output()
 
 
 def test_sync_local_stage_payloads_retains_payload_until_request_is_active():

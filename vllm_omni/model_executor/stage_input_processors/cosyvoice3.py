@@ -271,3 +271,102 @@ def talker2code2wav_async_chunk(
 
         state["emitted_chunks"] = int(state.get("emitted_chunks", 0)) + 1
         return payload
+
+
+# ============================================================================
+# PR3 worker-connector data plane (non-async-chunk path) — Group D-ish.
+# cosyvoice3 talker emits `multimodal_outputs={"embed": {"speech_token": t,
+# "speech_feat": t, "embedding": t}}` ONLY at prefill (decode steps emit
+# `{}`).  After flatten_payload (data_entry_keys.py:280-302) these become
+# flat top-level keys `embed.speech_token` etc., persisted across decode
+# steps by the accumulator (decode doesn't re-emit them).  Shipping via
+# the connector keeps the orchestrator off the heavy-tensor path.
+# ============================================================================
+
+# All three embed tensors are emitted once at prefill and must REPLACE-not-
+# CONCAT across the (already trivial) per-request accumulator history so a
+# regression where decode unexpectedly re-emits them does not silently
+# duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+
+
+def text2flow_token_only(
+    source_outputs: list,
+    prompt: OmniTokensPrompt | TextPrompt = None,
+    _requires_multimodal_data: bool = True,
+):
+    """Sync-side builder for the non-async-chunk text→flow path.
+
+    Mirrors the legacy `text2flow` shape but strips the prefill embed
+    tensors out of `additional_information` — those travel via the worker
+    connector payload built by `text2flow_full_payload`.  Small metadata
+    (`ids.prompt` = the talker's original prompt token prefix) stays
+    inline so the flow stage can still locate the prefix.
+
+    prompt_token_ids = the talker's `cumulative_token_ids` (real codec
+    tokens, not [0]*N) because the flow stage consumes talker output
+    verbatim.
+    """
+    del prompt
+    engine_inputs: list[OmniTokensPrompt] = []
+    for source_output in source_outputs:
+        if not source_output.finished:
+            continue
+        output = source_output.outputs[0]
+        output_ids = _ensure_list(output.cumulative_token_ids)
+        prefix_ids = _ensure_list(source_output.prompt_token_ids)
+        # Preserve full multimodal_output (incl. embed.*) in additional_information
+        # for now: the worker connector wire to model_intermediate_buffer on the
+        # code2wav side is not yet plumbed.  Filed as Phase 4 follow-up (parallel
+        # to #90 speaker/language re-routing).  text2flow_full_payload still ships
+        # embed.* via the connector — currently redundant but ready for activation.
+        multi_modal_data = output.multimodal_output
+        if multi_modal_data is None:
+            raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
+        additional_info: dict[str, Any] = dict(multi_modal_data)
+        additional_info.setdefault("ids", {})["prompt"] = prefix_ids
+        engine_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=output_ids,
+                additional_information=additional_info,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+    return engine_inputs
+
+
+text2flow_token_only._is_sync_input = True
+
+
+def text2flow_full_payload(
+    transfer_manager,
+    pooling_output,
+    request,
+):
+    """Producer-side packer.
+
+    Reads the prefill-emitted `embed.{speech_token, speech_feat, embedding}`
+    from the accumulator (flat dotted keys after flatten_payload; nested
+    fallback for safety) and ships them as a single connector payload.
+    The downstream flow stage reads these from `model_intermediate_buffer`
+    (see cosyvoice3.py:671 in the code2wav forward — runtime_info pickup).
+    """
+    del transfer_manager, request
+    if not isinstance(pooling_output, dict):
+        return None
+    embed_out: dict[str, Any] = {}
+    for key in ("speech_token", "speech_feat", "embedding"):
+        v = pooling_output.get(f"embed.{key}")
+        if v is None:
+            nested = pooling_output.get("embed")
+            if isinstance(nested, dict):
+                v = nested.get(key)
+        if isinstance(v, torch.Tensor) and v.numel() > 0:
+            embed_out[key] = v
+    if not embed_out:
+        return None
+    return {
+        "embed": embed_out,
+        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    }

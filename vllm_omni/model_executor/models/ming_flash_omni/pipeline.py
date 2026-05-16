@@ -42,6 +42,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             # Thinker reads the LLM sub-config of BailingMM2Config
             hf_config_name="llm_config",
             engine_output_type="text",
+            custom_process_next_stage_input_func=f"{_PROC}.thinker2talker_full_payload",
             sampling_constraints={"detokenize": True},
         ),
         StagePipelineConfig(
@@ -58,6 +59,7 @@ MING_FLASH_OMNI_PIPELINE = PipelineConfig(
             engine_output_type="audio",
             tokenizer_subdir="talker/llm",
             custom_process_input_func=f"{_PROC}.thinker2talker",
+            sync_process_input_func=f"{_PROC}.thinker2talker_token_only",
         ),
     ),
 )

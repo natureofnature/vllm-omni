@@ -47,19 +47,30 @@ logger = init_logger(__name__)
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
-    """Structural gate: accumulate full-payload outputs iff the configured
-    custom_process_func is a sync-side builder (marked by `_is_sync_input`)
-    and the stage is not in async_chunk mode.
+    """Producer-side structural gate.
 
-    Lives at module level so the producer-side `OmniConnectorModelRunnerMixin
-    ._should_accumulate_full_payload_output()` does not need an arch-specific
-    import chain (the structural check is arch-agnostic).
+    Fires iff the worker has a connector payload builder loaded
+    (``custom_process_func`` resolved via ``_load_custom_func`` from the
+    stage_config's ``custom_process_next_stage_input_func`` or the
+    ``*_full_payload`` derivative of ``custom_process_input_func``), the
+    stage is not in async_chunk mode, and ``model_stage`` is set.
+
+    NOTE: the ``_is_sync_input`` marker is on the *consumer-side*
+    ``*_token_only`` builder, not on the ``*_full_payload`` packer that
+    workers load on the *producer* side.  So checking it here would always
+    return False and the accumulator would never run.  The
+    consumer-side scheduler gate (``uses_full_payload_input_coordinator``
+    in ``omni_scheduling_coordinator.py``) is where the marker is
+    appropriately tested.
+
+    Pre-Phase-2a, this gate was an arch + stage whitelist
+    (``Qwen3OmniMoeForConditionalGeneration`` and ``thinker``/``talker``).
+    Phase 2a generalized that to "any stage with a loaded packer + not
+    async_chunk + model_stage set" — arch-agnostic.
     """
     if custom_process_func is None:
         return False
     if getattr(model_config, "async_chunk", False):
-        return False
-    if not getattr(custom_process_func, "_is_sync_input", False):
         return False
     return getattr(model_config, "model_stage", None) is not None
 

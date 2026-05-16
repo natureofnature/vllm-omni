@@ -24,24 +24,43 @@ from vllm_omni.core.sched.output import OmniInputRegistration
 logger = init_logger(__name__)
 
 
-def uses_full_payload_input_coordinator(model_config: Any) -> bool:
-    """Structural gate: a stage uses the full-payload input coordinator iff
-    it is a downstream multi-stage stage (stage_id > 0), is not in async_chunk
-    mode, and has a sync-side input builder wired (detected via the
-    `_is_sync_input` marker on the resolved `custom_process_input_func`).
+# (arch, model_stage) pairs that route their full_payload stage input via
+# the worker connector and therefore need the scheduler-side coordinator to
+# park requests in WAITING_FOR_INPUT until the recv side delivers.  This set
+# must stay aligned with the arch scope of `init_omni_connectors` in
+# gpu_ar_model_runner.py and gpu_generation_model_runner.py.  Adding a stage
+# here without also wiring its worker connector init produces a permanent
+# Stage 1 hang (gate parks the request, no transport ever releases it).
+#
+# The `_is_sync_input` markers on per-model `*_token_only` builders in
+# stage_input_processors/ remain as forward-compat documentation; when init
+# is generalised (see tmp/trim_refactor branch) this whitelist can move back
+# to a structural marker check or be dropped entirely.
+_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+    }
+)
 
-    The marker is set per-builder in each model's stage_input_processor
-    module (e.g. `thinker2talker_token_only._is_sync_input = True` in
-    qwen3_omni.py).  This avoids hard-coding the arch / stage_name whitelist.
+
+def uses_full_payload_input_coordinator(model_config: Any) -> bool:
+    """Returns True iff this stage parks pending requests in
+    WAITING_FOR_INPUT awaiting a full_payload delivery on the worker connector.
+
+    Gated by (model_arch, model_stage) — see _FULL_PAYLOAD_INPUT_STAGES for the
+    rationale on why this is a whitelist instead of a marker-driven structural
+    gate.
     """
     if getattr(model_config, "stage_id", 0) <= 0:
         return False
     if getattr(model_config, "async_chunk", False):
         return False
-    proc = getattr(model_config, "custom_process_input_func", None)
-    if proc is None or not getattr(proc, "_is_sync_input", False):
-        return False
-    return getattr(model_config, "model_stage", None) is not None
+    key = (
+        getattr(model_config, "model_arch", None),
+        getattr(model_config, "model_stage", None),
+    )
+    return key in _FULL_PAYLOAD_INPUT_STAGES
 
 
 class OmniSchedulingCoordinator:
