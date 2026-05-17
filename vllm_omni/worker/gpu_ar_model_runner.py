@@ -84,11 +84,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
-        # Only Qwen3-Omni currently consumes the connector-based full-payload
-        # handoff added in this PR. Other model architectures (e.g. Bagel
-        # diffusion) retain their pre-existing runner behavior so this PR
-        # does not perturb them.
-        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+        # Worker-connector full-payload init is gated by an arch allowlist that
+        # grows as each per-arch transition is verified end-to-end (PR3 incremental
+        # Block A).  Adding an arch here without also wiring its scheduler-side
+        # gate entries in `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`
+        # produces a Stage-1 hang on the consumer side (request parks but no
+        # transport ever releases).  Keep the two in lockstep.
+        _BLOCK_A_INIT_ALLOWLIST = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+        }
+        if getattr(self.model_config, "model_arch", None) in _BLOCK_A_INIT_ALLOWLIST:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,

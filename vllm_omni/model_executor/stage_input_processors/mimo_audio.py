@@ -147,6 +147,20 @@ def llm2code2wav_async_chunk(
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
+    # Null guard: under Block A universal-ish init, the producer-side
+    # chunk_transfer_adapter calls this every emit step including no-output
+    # steps where pooling_output is None.  Pre-Block-A this code path was
+    # unreachable (no connector init for mimo_audio).
+    if pooling_output is None or not isinstance(pooling_output, dict):
+        if is_finished:
+            connector = getattr(transfer_manager, "connector", None)
+            raw_cfg = getattr(connector, "config", {}) or {}
+            cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
+            chunk_size = int(cfg.get("codec_chunk_frames", 3))
+            left_context_size = int(cfg.get("codec_left_context_frames", 3))
+            request_id = getattr(request, "external_req_id", None)
+            return _flush_remaining_codes(transfer_manager, request_id, chunk_size, left_context_size)
+        return None
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
