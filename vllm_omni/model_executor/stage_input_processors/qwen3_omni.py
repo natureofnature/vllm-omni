@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 # Pooling output layer keys: "0" = word embedding, "24" = accept_hidden_layer
 _EMBED_LAYER_KEY = "0"
 _HIDDEN_LAYER_KEY = "24"
+# Per-model REPLACE-keys for the full-payload accumulator.  Keys in this
+# set use REPLACE semantics (subsequent emissions discard prior chunks)
+# instead of CONCAT.  qwen3-omni currently has none — model_outputs is
+# not emitted by the thinker/talker forward.
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
+
 _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196
 _QWEN3_CODEC_BOS_TOKEN_ID = 4197
@@ -117,19 +123,6 @@ def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
     except (TypeError, ValueError):
         return False
     return 0 <= token_id < _QWEN3_CODEC_CODEBOOK_SIZE
-
-
-def should_accumulate_qwen3_omni_full_payload_output(
-    model_config: Any,
-    custom_process_func: Any,
-) -> bool:
-    """Return whether Qwen3-Omni should accumulate full-payload outputs."""
-    return (
-        custom_process_func is not None
-        and not getattr(model_config, "async_chunk", False)
-        and getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration"
-        and getattr(model_config, "model_stage", None) in {"thinker", "talker"}
-    )
 
 
 def _extract_qwen3_full_payload_codec_rows(
@@ -963,3 +956,8 @@ def talker2code2wav(
         )
 
     return code2wav_inputs
+
+
+# Mark sync-side builders for the structural full-payload gate (see
+# should_accumulate_full_payload_output above).
+thinker2talker_token_only._is_sync_input = True
