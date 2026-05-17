@@ -59,10 +59,17 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Scope full-payload connector init to Qwen3-Omni: other generation
-        # models (e.g. Bagel DiT) retain their pre-existing runner setup
-        # so this refactor does not perturb them.
-        if getattr(self.model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
+        # See gpu_ar_model_runner.py for Block A allowlist policy.
+        _BLOCK_A_INIT_ALLOWLIST = {
+            "Qwen3OmniMoeForConditionalGeneration",
+            "Qwen2_5OmniForConditionalGeneration",
+            "CovoAudioForConditionalGeneration",
+            "MiMoAudioModel",
+            "Qwen3TTSTalkerForConditionalGeneration",
+            "Qwen3TTSCode2Wav",
+            "CosyVoice3Model",
+        }
+        if getattr(self.model_config, "model_arch", None) in _BLOCK_A_INIT_ALLOWLIST:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,

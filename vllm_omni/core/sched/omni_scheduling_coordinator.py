@@ -40,6 +40,22 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("Qwen3OmniMoeForConditionalGeneration", "talker"),
         ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+        # PR3 Block A incremental: enabling qwen2_5_omni talker->code2wav only.
+        # thinker->talker stays orchestrator-routed because its
+        # `thinker2talker_full_payload` is a no-op (heavy `text_hidden_states`
+        # not yet plumbed into pooler_output).  Adding (Qwen2_5, talker) here
+        # without that plumbing would park talker requests in WAITING_FOR_INPUT
+        # with no transport to release them.
+        ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
+        # PR3 Block A: covo_audio is fused_thinker_talker (Stage 0) → code2wav (Stage 1)
+        ("CovoAudioForConditionalGeneration", "code2wav"),
+        # PR3 Block A: mimo_audio is fused_thinker_talker (Stage 0) → code2wav (Stage 1)
+        ("MiMoAudioModel", "code2wav"),
+        # PR3 Block A: qwen3_tts is Qwen3TTSTalkerForConditionalGeneration (Stage 0)
+        # → Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
+        ("Qwen3TTSCode2Wav", "code2wav"),
+        # PR3 Block A: cosyvoice3 stages cosyvoice3_talker (Stage 0) → cosyvoice3_code2wav (Stage 1)
+        ("CosyVoice3Model", "cosyvoice3_code2wav"),
     }
 )
 
