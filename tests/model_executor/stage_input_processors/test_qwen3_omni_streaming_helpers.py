@@ -440,3 +440,60 @@ def test_thinker2talker_full_payload_preserves_under_capture() -> None:
     assert payload is not None
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_accumulator_replaces_keys_in_replace_set() -> None:
+    """REPLACE-key semantics: subsequent emissions of the same key replace, not append."""
+    from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+
+    class _StubMixin(OmniConnectorModelRunnerMixin):
+        def __init__(self):
+            self._pending_full_payload_send = {}
+            self._full_payload_replace_keys_cached = frozenset({"model_outputs"})
+
+    stub = _StubMixin()
+    stub.accumulate_full_payload_output(
+        "req1",
+        {
+            "model_outputs": torch.tensor([[1.0, 2.0]]),
+            "hidden_states.output": torch.tensor([[10.0]]),
+        },
+        request=None,
+    )
+    stub.accumulate_full_payload_output(
+        "req1",
+        {
+            "model_outputs": torch.tensor([[3.0, 4.0]]),
+            "hidden_states.output": torch.tensor([[20.0]]),
+        },
+        request=None,
+    )
+    output, _ = stub._materialize_full_payload_entry(stub._pending_full_payload_send["req1"])
+    # model_outputs REPLACED (second value only):
+    assert torch.equal(output["model_outputs"], torch.tensor([[3.0, 4.0]]))
+    # hidden_states.output CONCATENATED:
+    assert torch.equal(output["hidden_states.output"], torch.tensor([[10.0], [20.0]]))
+
+
+def test_accumulator_concat_default_when_no_replace_keys() -> None:
+    """Default semantics: 2-D+ tensors concat across emissions when not in replace_keys."""
+    from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
+
+    class _StubMixin(OmniConnectorModelRunnerMixin):
+        def __init__(self):
+            self._pending_full_payload_send = {}
+            self._full_payload_replace_keys_cached = frozenset()
+
+    stub = _StubMixin()
+    stub.accumulate_full_payload_output(
+        "req1",
+        {"embed.prefill": torch.tensor([[1.0]])},
+        request=None,
+    )
+    stub.accumulate_full_payload_output(
+        "req1",
+        {"embed.prefill": torch.tensor([[2.0]])},
+        request=None,
+    )
+    output, _ = stub._materialize_full_payload_entry(stub._pending_full_payload_send["req1"])
+    assert torch.equal(output["embed.prefill"], torch.tensor([[1.0], [2.0]]))

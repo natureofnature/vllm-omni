@@ -46,6 +46,24 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
+    """Structural gate: accumulate full-payload outputs iff the configured
+    custom_process_func is a sync-side builder (marked by `_is_sync_input`)
+    and the stage is not in async_chunk mode.
+
+    Lives at module level so the producer-side `OmniConnectorModelRunnerMixin
+    ._should_accumulate_full_payload_output()` does not need an arch-specific
+    import chain (the structural check is arch-agnostic).
+    """
+    if custom_process_func is None:
+        return False
+    if getattr(model_config, "async_chunk", False):
+        return False
+    if not getattr(custom_process_func, "_is_sync_input", False):
+        return False
+    return getattr(model_config, "model_stage", None) is not None
+
+
 class OmniConnectorModelRunnerMixin:
     """Unified data-plane communication mixin for Model Runners.
 
@@ -698,19 +716,12 @@ class OmniConnectorModelRunnerMixin:
         if model_config is None:
             self._should_accumulate_full_payload_output_cached = False
             return False
-        if getattr(model_config, "model_arch", None) == "Qwen3OmniMoeForConditionalGeneration":
-            from vllm_omni.model_executor.stage_input_processors.qwen3_omni import (
-                should_accumulate_qwen3_omni_full_payload_output,
-            )
-
-            result = should_accumulate_qwen3_omni_full_payload_output(
-                model_config,
-                getattr(self, "_custom_process_func", None),
-            )
-            self._should_accumulate_full_payload_output_cached = result
-            return result
-        self._should_accumulate_full_payload_output_cached = False
-        return False
+        result = should_accumulate_full_payload_output(
+            model_config,
+            getattr(self, "_custom_process_func", None),
+        )
+        self._should_accumulate_full_payload_output_cached = result
+        return result
 
     @staticmethod
     def _new_full_payload_accumulator(output: dict[str, Any]):
@@ -736,6 +747,43 @@ class OmniConnectorModelRunnerMixin:
                 output[k] = tensors[0] if len(tensors) == 1 else torch.cat(tensors, dim=0)
         return output, request
 
+    def _resolve_full_payload_replace_keys(self) -> frozenset:
+        """Per-model REPLACE-key set for the full-payload accumulator.
+
+        Looked up from the SIP module that ships the model's sync builder
+        (`model_config.custom_process_input_func.__module__`).  The module
+        declares ``_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str]``; if absent,
+        returns the empty set.
+
+        Cached per instance.  Keys in this set use REPLACE semantics in the
+        accumulator (subsequent emissions discard prior chunks) instead of
+        the default CONCAT semantics.  Use for tensors that carry the full
+        result so far rather than per-step deltas (e.g. ``model_outputs``).
+        """
+        cached = getattr(self, "_full_payload_replace_keys_cached", None)
+        if cached is not None:
+            return cached
+        proc = getattr(self, "_custom_process_func", None)
+        if proc is None:
+            self._full_payload_replace_keys_cached = frozenset()
+            return self._full_payload_replace_keys_cached
+        module_name = getattr(proc, "__module__", None)
+        if module_name is None:
+            self._full_payload_replace_keys_cached = frozenset()
+            return self._full_payload_replace_keys_cached
+        try:
+            import importlib as _il
+            import sys as _sys
+
+            mod = _sys.modules.get(module_name) or _il.import_module(module_name)
+            keys = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
+        except ImportError:
+            keys = frozenset()
+        if not isinstance(keys, (frozenset, set)):
+            keys = frozenset()
+        self._full_payload_replace_keys_cached = frozenset(keys)
+        return self._full_payload_replace_keys_cached
+
     def accumulate_full_payload_output(
         self,
         req_id: str,
@@ -758,6 +806,7 @@ class OmniConnectorModelRunnerMixin:
         The data is actually sent when ``flush_full_payload_outputs`` is called
         with the finished request IDs from the next scheduler cycle.
         """
+        replace_keys = self._resolve_full_payload_replace_keys()
         existing = self._pending_full_payload_send.get(req_id)
 
         if existing is None:
@@ -772,6 +821,19 @@ class OmniConnectorModelRunnerMixin:
 
         for k, v in pooler_output.items():
             if v is None:
+                continue
+            if k in replace_keys:
+                # Explicit REPLACE semantics: the new value supersedes any
+                # prior chunks (e.g. `model_outputs` carries the full result
+                # so far, not an appendable per-step delta).
+                latest.pop(k, None)
+                if isinstance(v, torch.Tensor) and v.dim() >= 2:
+                    chunks[k] = [v]
+                    rows[k] = int(v.shape[0])
+                else:
+                    chunks.pop(k, None)
+                    rows.pop(k, None)
+                    latest[k] = v
                 continue
             if isinstance(v, torch.Tensor) and v.dim() >= 2:
                 if k in chunks and chunks[k] and v.shape[1:] == chunks[k][0].shape[1:]:
