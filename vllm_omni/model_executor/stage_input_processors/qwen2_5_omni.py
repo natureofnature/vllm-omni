@@ -1,3 +1,5 @@
+import logging
+
 import torch
 from vllm.inputs import TextPrompt
 
@@ -10,6 +12,8 @@ from vllm_omni.data_entry_keys import (
     to_dict,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = logging.getLogger(__name__)
 
 TALKER_CODEC_PAD_TOKEN_ID = 8292
 TALKER_CODEC_START_TOKEN_ID = 8293
@@ -265,19 +269,139 @@ def thinker2talker_full_payload(
     pooling_output,
     request,
 ):
-    """Producer-side packer — no-op.
+    """Producer-side packer for the worker-connector data plane.
 
-    qwen2_5_omni's thinker emits its last-layer hidden state via
-    ``text_hidden_states`` (the OmniOutput field), which is materialized
-    into ``multimodal_output["latent"]`` at the engine boundary.  That
-    field is NOT plumbed into the AR runner's pooler_output chain
-    (data_entry_keys.flatten_payload + gpu_ar_model_runner emit), so the
-    accumulator cannot ship it via the worker connector today.
+    The AR runner emits per-step ``pooling_output["hidden"]`` (the
+    thinker's last-layer hidden states for the request span, unpacked
+    from ``OmniOutput.text_hidden_states``).  The full-payload
+    accumulator concatenates those per-step rows across decode steps, so
+    by the time this builder fires the materialized
+    ``pooling_output["hidden"]`` contains the full prefill+decode
+    hidden-state trajectory of size
+    ``len(prompt_token_ids) + len(output_token_ids)``.
 
-    Returning None tells the connector to skip the send for this
-    transition; the consumer reads the latent via additional_information
-    (preserved by thinker2talker_token_only).  Filed as Phase 4 follow-up
-    alongside #90 (speaker/language) and cosyvoice3 (embed.*).
+    We split it at ``len(prompt_token_ids)`` into prefill embeddings and
+    decode hidden states, then pack the ``OmniPayload``-shaped dict that
+    the talker's ``thinker_to_talker_process`` already reads (keys
+    ``embed.prefill`` / ``hidden_states.output`` / ``ids.prompt`` /
+    ``ids.output``).  Shape matches what
+    ``thinker2talker_token_only`` writes into
+    ``additional_information``, so the consumer-side coordinator gate
+    flip is a drop-in once the no-touch coordinator file is updated.
+
+    Like ``qwen3_omni.thinker2talker_full_payload``, we apply a
+    finish-reason-aware stop-row trim: vLLM v1 appends the sampled
+    token to ``output_token_ids`` before ``check_stop``, so a request
+    that finished via ``FINISHED_STOPPED`` has one extra accumulated
+    hidden-state row that the talker must not consume.  Max-token
+    finishes need no drop.  Status is read from the request when
+    available; otherwise we fall back to a last-token-in-stop-set
+    heuristic.
     """
-    del transfer_manager, pooling_output, request
-    return None
+    del transfer_manager
+    if not isinstance(pooling_output, dict):
+        return None
+
+    hidden = pooling_output.get("hidden")
+    if not isinstance(hidden, torch.Tensor):
+        return None
+
+    def _ensure_list(x):
+        if x is None:
+            return []
+        if hasattr(x, "_x"):
+            return list(x._x)
+        if isinstance(x, list):
+            return list(x)
+        return list(x)
+
+    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", None))
+    output_token_ids = _ensure_list(getattr(request, "output_token_ids", None))
+    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    if not all_token_ids:
+        all_token_ids = list(prompt_token_ids) + list(output_token_ids)
+
+    # Length-aware trim of accumulated thinker output, finish-reason-aware.
+    # Mirror qwen3_omni.thinker2talker_full_payload's logic so a stop-finish
+    # does not leak an extra hidden-state row to the talker.
+    status = getattr(request, "status", None)
+    status_name = getattr(status, "name", None) or ""
+    if not status_name and status is not None:
+        status_name = str(status).rsplit(".", 1)[-1]
+    stop_emission_drop = 1 if status_name == "FINISHED_STOPPED" else 0
+    if stop_emission_drop == 0 and not status_name and output_token_ids:
+        # Worker-side CachedRequestState has no `.status` field in vLLM v1;
+        # fall back to a last-token-in-stop-set heuristic.
+        sampling_params = getattr(request, "sampling_params", None)
+        if sampling_params is not None:
+            stop_ids: set[int] = set()
+            ignore_eos = bool(getattr(sampling_params, "ignore_eos", False))
+            for sid in getattr(sampling_params, "stop_token_ids", None) or ():
+                if isinstance(sid, int):
+                    stop_ids.add(sid)
+            if not ignore_eos:
+                for eos in (
+                    getattr(sampling_params, "eos_token_id", None),
+                    getattr(sampling_params, "_eos_token_id", None),
+                ):
+                    if isinstance(eos, int):
+                        stop_ids.add(eos)
+                for sid in (
+                    getattr(sampling_params, "all_stop_token_ids", None)
+                    or getattr(sampling_params, "_all_stop_token_ids", None)
+                    or ()
+                ):
+                    if isinstance(sid, int):
+                        stop_ids.add(sid)
+            if stop_ids and output_token_ids[-1] in stop_ids:
+                stop_emission_drop = 1
+
+    # Trim accumulated thinker output based on stop_emission_drop computed
+    # above.  Mirror qwen3_omni.thinker2talker_full_payload's contract:
+    #   target_rows = len(all_token_ids) - stop_emission_drop
+    # which excludes the stop-emission row for FINISHED_STOPPED but keeps
+    # all rows for FINISHED_LENGTH_CAPPED (max_tokens) finishes.
+    if stop_emission_drop > 0 and len(output_token_ids) >= stop_emission_drop:
+        output_token_ids = output_token_ids[:-stop_emission_drop]
+    h = hidden.detach().cpu().to(torch.float32)
+    target_rows = max(0, len(all_token_ids) - stop_emission_drop)
+    if target_rows <= 0:
+        return None
+    if h.dim() >= 1 and h.shape[0] > target_rows:
+        logger.warning(
+            "qwen2_5_omni.thinker2talker_full_payload: excess hidden rows "
+            "(got %d, target %d, stop_drop %d) for req=%s; trimming",
+            int(h.shape[0]),
+            target_rows,
+            stop_emission_drop,
+            getattr(request, "request_id", None),
+        )
+        h = h[:target_rows]
+
+    prompt_len = len(prompt_token_ids)
+    if h.shape[0] < prompt_len:
+        # Under-captured prefill — defensively skip rather than ship a
+        # truncated payload that would confuse the talker's prefill path.
+        return None
+
+    prefill_hidden = h[:prompt_len]
+    decode_hidden = h[prompt_len:]
+
+    payload: OmniPayload = to_dict(
+        OmniPayloadStruct(
+            hidden_states=HiddenStatesStruct(
+                output=decode_hidden,
+                output_shape=list(decode_hidden.shape),
+            ),
+            embed=EmbeddingsStruct(
+                prefill=prefill_hidden,
+                prefill_shape=list(prefill_hidden.shape),
+            ),
+            ids=IdsStruct(
+                prompt=list(prompt_token_ids),
+                output=list(output_token_ids),
+            ),
+        )
+    )
+    # payload["meta"] removed — was the only diff vs legacy payload, causes mix_to_text_audio_001 failure
+    return payload

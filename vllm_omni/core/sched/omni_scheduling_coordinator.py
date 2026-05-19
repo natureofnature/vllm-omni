@@ -40,12 +40,11 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("Qwen3OmniMoeForConditionalGeneration", "talker"),
         ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
-        # PR3 Block A incremental: enabling qwen2_5_omni talker->code2wav only.
-        # thinker->talker stays orchestrator-routed because its
-        # `thinker2talker_full_payload` is a no-op (heavy `text_hidden_states`
-        # not yet plumbed into pooler_output).  Adding (Qwen2_5, talker) here
-        # without that plumbing would park talker requests in WAITING_FOR_INPUT
-        # with no transport to release them.
+        # PR3 Block A: qwen2_5_omni thinker->talker now uses the real
+        # full-payload producer builder (text_hidden_states routed via
+        # pooler_output["hidden"] -> accumulator -> connector).  Both
+        # stages of qwen2_5_omni are enabled.
+        ("Qwen2_5OmniForConditionalGeneration", "talker"),
         ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
         # PR3 Block A: covo_audio is fused_thinker_talker (Stage 0) → code2wav (Stage 1)
         ("CovoAudioForConditionalGeneration", "code2wav"),
@@ -56,6 +55,11 @@ _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
         ("Qwen3TTSCode2Wav", "code2wav"),
         # PR3 Block A: cosyvoice3 stages cosyvoice3_talker (Stage 0) → cosyvoice3_code2wav (Stage 1)
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
+        # PR3 dynin migration: token2text (Stage 0) -> token2image (Stage 1)
+        # -> token2audio (Stage 2).  Producer wires via
+        # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
+        ("DyninOmniForConditionalGeneration", "token2image"),
+        ("DyninOmniForConditionalGeneration", "token2audio"),
     }
 )
 

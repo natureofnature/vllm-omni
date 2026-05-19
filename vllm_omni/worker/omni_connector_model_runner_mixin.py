@@ -253,6 +253,21 @@ class OmniConnectorModelRunnerMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
+        # Force-flush any pending full-payload accumulator entry before
+        # cleanup proceeds.  Without this, finished requests with no
+        # downstream consumer (e.g. text-only on multi-modal arch) leave
+        # the entry orphaned in _pending_full_payload_send across requests,
+        # which empirically destabilises subsequent thinker forwards
+        # (test_thinker_prefix_caching regression).  flush is a near-no-op
+        # for paths with no consumer, and idempotent when the entry has
+        # already been flushed by the scheduler-driven path.
+        try:
+            self.flush_full_payload_outputs({req_id})
+        except Exception:
+            # Defensive: connector may not be initialised for archs
+            # outside the Block A allowlist.  Cleanup must still proceed.
+            pass
+
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:
@@ -1007,11 +1022,11 @@ class OmniConnectorModelRunnerMixin:
         if self._stage_id == 0:
             return
         request_id = request.request_id
-        self._request_ids_mapping[request_id] = getattr(
-            request,
-            "external_req_id",
-            request_id,
-        )
+        # Codex Issue 3: explicit external_req_id=None should fall back to
+        # request_id; otherwise recv keys become `None_<stage>_<chunk>` and
+        # collide across requests.
+        ext = getattr(request, "external_req_id", None)
+        self._request_ids_mapping[request_id] = ext if ext is not None else request_id
         with self._lock:
             if request_id in self._stage_recv_req_ids:
                 return
@@ -2195,7 +2210,10 @@ class OmniConnectorModelRunnerMixin:
         if mapped is not None:
             return mapped
         if request is not None:
-            return getattr(request, "external_req_id", fallback_req_id)
+            # Codex Issue 3: external_req_id may be explicitly None; fall back.
+            ext = getattr(request, "external_req_id", None)
+            if ext is not None:
+                return ext
         return fallback_req_id
 
     def _resolve_next_stage_id(self, model_config: Any) -> int:
