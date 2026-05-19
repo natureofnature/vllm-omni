@@ -68,6 +68,7 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
             "Qwen3TTSTalkerForConditionalGeneration",
             "Qwen3TTSCode2Wav",
             "CosyVoice3Model",
+            "DyninOmniForConditionalGeneration",
         }
         if getattr(self.model_config, "model_arch", None) in _BLOCK_A_INIT_ALLOWLIST:
             self.init_omni_connectors(

@@ -101,17 +101,22 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
     input through the worker connector.
     """
 
-    def test_qwen3_omni_talker_and_code2wav_fire_gate(self):
-        for model_stage in ("talker", "code2wav"):
+    def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
+        """All (arch, stage) pairs in _FULL_PAYLOAD_INPUT_STAGES must fire
+        the gate when stage_id > 0 and async_chunk=False.
+        """
+        from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
+
+        for arch, stage in _FULL_PAYLOAD_INPUT_STAGES:
             model_config = SimpleNamespace(
                 stage_id=1,
                 async_chunk=False,
-                model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage=model_stage,
+                model_arch=arch,
+                model_stage=stage,
             )
             self.assertTrue(
                 uses_full_payload_input_coordinator(model_config),
-                msg=f"expected gate to fire for Qwen3Omni/{model_stage}",
+                msg=f"expected gate to fire for {arch}/{stage} (entry in _FULL_PAYLOAD_INPUT_STAGES)",
             )
 
     def test_other_arch_or_stage_or_mode_does_not_fire(self):
@@ -127,9 +132,6 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
                 async_chunk=False,
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
                 model_stage="some_future_stage",
-            ),
-            SimpleNamespace(
-                stage_id=1, async_chunk=False, model_arch="Qwen2_5OmniForConditionalGeneration", model_stage="talker"
             ),
             SimpleNamespace(
                 stage_id=1, async_chunk=False, model_arch="Qwen3TTSForConditionalGeneration", model_stage="code2wav"
