@@ -160,23 +160,6 @@ def _make_runner_for_mimo(req_id="r_mimo"):
     return runner
 
 
-def test_generation_overlay_full_payload_input_ids_replaces_placeholders():
-    from vllm_omni.worker.gpu_generation_model_runner import GPUGenerationModelRunner
-
-    runner = object.__new__(GPUGenerationModelRunner)
-    runner.model_config = SimpleNamespace(async_chunk=False)
-    runner.model_intermediate_buffer = {
-        "r1": {"codes": {"audio": [9, 8]}},
-        "r2": {"codes": {"audio": torch.tensor([7, 6, 5], dtype=torch.long)}},
-    }
-    runner.query_start_loc = SimpleNamespace(cpu=torch.tensor([0, 2], dtype=torch.int32))
-    input_ids = torch.zeros(5, dtype=torch.long)
-
-    GPUGenerationModelRunner._overlay_full_payload_input_ids(runner, input_ids, ["r1", "r2"], [2, 3])
-
-    assert input_ids.tolist() == [9, 8, 7, 6, 5]
-
-
 def test_talker_mtp_forward_cpu_updates_inputs_and_info(monkeypatch):
     # Patch the module-level `set_forward_context` symbol used inside
     # OmniGPUModelRunner._talker_mtp_forward.

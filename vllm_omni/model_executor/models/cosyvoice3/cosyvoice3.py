@@ -5,7 +5,6 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from functools import partial
 from threading import Lock
-from typing import Any
 
 import torch
 import torch.nn as nn
@@ -533,111 +532,6 @@ class CosyVoice3Model(
             return False
         return True
 
-    def build_pooler_payload(
-        self,
-        *,
-        req_id: str,
-        req_index: int,
-        input_batch: Any,
-        sampled_token_ids: Any | None = None,
-        invalid_req_indices: set[int] | None = None,
-    ) -> dict[str, object] | None:
-        if self.model_stage != "cosyvoice3_talker":
-            return None
-        codec_rows = self._pooler_codec_rows(
-            req_id=req_id,
-            req_index=req_index,
-            input_batch=input_batch,
-            sampled_token_ids=sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-        )
-        if codec_rows is None:
-            return None
-        return {"codes.audio": codec_rows}
-
-    def _pooler_codec_rows(
-        self,
-        *,
-        req_id: str,
-        req_index: int,
-        input_batch: Any,
-        sampled_token_ids: Any | None,
-        invalid_req_indices: set[int] | None,
-    ) -> torch.Tensor | None:
-        input_req_index = getattr(input_batch, "req_id_to_index", {}).get(req_id)
-        if input_req_index is None:
-            return None
-
-        speech_token_size = int(self.config.llm["speech_token_size"])
-        cache = getattr(self, "_pooler_codec_history_by_req", None)
-        if cache is None:
-            cache = {}
-            self._pooler_codec_history_by_req = cache
-        sampled_seen = getattr(self, "_pooler_codec_sampled_seen_by_req", None)
-        if sampled_seen is None:
-            sampled_seen = set()
-            self._pooler_codec_sampled_seen_by_req = sampled_seen
-        sampled_finished = getattr(self, "_pooler_codec_sampled_finished_by_req", None)
-        if sampled_finished is None:
-            sampled_finished = set()
-            self._pooler_codec_sampled_finished_by_req = sampled_finished
-
-        if sampled_token_ids is not None and (invalid_req_indices is None or req_index not in invalid_req_indices):
-            sampled_ids = self._pooler_sampled_token_ids(sampled_token_ids, req_index)
-            if sampled_ids:
-                sampled_seen.add(req_id)
-                current = cache.setdefault(req_id, [])
-                current.extend(token_id for token_id in sampled_ids if 0 <= token_id < speech_token_size)
-                if any(token_id >= speech_token_size for token_id in sampled_ids):
-                    sampled_finished.add(req_id)
-        elif req_id not in cache:
-            history = self._pooler_output_history_from_input_batch(
-                input_batch,
-                input_req_index,
-                speech_token_size,
-            )
-            if history:
-                cache[req_id] = history
-
-        token_ids = cache.get(req_id, [])
-        if not token_ids or (req_id in sampled_seen and req_id not in sampled_finished):
-            return None
-        return torch.tensor(token_ids, dtype=torch.long).reshape(-1, 1)
-
-    @staticmethod
-    def _pooler_output_history_from_input_batch(
-        input_batch: Any,
-        req_index: int,
-        speech_token_size: int,
-    ) -> list[int]:
-        prompt_lens = getattr(input_batch, "num_prompt_tokens", None)
-        num_tokens = getattr(input_batch, "num_tokens_no_spec", None)
-        token_ids_cpu = getattr(input_batch, "token_ids_cpu", None)
-        if prompt_lens is None or num_tokens is None or token_ids_cpu is None:
-            return []
-        start = int(prompt_lens[req_index])
-        end = int(num_tokens[req_index])
-        if end <= start:
-            return []
-        return [
-            int(token_id)
-            for token_id in token_ids_cpu[req_index, start:end].tolist()
-            if 0 <= int(token_id) < speech_token_size
-        ]
-
-    @staticmethod
-    def _pooler_sampled_token_ids(sampled_token_ids: Any, req_index: int) -> list[int]:
-        if sampled_token_ids is None or req_index >= len(sampled_token_ids):
-            return []
-        req_sampled_ids = sampled_token_ids[req_index]
-        if isinstance(req_sampled_ids, torch.Tensor):
-            req_sampled_ids = req_sampled_ids.detach().to("cpu").reshape(-1).tolist()
-        elif not isinstance(req_sampled_ids, list):
-            req_sampled_ids = list(req_sampled_ids) if req_sampled_ids is not None else []
-        if -1 in req_sampled_ids:
-            req_sampled_ids = req_sampled_ids[: req_sampled_ids.index(-1)]
-        return [int(token_id) for token_id in req_sampled_ids]
-
     def sample(
         self,
         logits: torch.Tensor,
@@ -890,14 +784,14 @@ class CosyVoice3Model(
                             else:
                                 self._stream_vocoder_cache_by_req[req_id] = new_cache_state
                 else:
-                    uses_connector_codes = payload.codes is not None and payload.codes.audio is not None
+                    token_offset = max(0, meta.talker_prefill_offset or 0) if meta else 0
                     tts_speech = self.code2wav.forward(
                         token=token.unsqueeze(0),
                         prompt_token=speech_token[:1],
                         prompt_feat=speech_feat[:1],
                         embedding=embedding[:1],
                         n_timesteps=10,
-                        token_offset_tokens=speech_token.shape[1] if uses_connector_codes else 0,
+                        token_offset_tokens=token_offset,
                     )
 
                 audio = tts_speech.reshape(-1).to(dtype=torch.float32)
