@@ -76,51 +76,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 model_config=self.model_config,
             )
 
-    @staticmethod
-    def _flatten_audio_codes_to_tensor(codes, device: torch.device) -> torch.Tensor | None:
-        if codes is None:
-            return None
-        if isinstance(codes, torch.Tensor):
-            return codes.reshape(-1).to(device=device, dtype=torch.long)
-        if isinstance(codes, (list, tuple)):
-            if not codes:
-                return torch.empty(0, device=device, dtype=torch.long)
-            if all(isinstance(item, torch.Tensor) for item in codes):
-                return torch.cat([item.reshape(-1).to(device=device, dtype=torch.long) for item in codes], dim=0)
-        try:
-            return torch.as_tensor(codes, device=device, dtype=torch.long).reshape(-1)
-        except (TypeError, ValueError):
-            return None
-
-    def _overlay_full_payload_input_ids(
-        self,
-        input_ids: torch.Tensor | None,
-        req_ids: list[str],
-        num_scheduled_tokens_np: np.ndarray,
-    ) -> None:
-        if input_ids is None or getattr(self.model_config, "async_chunk", False):
-            return
-
-        for req_index, req_id in enumerate(req_ids):
-            scheduled = int(num_scheduled_tokens_np[req_index])
-            if scheduled <= 0:
-                continue
-            payload = self.model_intermediate_buffer.get(req_id)
-            codes = self._payload_audio_codes(payload)
-            if codes is None:
-                continue
-            flat_codes = self._flatten_audio_codes_to_tensor(codes, input_ids.device)
-            if flat_codes is None or flat_codes.numel() == 0:
-                continue
-            start = int(self.query_start_loc.cpu[req_index])
-            end = start + scheduled
-            if flat_codes.numel() != scheduled:
-                message = "full-payload input_ids override length mismatch for req=%s: payload=%d scheduled=%d"
-                message_args = (req_id, int(flat_codes.numel()), scheduled)
-                logger.error(message, *message_args)
-                raise RuntimeError(message % message_args)
-            input_ids[start:end].copy_(flat_codes.to(dtype=input_ids.dtype))
-
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
         for req_id in scheduler_output.finished_req_ids:
@@ -344,8 +299,6 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 num_tokens_padded,
                 intermediate_tensors,
             )
-            self._overlay_full_payload_input_ids(input_ids, req_ids, num_scheduled_tokens_np)
-
             # [Omni] Pass token counts per request for code2wav output slicing
             model_kwargs["seq_token_counts"] = tokens
 

@@ -138,77 +138,6 @@ def _make_sampling_metadata(
     )
 
 
-def test_build_pooler_payload_waits_for_sampled_stop_token():
-    model = _make_talker_model()
-    input_batch = SimpleNamespace(
-        req_id_to_index={"r1": 0},
-        num_prompt_tokens=[3],
-        num_tokens_no_spec=[3],
-        token_ids_cpu=torch.tensor([[101, 102, 103]], dtype=torch.long),
-    )
-
-    payload = model.build_pooler_payload(
-        req_id="r1",
-        req_index=0,
-        input_batch=input_batch,
-        sampled_token_ids=[[10]],
-        invalid_req_indices=set(),
-    )
-    assert payload is None
-
-    payload = model.build_pooler_payload(
-        req_id="r1",
-        req_index=0,
-        input_batch=input_batch,
-        sampled_token_ids=[[20, 6562]],
-        invalid_req_indices=set(),
-    )
-    assert payload is not None
-    assert torch.equal(payload["codes.audio"], torch.tensor([[10], [20]], dtype=torch.long))
-
-
-def test_build_pooler_payload_falls_back_to_input_batch_history():
-    model = _make_talker_model()
-    input_batch = SimpleNamespace(
-        req_id_to_index={"r1": 0},
-        num_prompt_tokens=[3],
-        num_tokens_no_spec=[8],
-        token_ids_cpu=torch.tensor([[101, 102, 103, 10, 20, 6562, -1, 30]], dtype=torch.long),
-    )
-
-    payload = model.build_pooler_payload(
-        req_id="r1",
-        req_index=0,
-        input_batch=input_batch,
-        sampled_token_ids=None,
-        invalid_req_indices=set(),
-    )
-
-    assert payload is not None
-    assert torch.equal(payload["codes.audio"], torch.tensor([[10], [20], [30]], dtype=torch.long))
-
-
-def test_split_request_ids_uses_seq_token_counts():
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
-    ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
-    chunks = CosyVoice3Model._split_request_ids(ids, [2, 2, 2])
-    assert [c.tolist() for c in chunks] == [[10, 11], [12, 13], [14]]
-
-
-def test_split_request_ids_honors_single_request_seq_token_counts():
-    CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
-    ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
-    chunks = CosyVoice3Model._split_request_ids(ids, [3])
-    assert [c.tolist() for c in chunks] == [[10, 11, 12]]
-
-
-def test_sanitize_codec_tokens_filters_out_of_range():
-    model = _make_code2wav_model()
-    raw = torch.tensor([-1, 0, 3, 4, 99], dtype=torch.long)
-    clean = model._sanitize_codec_tokens(raw)
-    assert clean.tolist() == [0, 3]
-
-
 def test_forward_prefers_token_offset_when_present():
     model = _make_code2wav_model()
 
@@ -318,7 +247,7 @@ def test_forward_uses_non_stream_decode_without_chunk_metadata():
     assert call["token_offset_tokens"] == 0
 
 
-def test_forward_trims_non_streaming_connector_codes():
+def test_forward_uses_non_stream_talker_prefill_offset():
     model = _make_code2wav_model()
 
     runtime_info = [
@@ -328,8 +257,7 @@ def test_forward_trims_non_streaming_connector_codes():
                 "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
                 "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
             },
-            "codes": {"audio": torch.tensor([0, 1, 2], dtype=torch.long)},
-            "meta": {"next_stage_prompt_len": 3},
+            "meta": {"talker_prefill_offset": 3},
         }
     ]
 

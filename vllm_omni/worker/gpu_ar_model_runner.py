@@ -172,43 +172,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return sampling_metadata
         return replace(sampling_metadata, output_token_ids=output_token_ids)
 
-    @staticmethod
-    def _pooler_payload_has_key(payload: dict[str, object], key: str) -> bool:
-        if payload.get(key) is not None:
-            return True
-        if "." not in key:
-            return False
-        cur: object = payload
-        for part in key.split("."):
-            if not isinstance(cur, dict) or part not in cur:
-                return False
-            cur = cur[part]
-        return cur is not None
-
-    def _attach_model_pooler_payload(
-        self,
-        payload: dict[str, object],
-        req_id: str,
-        sampled_token_ids: Any,
-        req_index: int,
-        invalid_req_indices: set[int] | None,
-    ) -> None:
-        build_pooler_payload = getattr(self.model, "build_pooler_payload", None)
-        if not callable(build_pooler_payload):
-            return
-        updates = build_pooler_payload(
-            req_id=req_id,
-            req_index=req_index,
-            input_batch=self.input_batch,
-            sampled_token_ids=sampled_token_ids,
-            invalid_req_indices=invalid_req_indices,
-        )
-        if not isinstance(updates, dict):
-            return
-        for key, value in updates.items():
-            if value is not None and not self._pooler_payload_has_key(payload, key):
-                payload[key] = value
-
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
         if not isinstance(info, dict):
@@ -965,7 +928,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
-        invalid_req_indices_set = set(invalid_req_indices)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
@@ -1077,13 +1039,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
-                self._attach_model_pooler_payload(
-                    payload,
-                    rid,
-                    sampler_output.sampled_token_ids,
-                    out_idx,
-                    invalid_req_indices_set,
-                )
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))

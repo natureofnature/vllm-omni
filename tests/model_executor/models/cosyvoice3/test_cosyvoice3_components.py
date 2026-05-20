@@ -306,9 +306,8 @@ def test_code2wav_forward_finalizes_hift_tail():
         prompt_token=torch.tensor([[4, 5]], dtype=torch.int32),
         prompt_feat=torch.ones((1, 4, 80), dtype=torch.float32),
         embedding=torch.ones((1, 192), dtype=torch.float32),
-        token_offset_tokens=2,
     )
 
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
-    assert forward_mel_calls[0]["token_offset_tokens"] == 2
+    assert forward_mel_calls[0]["token_offset_tokens"] == 0
