@@ -121,6 +121,94 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         with maybe_disable_pin_memory_for_ray(self, total_bytes):
             return super()._make_buffer(*size, dtype=dtype, numpy=numpy)
 
+    def _build_model_sampler_output_token_ids(self) -> list[list[int]]:
+        """Build decoded-token history for custom model samplers.
+
+        vLLM only populates sampling_metadata.output_token_ids when penalties or
+        logits processors require it. CosyVoice3's custom RAS sampler also
+        depends on this history, so we reconstruct it directly from the input
+        batch for prefer_model_sampler models.
+        """
+        req_output_token_ids = getattr(self.input_batch, "req_output_token_ids", [])
+        req_ids = list(getattr(self.input_batch, "req_ids", []))
+        output_token_ids = [list(req_output_token_ids[idx] or []) for idx in range(len(req_ids))]
+
+        sampled_token_ids_cpu = getattr(self.input_batch, "sampled_token_ids_cpu", None)
+        async_copy_ready_event = getattr(self.input_batch, "async_copy_ready_event", None)
+        prev_req_id_to_index = getattr(self.input_batch, "prev_req_id_to_index", None)
+        if sampled_token_ids_cpu is None or not output_token_ids or prev_req_id_to_index is None:
+            return output_token_ids
+
+        sampled_token_ids: list[list[int]] | None = None
+        for index, req_id in enumerate(req_ids):
+            prev_index = prev_req_id_to_index.get(req_id)
+            if prev_index is None:
+                continue
+            req_history = output_token_ids[index]
+            if not req_history or req_history[-1] != -1:
+                continue
+            if sampled_token_ids is None:
+                assert async_copy_ready_event is not None
+                async_copy_ready_event.synchronize()
+                sampled_token_ids = sampled_token_ids_cpu.tolist()
+            new_ids = list(sampled_token_ids[prev_index])
+            if not new_ids:
+                continue
+            num_sampled_ids = len(new_ids) if new_ids[-1] != -1 else new_ids.index(-1)
+            first_placeholder = req_history.index(-1)
+            num_placeholders = len(req_history) - first_placeholder
+            num_to_replace = min(num_sampled_ids, num_placeholders)
+            req_history[first_placeholder : first_placeholder + num_to_replace] = new_ids[:num_to_replace]
+
+        for index, req_history in enumerate(output_token_ids):
+            if -1 in req_history:
+                output_token_ids[index] = req_history[: req_history.index(-1)]
+
+        return output_token_ids
+
+    def _sampling_metadata_for_model_sampler(self, sampling_metadata):
+        output_token_ids = self._build_model_sampler_output_token_ids()
+        if output_token_ids == sampling_metadata.output_token_ids:
+            return sampling_metadata
+        return replace(sampling_metadata, output_token_ids=output_token_ids)
+
+    @staticmethod
+    def _pooler_payload_has_key(payload: dict[str, object], key: str) -> bool:
+        if payload.get(key) is not None:
+            return True
+        if "." not in key:
+            return False
+        cur: object = payload
+        for part in key.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return False
+            cur = cur[part]
+        return cur is not None
+
+    def _attach_model_pooler_payload(
+        self,
+        payload: dict[str, object],
+        req_id: str,
+        sampled_token_ids: Any,
+        req_index: int,
+        invalid_req_indices: set[int] | None,
+    ) -> None:
+        build_pooler_payload = getattr(self.model, "build_pooler_payload", None)
+        if not callable(build_pooler_payload):
+            return
+        updates = build_pooler_payload(
+            req_id=req_id,
+            req_index=req_index,
+            input_batch=self.input_batch,
+            sampled_token_ids=sampled_token_ids,
+            invalid_req_indices=invalid_req_indices,
+        )
+        if not isinstance(updates, dict):
+            return
+        for key, value in updates.items():
+            if value is not None and not self._pooler_payload_has_key(payload, key):
+                payload[key] = value
+
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
         if not isinstance(info, dict):
@@ -917,6 +1005,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
+        invalid_req_indices_set = set(invalid_req_indices)
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         if needs_pooler_payload:
@@ -986,7 +1075,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
 
             pooler_output = []
-            for rid in req_ids_output_copy:
+            for out_idx, rid in enumerate(req_ids_output_copy):
                 if rid not in downstream_req_id_set:
                     pooler_output.append({})
                     continue
@@ -1041,6 +1130,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                                 seq_len=seq_len,
                             )
                     payload.update(mm_payload)
+                self._attach_model_pooler_payload(
+                    payload,
+                    rid,
+                    sampler_output.sampled_token_ids,
+                    out_idx,
+                    invalid_req_indices_set,
+                )
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))

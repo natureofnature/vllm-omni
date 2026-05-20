@@ -46,6 +46,25 @@ def _ensure_list(x: Any) -> list[Any]:
         return [x]
 
 
+def _to_token_id_list(value: Any) -> list[int]:
+    if value is None:
+        return []
+    if isinstance(value, torch.Tensor):
+        value = value.detach().to("cpu").reshape(-1).tolist()
+    token_ids: list[int] = []
+    for item in _ensure_list(value):
+        if isinstance(item, torch.Tensor):
+            token_ids.extend(_to_token_id_list(item))
+            continue
+        if isinstance(item, (list, tuple)):
+            token_ids.extend(_to_token_id_list(item))
+            continue
+        token_id = int(item)
+        if token_id >= 0:
+            token_ids.append(token_id)
+    return token_ids
+
+
 def _to_cpu_tensor(x: Any) -> torch.Tensor | None:
     if isinstance(x, list):
         if not x:
@@ -287,7 +306,9 @@ def talker2code2wav_async_chunk(
 # CONCAT across the (already trivial) per-request accumulator history so a
 # regression where decode unexpectedly re-emits them does not silently
 # duplicate the prefill tensor.  See mixin._FULL_PAYLOAD_REPLACE_KEYS.
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset({"embed.speech_token", "embed.speech_feat", "embed.embedding"})
+_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset(
+    {"codes.audio", "embed.speech_token", "embed.speech_feat", "embed.embedding"}
+)
 
 
 def text2flow_token_only(
@@ -297,15 +318,9 @@ def text2flow_token_only(
 ):
     """Sync-side builder for the non-async-chunk text→flow path.
 
-    Mirrors the legacy `text2flow` shape but strips the prefill embed
-    tensors out of `additional_information` — those travel via the worker
-    connector payload built by `text2flow_full_payload`.  Small metadata
-    (`ids.prompt` = the talker's original prompt token prefix) stays
-    inline so the flow stage can still locate the prefix.
-
-    prompt_token_ids = the talker's `cumulative_token_ids` (real codec
-    tokens, not [0]*N) because the flow stage consumes talker output
-    verbatim.
+    Connector-delivered codec ids replace these only when the talker reached
+    a real stop token; max-token fallbacks keep this legacy token path and
+    prompt conditioning metadata.
     """
     del prompt
     engine_inputs: list[OmniTokensPrompt] = []
@@ -315,11 +330,6 @@ def text2flow_token_only(
         output = source_output.outputs[0]
         output_ids = _ensure_list(output.cumulative_token_ids)
         prefix_ids = _ensure_list(source_output.prompt_token_ids)
-        # Preserve full multimodal_output (incl. embed.*) in additional_information
-        # for now: the worker connector wire to model_intermediate_buffer on the
-        # code2wav side is not yet plumbed.  Filed as Phase 4 follow-up (parallel
-        # to #90 speaker/language re-routing).  text2flow_full_payload still ships
-        # embed.* via the connector — currently redundant but ready for activation.
         multi_modal_data = output.multimodal_output
         if multi_modal_data is None:
             raise RuntimeError(f"Missing multimodal_output for request {source_output.request_id}")
@@ -346,13 +356,13 @@ def text2flow_full_payload(
 ):
     """Producer-side packer.
 
-    Reads the prefill-emitted `embed.{speech_token, speech_feat, embedding}`
-    from the accumulator (flat dotted keys after flatten_payload; nested
-    fallback for safety) and ships them as a single connector payload.
+    Reads accumulated talker codec ids plus prefill-emitted
+    `embed.{speech_token, speech_feat, embedding}` from the accumulator and
+    ships them as a single connector payload.
     The downstream flow stage reads these from `model_intermediate_buffer`
     (see cosyvoice3.py:671 in the code2wav forward — runtime_info pickup).
     """
-    del transfer_manager, request
+    del transfer_manager
     if not isinstance(pooling_output, dict):
         return None
     embed_out: dict[str, Any] = {}
@@ -364,9 +374,21 @@ def text2flow_full_payload(
                 v = nested.get(key)
         if isinstance(v, torch.Tensor) and v.numel() > 0:
             embed_out[key] = v
-    if not embed_out:
+    token_ids = _to_token_id_list(pooling_output.get("codes.audio"))
+    if not token_ids:
+        nested_codes = pooling_output.get("codes")
+        if isinstance(nested_codes, dict):
+            token_ids = _to_token_id_list(nested_codes.get("audio"))
+    if not embed_out and not token_ids:
         return None
-    return {
-        "embed": embed_out,
-        "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
+    payload: dict[str, Any] = {
+        "meta": {
+            "finished": torch.tensor(True, dtype=torch.bool),
+        }
     }
+    if embed_out:
+        payload["embed"] = embed_out
+    if token_ids:
+        payload["codes"] = {"audio": torch.tensor(token_ids, dtype=torch.long)}
+        payload["meta"]["next_stage_prompt_len"] = len(token_ids)
+    return payload

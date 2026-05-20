@@ -138,6 +138,56 @@ def _make_sampling_metadata(
     )
 
 
+def test_build_pooler_payload_waits_for_sampled_stop_token():
+    model = _make_talker_model()
+    input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=[3],
+        num_tokens_no_spec=[3],
+        token_ids_cpu=torch.tensor([[101, 102, 103]], dtype=torch.long),
+    )
+
+    payload = model.build_pooler_payload(
+        req_id="r1",
+        req_index=0,
+        input_batch=input_batch,
+        sampled_token_ids=[[10]],
+        invalid_req_indices=set(),
+    )
+    assert payload is None
+
+    payload = model.build_pooler_payload(
+        req_id="r1",
+        req_index=0,
+        input_batch=input_batch,
+        sampled_token_ids=[[20, 6562]],
+        invalid_req_indices=set(),
+    )
+    assert payload is not None
+    assert torch.equal(payload["codes.audio"], torch.tensor([[10], [20]], dtype=torch.long))
+
+
+def test_build_pooler_payload_falls_back_to_input_batch_history():
+    model = _make_talker_model()
+    input_batch = SimpleNamespace(
+        req_id_to_index={"r1": 0},
+        num_prompt_tokens=[3],
+        num_tokens_no_spec=[8],
+        token_ids_cpu=torch.tensor([[101, 102, 103, 10, 20, 6562, -1, 30]], dtype=torch.long),
+    )
+
+    payload = model.build_pooler_payload(
+        req_id="r1",
+        req_index=0,
+        input_batch=input_batch,
+        sampled_token_ids=None,
+        invalid_req_indices=set(),
+    )
+
+    assert payload is not None
+    assert torch.equal(payload["codes.audio"], torch.tensor([[10], [20], [30]], dtype=torch.long))
+
+
 def test_split_request_ids_uses_seq_token_counts():
     CosyVoice3Model, _ = _cosyvoice3_model_and_runner()
     ids = torch.tensor([10, 11, 12, 13, 14], dtype=torch.long)
@@ -265,6 +315,32 @@ def test_forward_uses_non_stream_decode_without_chunk_metadata():
     assert len(model.code2wav.forward_streaming_calls) == 0
     call = model.code2wav.forward_calls[0]
     assert call["token"].tolist() == [[0, 1, 2]]
+    assert call["token_offset_tokens"] == 0
+
+
+def test_forward_trims_non_streaming_connector_codes():
+    model = _make_code2wav_model()
+
+    runtime_info = [
+        {
+            "embed": {
+                "speech_token": torch.tensor([[1, 2, 3]], dtype=torch.long),
+                "speech_feat": torch.tensor([[[0.1, 0.2], [0.3, 0.4]]], dtype=torch.float32),
+                "embedding": torch.tensor([[0.5, 0.6]], dtype=torch.float32),
+            },
+            "codes": {"audio": torch.tensor([0, 1, 2], dtype=torch.long)},
+            "meta": {"next_stage_prompt_len": 3},
+        }
+    ]
+
+    model.forward(
+        input_ids=torch.tensor([0, 1, 2], dtype=torch.long),
+        positions=torch.tensor([0, 1, 2], dtype=torch.long),
+        model_intermediate_buffer=runtime_info,
+        seq_token_counts=[3],
+    )
+
+    assert model.code2wav.forward_calls[0]["token_offset_tokens"] == 3
 
 
 def test_forward_reuses_streaming_cache_state_between_chunks():
