@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import queue
 import socket
 import threading
@@ -32,7 +33,10 @@ try:
 except ImportError:
     TransferEngine = None
 
-_BUFFER_TTL_SECONDS = 300
+# Stale buffer TTL: buffers older than this are reclaimed to prevent leaks
+# when a receiver crashes or never pulls.  Override per-connector via
+# ``buffer_ttl_seconds`` in the connector config.
+_DEFAULT_BUFFER_TTL_SECONDS = 300.0
 
 QUERY_INFO = b"query_info"
 CLEANUP_KEY = b"cleanup_key"
@@ -126,6 +130,18 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         self.device_name = _resolve_device_name(config.get("device_name", "auto"), self.protocol)
         self.pool_size = int(config.get("memory_pool_size", 1024**3))
         self.pool_device = _resolve_pool_device(config.get("memory_pool_device", "npu"))
+
+        raw_ttl = config.get("buffer_ttl_seconds", _DEFAULT_BUFFER_TTL_SECONDS)
+        try:
+            self.buffer_ttl_seconds = float(raw_ttl)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"buffer_ttl_seconds must be a number, got {raw_ttl!r}"
+            ) from exc
+        if not math.isfinite(self.buffer_ttl_seconds) or self.buffer_ttl_seconds <= 0:
+            raise ValueError(
+                f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}"
+            )
         self.sender_host = config.get("sender_host")
         sender_zmq_port = config.get("sender_zmq_port")
         self.sender_zmq_port = self._resolve_optional_port(sender_zmq_port, "sender_zmq_port")
@@ -658,6 +674,7 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
             "protocol": self.protocol,
             "pool_device": self.pool_device,
             "pool_size": self.pool_size,
+            "buffer_ttl_seconds": self.buffer_ttl_seconds,
             **self._metrics,
         }
 
@@ -716,14 +733,15 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
 
     def _cleanup_stale_buffers(self) -> None:
         now = _time_mod.monotonic()
+        ttl = self.buffer_ttl_seconds
         with self._local_buffers_lock:
-            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
+            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > ttl]
             for key in stale_keys:
                 item = self._local_buffers.pop(key)
                 _, _, holder, should_release, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
-                logger.warning("TTL expired (%ss): cleaned up stale buffer for %s", _BUFFER_TTL_SECONDS, key)
+                logger.warning("TTL expired (%ss): cleaned up stale buffer for %s", ttl, key)
 
     def _zmq_listener_loop(self) -> None:
         socket_obj = self.zmq_ctx.socket(zmq.ROUTER)

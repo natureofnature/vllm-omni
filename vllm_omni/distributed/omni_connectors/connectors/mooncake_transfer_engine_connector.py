@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import math
 import os
 import queue
 import socket
@@ -27,9 +28,10 @@ try:
 except ImportError:
     TransferEngine = None
 
-# Stale buffer TTL: buffers older than this are automatically reclaimed
-# to prevent memory leaks when receiver crashes or gives up.
-_BUFFER_TTL_SECONDS = 300  # 5 minutes
+# Stale buffer TTL: buffers older than this are reclaimed to prevent leaks
+# when a receiver crashes or never pulls.  Override per-connector via
+# ``buffer_ttl_seconds`` in the connector config.
+_DEFAULT_BUFFER_TTL_SECONDS = 300.0  # 5 minutes
 
 # ZMQ Message constants
 TRANS_DONE = b"trans_done"
@@ -155,6 +157,19 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         self.pool_size = config.get("memory_pool_size", 1024**3)  # Default 1GB
         self.pool_device = config.get("memory_pool_device", "cpu")
 
+        # --- Buffer Lifetime Configuration ---
+        raw_ttl = config.get("buffer_ttl_seconds", _DEFAULT_BUFFER_TTL_SECONDS)
+        try:
+            self.buffer_ttl_seconds = float(raw_ttl)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"buffer_ttl_seconds must be a number, got {raw_ttl!r}"
+            ) from exc
+        if not math.isfinite(self.buffer_ttl_seconds) or self.buffer_ttl_seconds <= 0:
+            raise ValueError(
+                f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}"
+            )
+
         # --- Sender Configuration (for receiver to query without metadata) ---
         # When receiver doesn't have metadata, it uses these to connect to sender
         self.sender_host = config.get("sender_host", None)
@@ -217,7 +232,8 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             f"MooncakeTransferEngineConnector config summary:\n"
             f"  Local: host={self.host}, zmq_port={self.zmq_port}, rpc_port={self.rpc_port}\n"
             f"  Remote: sender_host={self.sender_host}, sender_zmq_port={self.sender_zmq_port}\n"
-            f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}"
+            f"  Role: can_put={self.can_put}, configured_role={config.get('role', 'sender')}\n"
+            f"  Buffer TTL: {self.buffer_ttl_seconds}s"
         )
 
         # Only sender needs ZMQ listener to handle pull requests
@@ -839,6 +855,7 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
             "protocol": self.protocol,
             "pool_device": self.pool_device,
             "pool_size": self.pool_size,
+            "buffer_ttl_seconds": self.buffer_ttl_seconds,
             **self._metrics,
         }
 
@@ -917,21 +934,22 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
     # -------------------------------------------------------
 
     def _cleanup_stale_buffers(self) -> None:
-        """Reclaim buffers older than ``_BUFFER_TTL_SECONDS``.
+        """Reclaim buffers older than ``self.buffer_ttl_seconds``.
         Prevents permanent memory leaks when a receiver crashes or times out
         without ever pulling the data.
         TODO(wzliu): In extreme rare case, long transfer time, there might exist
         TTL cleanup vs in-flight transfer conflict, which will be handled in the next PR.
         """
         now = _time_mod.monotonic()
+        ttl = self.buffer_ttl_seconds
         with self._local_buffers_lock:
-            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > _BUFFER_TTL_SECONDS]
+            stale_keys = [k for k, v in self._local_buffers.items() if now - v[5] > ttl]
             for k in stale_keys:
                 item = self._local_buffers.pop(k)
                 _, _, holder, should_release, _, _ = item
                 if should_release and isinstance(holder, ManagedBuffer):
                     holder.release()
-                logger.warning(f"TTL expired ({_BUFFER_TTL_SECONDS}s): cleaned up stale buffer for {k}")
+                logger.warning(f"TTL expired ({ttl}s): cleaned up stale buffer for {k}")
 
     def _zmq_listener_loop(self):
         socket = self.zmq_ctx.socket(zmq.ROUTER)

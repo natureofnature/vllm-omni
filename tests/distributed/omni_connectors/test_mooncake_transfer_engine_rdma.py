@@ -253,6 +253,48 @@ class TestBasicConnector:
             ok, _, _ = c.put("s", "s", "recovery", torch.randn(1000))
             assert ok, "Pool recovery failed after cleanup"
 
+    def test_buffer_ttl_default(self):
+        """Without override, buffer_ttl_seconds keeps its 300s default."""
+        port = _free_port()
+        with MooncakeTransferEngineConnector(_connector_config(port)) as c:
+            assert c.buffer_ttl_seconds == 300.0
+
+    def test_buffer_ttl_override_from_config(self):
+        """``buffer_ttl_seconds`` is read from the connector config."""
+        port = _free_port()
+        cfg = _connector_config(port)
+        cfg["buffer_ttl_seconds"] = 1200
+        with MooncakeTransferEngineConnector(cfg) as c:
+            assert c.buffer_ttl_seconds == 1200.0
+
+    def test_buffer_ttl_invalid_rejected(self):
+        """Reject non-finite, non-positive, and non-numeric TTL values."""
+        for bad in (0, "abc", float("nan"), float("inf")):
+            cfg = _connector_config(_free_port())
+            cfg["buffer_ttl_seconds"] = bad
+            with pytest.raises(ValueError, match="buffer_ttl_seconds"):
+                MooncakeTransferEngineConnector(cfg)
+
+    def test_buffer_ttl_eviction_honors_config(self):
+        """``_cleanup_stale_buffers`` uses the configured TTL, not the default.
+
+        With a 0.2s TTL, a buffer put now should still be present immediately
+        after cleanup runs, but absent after sleeping past the TTL window.
+        """
+        port = _free_port()
+        cfg = _connector_config(port)
+        cfg["buffer_ttl_seconds"] = 0.2
+        with MooncakeTransferEngineConnector(cfg) as c:
+            ok, _, _ = c.put("s", "s", "ttl_test", torch.randn(100))
+            assert ok
+            key = MooncakeTransferEngineConnector._make_key("ttl_test", "s", "s")
+            assert key in c._local_buffers
+            c._cleanup_stale_buffers()
+            assert key in c._local_buffers, "buffer evicted before TTL elapsed"
+            time.sleep(0.3)
+            c._cleanup_stale_buffers()
+            assert key not in c._local_buffers, "buffer not evicted after TTL elapsed"
+
 
 # ---------------------------------------------------------------------------
 # 2. End-to-end RDMA transfer (producer + consumer, single node)

@@ -35,6 +35,7 @@ runtime:
         device_name: ""               # RDMA device (e.g., "mlx5_0"), empty for auto-detect
         memory_pool_size: 4294967296  # 4 GB (CPU); use 2147483648 (2 GB) for GPU
         memory_pool_device: "cpu"     # "cpu" for pinned memory (recommended), "cuda" for GPUDirect RDMA
+        buffer_ttl_seconds: 300       # Fallback TTL for unconsumed buffers (raise for slow consumers)
 ```
 
 Wire stages to the connector:
@@ -66,6 +67,7 @@ stage_args:
 |---|---|---|
 | `memory_pool_size` | 4 GB (CPU) / 2 GB (GPU) | Total size of the RDMA-registered memory pool in bytes. Recommended 4 GB for CPU pinned memory; 2 GB for GPU VRAM to conserve device memory. |
 | `memory_pool_device` | `"cpu"` | `"cpu"`: pinned host memory (recommended, works on all topologies). `"cuda"`: GPU VRAM for GPUDirect RDMA (requires NIC-GPU direct PCIe connectivity, PIX topology). |
+| `buffer_ttl_seconds` | `300` | Fallback TTL (seconds) used by the sender to reclaim buffers that no receiver ever pulled. Normal release happens via `cleanup()` after a successful RDMA pull; TTL only fires when the receiver never arrives. Raise this when the downstream stage's worst-case queue wait can exceed the default (e.g. high HTTP concurrency against a stage with `max_num_seqs: 1`) — otherwise the receiver will time out trying to fetch a buffer that TTL has already evicted. Must be a finite positive number; NaN / ±inf are rejected to prevent the leak-prevention sweep from being silently disabled. |
 
 ### Networking
 
@@ -182,6 +184,7 @@ echo "MC_IB_PCI_RELAXED_ORDERING=${MC_IB_PCI_RELAXED_ORDERING:-<not set>}"
 | `zmq.error.Again: Resource temporarily unavailable` | ZMQ recv timeout (transfer took too long) | Check NIC selection; increase data may need longer timeout |
 | `Mooncake Engine initialization failed` | Missing RDMA drivers or `/dev/infiniband` | Install Mellanox OFED; in Docker add `--device=/dev/infiniband` |
 | `MemoryError` in allocator | Memory pool too small for payload | Increase `memory_pool_size` |
+| `Timeout waiting for KV cache ... after Xs` + sender logs `TTL expired (300s): cleaned up stale buffer` | Downstream stage's queue wait exceeded the buffer TTL (typical under high HTTP concurrency against `max_num_seqs: 1`) | Raise `buffer_ttl_seconds` above the worst-case queue wait, and/or increase downstream `max_num_seqs` or replica count |
 | GPU transfer slower than CPU | GPU BAR1 bandwidth limitation (PXB/NODE topology) | Use `memory_pool_device: "cpu"` instead of `"cuda"` |
 
 ### Multi-NIC Environments (DGX)
@@ -699,6 +702,8 @@ This is intended to reduce false timeouts for large remote writes.
 #### 11.2 Stale Buffer Reclamation
 
 The sender periodically reclaims old entries from `_local_buffers` using a TTL policy. This protects the memory pool from permanent leaks if a receiver crashes or never consumes a prepared payload.
+
+The TTL defaults to 300 seconds and can be overridden via the `buffer_ttl_seconds` field in the connector config. Tune this when the receiving stage's worst-case queue wait can exceed the default — for example, high HTTP concurrency against a diffusion stage configured with `max_num_seqs: 1`: a receiver that picks up a request later than `buffer_ttl_seconds` after the producer's `put()` will find its buffer already evicted, surfacing as `Timeout waiting for KV cache for request ... after Xs` on the receiver side. A rough rule of thumb is `buffer_ttl_seconds ≥ recv_timeout × expected_queue_depth`.
 
 This is a practical recovery mechanism, although the code notes that TTL cleanup can still race with very long-running in-flight transfers.
 
