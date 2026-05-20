@@ -293,14 +293,22 @@ def test_code2wav_forward_finalizes_hift_tail():
     model = object.__new__(CosyVoice3Code2Wav)
     nn.Module.__init__(model)
     model.hift = DummyHiFT()
-    model._forward_mel = lambda **_: torch.ones((1, 80, 8), dtype=torch.float32)
+    forward_mel_calls = []
+
+    def fake_forward_mel(**kwargs):
+        forward_mel_calls.append(kwargs)
+        return torch.ones((1, 80, 8), dtype=torch.float32)
+
+    model._forward_mel = fake_forward_mel
 
     out = model.forward(
         token=torch.tensor([[1, 2, 3]], dtype=torch.int32),
         prompt_token=torch.tensor([[4, 5]], dtype=torch.int32),
         prompt_feat=torch.ones((1, 4, 80), dtype=torch.float32),
         embedding=torch.ones((1, 192), dtype=torch.float32),
+        token_offset_tokens=2,
     )
 
     assert out.shape == (1, 1, 8)
     assert model.hift.finalize_calls == [True]
+    assert forward_mel_calls[0]["token_offset_tokens"] == 2
