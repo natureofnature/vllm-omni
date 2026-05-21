@@ -7,6 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.inputs import TextPrompt
+from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import (
     CodesStruct,
@@ -15,6 +16,8 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
 
 _COSYVOICE3_SPEECH_TOKEN_SIZE = 6561
 
@@ -396,7 +399,14 @@ def text2flow_full_payload(
     (see cosyvoice3.py:671 in the code2wav forward — runtime_info pickup).
     """
     del transfer_manager
+    rid = getattr(request, "external_req_id", None) or getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "cosyvoice3.text2flow_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
     embed_out: dict[str, Any] = {}
     for key in ("speech_token", "speech_feat", "embedding"):
@@ -408,6 +418,12 @@ def text2flow_full_payload(
         if isinstance(v, torch.Tensor) and v.numel() > 0:
             embed_out[key] = v
     if not embed_out:
+        logger.warning(
+            "cosyvoice3.text2flow_full_payload: no embed.{speech_token,speech_feat,embedding} "
+            "found in pooling_output (keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
         return None
     return {
         "meta": {

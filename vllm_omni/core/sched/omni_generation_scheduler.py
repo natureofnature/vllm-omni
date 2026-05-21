@@ -646,7 +646,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        self._capture_omni_connector_output(model_runner_output, model_mode="generation")
+        self._capture_omni_connector_output(model_runner_output)
 
         return engine_core_outputs
 

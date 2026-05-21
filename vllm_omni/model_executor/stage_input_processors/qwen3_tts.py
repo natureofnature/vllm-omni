@@ -436,7 +436,14 @@ def talker2code2wav_full_payload(
     crop to seq_len, prepend ref, codebook-major flatten).
     """
     del transfer_manager
+    rid = getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
 
     # codes.audio — try flat dotted first (flatten_payload), then nested fallback.
@@ -446,10 +453,21 @@ def talker2code2wav_full_payload(
         if isinstance(codes_nested, dict):
             audio = codes_nested.get("audio")
     if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: missing/empty codes.audio "
+            "(keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
         return None
     audio = audio.to(torch.long)
     audio = _filter_audio_codes_qwen3_tts(audio)
     if audio.numel() == 0:
+        logger.warning(
+            "qwen3_tts.talker2code2wav_full_payload: audio empty after codec "
+            "filter (negative/all-zero/out-of-range rows dropped) for req=%s.",
+            rid,
+        )
         return None
 
     output_token_ids = list(getattr(request, "output_token_ids", None) or [])

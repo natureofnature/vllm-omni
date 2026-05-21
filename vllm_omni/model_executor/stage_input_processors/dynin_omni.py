@@ -5,8 +5,11 @@ from typing import Any
 
 import torch
 from vllm.inputs import TextPrompt
+from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
+
+logger = init_logger(__name__)
 
 
 def _to_prompt_dict(prompt_item: OmniTokensPrompt | TextPrompt | str | None) -> dict[str, Any]:
@@ -178,6 +181,12 @@ def _build_full_payload(pooling_output: dict[str, Any] | None, request: Any) -> 
     if not token_ids and request is not None:
         token_ids = _to_token_id_list(getattr(request, "output_token_ids", None))
     if not token_ids:
+        logger.warning(
+            "dynin_omni._build_full_payload: no token_ids found in pooling_output "
+            "(keys=%s) or request.output_token_ids for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            getattr(request, "request_id", "?"),
+        )
         return None
 
     src_additional_info = getattr(request, "additional_information", {}) if request is not None else {}

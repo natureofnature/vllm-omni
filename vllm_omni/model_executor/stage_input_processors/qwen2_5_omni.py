@@ -176,11 +176,22 @@ def talker2code2wav_full_payload(
     boundary tokens and pack a minimal payload.
     """
     del transfer_manager
+    rid = getattr(request, "request_id", "?")
     token_ids = list(getattr(request, "output_token_ids", None) or [])
     if not token_ids:
+        logger.warning(
+            "qwen2_5_omni.talker2code2wav_full_payload: empty output_token_ids "
+            "for req=%s; consumer wait gate may hang.",
+            rid,
+        )
         return None
     token_ids = _strip_codec_boundaries(token_ids)
     if not token_ids:
+        logger.warning(
+            "qwen2_5_omni.talker2code2wav_full_payload: codec ids empty after "
+            "stripping boundary tokens for req=%s; consumer wait gate may hang.",
+            rid,
+        )
         return None
     return {
         "codes": {"audio": token_ids},
@@ -285,11 +296,24 @@ def thinker2talker_full_payload(
     heuristic.
     """
     del transfer_manager
+    rid = getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "qwen2_5_omni.thinker2talker_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
 
     hidden = pooling_output.get("hidden")
     if not isinstance(hidden, torch.Tensor):
+        logger.warning(
+            "qwen2_5_omni.thinker2talker_full_payload: missing 'hidden' tensor "
+            "(keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
         return None
 
     def _ensure_list(x):
@@ -352,6 +376,13 @@ def thinker2talker_full_payload(
     h = hidden.detach().cpu().to(torch.float32)
     target_rows = max(0, len(all_token_ids) - stop_emission_drop)
     if target_rows <= 0:
+        logger.warning(
+            "qwen2_5_omni.thinker2talker_full_payload: target_rows<=0 "
+            "(all_token_ids=%d, stop_drop=%d) for req=%s; nothing to ship.",
+            len(all_token_ids),
+            stop_emission_drop,
+            getattr(request, "request_id", "?"),
+        )
         return None
     if h.dim() >= 1 and h.shape[0] > target_rows:
         logger.warning(
@@ -366,8 +397,15 @@ def thinker2talker_full_payload(
 
     prompt_len = len(prompt_token_ids)
     if h.shape[0] < prompt_len:
-        # Under-captured prefill — defensively skip rather than ship a
+        # Under-captured prefill -- defensively skip rather than ship a
         # truncated payload that would confuse the talker's prefill path.
+        logger.warning(
+            "qwen2_5_omni.thinker2talker_full_payload: hidden rows=%d < prompt_len=%d "
+            "for req=%s; under-captured prefill, skipping payload.",
+            int(h.shape[0]),
+            prompt_len,
+            getattr(request, "request_id", "?"),
+        )
         return None
 
     prefill_hidden = h[:prompt_len]
