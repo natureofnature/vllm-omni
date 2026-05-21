@@ -83,6 +83,7 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
         self._consume_pending_connector_output(model_mode="generation")
+        self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)
 

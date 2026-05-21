@@ -211,6 +211,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
         self._consume_pending_connector_output(model_mode="ar")
+        self._process_pending_input_timeouts()
 
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.process_pending_chunks(self.waiting, self.running)

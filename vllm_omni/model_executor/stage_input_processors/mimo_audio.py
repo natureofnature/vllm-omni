@@ -339,7 +339,9 @@ def _filter_zero_codec_rows(codec_codes: torch.Tensor) -> torch.Tensor:
     is_all_zero = (codec_codes == 0).all(dim=(1, 2, 3))
     nonzero_idx = (~is_all_zero).nonzero(as_tuple=True)[0]
     if len(nonzero_idx) == 0:
-        return codec_codes
+        # All rows are zero-padded; return an empty tensor so the caller
+        # can detect this via numel()==0 and skip the request.
+        return codec_codes[:0]
     if len(nonzero_idx) < codec_codes.shape[0]:
         return codec_codes[nonzero_idx]
     return codec_codes

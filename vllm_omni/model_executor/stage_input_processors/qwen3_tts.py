@@ -53,10 +53,13 @@ def talker2code2wav(
         # audio_codes may still contain zero-padded / invalid rows, so trim only
         # after filtering valid frames instead of trying to align EOS indices.
         seq_len = max(len(token_ids) - 1, 0)
-        # Filter invalid frames: zero-padded (EOS) and frames containing
-        # out-of-range values (e.g. stop_token_id=2150 exceeds codebook_size=2048).
+        # Filter invalid frames: zero-padded (EOS), out-of-range values (e.g.
+        # stop_token_id=2150 exceeds codebook_size=2048), and negative
+        # sentinels (e.g. -1 padding).
         _CODEBOOK_SIZE = 2048
-        valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+        valid_mask = (
+            (audio_codes >= 0).all(dim=1) & audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+        )
         audio_codes = audio_codes[valid_mask]
         if seq_len > 0 and audio_codes.ndim == 2 and int(audio_codes.shape[0]) > seq_len:
             audio_codes = audio_codes[-seq_len:]
@@ -307,7 +310,7 @@ _NUM_QUANTIZERS_DEFAULT = 16
 
 
 def _filter_audio_codes_qwen3_tts(audio_codes: torch.Tensor) -> torch.Tensor:
-    """Filter zero-padded + out-of-range codec frames.
+    """Filter zero-padded, out-of-range, and negative-padded codec frames.
 
     Mirrors the orchestrator-path body in `talker2code2wav` above.
     """
@@ -315,7 +318,9 @@ def _filter_audio_codes_qwen3_tts(audio_codes: torch.Tensor) -> torch.Tensor:
         return audio_codes
     if audio_codes.ndim != 2:
         return audio_codes
-    valid_mask = audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+    valid_mask = (
+        (audio_codes >= 0).all(dim=1) & audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+    )
     return audio_codes[valid_mask]
 
 
