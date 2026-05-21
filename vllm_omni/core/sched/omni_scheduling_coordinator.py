@@ -32,10 +32,6 @@ logger = init_logger(__name__)
 # here without also wiring its worker connector init produces a permanent
 # Stage 1 hang (gate parks the request, no transport ever releases it).
 #
-# The `_is_sync_input` markers on per-model `*_token_only` builders in
-# stage_input_processors/ remain as forward-compat documentation; when
-# init is generalised this whitelist can move back to a structural marker
-# check or be dropped entirely.
 _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("Qwen3OmniMoeForConditionalGeneration", "talker"),

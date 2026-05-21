@@ -389,9 +389,6 @@ def llm2code2wav_token_only(
     return code2wav_inputs
 
 
-llm2code2wav_token_only._is_sync_input = True
-
-
 def llm2code2wav_full_payload(
     transfer_manager,
     pooling_output: dict,

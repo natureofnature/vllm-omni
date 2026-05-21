@@ -265,9 +265,3 @@ def token2image_to_token2audio_token_only(
     source_stage_id = engine_input_source[0] if engine_input_source else 0
     source_outputs = stage_list[source_stage_id].engine_outputs
     return _token_only_from_source(source_outputs)
-
-
-# Mark sync-side builders for forward compatibility; current consumer
-# wait gating is _FULL_PAYLOAD_INPUT_STAGES-driven.
-token2text_to_token2image_token_only._is_sync_input = True
-token2image_to_token2audio_token_only._is_sync_input = True

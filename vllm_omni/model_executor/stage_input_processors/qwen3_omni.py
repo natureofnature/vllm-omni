@@ -955,8 +955,3 @@ def talker2code2wav(
         )
 
     return code2wav_inputs
-
-
-# Mark for forward compatibility; current consumer wait gating is
-# _FULL_PAYLOAD_INPUT_STAGES-driven (see should_accumulate_full_payload_output above).
-thinker2talker_token_only._is_sync_input = True

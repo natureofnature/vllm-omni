@@ -54,17 +54,6 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
     stage_config's ``custom_process_next_stage_input_func`` or the
     ``*_full_payload`` derivative of ``custom_process_input_func``), the
     stage is not in async_chunk mode, and ``model_stage`` is set.
-
-    NOTE: the ``_is_sync_input`` marker is on the *consumer-side*
-    ``*_token_only`` builder, not on the ``*_full_payload`` payload builder that
-    workers load on the *producer* side, so checking it here would
-    always return False and the full-payload accumulator would never run.  The
-    marker itself is currently dormant forward-compat documentation:
-    the consumer-side scheduler gate
-    (``uses_full_payload_input_coordinator`` in
-    ``omni_scheduling_coordinator.py``) is whitelist-driven on
-    ``(model_arch, model_stage)`` against ``_FULL_PAYLOAD_INPUT_STAGES``
-    -- adding the marker alone does not open a consumer-wait gate.
     """
     if custom_process_func is None:
         return False

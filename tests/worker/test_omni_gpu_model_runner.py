@@ -410,6 +410,9 @@ def _make_full_payload_accumulation_runner(
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
     runner._stage_id = 1
+    # Non-None sentinel: the gate short-circuits to False when no connector
+    # is configured at all (terminal stages in pipelines with no connector).
+    runner._omni_connector = object()
     return runner
 
 

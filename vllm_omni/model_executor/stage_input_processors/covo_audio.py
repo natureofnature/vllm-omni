@@ -74,12 +74,6 @@ def llm2code2wav_token_only(
     return code2wav_inputs
 
 
-# Mark for forward compatibility; current consumer wait gating is
-# _FULL_PAYLOAD_INPUT_STAGES-driven (see the mixin
-# should_accumulate_full_payload_output docstring).
-llm2code2wav_token_only._is_sync_input = True
-
-
 def llm2code2wav_full_payload(
     transfer_manager: Any,
     pooling_output: dict[str, Any],
