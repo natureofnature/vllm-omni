@@ -99,11 +99,11 @@ def talker2code2wav(
 # omni_scheduling_coordinator):
 # - thinker->talker reads accumulated ``pooling_output["hidden"]`` and
 #   packs an OmniPayload-shaped dict (embed.prefill /
-#   hidden_states.output / ids.prompt / ids.output) for the talker.
-#   ``thinker2talker_token_only`` writes the same shape into
-#   ``additional_information`` as a legacy sync fallback; the talker's
-#   ``talker_preprocess`` reads either source through the same payload
-#   keys.
+#   hidden_states.output / ids.prompt / ids.output) for the talker, which
+#   the talker's ``talker_preprocess`` reads from
+#   ``model_intermediate_buffer``.  The shape matches what legacy
+#   ``thinker2talker`` writes into ``additional_information`` as a debug
+#   fallback; ``thinker2talker_token_only`` only allocates prompt slots.
 # - talker->code2wav strips TALKER_CODEC_{START,END} boundary tokens
 #   and ships the codec token ids.
 # ============================================================================
@@ -164,9 +164,6 @@ def talker2code2wav_token_only(
     return code2wav_inputs
 
 
-talker2code2wav_token_only._is_sync_input = True
-
-
 def talker2code2wav_full_payload(
     transfer_manager,
     pooling_output: dict,
@@ -199,13 +196,13 @@ def talker2code2wav_full_payload(
 # per decode step on ``pooling_output["hidden"]`` (unpacked from
 # ``OmniOutput.text_hidden_states``); the full-payload accumulator
 # concatenates them so ``thinker2talker_full_payload`` sees the full
-# prefill+decode trajectory and packs an OmniPayload-shaped dict.
-# ``thinker2talker_token_only`` writes the same shape into
-# ``additional_information`` as a legacy sync fallback; the talker's
-# ``talker_preprocess`` reads ``info_dict`` regardless of source.
+# prefill+decode trajectory and packs an OmniPayload-shaped dict that
+# the talker's ``talker_preprocess`` reads from
+# ``model_intermediate_buffer``.  ``thinker2talker_token_only`` only
+# allocates the talker's codec prompt slots; legacy
+# ``thinker2talker`` above remains as a debug fallback that bundles the
+# same shape into ``additional_information``.
 # ============================================================================
-
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
 
 
 def thinker2talker_token_only(
@@ -213,21 +210,17 @@ def thinker2talker_token_only(
     prompt: OmniTokensPrompt | TextPrompt = None,
     requires_multimodal_data: bool = False,
 ):
-    """Sync-side builder for the non-async-chunk thinker->talker path.
+    """Placeholder builder for the connector-driven thinker->talker path.
 
-    Body mirrors the legacy ``thinker2talker`` above: packs an
-    OmniPayload-shaped dict (hidden_states.output / embed.prefill /
-    ids.prompt / ids.output) into ``additional_information``, allocates
-    TALKER_CODEC_{START,PAD,END} prompt slots, and forwards
-    ``multi_modal_data``.  Serves as a legacy sync fallback; the same
-    shape is also built by ``thinker2talker_full_payload`` below and
-    shipped via the worker connector.
+    Allocates the TALKER_CODEC_{START,PAD,END} prompt slots sized to the
+    thinker prompt length and forwards ``multi_modal_data``.  The bulk
+    payload (hidden_states / embed / ids) ships exclusively through
+    ``thinker2talker_full_payload`` via the worker connector and lands
+    in ``model_intermediate_buffer`` before the talker's forward() runs.
 
-    The ``_is_sync_input = True`` marker below is currently dormant
-    forward-compat documentation -- the consumer-wait gate is
-    whitelist-driven via ``_FULL_PAYLOAD_INPUT_STAGES`` (see the mixin
-    ``should_accumulate_full_payload_output`` docstring), not by this
-    marker.
+    Consumer-wait gating is whitelist-driven via
+    ``_FULL_PAYLOAD_INPUT_STAGES`` (see the mixin
+    ``should_accumulate_full_payload_output`` docstring).
     """
     thinker_outputs = source_outputs
     talker_inputs = []
@@ -237,29 +230,14 @@ def thinker2talker_token_only(
         thinker_output.request_id: p.get("multi_modal_data", None) for thinker_output, p in zip(thinker_outputs, prompt)
     }
 
-    for i, thinker_output in enumerate(thinker_outputs):
-        output = thinker_output.outputs[0]
+    for thinker_output in thinker_outputs:
         prompt_token_ids = thinker_output.prompt_token_ids
-        thinker_output_ids = output.cumulative_token_ids
-        prompt_token_ids_len = len(prompt_token_ids)
-        mm: OmniPayload = output.multimodal_output
-        latent = mm["latent"]
-        thinker_hidden_states = latent.clone().detach().to(latent.device)
-        decode_hidden = thinker_hidden_states[prompt_token_ids_len:].to(torch.float32)
-        prefill_hidden = thinker_hidden_states[:prompt_token_ids_len].to(torch.float32)
-        additional_information = to_dict(
-            OmniPayloadStruct(
-                hidden_states=HiddenStatesStruct(output=decode_hidden, output_shape=list(decode_hidden.shape)),
-                embed=EmbeddingsStruct(prefill=prefill_hidden, prefill_shape=list(prefill_hidden.shape)),
-                ids=IdsStruct(prompt=list(prompt_token_ids), output=list(thinker_output_ids)),
-            )
-        )
         talker_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=[TALKER_CODEC_START_TOKEN_ID]
                 + [TALKER_CODEC_PAD_TOKEN_ID] * (len(prompt_token_ids))
                 + [TALKER_CODEC_END_TOKEN_ID],
-                additional_information=additional_information,
+                additional_information=None,
                 multi_modal_data=(
                     multi_modal_data[thinker_output.request_id]
                     if requires_multimodal_data and multi_modal_data is not None
@@ -270,9 +248,6 @@ def thinker2talker_token_only(
         )
 
     return talker_inputs
-
-
-thinker2talker_token_only._is_sync_input = True
 
 
 def thinker2talker_full_payload(
@@ -293,11 +268,12 @@ def thinker2talker_full_payload(
 
     We split it at ``len(prompt_token_ids)`` into prefill embeddings and
     decode hidden states, then pack the ``OmniPayload``-shaped dict that
-    the talker's ``thinker_to_talker_process`` already reads (keys
-    ``embed.prefill`` / ``hidden_states.output`` / ``ids.prompt`` /
-    ``ids.output``).  Shape matches what ``thinker2talker_token_only``
-    writes into ``additional_information``, so the talker consumes the
-    same payload layout from either path.
+    the talker's ``thinker_to_talker_process`` reads from
+    ``model_intermediate_buffer`` (keys ``embed.prefill`` /
+    ``hidden_states.output`` / ``ids.prompt`` / ``ids.output``).  Shape
+    matches what legacy ``thinker2talker`` writes into
+    ``additional_information`` as a debug fallback, so the talker
+    consumes the same payload layout from either path.
 
     Like ``qwen3_omni.thinker2talker_full_payload``, we apply a
     finish-reason-aware stop-row trim: vLLM v1 appends the sampled

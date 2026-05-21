@@ -383,9 +383,6 @@ def text2flow_token_only(
     return engine_inputs
 
 
-text2flow_token_only._is_sync_input = True
-
-
 def text2flow_full_payload(
     transfer_manager,
     pooling_output,

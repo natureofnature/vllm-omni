@@ -104,22 +104,13 @@ def thinker2talker(
     return talker_inputs
 
 
-# ============================================================================
-# Worker-connector data plane (non-async-chunk path) -- inactive for
-# ming_flash_omni.
-# ming_flash_omni's thinker->talker bridge passes detokenized text only;
-# voice/speaker metadata flows through the USER request's
-# additional_information, not the model's pooler_output.  No heavy
-# tensor to migrate, so ``thinker2talker_full_payload`` returns None.
 # ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
 # ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
 # initialised for this arch and the consumer never waits on a connector
-# payload; data flows through ``additional_information`` written by
-# ``thinker2talker_token_only``.  The ``*_full_payload`` definition is
-# retained for forward compatibility.
-# ============================================================================
-
-_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
+# payload.  Data flows through ``additional_information`` written by
+# ``thinker2talker_token_only`` (wired as ``sync_process_input_func``
+# in the pipeline) or the legacy ``thinker2talker`` (wired as
+# ``custom_process_input_func``).
 
 
 def thinker2talker_token_only(
@@ -176,24 +167,3 @@ def thinker2talker_token_only(
         )
 
     return talker_inputs
-
-
-thinker2talker_token_only._is_sync_input = True
-
-
-def thinker2talker_full_payload(
-    transfer_manager,
-    pooling_output,
-    request,
-):
-    """Producer-side payload builder — no-op.
-
-    ming_flash_omni's thinker emits no heavy tensor to ship via the
-    worker connector (the bridge passes text only, and speaker metadata
-    arrives through the USER request's additional_information).
-    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
-    function is never invoked at runtime; it is retained for forward
-    compatibility with the connector path.
-    """
-    del transfer_manager, pooling_output, request
-    return None

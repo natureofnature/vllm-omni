@@ -324,6 +324,21 @@ def _filter_audio_codes_qwen3_tts(audio_codes: torch.Tensor) -> torch.Tensor:
     return audio_codes[valid_mask]
 
 
+def _coerce_ref_code_len(raw) -> int:
+    """Coerce mm["meta"]["ref_code_len"] / pooling_output["meta.ref_code_len"]
+    raw value (Tensor | int | None) into a non-negative int.  Mirrors the
+    extraction inlined in the legacy ``talker2code2wav`` path; clamps any
+    negative input to 0 since downstream code treats this as a non-negative
+    frame count."""
+    if isinstance(raw, torch.Tensor):
+        value = int(raw.reshape(-1)[-1].item()) if raw.numel() > 0 else 0
+    elif raw is None:
+        value = 0
+    else:
+        value = int(raw)
+    return max(value, 0)
+
+
 def _normalize_ref_code(ref_code, num_quantizers: int, ref_code_len: int):
     """Coerce ref_code into a [ref_len, Q] tensor or None.  Mirrors orchestrator path."""
     if isinstance(ref_code, list):
@@ -383,12 +398,7 @@ def talker2code2wav_token_only(
 
         ref_code_raw = mm_codes.get("ref") if isinstance(mm_codes, dict) else None
         ref_code_len_raw = mm.get("meta", {}).get("ref_code_len") if isinstance(mm.get("meta"), dict) else None
-        if isinstance(ref_code_len_raw, torch.Tensor):
-            ref_code_len = int(ref_code_len_raw.reshape(-1)[-1].item()) if ref_code_len_raw.numel() > 0 else 0
-        elif ref_code_len_raw is None:
-            ref_code_len = 0
-        else:
-            ref_code_len = int(ref_code_len_raw)
+        ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
         _, ref_frames = _normalize_ref_code(ref_code_raw, num_quantizers, ref_code_len)
 
         # Codebook-major flat: Q * (ref_frames + audio_frames)
@@ -410,9 +420,6 @@ def talker2code2wav_token_only(
             )
         )
     return code2wav_inputs
-
-
-talker2code2wav_token_only._is_sync_input = True
 
 
 def talker2code2wav_full_payload(
@@ -458,12 +465,7 @@ def talker2code2wav_full_payload(
         meta_nested = pooling_output.get("meta")
         if isinstance(meta_nested, dict):
             ref_code_len_raw = meta_nested.get("ref_code_len")
-    if isinstance(ref_code_len_raw, torch.Tensor):
-        ref_code_len = int(ref_code_len_raw.reshape(-1)[-1].item()) if ref_code_len_raw.numel() > 0 else 0
-    elif ref_code_len_raw is None:
-        ref_code_len = 0
-    else:
-        ref_code_len = int(ref_code_len_raw)
+    ref_code_len = _coerce_ref_code_len(ref_code_len_raw)
 
     # codes.ref — flat dotted then nested fallback.
     ref_code_raw = pooling_output.get("codes.ref")
