@@ -255,10 +255,11 @@ class OmniConnectorModelRunnerMixin:
         # cleanup proceeds.  Without this, finished requests with no
         # downstream consumer (e.g. text-only on multi-modal arch) leave
         # the entry orphaned in _pending_full_payload_send across requests,
-        # which empirically destabilises subsequent thinker forwards
-        # (test_thinker_prefix_caching regression).  flush is a near-no-op
-        # for paths with no consumer, and idempotent when the entry has
-        # already been flushed by the scheduler-driven path.
+        # which empirically destabilises subsequent thinker forwards by
+        # making prefix-cache reuse observe stale accumulator state.
+        # flush is a near-no-op for paths with no consumer, and idempotent
+        # when the entry has already been flushed by the scheduler-driven
+        # path.
         try:
             self.flush_full_payload_outputs({req_id})
         except Exception:
@@ -733,6 +734,27 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
+        if getattr(self, "_omni_connector", None) is None:
+            # No connector at all: send_full_payload_outputs would no-op.
+            # Skip the per-step accumulator+build that would otherwise be
+            # silently discarded.  Defends against a terminal stage whose
+            # custom_process_input_func has a *_full_payload derivative in
+            # the same module (e.g. dynin stage 2 token2image_to_token2audio
+            # in pipelines that don't configure any connector at all).
+            #
+            # Known limitation: a *terminal-consumer* stage that has a
+            # connector configured for receiving upstream input is NOT
+            # caught here -- ``_omni_connector`` is non-None for it, and
+            # ``_load_custom_func`` may still resolve a ``*_full_payload``
+            # derivative from this stage's ``custom_process_input_func``.
+            # In that case the accumulator builds payloads that
+            # ``send_full_payload_outputs`` later drops via its own
+            # connector-side checks (wasted CPU, not a functional bug).
+            # A topology-aware gate (explicit producer field or pipeline
+            # is_terminal info) would close the gap; that change is out
+            # of scope for this PR.
+            self._should_accumulate_full_payload_output_cached = False
+            return False
         cached = getattr(self, "_should_accumulate_full_payload_output_cached", None)
         if cached is not None:
             return cached

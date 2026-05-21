@@ -191,8 +191,11 @@ def _build_full_payload(pooling_output: dict[str, Any] | None, request: Any) -> 
     payload = _normalize_additional_info(src_additional_info)
     payload.update(_normalize_additional_info(runtime_bridge_info))
     payload["detok_id"] = [_to_int(pooling_output.get("detok_id"), default=_to_int(payload.get("detok_id"), default=0))]
-    payload["code_predictor_codes"] = token_ids
-    payload["finished"] = torch.tensor(True, dtype=torch.bool)
+    # Use nested OmniPayload shape so the scheduling-metadata extractor in
+    # OmniConnectorModelRunnerMixin reads codes.audio and meta.finished
+    # (flat keys at the top level are silently dropped with a warning).
+    payload["codes"] = {"audio": token_ids}
+    payload["meta"] = {"finished": torch.tensor(True, dtype=torch.bool)}
     return payload
 
 

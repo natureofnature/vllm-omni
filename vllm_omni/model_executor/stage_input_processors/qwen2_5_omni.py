@@ -413,5 +413,7 @@ def thinker2talker_full_payload(
             ),
         )
     )
-    # payload["meta"] removed — was the only diff vs legacy payload, causes mix_to_text_audio_001 failure
+    # Intentionally omit payload["meta"]: the thinker->talker transition
+    # carries no scheduler-relevant metadata (next_stage_prompt_len /
+    # left_context_size are not set on this edge).
     return payload

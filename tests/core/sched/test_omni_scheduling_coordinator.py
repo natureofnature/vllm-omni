@@ -101,13 +101,46 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
     These tests pin which ``(arch, stage)`` pairs the gate fires for today.
     """
 
-    def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
-        """All (arch, stage) pairs in _FULL_PAYLOAD_INPUT_STAGES must fire
-        the gate when stage_id > 0 and async_chunk=False.
+    # Expected whitelist (model_arch, model_stage).  Hardcoded to avoid the
+    # tautology of importing _FULL_PAYLOAD_INPUT_STAGES and asserting it
+    # against itself; any drift between this matrix and the whitelist will
+    # fail loudly here.
+    EXPECTED_FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
+        {
+            ("Qwen3OmniMoeForConditionalGeneration", "talker"),
+            ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+            ("Qwen2_5OmniForConditionalGeneration", "talker"),
+            ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
+            ("CovoAudioForConditionalGeneration", "code2wav"),
+            ("MiMoAudioModel", "code2wav"),
+            ("Qwen3TTSCode2Wav", "code2wav"),
+            ("CosyVoice3Model", "cosyvoice3_code2wav"),
+            ("DyninOmniForConditionalGeneration", "token2image"),
+            ("DyninOmniForConditionalGeneration", "token2audio"),
+        }
+    )
+
+    def test_whitelist_matches_expected_matrix(self):
+        """_FULL_PAYLOAD_INPUT_STAGES must equal the hardcoded expected matrix.
+
+        Catches both accidental additions (which would silently enable the
+        consumer-wait gate for a new arch) and accidental removals (which
+        would silently disable an enabled arch).
         """
         from vllm_omni.core.sched.omni_scheduling_coordinator import _FULL_PAYLOAD_INPUT_STAGES
 
-        for arch, stage in _FULL_PAYLOAD_INPUT_STAGES:
+        self.assertEqual(
+            frozenset(_FULL_PAYLOAD_INPUT_STAGES),
+            self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES,
+            msg="_FULL_PAYLOAD_INPUT_STAGES drifted from the expected matrix; "
+            "update EXPECTED_FULL_PAYLOAD_INPUT_STAGES if intentional.",
+        )
+
+    def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
+        """Every (arch, stage) pair in the expected matrix must fire
+        the gate when stage_id > 0 and async_chunk=False.
+        """
+        for arch, stage in self.EXPECTED_FULL_PAYLOAD_INPUT_STAGES:
             model_config = SimpleNamespace(
                 stage_id=1,
                 async_chunk=False,
@@ -116,7 +149,7 @@ class TestFullPayloadCoordinatorSelection(unittest.TestCase):
             )
             self.assertTrue(
                 uses_full_payload_input_coordinator(model_config),
-                msg=f"expected gate to fire for {arch}/{stage} (entry in _FULL_PAYLOAD_INPUT_STAGES)",
+                msg=f"expected gate to fire for {arch}/{stage}",
             )
 
     def test_other_arch_or_stage_or_mode_does_not_fire(self):
