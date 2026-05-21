@@ -135,13 +135,9 @@ class YuanrongTransferEngineConnector(OmniConnectorBase):
         try:
             self.buffer_ttl_seconds = float(raw_ttl)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"buffer_ttl_seconds must be a number, got {raw_ttl!r}"
-            ) from exc
+            raise ValueError(f"buffer_ttl_seconds must be a number, got {raw_ttl!r}") from exc
         if not math.isfinite(self.buffer_ttl_seconds) or self.buffer_ttl_seconds <= 0:
-            raise ValueError(
-                f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}"
-            )
+            raise ValueError(f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}")
         self.sender_host = config.get("sender_host")
         sender_zmq_port = config.get("sender_zmq_port")
         self.sender_zmq_port = self._resolve_optional_port(sender_zmq_port, "sender_zmq_port")

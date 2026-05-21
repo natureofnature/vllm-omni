@@ -162,13 +162,9 @@ class MooncakeTransferEngineConnector(OmniConnectorBase):
         try:
             self.buffer_ttl_seconds = float(raw_ttl)
         except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"buffer_ttl_seconds must be a number, got {raw_ttl!r}"
-            ) from exc
+            raise ValueError(f"buffer_ttl_seconds must be a number, got {raw_ttl!r}") from exc
         if not math.isfinite(self.buffer_ttl_seconds) or self.buffer_ttl_seconds <= 0:
-            raise ValueError(
-                f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}"
-            )
+            raise ValueError(f"buffer_ttl_seconds must be a finite positive number, got {self.buffer_ttl_seconds}")
 
         # --- Sender Configuration (for receiver to query without metadata) ---
         # When receiver doesn't have metadata, it uses these to connect to sender
