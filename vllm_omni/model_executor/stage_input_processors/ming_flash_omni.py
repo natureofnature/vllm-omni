@@ -105,13 +105,18 @@ def thinker2talker(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group D minimal.
-# ming_flash_omni's thinker→talker bridge passes detokenized text only;
+# Worker-connector data plane (non-async-chunk path) -- inactive for
+# ming_flash_omni.
+# ming_flash_omni's thinker->talker bridge passes detokenized text only;
 # voice/speaker metadata flows through the USER request's
-# additional_information, not the model's pooler_output.  So there is no
-# heavy tensor to migrate — the PR3 change is structural-only: register
-# the _is_sync_input marker so the Phase 2a gate applies consistently.
-# full_payload returns None (no per-step connector data).
+# additional_information, not the model's pooler_output.  No heavy
+# tensor to migrate, so ``thinker2talker_full_payload`` returns None.
+# ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` or
+# ``_FULL_PAYLOAD_INPUT_STAGES``, so the worker connector is not
+# initialised for this arch and the consumer never waits on a connector
+# payload; data flows through ``additional_information`` written by
+# ``thinker2talker_token_only``.  The ``*_full_payload`` definition is
+# retained for forward compatibility.
 # ============================================================================
 
 _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
@@ -124,9 +129,9 @@ def thinker2talker_token_only(
 ) -> list[OmniTokensPrompt]:
     """Sync-side builder for the non-async-chunk thinker→talker path.
 
-    Ports the legacy ``thinker2talker`` body to the standard PR3 SIP
-    signature (``source_outputs`` instead of ``stage_list,
-    engine_input_source``).  Body is otherwise identical: extracts the
+    Ports the legacy ``thinker2talker`` body to the new stage-input-processor signature
+    (``source_outputs`` instead of ``stage_list, engine_input_source``).
+    Body is otherwise identical: extracts the
     generated text from each thinker output and packages it with the
     request's voice/speaker additional_information for the talker.
     """
@@ -181,14 +186,14 @@ def thinker2talker_full_payload(
     pooling_output,
     request,
 ):
-    """Producer-side packer — no-op.
+    """Producer-side payload builder — no-op.
 
-    ming_flash_omni's thinker emits no heavy tensor to ship via the worker
-    connector (the bridge passes text only, and speaker metadata arrives
-    through the USER request's additional_information).  Returning None
-    causes the connector to skip the send for this transition.  The
-    structural gate still fires so Phase 2a / 2d infrastructure behavior
-    is consistent across in-scope models.
+    ming_flash_omni's thinker emits no heavy tensor to ship via the
+    worker connector (the bridge passes text only, and speaker metadata
+    arrives through the USER request's additional_information).
+    ming_flash_omni is not in ``_OMNI_CONNECTOR_INIT_ARCHS`` so this
+    function is never invoked at runtime; it is retained for forward
+    compatibility with the connector path.
     """
     del transfer_manager, pooling_output, request
     return None

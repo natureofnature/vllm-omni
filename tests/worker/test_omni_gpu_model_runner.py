@@ -425,7 +425,7 @@ def test_accumulate_full_payload_output_preserves_aligned_all_zero_qwen3_omni_co
 
 
 def test_accumulate_full_payload_output_keeps_misaligned_all_zero_qwen3_omni_codec_rows():
-    # After removing the sender-side zero filter, the accumulator keeps every
+    # After removing the sender-side zero filter, the full-payload accumulator keeps every
     # codec row including misaligned all-zero rows. The downstream consumer
     # (_extract_qwen3_full_payload_codec_rows) is the authoritative crop and
     # filters by output_token_ids.
@@ -474,13 +474,13 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 def test_full_payload_output_accumulation_hook_matrix():
     """Producer-side gate: fires iff custom_process_func is loaded and not async_chunk.
 
-    Phase 2a generalized the gate from an arch + stage whitelist to a structural
-    check on the loaded packer.  `_custom_process_func is None` short-circuits;
+    The gate is a structural check on the loaded payload builder.
+    `_custom_process_func is None` short-circuits;
     that maps to terminal stages (e.g. code2wav, qwen3_tts code2wav, qwen2_5
     code2wav) whose stage_config has no `custom_process_next_stage_input_func`
     and no `*_full_payload` derivative of `custom_process_input_func`.
     """
-    # Thinker / talker producer stages: packer loaded -> gate fires.
+    # Thinker / talker producer stages: payload builder loaded -> gate fires.
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
 
@@ -495,9 +495,9 @@ def test_full_payload_output_accumulation_hook_matrix():
         model_stage="talker", async_chunk=True
     )._should_accumulate_full_payload_output()
 
-    # Non-qwen3 arches: gate is now arch-agnostic, but if the fixture's arch
-    # has no PR3 wire its runtime `_custom_process_func` would be None.
-    # Emulate that.
+    # Non-qwen3 arches: gate is arch-agnostic, but if the fixture's arch
+    # does not configure a connector payload builder, its runtime
+    # `_custom_process_func` is None.  Emulate that.
     runner = _make_full_payload_accumulation_runner(model_arch="Qwen3TTSForConditionalGeneration")
     runner._custom_process_func = None
     runner._should_accumulate_full_payload_output_cached = None

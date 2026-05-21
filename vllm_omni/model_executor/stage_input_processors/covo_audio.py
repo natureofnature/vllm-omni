@@ -28,7 +28,7 @@ def llm2code2wav(
     """Legacy orchestrator-path builder (retained for async_chunk + back-compat).
 
     The non-async-chunk path now goes through ``llm2code2wav_token_only`` +
-    worker connector + ``llm2code2wav_full_payload`` (PR3).
+    worker connector + ``llm2code2wav_full_payload``.
     """
     talker_outputs = source_outputs
     code2wav_inputs = []
@@ -74,9 +74,9 @@ def llm2code2wav_token_only(
     return code2wav_inputs
 
 
-# Mark as the sync-side input builder — the structural full-payload gate
-# (omni_connector_model_runner_mixin.should_accumulate_full_payload_output)
-# fires only when the resolved custom_process_func carries this marker.
+# Mark for forward compatibility; current consumer wait gating is
+# _FULL_PAYLOAD_INPUT_STAGES-driven (see the mixin
+# should_accumulate_full_payload_output docstring).
 llm2code2wav_token_only._is_sync_input = True
 
 
@@ -85,10 +85,10 @@ def llm2code2wav_full_payload(
     pooling_output: dict[str, Any],
     request: Any,
 ) -> dict[str, Any] | None:
-    """Producer-side packer for the worker connector data plane.
+    """Producer-side payload builder for the worker connector data plane.
 
     covo_audio's fused_thinker_talker stage emits codec ids via
-    ``request.output_token_ids`` (token-id-only Group B shape — no
+    ``request.output_token_ids`` (token-ids only -- no
     hidden_states or embed tensors), so the connector payload is
     just the filtered audio codes plus a finished marker.
     """

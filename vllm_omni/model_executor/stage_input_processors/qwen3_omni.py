@@ -484,13 +484,12 @@ def thinker2talker_full_payload(
 
     # Length-aware trim of accumulated thinker output, finish-reason-aware.
     # vLLM appends the sampled token to `output_token_ids` BEFORE
-    # `check_stop` (scheduler.py:1641-1651), so a stop-finished request
-    # has accumulator_rows == len(all_token_ids) including the stop
-    # emission row -- the talker must NOT consume that row (fba23325
-    # spurious-phoneme regression).  Max-token finishes do not append
-    # an extra forward, so no drop is needed (BK 9702 long-output
-    # regression).  Primary: distinguish via `request.status`. Fallback
-    # only when status is absent: last-token-in-stop-id heuristic.
+    # `check_stop`, so a stop-finished request has accumulator_rows
+    # == len(all_token_ids) including the stop emission row -- the
+    # talker must NOT consume that row.  Max-token finishes do not
+    # append an extra forward, so no drop is needed.  Primary:
+    # distinguish via `request.status`.  Fallback only when status
+    # is absent: last-token-in-stop-id heuristic.
     status = getattr(request, "status", None)
     status_name = getattr(status, "name", None) or ""
     if not status_name and status is not None:
@@ -958,6 +957,6 @@ def talker2code2wav(
     return code2wav_inputs
 
 
-# Mark sync-side builders for the structural full-payload gate (see
-# should_accumulate_full_payload_output above).
+# Mark for forward compatibility; current consumer wait gating is
+# _FULL_PAYLOAD_INPUT_STAGES-driven (see should_accumulate_full_payload_output above).
 thinker2talker_token_only._is_sync_input = True

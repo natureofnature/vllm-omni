@@ -283,12 +283,12 @@ def talker2code2wav_async_chunk(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group C multi-key.
-# AR runner's `flatten_payload` (data_entry_keys.py:280-302) converts the
-# model emit `multimodal_outputs={"codes": {"audio": ..., "ref": ...},
-# "meta": {"ref_code_len": ..., "codec_streaming": ...}}` to flat dotted keys
-# (`codes.audio`, `codes.ref`, `meta.ref_code_len`, `meta.codec_streaming`)
-# before the accumulator runs.
+# Worker-connector data plane (non-async-chunk path).
+# AR runner's `flatten_payload` converts the model emit
+# `multimodal_outputs={"codes": {"audio": ..., "ref": ...},
+# "meta": {"ref_code_len": ..., "codec_streaming": ...}}` to flat dotted
+# keys (`codes.audio`, `codes.ref`, `meta.ref_code_len`,
+# `meta.codec_streaming`) before the full-payload accumulator runs.
 # - codes.audio is 2-D so default CONCAT across steps builds the full sequence.
 # - codes.ref is a list (not Tensor with dim>=2) so accumulator LATEST-wins
 #   keeps the prefill-emitted ref tensor across decode steps (which don't emit
@@ -415,7 +415,7 @@ def talker2code2wav_full_payload(
     pooling_output,
     request,
 ):
-    """Producer-side packer.
+    """Producer-side payload builder.
 
     Reads accumulated codec from `pooling_output["codes.audio"]` (CONCAT
     across steps via flatten_payload), latest `pooling_output["codes.ref"]`

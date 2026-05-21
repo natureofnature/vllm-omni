@@ -94,11 +94,11 @@ class MockQueue:
 class TestFullPayloadCoordinatorSelection(unittest.TestCase):
     """Tests for the (model_arch, model_stage) whitelist gate.
 
-    The gate scope must stay aligned with init_omni_connectors arch scope in
-    gpu_ar_model_runner.py / gpu_generation_model_runner.py.  Until those init
-    sites are generalised (planned for a later PR matching the tmp/trim_refactor
-    branch shape), only Qwen3-Omni talker / code2wav route full_payload stage
-    input through the worker connector.
+    The init_omni_connectors arch allowlist is keyed by ``model_arch`` and
+    is a superset of the stages registered here -- consumer-wait stages
+    must be registered explicitly in ``_FULL_PAYLOAD_INPUT_STAGES``, while
+    the init allowlist covers both producer- and consumer-side runners.
+    These tests pin which ``(arch, stage)`` pairs the gate fires for today.
     """
 
     def test_all_whitelisted_arch_stage_pairs_fire_gate(self):
