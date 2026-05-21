@@ -252,9 +252,16 @@ class OmniConnectorModelRunnerMixin:
         try:
             self.flush_full_payload_outputs({req_id})
         except Exception:
-            # Defensive: connector may not be initialised for archs
-            # outside the connector init allowlist.  Cleanup must still proceed.
-            pass
+            # Cleanup must still proceed regardless of flush errors here --
+            # we already gated on ``_omni_connector_initialized`` upstream,
+            # so any exception here reflects a real connector-side issue
+            # (shared memory corruption, background thread crash) worth
+            # surfacing rather than silently swallowing.
+            logger.warning(
+                "flush_full_payload_outputs(%s) raised during cleanup; continuing tear-down.",
+                req_id,
+                exc_info=True,
+            )
 
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]

@@ -566,7 +566,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 engine_core_outputs[0] = eco = EngineCoreOutputs()
             eco.scheduler_stats = stats
 
-        self._capture_omni_connector_output(model_runner_output, model_mode="ar")
+        self._capture_omni_connector_output(model_runner_output)
 
         # Free blocks that were held for transfer (kv_ready and
         # active_kv_transfers updates already done before the per-request loop).

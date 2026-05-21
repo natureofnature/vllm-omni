@@ -2,9 +2,12 @@
 from typing import Any
 
 import torch
+from vllm.logger import init_logger
 
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.models.covo_audio.config_covo_audio import COVO_AUDIO_TOKEN_INDEX
+
+logger = init_logger(__name__)
 
 # Per-model REPLACE-keys for the full-payload accumulator (none for covo_audio:
 # the producer side does not emit per-step hidden_states / model_outputs;
@@ -88,6 +91,10 @@ def llm2code2wav_full_payload(
     """
     output_token_ids = list(getattr(request, "output_token_ids", None) or [])
     if not output_token_ids:
+        logger.warning(
+            "covo_audio.llm2code2wav_full_payload: empty output_token_ids for req=%s; consumer wait gate may hang.",
+            getattr(request, "request_id", "?"),
+        )
         return None
     audio_codes = _filter_audio_codes(output_token_ids)
     return {

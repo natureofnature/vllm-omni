@@ -405,7 +405,14 @@ def llm2code2wav_full_payload(
     is kept in case a future runtime path bypasses `flatten_payload`.
     """
     del transfer_manager
+    rid = getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "mimo_audio.llm2code2wav_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
     codec_codes = pooling_output.get("codes.audio")
     if codec_codes is None:
@@ -414,10 +421,20 @@ def llm2code2wav_full_payload(
         if isinstance(codes, dict):
             codec_codes = codes.get("audio")
     if not isinstance(codec_codes, torch.Tensor) or codec_codes.numel() == 0:
+        logger.warning(
+            "mimo_audio.llm2code2wav_full_payload: missing/empty codes.audio "
+            "(keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
         return None
     codec_codes = codec_codes.to(torch.long)
     codec_codes = _filter_zero_codec_rows(codec_codes)
     if codec_codes.numel() == 0:
+        logger.warning(
+            "mimo_audio.llm2code2wav_full_payload: codec_codes empty after _filter_zero_codec_rows for req=%s.",
+            rid,
+        )
         return None
 
     pad_vec = torch.tensor([TALKER_CODEC_PAD_TOKEN_ID] * 4)

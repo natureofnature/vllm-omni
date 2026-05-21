@@ -8,7 +8,7 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 
-from vllm_omni.core.sched.output import OmniInputRegistration, OmniSchedulerOutput
+from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 
 logger = init_logger(__name__)
 
@@ -101,21 +101,19 @@ class OmniSchedulerMixin:
         )
         self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
 
-    def _capture_omni_connector_output(self, model_runner_output: Any, model_mode: str) -> None:
+    def _capture_omni_connector_output(self, model_runner_output: Any) -> None:
         """Stash the model runner's omni_connector_output for next schedule().
 
-        Called at the tail of every ``update_from_output()``.  Identical
-        between AR and generation schedulers except for ``model_mode``.
-
-        NOTE: this method only stashes the output.  Applying the metadata
-        is the responsibility of ``_consume_pending_connector_output()``
-        at the start of the next ``schedule()`` cycle.  Applying it twice
-        (once here, once on consume) is unsafe under
-        ``update_request_metadata`` in generation mode, which resets
-        ``prompt_token_ids`` / ``_output_token_ids`` / ``num_computed_tokens``
-        and would clobber any progress between the two calls.
+        Called at the tail of every ``update_from_output()`` -- identical
+        between AR and generation schedulers.  Only stashes the output;
+        applying the metadata is the responsibility of
+        ``_consume_pending_connector_output()`` at the start of the next
+        ``schedule()`` cycle.  Applying it twice (once here, once on
+        consume) is unsafe under ``update_request_metadata`` in
+        generation mode, which resets ``prompt_token_ids`` /
+        ``_output_token_ids`` / ``num_computed_tokens`` and would
+        clobber any progress between the two calls.
         """
-        del model_mode  # only used by the (removed) double-apply branch
         omni_output = getattr(model_runner_output, "omni_connector_output", None)
         if omni_output is None:
             return
@@ -126,7 +124,7 @@ class OmniSchedulerMixin:
         base: SchedulerOutput,
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
-        pending_input_registrations: list[OmniInputRegistration] | None = None,
+        pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 

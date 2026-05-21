@@ -72,7 +72,7 @@ class OmniCachedRequestData(CachedRequestData):
 
 
 @dataclass
-class OmniInputRegistration:
+class OmniChunkRecvHandle:
     """Minimal identifier carried from scheduler to runner for chunk-recv
     registration.
 
@@ -93,4 +93,4 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
-    pending_input_registrations: list[OmniInputRegistration] = field(default_factory=list)
+    pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
