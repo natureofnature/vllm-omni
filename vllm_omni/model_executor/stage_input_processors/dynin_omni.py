@@ -149,7 +149,7 @@ def token2image_to_token2audio(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path).
+# Worker-connector data plane (non-async-chunk path).
 # ============================================================================
 
 # Per-model REPLACE-keys for the full-payload accumulator.  dynin_omni's
@@ -160,7 +160,7 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
 
 
 def _build_full_payload(pooling_output: dict[str, Any] | None, request: Any) -> dict[str, Any] | None:
-    """Producer-side packer: assemble dynin_omni connector payload.
+    """Producer-side payload builder: assemble dynin_omni connector payload.
 
     Reads token_ids from ``pooling_output["token_ids"]`` (preferred) or
     ``request.output_token_ids`` (fallback).  Reads structured non-tensor
@@ -201,7 +201,7 @@ def token2text_to_token2image_full_payload(
     pooling_output: dict[str, Any],
     request: Any,
 ) -> dict[str, Any] | None:
-    """Producer-side packer for the Stage-0 → Stage-1 (text → image) transition."""
+    """Producer-side payload builder for the Stage-0 → Stage-1 (text → image) transition."""
     del transfer_manager
     return _build_full_payload(pooling_output, request)
 
@@ -211,7 +211,7 @@ def token2image_to_token2audio_full_payload(
     pooling_output: dict[str, Any],
     request: Any,
 ) -> dict[str, Any] | None:
-    """Producer-side packer for the Stage-1 → Stage-2 (image → audio) transition."""
+    """Producer-side payload builder for the Stage-1 → Stage-2 (image → audio) transition."""
     del transfer_manager
     return _build_full_payload(pooling_output, request)
 
@@ -264,6 +264,7 @@ def token2image_to_token2audio_token_only(
     return _token_only_from_source(source_outputs)
 
 
-# Mark sync-side builders for the structural full-payload gate.
+# Mark sync-side builders for forward compatibility; current consumer
+# wait gating is _FULL_PAYLOAD_INPUT_STAGES-driven.
 token2text_to_token2image_token_only._is_sync_input = True
 token2image_to_token2audio_token_only._is_sync_input = True

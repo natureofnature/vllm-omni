@@ -220,11 +220,10 @@ def test_thinker2talker_full_payload_drops_stop_emission_row_when_finished_stopp
     """FINISHED_STOPPED: drop 1 extra row even when rows == target.
 
     vLLM appends the stop-token to output_token_ids before check_stop, so
-    len(all_token_ids) includes the stop slot AND the accumulator has the
-    stop emission's forward row.  Both counts equal P+O (here 3).  Talker
+    len(all_token_ids) includes the stop slot AND the full-payload
+    accumulator has the stop emission's forward row.  Both counts equal P+O (here 3).  Talker
     target should be P+O-1 (=2), not P+O.  Without the extra drop the
-    stop emission's hidden state leaks into talker prefill (fba23325
-    spurious-phoneme regression).
+    stop emission's hidden state leaks into talker prefill.
     """
     request = SimpleNamespace(
         request_id="thinker-stop-finished",
@@ -272,7 +271,7 @@ def test_thinker2talker_full_payload_drops_stop_emission_via_eos_fallback() -> N
 
 
 def test_thinker2talker_full_payload_no_drop_when_finished_length_capped() -> None:
-    """FINISHED_LENGTH_CAPPED (max_tokens): no extra drop; BK 9702 regression guard."""
+    """FINISHED_LENGTH_CAPPED (max_tokens): no extra drop applied."""
     request = SimpleNamespace(
         request_id="thinker-length-capped",
         prompt_token_ids=[151644, 872],
@@ -528,7 +527,7 @@ def test_covo_audio_llm2code2wav_token_only_smoke() -> None:
 
 
 def test_covo_audio_llm2code2wav_full_payload_smoke() -> None:
-    """Smoke: covo_audio producer-side packer returns audio_codes + finished."""
+    """Smoke: covo_audio producer-side payload builder returns audio_codes + finished."""
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.models.covo_audio.config_covo_audio import COVO_AUDIO_TOKEN_INDEX
@@ -577,7 +576,7 @@ def test_dynin_omni_token_only_smoke() -> None:
 
 
 def test_dynin_omni_full_payload_smoke() -> None:
-    """Smoke: dynin_omni producer-side packer returns token_ids + finished."""
+    """Smoke: dynin_omni producer-side payload builder returns token_ids + finished."""
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.stage_input_processors.dynin_omni import (
@@ -621,7 +620,7 @@ def test_qwen2_5_omni_talker2code2wav_token_only_smoke() -> None:
 
 
 def test_qwen2_5_omni_talker2code2wav_full_payload_smoke() -> None:
-    """Smoke: qwen2_5_omni producer-side packer strips boundaries."""
+    """Smoke: qwen2_5_omni producer-side payload builder strips boundaries."""
     from types import SimpleNamespace
 
     from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
@@ -668,7 +667,7 @@ def test_mimo_audio_llm2code2wav_token_only_smoke() -> None:
 
 
 def test_mimo_audio_llm2code2wav_full_payload_smoke() -> None:
-    """Smoke: mimo_audio producer-side packer reads flat codes.audio + flattens."""
+    """Smoke: mimo_audio producer-side payload builder reads flat codes.audio + flattens."""
     from types import SimpleNamespace
 
     import torch
@@ -831,7 +830,7 @@ def test_cosyvoice3_text2flow_token_only_smoke() -> None:
             self.prompt_token_ids = prompt_tids
             self.finished = True
 
-    # multimodal_output has embed.* + we expect token_only to preserve it (Phase 4 #90 follow-up).
+    # multimodal_output has embed.* + we expect token_only to preserve it.
     import torch
 
     embed = {"speech_token": torch.zeros(2, 4)}
@@ -936,7 +935,7 @@ def test_ming_flash_omni_thinker2talker_token_only_smoke() -> None:
 
 
 def test_ming_flash_omni_thinker2talker_full_payload_noop() -> None:
-    """thinker2talker_full_payload returns None — no heavy tensor migration."""
+    """ming_flash_omni thinker2talker_full_payload is a no-op (returns None)."""
     from vllm_omni.model_executor.stage_input_processors.ming_flash_omni import (
         thinker2talker_full_payload,
     )
@@ -987,7 +986,7 @@ def test_qwen2_5_omni_thinker2talker_token_only_smoke() -> None:
 
 
 def test_qwen2_5_omni_thinker2talker_full_payload_noop() -> None:
-    """thinker2talker_full_payload returns None — no heavy tensor migration today."""
+    """thinker2talker_full_payload returns None when pooling_output lacks the "hidden" key (defensive)."""
     from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
         thinker2talker_full_payload,
     )

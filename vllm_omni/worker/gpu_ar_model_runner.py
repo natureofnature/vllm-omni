@@ -84,13 +84,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self.inputs_embeds = self._make_buffer(self.max_num_tokens, self.hidden_size, dtype=self.dtype, numpy=False)
         # Initialize KV cache manager (preserve vllm_config fallback behavior)
         self.kv_transfer_manager = OmniKVTransferManager.from_vllm_config(self.vllm_config, self.model_config)
-        # Worker-connector full-payload init is gated by an arch allowlist that
-        # grows as each per-arch transition is verified end-to-end (PR3 incremental
-        # Block A).  Adding an arch here without also wiring its scheduler-side
-        # gate entries in `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`
-        # produces a Stage-1 hang on the consumer side (request parks but no
-        # transport ever releases).  Keep the two in lockstep.
-        _BLOCK_A_INIT_ALLOWLIST = {
+        # Worker-connector init is gated by a per-`model_arch` allowlist
+        # (covers both producer-side and consumer-side runners for the
+        # arches below).  Consumer-wait stages must be registered
+        # separately as `(model_arch, model_stage)` tuples in
+        # `omni_scheduling_coordinator._FULL_PAYLOAD_INPUT_STAGES`;
+        # forgetting that produces a Stage-1 hang on the consumer.
+        _OMNI_CONNECTOR_INIT_ARCHS = {
             "Qwen3OmniMoeForConditionalGeneration",
             "Qwen2_5OmniForConditionalGeneration",
             "CovoAudioForConditionalGeneration",
@@ -100,7 +100,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             "CosyVoice3Model",
             "DyninOmniForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _BLOCK_A_INIT_ALLOWLIST:
+        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
             self.init_omni_connectors(
                 vllm_config=self.vllm_config,
                 model_config=self.model_config,

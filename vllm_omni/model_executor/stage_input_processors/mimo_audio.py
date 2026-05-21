@@ -147,10 +147,8 @@ def llm2code2wav_async_chunk(
     Accumulates codes in connector per request_id,
     returns payload only when chunk_size is full or request is finished; returns None when waiting.
     """
-    # Null guard: under Block A universal-ish init, the producer-side
-    # chunk_transfer_adapter calls this every emit step including no-output
-    # steps where pooling_output is None.  Pre-Block-A this code path was
-    # unreachable (no connector init for mimo_audio).
+    # Null guard: chunk_transfer_adapter calls this every emit step
+    # including no-output steps where pooling_output is None.
     if pooling_output is None or not isinstance(pooling_output, dict):
         if is_finished:
             connector = getattr(transfer_manager, "connector", None)
@@ -317,10 +315,10 @@ def llm2code2wav(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group B.
-# AR runner's `flatten_payload` (data_entry_keys.py:280-302) converts the
-# model emit `multimodal_outputs={"codes": {"audio": ...}}` to flat
-# `pooling_output["codes.audio"]` before the accumulator runs, so default
+# Worker-connector data plane (non-async-chunk path).
+# AR runner's `flatten_payload` converts the model emit
+# `multimodal_outputs={"codes": {"audio": ...}}` to flat
+# `pooling_output["codes.audio"]` before the full-payload accumulator runs, so default
 # CONCAT semantics build the full codec tensor across all decode steps.
 # ============================================================================
 
@@ -397,7 +395,7 @@ def llm2code2wav_full_payload(
     pooling_output: dict,
     request,
 ) -> dict | None:
-    """Producer-side packer for the worker connector data plane.
+    """Producer-side payload builder for the worker connector data plane.
 
     AR runner's ``flatten_payload`` converts the per-step model emit
     ``{"codes": {"audio": ...}}`` to ``pooling_output["codes.audio"]``.

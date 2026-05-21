@@ -33,30 +33,30 @@ logger = init_logger(__name__)
 # Stage 1 hang (gate parks the request, no transport ever releases it).
 #
 # The `_is_sync_input` markers on per-model `*_token_only` builders in
-# stage_input_processors/ remain as forward-compat documentation; when init
-# is generalised (see tmp/trim_refactor branch) this whitelist can move back
-# to a structural marker check or be dropped entirely.
+# stage_input_processors/ remain as forward-compat documentation; when
+# init is generalised this whitelist can move back to a structural marker
+# check or be dropped entirely.
 _FULL_PAYLOAD_INPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
     {
         ("Qwen3OmniMoeForConditionalGeneration", "talker"),
         ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
-        # PR3 Block A: qwen2_5_omni thinker->talker now uses the real
-        # full-payload producer builder (text_hidden_states routed via
+        # qwen2_5_omni thinker->talker uses the real full-payload
+        # producer builder (text_hidden_states routed via
         # pooler_output["hidden"] -> accumulator -> connector).  Both
         # stages of qwen2_5_omni are enabled.
         ("Qwen2_5OmniForConditionalGeneration", "talker"),
         ("Qwen2_5OmniForConditionalGeneration", "code2wav"),
-        # PR3 Block A: covo_audio is fused_thinker_talker (Stage 0) → code2wav (Stage 1)
+        # covo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
         ("CovoAudioForConditionalGeneration", "code2wav"),
-        # PR3 Block A: mimo_audio is fused_thinker_talker (Stage 0) → code2wav (Stage 1)
+        # mimo_audio: fused_thinker_talker (Stage 0) -> code2wav (Stage 1).
         ("MiMoAudioModel", "code2wav"),
-        # PR3 Block A: qwen3_tts is Qwen3TTSTalkerForConditionalGeneration (Stage 0)
-        # → Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
+        # qwen3_tts: Qwen3TTSTalkerForConditionalGeneration (Stage 0)
+        # -> Qwen3TTSCode2Wav (Stage 1).  Stage 1 is the consumer.
         ("Qwen3TTSCode2Wav", "code2wav"),
-        # PR3 Block A: cosyvoice3 stages cosyvoice3_talker (Stage 0) → cosyvoice3_code2wav (Stage 1)
+        # cosyvoice3: cosyvoice3_talker (Stage 0) -> cosyvoice3_code2wav (Stage 1).
         ("CosyVoice3Model", "cosyvoice3_code2wav"),
-        # PR3 dynin migration: token2text (Stage 0) -> token2image (Stage 1)
-        # -> token2audio (Stage 2).  Producer wires via
+        # dynin: token2text (Stage 0) -> token2image (Stage 1) ->
+        # token2audio (Stage 2).  Producer wires via
         # custom_process_next_stage_input_func: *_full_payload in deploy yaml.
         ("DyninOmniForConditionalGeneration", "token2image"),
         ("DyninOmniForConditionalGeneration", "token2audio"),

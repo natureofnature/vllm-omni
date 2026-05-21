@@ -93,9 +93,19 @@ def talker2code2wav(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group B half.
-# Only talker→code2wav is migrated in this commit; thinker→talker (Group A)
-# requires model-side pooler_output emit and is deferred.
+# Worker-connector data plane (non-async-chunk path).
+# Both transitions ship payloads via the worker connector
+# (registered in ``_FULL_PAYLOAD_INPUT_STAGES`` in
+# omni_scheduling_coordinator):
+# - thinker->talker reads accumulated ``pooling_output["hidden"]`` and
+#   packs an OmniPayload-shaped dict (embed.prefill /
+#   hidden_states.output / ids.prompt / ids.output) for the talker.
+#   ``thinker2talker_token_only`` writes the same shape into
+#   ``additional_information`` as a legacy sync fallback; the talker's
+#   ``talker_preprocess`` reads either source through the same payload
+#   keys.
+# - talker->code2wav strips TALKER_CODEC_{START,END} boundary tokens
+#   and ships the codec token ids.
 # ============================================================================
 
 # Per-model REPLACE-keys for the full-payload accumulator.  qwen2_5_omni's
@@ -162,9 +172,9 @@ def talker2code2wav_full_payload(
     pooling_output: dict,
     request,
 ) -> dict | None:
-    """Producer-side packer: ship the stripped codec ids via connector.
+    """Producer-side payload builder: ship the stripped codec ids via connector.
 
-    Group B shape — token_ids only.  The talker stage's output already
+    Token-ids-only shape.  The talker stage's output already
     carries the codec ids on ``request.output_token_ids``; we strip the
     boundary tokens and pack a minimal payload.
     """
@@ -182,18 +192,17 @@ def talker2code2wav_full_payload(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group A reduced
-# to D-minimal shape.
+# Worker-connector data plane (non-async-chunk path) -- thinker->talker.
 #
-# Three subagent investigations (2026-05-16, audits/) confirmed:
-# - qwen2_5_omni talker consumes ONE tensor (last-layer hidden state) via
-#   Linear(3584, 896); no early-layer-0 consumer, no `accept_hidden_layer`
-#   HF config field.
-# - `text_hidden_states` is NOT plumbed into the AR runner pooler_output
-#   chain, so the existing accumulator cannot ship it.
-# So the PR3 migration is structural-only: thinker2talker_token_only mirrors
-# the legacy body so additional_information continues to carry the latent
-# tensor (same as cosyvoice3's post-fix state).  full_payload returns None.
+# qwen2_5_omni's talker consumes the thinker's last-layer hidden state
+# via Linear(3584, 896).  The AR runner publishes those hidden states
+# per decode step on ``pooling_output["hidden"]`` (unpacked from
+# ``OmniOutput.text_hidden_states``); the full-payload accumulator
+# concatenates them so ``thinker2talker_full_payload`` sees the full
+# prefill+decode trajectory and packs an OmniPayload-shaped dict.
+# ``thinker2talker_token_only`` writes the same shape into
+# ``additional_information`` as a legacy sync fallback; the talker's
+# ``talker_preprocess`` reads ``info_dict`` regardless of source.
 # ============================================================================
 
 _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
@@ -206,17 +215,19 @@ def thinker2talker_token_only(
 ):
     """Sync-side builder for the non-async-chunk thinker->talker path.
 
-    Body is identical to legacy ``thinker2talker`` above — preserves the
-    orchestrator-shaped data path (latent in additional_information) so
-    the talker stage receives thinker hidden states without requiring the
-    worker connector to deliver them.  Filed as a Phase 4 follow-up to
-    route the latent via connector once the AR runner's text_hidden_states
-    plumbing is wired into pooler_output / model_intermediate_buffer.
+    Body mirrors the legacy ``thinker2talker`` above: packs an
+    OmniPayload-shaped dict (hidden_states.output / embed.prefill /
+    ids.prompt / ids.output) into ``additional_information``, allocates
+    TALKER_CODEC_{START,PAD,END} prompt slots, and forwards
+    ``multi_modal_data``.  Serves as a legacy sync fallback; the same
+    shape is also built by ``thinker2talker_full_payload`` below and
+    shipped via the worker connector.
 
-    The ``_is_sync_input = True`` marker below activates the Phase 2a
-    structural gate so the rest of the PR3 infrastructure (gen scheduler
-    bridge, runner lifecycle, full-payload accumulator) participates
-    consistently with the other 8 migrated transitions.
+    The ``_is_sync_input = True`` marker below is currently dormant
+    forward-compat documentation -- the consumer-wait gate is
+    whitelist-driven via ``_FULL_PAYLOAD_INPUT_STAGES`` (see the mixin
+    ``should_accumulate_full_payload_output`` docstring), not by this
+    marker.
     """
     thinker_outputs = source_outputs
     talker_inputs = []
@@ -269,7 +280,7 @@ def thinker2talker_full_payload(
     pooling_output,
     request,
 ):
-    """Producer-side packer for the worker-connector data plane.
+    """Producer-side payload builder for the worker-connector data plane.
 
     The AR runner emits per-step ``pooling_output["hidden"]`` (the
     thinker's last-layer hidden states for the request span, unpacked
@@ -284,10 +295,9 @@ def thinker2talker_full_payload(
     decode hidden states, then pack the ``OmniPayload``-shaped dict that
     the talker's ``thinker_to_talker_process`` already reads (keys
     ``embed.prefill`` / ``hidden_states.output`` / ``ids.prompt`` /
-    ``ids.output``).  Shape matches what
-    ``thinker2talker_token_only`` writes into
-    ``additional_information``, so the consumer-side coordinator gate
-    flip is a drop-in once the no-touch coordinator file is updated.
+    ``ids.output``).  Shape matches what ``thinker2talker_token_only``
+    writes into ``additional_information``, so the talker consumes the
+    same payload layout from either path.
 
     Like ``qwen3_omni.thinker2talker_full_payload``, we apply a
     finish-reason-aware stop-row trim: vLLM v1 appends the sampled

@@ -327,13 +327,13 @@ def talker2code2wav_async_chunk(
 
 
 # ============================================================================
-# PR3 worker-connector data plane (non-async-chunk path) — Group D-ish.
+# Worker-connector data plane (non-async-chunk path).
 # cosyvoice3 talker emits `multimodal_outputs={"embed": {"speech_token": t,
 # "speech_feat": t, "embedding": t}}` ONLY at prefill (decode steps emit
-# `{}`).  After flatten_payload (data_entry_keys.py:280-302) these become
-# flat top-level keys `embed.speech_token` etc., persisted across decode
-# steps by the accumulator (decode doesn't re-emit them).  Shipping via
-# the connector keeps the orchestrator off the heavy-tensor path.
+# `{}`).  After flatten_payload these become flat top-level keys
+# `embed.speech_token` etc., persisted across decode steps by the
+# full-payload accumulator (decode doesn't re-emit them).  Shipping via the connector
+# keeps the orchestrator off the heavy-tensor path.
 # ============================================================================
 
 # All three embed tensors are emitted once at prefill and must REPLACE-not-
@@ -391,7 +391,7 @@ def text2flow_full_payload(
     pooling_output,
     request,
 ):
-    """Producer-side packer.
+    """Producer-side payload builder.
 
     Reads prefill-emitted `embed.{speech_token, speech_feat, embedding}` from
     the accumulator and ships prompt conditioning as a connector payload.

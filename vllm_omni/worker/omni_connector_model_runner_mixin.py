@@ -56,17 +56,15 @@ def should_accumulate_full_payload_output(model_config, custom_process_func) -> 
     stage is not in async_chunk mode, and ``model_stage`` is set.
 
     NOTE: the ``_is_sync_input`` marker is on the *consumer-side*
-    ``*_token_only`` builder, not on the ``*_full_payload`` packer that
-    workers load on the *producer* side.  So checking it here would always
-    return False and the accumulator would never run.  The
-    consumer-side scheduler gate (``uses_full_payload_input_coordinator``
-    in ``omni_scheduling_coordinator.py``) is where the marker is
-    appropriately tested.
-
-    Pre-Phase-2a, this gate was an arch + stage whitelist
-    (``Qwen3OmniMoeForConditionalGeneration`` and ``thinker``/``talker``).
-    Phase 2a generalized that to "any stage with a loaded packer + not
-    async_chunk + model_stage set" — arch-agnostic.
+    ``*_token_only`` builder, not on the ``*_full_payload`` payload builder that
+    workers load on the *producer* side, so checking it here would
+    always return False and the full-payload accumulator would never run.  The
+    marker itself is currently dormant forward-compat documentation:
+    the consumer-side scheduler gate
+    (``uses_full_payload_input_coordinator`` in
+    ``omni_scheduling_coordinator.py``) is whitelist-driven on
+    ``(model_arch, model_stage)`` against ``_FULL_PAYLOAD_INPUT_STAGES``
+    -- adding the marker alone does not open a consumer-wait gate.
     """
     if custom_process_func is None:
         return False
@@ -265,7 +263,7 @@ class OmniConnectorModelRunnerMixin:
             self.flush_full_payload_outputs({req_id})
         except Exception:
             # Defensive: connector may not be initialised for archs
-            # outside the Block A allowlist.  Cleanup must still proceed.
+            # outside the connector init allowlist.  Cleanup must still proceed.
             pass
 
         ext_id = self._request_ids_mapping.pop(req_id, None)
@@ -776,7 +774,7 @@ class OmniConnectorModelRunnerMixin:
     def _resolve_full_payload_replace_keys(self) -> frozenset:
         """Per-model REPLACE-key set for the full-payload accumulator.
 
-        Looked up from the SIP module that ships the model's sync builder
+        Looked up from the stage-input-processor module that ships the model's sync builder
         (`model_config.custom_process_input_func.__module__`).  The module
         declares ``_FULL_PAYLOAD_REPLACE_KEYS: frozenset[str]``; if absent,
         returns the empty set.
@@ -1022,9 +1020,9 @@ class OmniConnectorModelRunnerMixin:
         if self._stage_id == 0:
             return
         request_id = request.request_id
-        # Codex Issue 3: explicit external_req_id=None should fall back to
-        # request_id; otherwise recv keys become `None_<stage>_<chunk>` and
-        # collide across requests.
+        # Explicit external_req_id=None must fall back to request_id;
+        # otherwise recv keys become `None_<stage>_<chunk>` and collide
+        # across requests.
         ext = getattr(request, "external_req_id", None)
         self._request_ids_mapping[request_id] = ext if ext is not None else request_id
         with self._lock:
@@ -2210,7 +2208,7 @@ class OmniConnectorModelRunnerMixin:
         if mapped is not None:
             return mapped
         if request is not None:
-            # Codex Issue 3: external_req_id may be explicitly None; fall back.
+            # external_req_id may be explicitly None; fall back.
             ext = getattr(request, "external_req_id", None)
             if ext is not None:
                 return ext
