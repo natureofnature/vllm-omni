@@ -628,6 +628,46 @@ def test_qwen2_5_omni_talker2code2wav_full_payload_smoke() -> None:
     assert payload["meta"]["finished"].item() is True
 
 
+def test_qwen2_5_omni_talker2code2wav_filters_control_tokens_and_placeholders() -> None:
+    """Qwen2.5 code2wav receives codec ids only, not talker prompt/control ids."""
+    from types import SimpleNamespace
+
+    from vllm_omni.model_executor.stage_input_processors.qwen2_5_omni import (
+        TALKER_CODEC_END_TOKEN_ID,
+        TALKER_CODEC_PAD_TOKEN_ID,
+        TALKER_CODEC_START_TOKEN_ID,
+        talker2code2wav_full_payload,
+        talker2code2wav_token_only,
+    )
+
+    class _Out:
+        def __init__(self, tids):
+            self.cumulative_token_ids = tids
+
+    class _Wrap:
+        def __init__(self, tids):
+            self.outputs = [_Out(tids)]
+
+    raw_ids = [
+        TALKER_CODEC_START_TOKEN_ID,
+        TALKER_CODEC_PAD_TOKEN_ID,
+        5,
+        6,
+        TALKER_CODEC_END_TOKEN_ID,
+        -1,
+        -1,
+    ]
+
+    token_only = talker2code2wav_token_only([_Wrap(raw_ids)])
+    assert len(token_only) == 1
+    assert len(token_only[0]["prompt_token_ids"]) == 4
+
+    payload = talker2code2wav_full_payload(None, {}, SimpleNamespace(output_token_ids=raw_ids))
+    assert payload is not None
+    assert payload["codes"]["audio"] == [5, 6, 6, 6]
+    assert payload["meta"]["finished"].item() is True
+
+
 def test_mimo_audio_llm2code2wav_token_only_smoke() -> None:
     """Smoke: mimo_audio token-only builder sizes prompt."""
     import torch

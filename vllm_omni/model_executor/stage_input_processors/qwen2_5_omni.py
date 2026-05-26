@@ -115,25 +115,27 @@ _FULL_PAYLOAD_REPLACE_KEYS: frozenset[str] = frozenset()
 
 
 def _strip_codec_boundaries(token_ids: list[int]) -> list[int]:
-    """Drop TALKER_CODEC_START/END boundary tokens (mirror talker2code2wav)
-    and filter sentinel/invalid codec ids.
+    """Keep only real codec ids for the code2wav stage.
 
-    The talker emits codec ids on `request.output_token_ids`.  Negative ids
-    (e.g., -1) appear as "stopped early" / "no token sampled this step"
-    sentinels and are NOT valid codec embedding indices.  Passing -1 to
-    `torch.embedding` triggers a CUDA gather-kernel OOB assert in the
-    code2wav stage (`vectorized_gather_kernel index out of bounds`).  We
-    filter them here at the producer-side strip so the worker connector
-    payload only ships valid codec ids.
+    The talker stream can contain prompt/control ids (START/PAD/END/MASK) in
+    addition to sampled codec ids.  Code2wav expects codec ids only; carrying
+    the prompt PAD span forward can inflate the sequence enough to OOM on L4.
+    Async scheduling may also leave trailing ``-1`` placeholders, so preserve
+    their length by repeating the last valid codec id.
     """
     tids = list(token_ids)
-    if tids and tids[0] == TALKER_CODEC_START_TOKEN_ID:
-        tids = tids[1:]
+    trailing_placeholder_count = 0
+    while trailing_placeholder_count < len(tids) and tids[-1 - trailing_placeholder_count] == -1:
+        trailing_placeholder_count += 1
+
     if tids and tids[-1] == TALKER_CODEC_END_TOKEN_ID:
         tids = tids[:-1]
-    # Filter negative sentinel ids that the talker engine may insert.
-    tids = [t for t in tids if t >= 0]
-    return tids
+        trailing_placeholder_count = 0
+
+    codec_ids = [tid for tid in tids if 0 <= tid < TALKER_CODEC_PAD_TOKEN_ID]
+    if trailing_placeholder_count > 0 and codec_ids:
+        codec_ids.extend([codec_ids[-1]] * trailing_placeholder_count)
+    return codec_ids
 
 
 def talker2code2wav_token_only(
