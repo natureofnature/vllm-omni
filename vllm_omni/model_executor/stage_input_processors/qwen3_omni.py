@@ -455,7 +455,13 @@ def thinker2talker_full_payload(
     request: OmniEngineCoreRequest,
 ) -> dict[str, Any] | None:
     """Pack complete thinker output for the non-async connector path."""
+    rid = getattr(request, "request_id", None)
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "thinker2talker_full_payload: pooling_output not a dict (type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
 
     layers = {
@@ -468,11 +474,13 @@ def thinker2talker_full_payload(
         hidden = pooling_output.get("hidden")
         thinker_emb = hidden if isinstance(hidden, torch.Tensor) else None
     if thinker_emb is None or thinker_hid is None:
-        logger.debug(
-            "thinker2talker_full_payload: missing thinker tensors for req=%s (embed=%s hidden=%s)",
-            getattr(request, "request_id", None),
+        logger.warning(
+            "thinker2talker_full_payload: missing thinker tensors for req=%s "
+            "(embed=%s hidden=%s keys=%s); consumer wait gate may hang.",
+            rid,
             thinker_emb is not None,
             thinker_hid is not None,
+            list(pooling_output.keys()),
         )
         return None
 
@@ -860,7 +868,14 @@ def talker2code2wav_full_payload(
     request: OmniEngineCoreRequest,
 ) -> dict[str, Any] | None:
     """Pack complete talker codec output for the non-async connector path."""
+    rid = getattr(request, "request_id", None)
     if not isinstance(pooling_output, dict):
+        logger.warning(
+            "talker2code2wav_full_payload: pooling_output not a dict "
+            "(type=%s) for req=%s; consumer wait gate may hang.",
+            type(pooling_output).__name__,
+            rid,
+        )
         return None
     code_predictor_codes = pooling_output.get("codes.audio")
     if code_predictor_codes is None:
@@ -868,10 +883,19 @@ def talker2code2wav_full_payload(
         if isinstance(codes, dict):
             code_predictor_codes = codes.get("audio")
     if code_predictor_codes is None:
+        logger.warning(
+            "talker2code2wav_full_payload: missing codes.audio (keys=%s) for req=%s; consumer wait gate may hang.",
+            list(pooling_output.keys()),
+            rid,
+        )
         return None
     if not isinstance(code_predictor_codes, torch.Tensor):
         code_predictor_codes = torch.as_tensor(code_predictor_codes)
     if code_predictor_codes.numel() == 0:
+        logger.warning(
+            "talker2code2wav_full_payload: empty codes.audio for req=%s; consumer wait gate may hang.",
+            rid,
+        )
         return None
 
     output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
@@ -881,6 +905,16 @@ def talker2code2wav_full_payload(
         list(output_token_ids),
     )
     if code_predictor_codes.numel() == 0:
+        logger.warning(
+            "talker2code2wav_full_payload: no valid codec rows after filtering "
+            "(raw_shape=%s output_ids_len=%d aligned_rows=%s valid_rows=%s) for req=%s; "
+            "consumer wait gate may hang.",
+            raw_shape,
+            len(output_token_ids),
+            codec_stats["aligned_rows"],
+            codec_stats["valid_rows"],
+            rid,
+        )
         return None
 
     codec_codes = code_predictor_codes.transpose(0, 1).cpu().reshape(-1).tolist()

@@ -49,15 +49,20 @@ logger = init_logger(__name__)
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
     """Producer-side structural gate.
 
-    Fires iff the worker has a connector payload builder loaded
-    (``custom_process_func`` resolved via ``_load_custom_func`` from the
-    stage_config's ``custom_process_next_stage_input_func`` or the
-    ``*_full_payload`` derivative of ``custom_process_input_func``), the
-    stage is not in async_chunk mode, and ``model_stage`` is set.
+    Fires iff the stage explicitly declares a downstream full-payload
+    producer hook via ``custom_process_next_stage_input_func``.  Consumer
+    stages may have ``custom_process_input_func`` values that can be
+    mechanically derived to ``*_full_payload`` helper names in the same
+    module; those are intentionally not enough to make the stage a producer.
     """
     if custom_process_func is None:
         return False
     if getattr(model_config, "async_chunk", False):
+        return False
+    if getattr(model_config, "final_output", False):
+        return False
+    next_stage_func = getattr(model_config, "custom_process_next_stage_input_func", None)
+    if not isinstance(next_stage_func, str) or not next_stage_func:
         return False
     return getattr(model_config, "model_stage", None) is not None
 

@@ -400,12 +400,16 @@ def _make_full_payload_accumulation_runner(
     model_arch="Qwen3OmniMoeForConditionalGeneration",
     model_stage="talker",
     async_chunk=False,
+    final_output=False,
+    custom_process_next_stage_input_func="module.full_payload",
 ):
     runner = object.__new__(OmniConnectorModelRunnerMixin)
     runner.model_config = SimpleNamespace(
         model_arch=model_arch,
         model_stage=model_stage,
         async_chunk=async_chunk,
+        final_output=final_output,
+        custom_process_next_stage_input_func=custom_process_next_stage_input_func,
     )
     runner._custom_process_func = object()
     runner._pending_full_payload_send = {}
@@ -475,22 +479,27 @@ def test_accumulate_full_payload_output_keeps_all_zero_qwen3_omni_prefill_placeh
 
 
 def test_full_payload_output_accumulation_hook_matrix():
-    """Producer-side gate: fires iff custom_process_func is loaded and not async_chunk.
+    """Producer-side gate: fires iff an explicit next-stage payload hook is loaded.
 
-    The gate is a structural check on the loaded payload builder.
-    `_custom_process_func is None` short-circuits;
-    that maps to terminal stages (e.g. code2wav, qwen3_tts code2wav, qwen2_5
-    code2wav) whose stage_config has no `custom_process_next_stage_input_func`
-    and no `*_full_payload` derivative of `custom_process_input_func`.
+    A derived `*_full_payload` helper from `custom_process_input_func` is not
+    enough: terminal/input-only consumer stages must not enqueue orphan
+    downstream payloads.
     """
-    # Thinker / talker producer stages: payload builder loaded -> gate fires.
+    # Thinker / talker producer stages: explicit next-stage payload hook -> gate fires.
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
 
-    # Terminal stage: emulate `_load_custom_func` returning None (no downstream).
-    runner = _make_full_payload_accumulation_runner(model_stage="code2wav")
-    runner._custom_process_func = None
-    runner._should_accumulate_full_payload_output_cached = None
+    # Terminal stage: even if _load_custom_func derived a builder from
+    # custom_process_input_func, final output stages are not producers.
+    runner = _make_full_payload_accumulation_runner(model_stage="code2wav", final_output=True)
+    assert not runner._should_accumulate_full_payload_output()
+
+    # Input-only consumer stage without an explicit producer hook must not
+    # accumulate/send just because a same-module *_full_payload helper exists.
+    runner = _make_full_payload_accumulation_runner(
+        model_stage="token2audio",
+        custom_process_next_stage_input_func=None,
+    )
     assert not runner._should_accumulate_full_payload_output()
 
     # async_chunk mode -> gate off.
