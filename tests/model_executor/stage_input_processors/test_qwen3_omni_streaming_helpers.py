@@ -246,6 +246,29 @@ def test_thinker2talker_full_payload_drops_stop_emission_row_when_finished_stopp
     assert payload["hidden_states"]["output"].shape[0] == 2
 
 
+def test_thinker2talker_full_payload_returns_empty_when_stop_consumes_all_rows() -> None:
+    """If the only generated row is a stop emission, ship empty tensors."""
+    request = SimpleNamespace(
+        request_id="thinker-stop-only",
+        prompt_token_ids=[],
+        output_token_ids=[151645],
+        all_token_ids=[151645],
+        sampling_params=None,
+        status=SimpleNamespace(name="FINISHED_STOPPED"),
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(1, 2),
+        "hidden_states.layer_24": torch.full((1, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_full_payload(None, pooling_output, request)
+
+    assert payload is not None
+    assert payload["embed"]["prefill"].shape[0] == 0
+    assert payload["hidden_states"]["output"].shape[0] == 0
+
+
 def test_thinker2talker_full_payload_drops_stop_emission_via_eos_fallback() -> None:
     """Stop-detection fallback: last token in sampling_params.eos_token_id."""
     EOS = 151645

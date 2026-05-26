@@ -125,6 +125,57 @@ def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
     return 0 <= token_id < _QWEN3_CODEC_CODEBOOK_SIZE
 
 
+def _qwen3_status_name(request: Any) -> str:
+    status = getattr(request, "status", None)
+    status_name = getattr(status, "name", None) or ""
+    if not status_name and status is not None:
+        status_name = str(status).rsplit(".", 1)[-1]
+    return status_name
+
+
+def _qwen3_stop_token_ids(sampling_params: Any) -> set[int]:
+    stop_ids: set[int] = set()
+    for sid in getattr(sampling_params, "stop_token_ids", None) or ():
+        if isinstance(sid, int):
+            stop_ids.add(sid)
+
+    if bool(getattr(sampling_params, "ignore_eos", False)):
+        return stop_ids
+
+    for eos in (
+        getattr(sampling_params, "eos_token_id", None),
+        getattr(sampling_params, "_eos_token_id", None),
+    ):
+        if isinstance(eos, int):
+            stop_ids.add(eos)
+    for sid in (
+        getattr(sampling_params, "all_stop_token_ids", None)
+        or getattr(sampling_params, "_all_stop_token_ids", None)
+        or ()
+    ):
+        if isinstance(sid, int):
+            stop_ids.add(sid)
+    return stop_ids
+
+
+def _qwen3_stop_emission_drop(request: Any, output_token_ids: list[Any]) -> int:
+    """Return 1 when the final thinker row is the stop-token emission."""
+    status_name = _qwen3_status_name(request)
+    if status_name == "FINISHED_STOPPED":
+        return 1
+    if status_name or not output_token_ids:
+        # Explicit non-stop finishes, especially FINISHED_LENGTH_CAPPED, should
+        # keep all generated rows.
+        return 0
+
+    sampling_params = getattr(request, "sampling_params", None)
+    if sampling_params is None:
+        return 0
+
+    stop_ids = _qwen3_stop_token_ids(sampling_params)
+    return 1 if stop_ids and output_token_ids[-1] in stop_ids else 0
+
+
 def _prepare_qwen3_talker_prefill(
     request: Any,
     thinker_emb: torch.Tensor,
@@ -139,42 +190,22 @@ def _prepare_qwen3_talker_prefill(
 
     # vLLM appends sampled tokens before stop checking.  Stop-finished requests
     # therefore have one final hidden row that the talker should not consume.
-    status = getattr(request, "status", None)
-    status_name = getattr(status, "name", None) or ""
-    if not status_name and status is not None:
-        status_name = str(status).rsplit(".", 1)[-1]
-    stop_emission_drop = 1 if status_name == "FINISHED_STOPPED" else 0
-
-    if stop_emission_drop == 0 and not status_name and output_token_ids:
-        sampling_params = getattr(request, "sampling_params", None)
-        if sampling_params is not None:
-            stop_ids: set[int] = set()
-            for sid in getattr(sampling_params, "stop_token_ids", None) or ():
-                if isinstance(sid, int):
-                    stop_ids.add(sid)
-            if not bool(getattr(sampling_params, "ignore_eos", False)):
-                for eos in (
-                    getattr(sampling_params, "eos_token_id", None),
-                    getattr(sampling_params, "_eos_token_id", None),
-                ):
-                    if isinstance(eos, int):
-                        stop_ids.add(eos)
-                for sid in (
-                    getattr(sampling_params, "all_stop_token_ids", None)
-                    or getattr(sampling_params, "_all_stop_token_ids", None)
-                    or ()
-                ):
-                    if isinstance(sid, int):
-                        stop_ids.add(sid)
-            if stop_ids and output_token_ids[-1] in stop_ids:
-                stop_emission_drop = 1
-
+    stop_emission_drop = _qwen3_stop_emission_drop(request, output_token_ids)
     target_rows = max(0, len(all_token_ids) - stop_emission_drop)
     request_id = getattr(request, "request_id", None)
 
     def _trim(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dim() < 1 or tensor.shape[0] == 0 or target_rows <= 0:
+        if tensor.dim() < 1 or tensor.shape[0] == 0:
             return tensor
+        if target_rows <= 0:
+            logger.warning(
+                "thinker2talker_full_payload: target_rows<=0 "
+                "(all_token_ids=%d, stop_drop=%d) for req=%s; shipping empty tensor",
+                len(all_token_ids),
+                stop_emission_drop,
+                request_id,
+            )
+            return tensor[:0]
         if tensor.shape[0] > target_rows + 1:
             logger.warning(
                 "thinker2talker_full_payload: unexpected excess rows "
