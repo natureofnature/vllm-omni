@@ -125,117 +125,6 @@ def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
     return 0 <= token_id < _QWEN3_CODEC_CODEBOOK_SIZE
 
 
-def _qwen3_status_name(request: Any) -> str:
-    status = getattr(request, "status", None)
-    status_name = getattr(status, "name", None) or ""
-    if not status_name and status is not None:
-        status_name = str(status).rsplit(".", 1)[-1]
-    return status_name
-
-
-def _qwen3_stop_token_ids(sampling_params: Any) -> set[int]:
-    stop_ids: set[int] = set()
-    for sid in getattr(sampling_params, "stop_token_ids", None) or ():
-        if isinstance(sid, int):
-            stop_ids.add(sid)
-
-    if bool(getattr(sampling_params, "ignore_eos", False)):
-        return stop_ids
-
-    for eos in (
-        getattr(sampling_params, "eos_token_id", None),
-        getattr(sampling_params, "_eos_token_id", None),
-    ):
-        if isinstance(eos, int):
-            stop_ids.add(eos)
-    for sid in (
-        getattr(sampling_params, "all_stop_token_ids", None)
-        or getattr(sampling_params, "_all_stop_token_ids", None)
-        or ()
-    ):
-        if isinstance(sid, int):
-            stop_ids.add(sid)
-    return stop_ids
-
-
-def _qwen3_stop_emission_drop(request: Any, output_token_ids: list[Any]) -> int:
-    """Return 1 when the final thinker row is the stop-token emission."""
-    status_name = _qwen3_status_name(request)
-    if status_name == "FINISHED_STOPPED":
-        return 1
-    if status_name or not output_token_ids:
-        # Explicit non-stop finishes, especially FINISHED_LENGTH_CAPPED, should
-        # keep all generated rows.
-        return 0
-
-    sampling_params = getattr(request, "sampling_params", None)
-    if sampling_params is None:
-        return 0
-
-    stop_ids = _qwen3_stop_token_ids(sampling_params)
-    return 1 if stop_ids and output_token_ids[-1] in stop_ids else 0
-
-
-def _prepare_qwen3_talker_prefill(
-    request: Any,
-    thinker_emb: torch.Tensor,
-    thinker_hid: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor, list[Any], list[Any]]:
-    """Build token ids and trim thinker rows that talker should consume."""
-    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
-    output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
-    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
-    if not all_token_ids:
-        all_token_ids = list(prompt_token_ids) + list(output_token_ids)
-
-    # vLLM appends sampled tokens before stop checking.  Stop-finished requests
-    # therefore have one final hidden row that the talker should not consume.
-    stop_emission_drop = _qwen3_stop_emission_drop(request, output_token_ids)
-    target_rows = max(0, len(all_token_ids) - stop_emission_drop)
-    request_id = getattr(request, "request_id", None)
-
-    def _trim(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dim() < 1 or tensor.shape[0] == 0:
-            return tensor
-        if target_rows <= 0:
-            logger.warning(
-                "thinker2talker_full_payload: target_rows<=0 "
-                "(all_token_ids=%d, stop_drop=%d) for req=%s; shipping empty tensor",
-                len(all_token_ids),
-                stop_emission_drop,
-                request_id,
-            )
-            return tensor[:0]
-        if tensor.shape[0] > target_rows + 1:
-            logger.warning(
-                "thinker2talker_full_payload: unexpected excess rows "
-                "(got %d, target %d, stop_drop %d) for req=%s; trimming to target",
-                int(tensor.shape[0]),
-                target_rows,
-                stop_emission_drop,
-                request_id,
-            )
-        if tensor.shape[0] > target_rows:
-            return tensor[:target_rows]
-        if tensor.shape[0] < target_rows:
-            logger.debug(
-                "thinker2talker_full_payload: under-captured rows "
-                "(got %d, target %d, stop_drop %d) for req=%s; talker may index past end",
-                int(tensor.shape[0]),
-                target_rows,
-                stop_emission_drop,
-                request_id,
-            )
-        return tensor
-
-    return (
-        _trim(thinker_emb),
-        _trim(thinker_hid),
-        list(prompt_token_ids),
-        list(all_token_ids),
-    )
-
-
 def _extract_qwen3_full_payload_codec_rows(
     code_predictor_codes: torch.Tensor,
     output_token_ids: list[int],
@@ -595,16 +484,30 @@ def thinker2talker_full_payload(
         )
         return None
 
-    (
-        thinker_emb_prefill,
-        thinker_hid_prefill,
-        prompt_token_ids,
-        all_token_ids,
-    ) = _prepare_qwen3_talker_prefill(
-        request,
-        thinker_emb,
-        thinker_hid,
-    )
+    prompt_token_ids = _ensure_list(getattr(request, "prompt_token_ids", []) or [])
+    all_token_ids = _ensure_list(getattr(request, "all_token_ids", None) or [])
+    if not all_token_ids:
+        output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
+        all_token_ids = list(prompt_token_ids) + list(output_token_ids)
+
+    # Trim the trailing stop-token row from the accumulated thinker output.
+    # The accumulator captures one hidden-state row per executed thinker
+    # forward (prefill + every decode step including the one that emitted
+    # the stop_token), so for a finished request thinker_emb has exactly one
+    # row more than the rows the talker should consume. async_chunk's
+    # chunk-0 path naturally captures only the prefill / non-stop portion,
+    # which is why the [async_chunk] parametrization passes while [default]
+    # over-generates one codec frame on short outputs (e.g.
+    # test_one_word_prompt_001[default]: audio extends "London" with
+    # spurious phonemes).
+    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 0:
+        thinker_emb_prefill = thinker_emb[:-1]
+    else:
+        thinker_emb_prefill = thinker_emb
+    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 0:
+        thinker_hid_prefill = thinker_hid[:-1]
+    else:
+        thinker_hid_prefill = thinker_hid
 
     payload: OmniPayload = {
         "embed": {
