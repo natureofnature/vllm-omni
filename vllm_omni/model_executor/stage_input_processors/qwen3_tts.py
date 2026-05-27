@@ -495,7 +495,7 @@ def talker2code2wav_full_payload(
     if ref_code is not None:
         audio = torch.cat([ref_code.to(audio.device), audio], dim=0)
 
-    codec_codes = audio.transpose(0, 1).cpu().reshape(-1).tolist()
+    codec_codes = audio.transpose(0, 1).to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
     return {
         "codes": {"audio": codec_codes},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},

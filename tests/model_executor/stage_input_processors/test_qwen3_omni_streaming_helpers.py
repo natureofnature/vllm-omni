@@ -523,7 +523,7 @@ def test_qwen3_tts_talker2code2wav_token_only_smoke() -> None:
 
 
 def test_qwen3_tts_talker2code2wav_full_payload_smoke() -> None:
-    """Smoke: qwen3_tts full_payload reads flat codes.audio + flattens col-major."""
+    """Smoke: qwen3_tts full_payload reads flat codes.audio + flattens codebook-major."""
     from types import SimpleNamespace
 
     import torch
@@ -540,7 +540,10 @@ def test_qwen3_tts_talker2code2wav_full_payload_smoke() -> None:
     assert payload is not None
     assert "codes" in payload and "audio" in payload["codes"]
     # codebook-major: shape [3, 16] -> [16, 3] -> flatten = 48 entries
-    assert len(payload["codes"]["audio"]) == 48
+    assert isinstance(payload["codes"]["audio"], torch.Tensor)
+    assert payload["codes"]["audio"].shape == (48,)
+    expected = audio.transpose(0, 1).reshape(-1)
+    assert torch.equal(payload["codes"]["audio"], expected)
     assert payload["meta"]["finished"].item() is True
 
 
@@ -572,15 +575,16 @@ def test_qwen3_tts_full_payload_with_ref_code() -> None:
 
     # Exact expected: ref (prepended) + audio (no crop since seq_len > rows), then
     # transpose [5, 16] -> [16, 5] and flatten row-major (codebook-major).
-    expected = torch.cat([ref, audio], dim=0).transpose(0, 1).reshape(-1).tolist()
-    assert payload["codes"]["audio"] == expected, (
-        f"codec flatten mismatch -- got first 8 = {payload['codes']['audio'][:8]}, expected first 8 = {expected[:8]}"
+    expected = torch.cat([ref, audio], dim=0).transpose(0, 1).reshape(-1)
+    assert torch.equal(payload["codes"]["audio"], expected), (
+        f"codec flatten mismatch -- got first 8 = {payload['codes']['audio'][:8].tolist()}, "
+        f"expected first 8 = {expected[:8].tolist()}"
     )
-    assert len(payload["codes"]["audio"]) == 80  # 16 quantizers * (2 ref + 3 audio) frames
+    assert payload["codes"]["audio"].shape == (80,)  # 16 quantizers * (2 ref + 3 audio) frames
 
     # Sanity guards: first codebook-major column = [ref[0,0], ref[1,0], audio[0,0], ...],
     # so the prepend order must put 100 before 1.
-    first_col = payload["codes"]["audio"][:5]
+    first_col = payload["codes"]["audio"][:5].tolist()
     assert first_col == [100, 116, 1, 17, 33], (
         f"first column wrong: {first_col} -- ref likely appended instead of prepended"
     )
@@ -601,7 +605,98 @@ def test_qwen3_tts_full_payload_nested_fallback() -> None:
     req = SimpleNamespace(output_token_ids=list(range(10)))
     payload = talker2code2wav_full_payload(None, pooling_output, req)
     assert payload is not None
-    assert len(payload["codes"]["audio"]) == 32  # 16 * 2
+    assert isinstance(payload["codes"]["audio"], torch.Tensor)
+    assert payload["codes"]["audio"].shape == (32,)  # 16 * 2
+
+
+def test_qwen3_tts_code2wav_prefers_connector_tensor_payload() -> None:
+    """Code2Wav should consume connector codec tensor instead of placeholder zeros."""
+    import torch
+
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
+        _codec_ids_from_payload_or_input,
+    )
+
+    placeholder = torch.zeros(6, dtype=torch.long)
+    codec = torch.arange(12, dtype=torch.long)
+
+    out = _codec_ids_from_payload_or_input(
+        placeholder,
+        {"codes": {"audio": codec}},
+    )
+
+    assert torch.equal(out, codec)
+
+
+def test_qwen3_tts_code2wav_accepts_legacy_list_payload() -> None:
+    """Back-compat: old list full-payloads still override placeholder tokens."""
+    import torch
+
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
+        _codec_ids_from_payload_or_input,
+    )
+
+    placeholder = torch.zeros(6, dtype=torch.long)
+
+    out = _codec_ids_from_payload_or_input(
+        placeholder,
+        {"codes": {"audio": [1, 2, 3, 4]}},
+    )
+
+    assert torch.equal(out, torch.tensor([1, 2, 3, 4], dtype=torch.long))
+
+
+def test_qwen3_tts_code2wav_forward_decodes_connector_payload() -> None:
+    """Forward should decode real connector codes, not token-only placeholders."""
+    from collections import Counter
+
+    import torch
+
+    from vllm_omni.model_executor.models.qwen3_tts.qwen3_tts_code2wav import (
+        Qwen3TTSCode2Wav,
+    )
+
+    class _Decoder:
+        def __init__(self):
+            self.last_codes = None
+
+        def chunked_decode(self, codes, **_kwargs):
+            self.last_codes = codes.detach().clone()
+            return codes.sum(dim=1).to(torch.float32)
+
+    decoder = _Decoder()
+    model = Qwen3TTSCode2Wav.__new__(Qwen3TTSCode2Wav)
+    torch.nn.Module.__init__(model)
+    model.decoder = decoder
+    model._num_quantizers = 2
+    model._total_upsample = 1
+    model._output_sample_rate = 24000
+    model._decode_chunk_frames = 300
+    model._decode_left_context_frames = 25
+    model._decode_batch_bucket_frames = []
+    model._decode_batch_max_size = 0
+    model._decode_variable_chunk_batch_min_frames = 326
+    model._logged_codec_stats = True
+    model._logged_malformed_codec_lengths = set()
+    model._batch_stats_enabled = False
+    model._batch_stats_log_every = 0
+    model._batch_stats_forwards = 0
+    model._batch_stats_groups = 0
+    model._batch_stats_requests = 0
+    model._batch_stats_padded_frames = 0
+    model._batch_stats_decoded_frames = 0
+    model._batch_stats_actual_frames = Counter()
+    model._batch_stats_bucket_groups = Counter()
+
+    payload_codes = torch.tensor([1, 3, 2, 4], dtype=torch.long)
+    out = model.forward(
+        input_ids=torch.zeros(4, dtype=torch.long),
+        runtime_additional_information=[{"codes": {"audio": payload_codes}, "meta": {}}],
+    )
+
+    assert decoder.last_codes is not None
+    assert torch.equal(decoder.last_codes, torch.tensor([[[1, 3], [2, 4]]], dtype=torch.long))
+    assert torch.equal(out.multimodal_outputs["model_outputs"][0], torch.tensor([3.0, 7.0]))
 
 
 def test_qwen3_tts_codec_filter_and_crop_edge_cases() -> None:
@@ -666,12 +761,12 @@ def test_qwen3_tts_codec_filter_and_crop_edge_cases() -> None:
     # After filter + crop, kept rows = [row4, row5, row6] = [[200,2047,210,220],[300,310,320,330],[400,410,420,430]]
     # Codebook-major flatten: transpose [3, Q] -> [Q, 3] -> reshape(-1)
     cropped = torch.tensor(kept[-3:], dtype=torch.long)
-    expected = cropped.transpose(0, 1).reshape(-1).tolist()
-    assert payload["codes"]["audio"] == expected
+    expected = cropped.transpose(0, 1).reshape(-1)
+    assert torch.equal(payload["codes"]["audio"], expected)
     # Sanity: confirm the boundary-valid 2047 survived (codex P2 #3 regression guard).
-    assert _CODEBOOK_SIZE - 1 in payload["codes"]["audio"]
+    assert _CODEBOOK_SIZE - 1 in payload["codes"]["audio"].tolist()
     # Sanity: confirm no negative or >=_CODEBOOK_SIZE codec id leaked through.
-    assert all(0 <= v < _CODEBOOK_SIZE for v in payload["codes"]["audio"])
+    assert bool(((payload["codes"]["audio"] >= 0) & (payload["codes"]["audio"] < _CODEBOOK_SIZE)).all())
 
 
 def test_cosyvoice3_text2flow_token_only_smoke() -> None:
