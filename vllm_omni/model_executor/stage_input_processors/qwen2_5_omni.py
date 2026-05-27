@@ -322,6 +322,7 @@ def thinker2talker_full_payload(
         if x is None:
             return []
         if hasattr(x, "_x"):
+            # vLLM wraps cached token-id lists in ConstantList-like objects.
             return list(x._x)
         if isinstance(x, list):
             return list(x)

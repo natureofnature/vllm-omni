@@ -820,16 +820,31 @@ class OmniConnectorModelRunnerMixin:
             self._full_payload_replace_keys_cached = frozenset()
             return self._full_payload_replace_keys_cached
         try:
-            import importlib as _il
             import sys as _sys
 
-            mod = _sys.modules.get(module_name) or _il.import_module(module_name)
+            mod = _sys.modules.get(module_name) or importlib.import_module(module_name)
             keys = getattr(mod, "_FULL_PAYLOAD_REPLACE_KEYS", frozenset())
         except ImportError:
+            logger.debug(
+                "Could not import stage input processor module %s while resolving "
+                "_FULL_PAYLOAD_REPLACE_KEYS; using CONCAT semantics for all keys.",
+                module_name,
+                exc_info=True,
+            )
             keys = frozenset()
         if not isinstance(keys, (frozenset, set)):
+            logger.debug(
+                "Ignoring non-set _FULL_PAYLOAD_REPLACE_KEYS from %s: %s",
+                module_name,
+                type(keys).__name__,
+            )
             keys = frozenset()
         self._full_payload_replace_keys_cached = frozenset(keys)
+        logger.debug(
+            "Resolved _FULL_PAYLOAD_REPLACE_KEYS for %s: %s",
+            module_name,
+            sorted(self._full_payload_replace_keys_cached),
+        )
         return self._full_payload_replace_keys_cached
 
     def accumulate_full_payload_output(

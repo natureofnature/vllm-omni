@@ -22,9 +22,14 @@ logger = init_logger(__name__)
 # Scope: this constant only covers the full-payload coordinator path
 # (``input_coordinator``).  The async-chunk path uses
 # ``chunk_transfer_adapter`` and is not affected by this constant.
+_INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "300")
 try:
-    DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "300"))
+    DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
 except ValueError:
+    logger.warning(
+        "Invalid VLLM_OMNI_INPUT_WAIT_TIMEOUT_S=%r; falling back to 300 seconds.",
+        _INPUT_WAIT_TIMEOUT_RAW,
+    )
     DEFAULT_INPUT_WAIT_TIMEOUT_S = 300.0
 
 
