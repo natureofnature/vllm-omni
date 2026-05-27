@@ -250,23 +250,24 @@ class OmniConnectorModelRunnerMixin:
         # downstream consumer (e.g. text-only on multi-modal arch) leave
         # the entry orphaned in _pending_full_payload_send across requests,
         # which empirically destabilises subsequent thinker forwards by
-        # making prefix-cache reuse observe stale accumulator state.
-        # flush is a near-no-op for paths with no consumer, and idempotent
-        # when the entry has already been flushed by the scheduler-driven
-        # path.
-        try:
-            self.flush_full_payload_outputs({req_id})
-        except Exception:
-            # Cleanup must still proceed regardless of flush errors here --
-            # we already gated on ``_omni_connector_initialized`` upstream,
-            # so any exception here reflects a real connector-side issue
-            # (shared memory corruption, background thread crash) worth
-            # surfacing rather than silently swallowing.
-            logger.warning(
-                "flush_full_payload_outputs(%s) raised during cleanup; continuing tear-down.",
-                req_id,
-                exc_info=True,
-            )
+        # making prefix-cache reuse observe stale accumulator state.  The
+        # flush is idempotent when the entry has already been flushed by the
+        # scheduler-driven path, but this cleanup path runs for every request,
+        # so skip it entirely when the request never accumulated a payload.
+        if req_id in self._pending_full_payload_send:
+            try:
+                self.flush_full_payload_outputs({req_id})
+            except Exception:
+                # Cleanup must still proceed regardless of flush errors here --
+                # we already gated on ``_omni_connector_initialized`` upstream,
+                # so any exception here reflects a real connector-side issue
+                # (shared memory corruption, background thread crash) worth
+                # surfacing rather than silently swallowing.
+                logger.warning(
+                    "flush_full_payload_outputs(%s) raised during cleanup; continuing tear-down.",
+                    req_id,
+                    exc_info=True,
+                )
 
         ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
@@ -899,6 +900,10 @@ class OmniConnectorModelRunnerMixin:
 
     def flush_full_payload_outputs(self, finished_req_ids: set[str]) -> None:
         """Send accumulated full_payload outputs for requests that just finished."""
+        pending_req_ids = set(self._pending_full_payload_send.keys())
+        if not (finished_req_ids & pending_req_ids):
+            return
+
         logger.info(
             "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
             self._stage_id,
