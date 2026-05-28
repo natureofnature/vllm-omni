@@ -27,7 +27,7 @@ NEGATIVE_PROMPT = "low quality, blurry, distorted, deformed, watermark"
 
 SINGLE_CARD_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"})
 PARALLEL_2_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=3)
-HSDP_4_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=5)
+HSDP_4_FEATURE_MARKS = hardware_marks(res={"cuda": "H100"}, num_cards=4)
 
 BAGEL_CI_DEPLOY = get_deploy_config_path("ci/bagel.yaml")
 BAGEL_PARALLEL_2_DEPLOY = modify_stage_config(
@@ -36,7 +36,7 @@ BAGEL_PARALLEL_2_DEPLOY = modify_stage_config(
 )
 BAGEL_HSDP_4_DEPLOY = modify_stage_config(
     BAGEL_CI_DEPLOY,
-    updates={"stages": {0: {"devices": "0"}, 1: {"devices": "1,2,3,4"}}},
+    updates={"stages": {0: {"devices": "0"}, 1: {"devices": "0,1,2,3"}}},
 )
 
 
