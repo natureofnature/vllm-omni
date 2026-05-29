@@ -1667,7 +1667,7 @@ class Bagel(nn.Module):
         if use_sp and use_cfg_text:
             if return_trajectory_latents and len(timesteps) > 0:
                 trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 in_cfg_window = t > cfg_interval[0] and t <= cfg_interval[1]
                 cfg_text_scale_ = cfg_text_scale if in_cfg_window else 1.0
@@ -1730,7 +1730,7 @@ class Bagel(nn.Module):
         if use_sp:
             if return_trajectory_latents and len(timesteps) > 0:
                 trajectory_latents.append(x_t.clone())
-            for i, t in enumerate(timesteps):
+            for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
                 timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
                 v_t = self.forward_single_branch(
                     x_t=x_t,
@@ -1796,7 +1796,7 @@ class Bagel(nn.Module):
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
 
-        for i, t in enumerate(timesteps):
+        for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             if t > cfg_interval[0] and t <= cfg_interval[1]:
                 cfg_text_scale_ = cfg_text_scale
@@ -1916,7 +1916,7 @@ class Bagel(nn.Module):
         if return_trajectory_latents and len(timesteps) > 0:
             trajectory_latents.append(x_t.clone())
 
-        for i, t in enumerate(timesteps):
+        for i, t in enumerate(timesteps.tolist()):  # host floats; a 0-d tensor t would sync each step
             timestep = torch.tensor([t] * x_t.shape[0], device=x_t.device)
             use_cfg_this_step = t > cfg_interval[0] and t <= cfg_interval[1] and cfg_text_scale > 1.0
 
