@@ -2,8 +2,12 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Unit tests for SharedMemoryConnector focusing on TP / CFG / metadata fallback."""
 
-import pytest
+import time
 
+import pytest
+import torch
+
+from vllm_omni.data_entry_keys import EmbeddingsStruct, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
     SharedMemoryConnector,
 )
@@ -16,6 +20,23 @@ def connector():
     c = SharedMemoryConnector({"shm_threshold_bytes": 64})
     yield c
     c.close()
+
+
+@pytest.fixture()
+def event_connector():
+    c = SharedMemoryConnector({"shm_threshold_bytes": 64, "async_shm": True})
+    yield c
+    c.close()
+
+
+def _wait_get(connector, key: str, metadata=None, timeout_s: float = 5.0):
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        result = connector.get("s0", "s1", key, metadata=metadata)
+        if result is not None:
+            return result
+        time.sleep(0.01)
+    return None
 
 
 # ── Key-based read (the fundamental SHM path) ────────────────────────
@@ -112,6 +133,57 @@ class TestMetadataFallback:
         assert result is not None
         obj, _ = result
         assert obj == data
+
+    def test_legacy_async_metadata_falls_back_to_key(self, event_connector):
+        data = {"legacy": "async"}
+        ok, size, meta = event_connector.put("s0", "s1", "legacy_async_key", data)
+        assert ok
+        assert size == 0
+        assert meta == {"async_shm": True, "shm_key": "legacy_async_key"}
+
+        legacy_meta = {"async_shm": True, "shm_key": "legacy_async_key"}
+        result = _wait_get(event_connector, "legacy_async_key", metadata=legacy_meta)
+        assert result is not None
+        obj, rsize = result
+        assert obj == data
+        assert rsize > 0
+
+
+class TestEventOnlyPath:
+    def test_async_shm_put_returns_async_key_metadata(self, event_connector):
+        data = {"hello": "event-only", "values": [1, 2, 3]}
+        ok, size, meta = event_connector.put("s0", "s1", "event_key_1", data)
+        assert ok
+        assert size == 0
+        assert meta == {"async_shm": True, "shm_key": "event_key_1"}
+        assert "source_port" not in meta
+
+        result = _wait_get(event_connector, "event_key_1", metadata=meta)
+        assert result is not None
+        obj, rsize = result
+        assert obj == data
+        assert rsize > 0
+
+    def test_async_shm_waits_prepared_cuda_event(self, event_connector):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA is required for event-only payload test")
+
+        with torch.cuda.device(0):
+            stream = torch.cuda.Stream()
+            tensor = torch.empty((16,), device="cuda")
+            with torch.cuda.stream(stream):
+                tensor.fill_(7)
+                payload = OmniPayloadStruct(embed=EmbeddingsStruct(decode=tensor))
+                prepared = event_connector.prepare_async_payload(payload)
+
+            ok, _, meta = event_connector.put("s0", "s1", "event_cuda_key", prepared)
+            assert ok
+
+            result = _wait_get(event_connector, "event_cuda_key", metadata=meta)
+            assert result is not None
+            assert event_connector._metrics["event_waits"] == 1
+            obj, _ = result
+            assert torch.equal(obj["embed"]["decode"].cpu(), torch.full((16,), 7, dtype=tensor.dtype))
 
 
 # ── Heterogeneous TP multi-key read ──────────────────────────────────

@@ -5,6 +5,7 @@ import importlib
 from collections import defaultdict, deque
 from collections.abc import Callable
 from typing import Any
+from unittest.mock import Mock
 
 import torch
 from vllm.v1.request import Request, RequestStatus
@@ -182,11 +183,28 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        payload_data = None
+        send_data = None
+        if getattr(self.connector, "async_shm", False) and self.custom_process_next_stage_input_func:
+            try:
+                payload_data = self.custom_process_next_stage_input_func(
+                    transfer_manager=self,
+                    pooling_output=unflatten_payload(pooling_output) if isinstance(pooling_output, dict) else pooling_output,
+                    request=request,
+                    is_finished=is_segment_finished,
+                )
+            except Exception as e:
+                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+            if payload_data is not None:
+                self._set_payload_meta(payload_data, is_finished, is_segment_finished)
+                send_data = self._prepare_connector_payload(payload_data)
         task = {
             "pooling_output": pooling_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "payload_data": payload_data,
+            "send_data": send_data,
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
@@ -303,8 +321,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
         # Process payload in save_loop thread
-        payload_data: OmniPayloadStruct | None = None
-        if self.custom_process_next_stage_input_func:
+        payload_data: OmniPayloadStruct | None = task.get("payload_data")
+        send_data = task.get("send_data")
+        if payload_data is None and self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
@@ -323,16 +342,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # Segment/request finish markers must still reach downstream even when
             # the processor has no tensor payload.
             payload_data = OmniPayloadStruct()
-        if payload_data.meta is None:
-            payload_data.meta = MetaStruct()
-        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
-        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+        if send_data is None:
+            self._set_payload_meta(payload_data, is_finished, is_segment_finished)
+            send_data = self._prepare_connector_payload(payload_data)
 
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
-            data=payload_data,
+            data=send_data,
         )
 
         if success:
@@ -361,6 +379,29 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:
                 cached_ic.pop(external_req_id, None)
+
+    @staticmethod
+    def _set_payload_meta(payload_data: Any, is_finished: bool, is_segment_finished: bool) -> None:
+        if isinstance(payload_data, dict):
+            meta = payload_data.get("meta")
+            if not isinstance(meta, dict):
+                meta = {}
+                payload_data["meta"] = meta
+            meta["finished"] = torch.tensor(is_finished, dtype=torch.bool)
+            meta["is_segment_finished"] = torch.tensor(is_segment_finished, dtype=torch.bool)
+            return
+        if payload_data.meta is None:
+            payload_data.meta = MetaStruct()
+        payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
+        payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
+
+    def _prepare_connector_payload(self, payload_data: Any) -> Any:
+        prepare = getattr(self.connector, "prepare_async_payload", None)
+        if isinstance(prepare, Mock) and not hasattr(type(self.connector), "prepare_async_payload"):
+            return payload_data
+        if callable(prepare):
+            return prepare(payload_data)
+        return payload_data
 
     def is_done_receiving_chunks(self, request_id: str) -> bool:
         """Return True if the request should stop polling upstream chunks.
