@@ -41,7 +41,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
-from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import build_mm_async_payload, build_mm_cpu, to_payload_element
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -1124,11 +1124,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
                 mm_source = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
                 mm_start = time.perf_counter()
-                mm_cpu = build_mm_cpu(mm_source)
+                if self._use_async_put_pooler_payload():
+                    mm_cpu = build_mm_async_payload(mm_source)
+                    mm_mode = "async_gpu"
+                else:
+                    mm_cpu = build_mm_cpu(mm_source)
+                    mm_mode = "sync_cpu"
                 if _shm_profile_enabled():
                     logger.warning(
-                        "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=sync_cpu "
+                        "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=%s "
                         "stage=%s elapsed_ms=%.3f",
+                        mm_mode,
                         getattr(self, "_stage_id", None),
                         (time.perf_counter() - mm_start) * 1000.0,
                     )

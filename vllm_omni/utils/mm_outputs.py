@@ -34,6 +34,26 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
     return mm_cpu
 
 
+def build_mm_async_payload(multimodal_outputs: dict) -> dict[str, object]:
+    """Build a stable GPU-resident multimodal payload for async connector puts.
+
+    This mirrors :func:`build_mm_cpu`'s recursive structure handling, but avoids
+    the synchronous D2H copy for CUDA tensors. CUDA tensors are cloned on device
+    so the async writer does not observe model-owned buffers after they are
+    reused or mutated by later decode steps.
+    """
+    mm_payload: dict[str, object] = {}
+    if not isinstance(multimodal_outputs, dict):
+        logger.warning("Multimodal outputs are not a dict and will not be passed")
+
+    if multimodal_outputs:
+        for k, v in multimodal_outputs.items():
+            payload_v = _to_async_payload(v)
+            if payload_v is not None:
+                mm_payload[k] = payload_v
+    return mm_payload
+
+
 def _to_cpu(value):
     """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
     if isinstance(value, torch.Tensor):
@@ -49,6 +69,27 @@ def _to_cpu(value):
         if not value:
             return value
         return [_to_cpu(v) for v in value]
+    return value
+
+
+def _to_async_payload(value):
+    """Recursively snapshot CUDA tensors without synchronizing to CPU."""
+    if isinstance(value, torch.Tensor):
+        value = value.detach()
+        if value.is_cuda:
+            return value.clone()
+        return value.to("cpu").contiguous()
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            payload_v = _to_async_payload(v)
+            if payload_v is not None:
+                out[k] = payload_v
+        return out or None
+    if isinstance(value, list):
+        if not value:
+            return value
+        return [_to_async_payload(v) for v in value]
     return value
 
 
