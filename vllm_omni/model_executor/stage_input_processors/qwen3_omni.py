@@ -111,11 +111,11 @@ def _ensure_list(x):
     return list(x)
 
 
-def _is_async_shm_transfer(transfer_manager: Any) -> bool:
+def _is_async_put_transfer(transfer_manager: Any) -> bool:
     connector = getattr(transfer_manager, "_omni_connector", None)
     if connector is None:
         connector = getattr(transfer_manager, "connector", None)
-    return bool(getattr(connector, "async_shm", False))
+    return bool(getattr(connector, "async_put", False))
 
 
 def _shm_profile_enabled() -> bool:
@@ -129,7 +129,7 @@ def _stage_payload_tensor(tensor: torch.Tensor, transfer_manager: Any) -> torch.
     shape = tuple(tensor.shape)
     bytes_ = tensor.numel() * tensor.element_size()
     tensor = tensor.detach()
-    if _is_async_shm_transfer(transfer_manager):
+    if _is_async_put_transfer(transfer_manager):
         if _shm_profile_enabled():
             logger.warning(
                 "OMNI_SHM_PROFILE stage_processor=qwen3_omni event=stage_payload_tensor mode=async_gpu "

@@ -57,12 +57,14 @@ def _make_model_config(
     async_chunk: bool = False,
     worker_type: str = "ar",
     custom_func: str | None = None,
+    model_arch: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         stage_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
+        model_arch=model_arch,
     )
 
 
@@ -1288,6 +1290,50 @@ class TestConnectorConfigValidation(unittest.TestCase):
 
         with self.assertRaisesRegex(RuntimeError, "missing connector name"):
             host.init_omni_connectors(vllm_config=None, model_config=model_config)
+
+    def test_qwen3_omni_shared_memory_defaults_to_async_put(self):
+        host = MixinHost()
+        model_config = _make_model_config(model_arch="Qwen3OmniMoeForConditionalGeneration")
+        model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"host": "127.0.0.1"}}
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.OmniConnectorFactory.create_connector",
+            return_value=object(),
+        ) as create_connector:
+            connector = host._create_connector(model_config)
+
+        self.assertIsNotNone(connector)
+        spec = create_connector.call_args.args[0]
+        self.assertTrue(spec.extra["async_put"])
+        self.assertEqual(spec.extra["host"], "127.0.0.1")
+
+    def test_qwen3_omni_shared_memory_respects_explicit_async_put_false(self):
+        host = MixinHost()
+        model_config = _make_model_config(model_arch="Qwen3OmniMoeForConditionalGeneration")
+        model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {"async_put": False}}
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.OmniConnectorFactory.create_connector",
+            return_value=object(),
+        ) as create_connector:
+            host._create_connector(model_config)
+
+        spec = create_connector.call_args.args[0]
+        self.assertFalse(spec.extra["async_put"])
+
+    def test_non_qwen3_omni_shared_memory_keeps_async_put_unset(self):
+        host = MixinHost()
+        model_config = _make_model_config(model_arch="Qwen2_5OmniForConditionalGeneration")
+        model_config.stage_connector_config = {"name": "SharedMemoryConnector", "extra": {}}
+
+        with patch(
+            "vllm_omni.worker.omni_connector_model_runner_mixin.OmniConnectorFactory.create_connector",
+            return_value=object(),
+        ) as create_connector:
+            host._create_connector(model_config)
+
+        spec = create_connector.call_args.args[0]
+        self.assertNotIn("async_put", spec.extra)
 
 
 class _FailingConnector:

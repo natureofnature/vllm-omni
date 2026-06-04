@@ -46,6 +46,8 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+_QWEN3_OMNI_ASYNC_PUT_ARCHS = frozenset({"Qwen3OmniMoeForConditionalGeneration"})
+
 
 def _shm_profile_enabled() -> bool:
     value = os.environ.get("OMNI_SHM_PROFILE") or os.environ.get("VLLM_OMNI_SHM_PROFILE", "")
@@ -1024,11 +1026,11 @@ class OmniConnectorModelRunnerMixin:
             prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
             if _shm_profile_enabled():
                 logger.info(
-                    "OMNI_SHM_PROFILE stage=%s event=prepare_full req=%s key=%s async_shm=%s prepare_ms=%.3f",
+                    "OMNI_SHM_PROFILE stage=%s event=prepare_full req=%s key=%s async_put=%s prepare_ms=%.3f",
                     self._stage_id,
                     req_id,
                     connector_put_key,
-                    bool(getattr(self._omni_connector, "async_shm", False)),
+                    bool(getattr(self._omni_connector, "async_put", False)),
                     prepare_ms,
                 )
 
@@ -1191,12 +1193,12 @@ class OmniConnectorModelRunnerMixin:
         prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
         if _shm_profile_enabled():
             logger.info(
-                "OMNI_SHM_PROFILE stage=%s event=prepare_chunk req=%s key=%s chunk=%s async_shm=%s prepare_ms=%.3f",
+                "OMNI_SHM_PROFILE stage=%s event=prepare_chunk req=%s key=%s chunk=%s async_put=%s prepare_ms=%.3f",
                 self._stage_id,
                 request_id,
                 connector_put_key,
                 chunk_id,
-                bool(getattr(self._omni_connector, "async_shm", False)),
+                bool(getattr(self._omni_connector, "async_put", False)),
                 prepare_ms,
             )
 
@@ -1836,13 +1838,13 @@ class OmniConnectorModelRunnerMixin:
         if _shm_profile_enabled():
             logger.warning(
                 "OMNI_SHM_PROFILE stage=%s event=recv_chunk_ready req=%s key=%s chunk=%s async_chunk=%s "
-                "async_shm=%s get_call_ms=%.3f wait_since_first_poll_ms=%.3f size=%s",
+                "async_put=%s get_call_ms=%.3f wait_since_first_poll_ms=%.3f size=%s",
                 self._stage_id,
                 req_id,
                 connector_get_key,
                 chunk_id,
                 self._async_chunk,
-                bool(getattr(connector, "async_shm", False)),
+                bool(getattr(connector, "async_put", False)),
                 get_ms,
                 wait_ms,
                 _size,
@@ -2060,19 +2062,19 @@ class OmniConnectorModelRunnerMixin:
         )
         if _shm_profile_enabled():
             logger.info(
-                "OMNI_SHM_PROFILE stage=%s event=connector_put req=%s key=%s chunk=%s success=%s async_shm=%s "
+                "OMNI_SHM_PROFILE stage=%s event=connector_put req=%s key=%s chunk=%s success=%s async_put=%s "
                 "prepare_ms=%.3f queue_wait_ms=%s put_return_ms=%.3f size=%s metadata_async=%s",
                 task["stage_id"],
                 request_id,
                 put_key,
                 task.get("_chunk_id"),
                 success,
-                bool(getattr(connector, "async_shm", False)),
+                bool(getattr(connector, "async_put", False)),
                 float(task.get("_prepare_ms") or 0.0),
                 f"{queue_wait_ms:.3f}" if queue_wait_ms is not None else "NA",
                 put_ms,
                 _size,
-                isinstance(_metadata, dict) and bool(_metadata.get("async_shm")),
+                isinstance(_metadata, dict) and bool(_metadata.get("async_put")),
             )
 
         if not success:
@@ -2246,6 +2248,12 @@ class OmniConnectorModelRunnerMixin:
             extra = {}
         elif not isinstance(extra, dict):
             raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
+
+        model_arch = getattr(model_config, "model_arch", None)
+        if name == "SharedMemoryConnector" and model_arch in _QWEN3_OMNI_ASYNC_PUT_ARCHS and "async_put" not in extra:
+            extra = dict(extra)
+            extra["async_put"] = True
+            logger.info("Enable async_put by default for %s with SharedMemoryConnector", model_arch)
 
         spec = ConnectorSpec(name=name, extra=extra)
         try:

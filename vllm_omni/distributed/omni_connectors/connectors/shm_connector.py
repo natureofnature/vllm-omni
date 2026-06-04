@@ -19,7 +19,7 @@ from .base import OmniConnectorBase
 
 logger = get_connector_logger(__name__)
 
-_ASYNC_PAYLOAD_WRAPPER_MARKER = "__omni_async_shm_payload__"
+_ASYNC_PAYLOAD_WRAPPER_MARKER = "__omni_async_put_payload__"
 _ASYNC_PAYLOAD_DATA = "data"
 _ASYNC_PAYLOAD_CUDA_EVENTS = "cuda_events"
 
@@ -56,7 +56,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         self.stage_id = config.get("stage_id", -1)
         self.device = config.get("device", "cuda:0")
         self.threshold = int(config.get("shm_threshold_bytes", 65536))
-        self.async_shm = bool(config.get("async_shm", config.get("async_put", False)))
+        self.async_put = bool(config.get("async_put", False))
         self.role = str(config.get("role", "sender")).lower()
         self.host = str(config.get("host", "127.0.0.1"))
         self._pending_keys: set[str] = set()
@@ -109,7 +109,7 @@ class SharedMemoryConnector(OmniConnectorBase):
     def _put_event_async(self, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         put_start = time.perf_counter()
         if not self._ensure_async_writer() or self._writer_pool is None:
-            logger.error("async_shm=True but writer pool could not be initialized")
+            logger.error("async_put=True but writer pool could not be initialized")
             return False, 0, None
 
         data, cuda_events = self._unwrap_async_payload(data)
@@ -136,7 +136,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 len(cuda_events),
                 (time.perf_counter() - put_start) * 1000.0,
             )
-        return True, 0, {"async_shm": True, "shm_key": put_key}
+        return True, 0, {"async_put": True, "shm_key": put_key}
 
     def _async_write_entry(self, entry: _AsyncShmEntry) -> None:
         write_start = time.perf_counter()
@@ -198,7 +198,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         This sidecar keeps the payload unchanged for serialization while
         carrying the events the writer must wait on before CPU staging.
         """
-        if not self.async_shm:
+        if not self.async_put:
             return data
         start = time.perf_counter()
         cuda_events = self._record_cuda_events(data)
@@ -281,7 +281,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         data: Any,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         try:
-            if self.async_shm:
+            if self.async_put:
                 return self._put_event_async(put_key, data)
 
             # Always serialize first to check size (and for SHM writing)
@@ -382,13 +382,13 @@ class SharedMemoryConnector(OmniConnectorBase):
             self._get_first_attempt_times.pop(get_key, None)
         logger.warning(
             "OMNI_SHM_PROFILE connector=SharedMemoryConnector stage=%s role=%s event=get_result "
-            "key=%s status=%s ready=%s async_shm=%s get_call_ms=%.3f wait_since_first_get_ms=%.3f size=%s",
+            "key=%s status=%s ready=%s async_put=%s get_call_ms=%.3f wait_since_first_get_ms=%.3f size=%s",
             self.stage_id,
             self.role,
             get_key,
             status,
             ready,
-            self.async_shm,
+            self.async_put,
             (time.perf_counter() - call_start) * 1000.0,
             (time.perf_counter() - first_attempt) * 1000.0,
             result[1] if result is not None else None,
@@ -413,7 +413,7 @@ class SharedMemoryConnector(OmniConnectorBase):
                 self._log_get_profile(get_key, result, call_start, first_attempt, "READY" if result else "MISS")
                 return result
 
-            if metadata.get("async_shm"):
+            if metadata.get("async_put"):
                 key = str(metadata.get("shm_key", get_key))
                 if profile_enabled and key != get_key:
                     first_attempt = self._get_first_attempt_times.setdefault(key, first_attempt)
@@ -468,7 +468,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         for key in tuple(self._get_first_attempt_times):
             if key == request_id or key.startswith(request_id + "_") or key.endswith("_" + request_id):
                 self._get_first_attempt_times.pop(key, None)
-        if self.async_shm:
+        if self.async_put:
             with self._entries_lock:
                 for key, entry in list(self._entries.items()):
                     if key == request_id or key.startswith(request_id + "_") or key.endswith("_" + request_id):
@@ -546,7 +546,7 @@ class SharedMemoryConnector(OmniConnectorBase):
         return {
             "status": "healthy",
             "threshold": self.threshold,
-            "async_shm": self.async_shm,
+            "async_put": self.async_put,
             "host": self.host,
             **self._metrics,
         }

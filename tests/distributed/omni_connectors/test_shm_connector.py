@@ -24,7 +24,7 @@ def connector():
 
 @pytest.fixture()
 def event_connector():
-    c = SharedMemoryConnector({"shm_threshold_bytes": 64, "async_shm": True})
+    c = SharedMemoryConnector({"shm_threshold_bytes": 64, "async_put": True})
     yield c
     c.close()
 
@@ -139,9 +139,9 @@ class TestMetadataFallback:
         ok, size, meta = event_connector.put("s0", "s1", "legacy_async_key", data)
         assert ok
         assert size == 0
-        assert meta == {"async_shm": True, "shm_key": "legacy_async_key"}
+        assert meta == {"async_put": True, "shm_key": "legacy_async_key"}
 
-        legacy_meta = {"async_shm": True, "shm_key": "legacy_async_key"}
+        legacy_meta = {"async_put": True, "shm_key": "legacy_async_key"}
         result = _wait_get(event_connector, "legacy_async_key", metadata=legacy_meta)
         assert result is not None
         obj, rsize = result
@@ -150,12 +150,12 @@ class TestMetadataFallback:
 
 
 class TestEventOnlyPath:
-    def test_async_shm_put_returns_async_key_metadata(self, event_connector):
+    def test_async_put_returns_async_key_metadata(self, event_connector):
         data = {"hello": "event-only", "values": [1, 2, 3]}
         ok, size, meta = event_connector.put("s0", "s1", "event_key_1", data)
         assert ok
         assert size == 0
-        assert meta == {"async_shm": True, "shm_key": "event_key_1"}
+        assert meta == {"async_put": True, "shm_key": "event_key_1"}
         assert "source_port" not in meta
 
         result = _wait_get(event_connector, "event_key_1", metadata=meta)
@@ -164,7 +164,7 @@ class TestEventOnlyPath:
         assert obj == data
         assert rsize > 0
 
-    def test_async_shm_waits_prepared_cuda_event(self, event_connector):
+    def test_async_put_waits_prepared_cuda_event(self, event_connector):
         if not torch.cuda.is_available():
             pytest.skip("CUDA is required for event-only payload test")
 

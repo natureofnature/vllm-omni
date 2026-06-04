@@ -185,11 +185,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
         payload_data = None
         send_data = None
-        if getattr(self.connector, "async_shm", False) and self.custom_process_next_stage_input_func:
+        if getattr(self.connector, "async_put", False) and self.custom_process_next_stage_input_func:
             try:
                 payload_data = self.custom_process_next_stage_input_func(
                     transfer_manager=self,
-                    pooling_output=unflatten_payload(pooling_output) if isinstance(pooling_output, dict) else pooling_output,
+                    pooling_output=unflatten_payload(pooling_output)
+                    if isinstance(pooling_output, dict)
+                    else pooling_output,
                     request=request,
                     is_finished=is_segment_finished,
                 )
