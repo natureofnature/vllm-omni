@@ -1123,26 +1123,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
                 mm_source = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
-                if self._use_async_put_pooler_payload() and isinstance(mm_source, dict):
-                    mm_start = time.perf_counter()
-                    mm_cpu = mm_source
-                    if _shm_profile_enabled():
-                        logger.warning(
-                            "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=async_gpu "
-                            "stage=%s elapsed_ms=%.3f",
-                            getattr(self, "_stage_id", None),
-                            (time.perf_counter() - mm_start) * 1000.0,
-                        )
-                else:
-                    mm_start = time.perf_counter()
-                    mm_cpu = build_mm_cpu(mm_source)
-                    if _shm_profile_enabled():
-                        logger.warning(
-                            "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=sync_cpu "
-                            "stage=%s elapsed_ms=%.3f",
-                            getattr(self, "_stage_id", None),
-                            (time.perf_counter() - mm_start) * 1000.0,
-                        )
+                mm_start = time.perf_counter()
+                mm_cpu = build_mm_cpu(mm_source)
+                if _shm_profile_enabled():
+                    logger.warning(
+                        "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=sync_cpu "
+                        "stage=%s elapsed_ms=%.3f",
+                        getattr(self, "_stage_id", None),
+                        (time.perf_counter() - mm_start) * 1000.0,
+                    )
 
             self._process_additional_information_updates(
                 hidden_states,
