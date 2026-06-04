@@ -4,6 +4,8 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+import os
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -109,10 +111,56 @@ def _ensure_list(x):
     return list(x)
 
 
-def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
+def _is_async_shm_transfer(transfer_manager: Any) -> bool:
+    connector = getattr(transfer_manager, "_omni_connector", None)
+    if connector is None:
+        connector = getattr(transfer_manager, "connector", None)
+    return bool(getattr(connector, "async_shm", False))
+
+
+def _shm_profile_enabled() -> bool:
+    value = os.environ.get("OMNI_SHM_PROFILE") or os.environ.get("VLLM_OMNI_SHM_PROFILE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _stage_payload_tensor(tensor: torch.Tensor, transfer_manager: Any) -> torch.Tensor:
+    start = time.perf_counter()
+    original_device = str(tensor.device)
+    shape = tuple(tensor.shape)
+    bytes_ = tensor.numel() * tensor.element_size()
+    tensor = tensor.detach()
+    if _is_async_shm_transfer(transfer_manager):
+        if _shm_profile_enabled():
+            logger.warning(
+                "OMNI_SHM_PROFILE stage_processor=qwen3_omni event=stage_payload_tensor mode=async_gpu "
+                "device=%s shape=%s bytes=%d elapsed_ms=%.3f",
+                original_device,
+                shape,
+                bytes_,
+                (time.perf_counter() - start) * 1000.0,
+            )
+        return tensor
+    cpu_tensor = tensor.cpu()
+    if _shm_profile_enabled():
+        logger.warning(
+            "OMNI_SHM_PROFILE stage_processor=qwen3_omni event=stage_payload_tensor mode=sync_cpu "
+            "device=%s shape=%s bytes=%d elapsed_ms=%.3f",
+            original_device,
+            shape,
+            bytes_,
+            (time.perf_counter() - start) * 1000.0,
+        )
+    return cpu_tensor
+
+
+def _as_tensor_or_none(value: Any, transfer_manager: Any | None = None) -> torch.Tensor | None:
     if isinstance(value, torch.Tensor):
+        if transfer_manager is not None:
+            return _stage_payload_tensor(value, transfer_manager)
         return value.detach().cpu()
     if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+        if transfer_manager is not None:
+            return _stage_payload_tensor(value[0], transfer_manager)
         return value[0].detach().cpu()
     return None
 
@@ -283,8 +331,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach().cpu()
+    staged_emb = _stage_payload_tensor(thinker_emb, transfer_manager)
+    staged_hid = _stage_payload_tensor(thinker_hid, transfer_manager)
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -293,8 +341,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             new_prompt_len = thinker_emb.shape[0]
             payload = OmniPayloadStruct(
                 meta=MetaStruct(finished=finished),
-                embed=EmbeddingsStruct(prefill=emb_cpu),
-                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                embed=EmbeddingsStruct(prefill=staged_emb),
+                hidden_states=HiddenStatesStruct(output=staged_hid),
                 ids=IdsStruct(
                     all=_ensure_list(request.all_token_ids[-new_prompt_len - 1 :]),
                     prompt=_ensure_list(request.prompt_token_ids[-new_prompt_len:]),
@@ -312,8 +360,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 if isinstance(saved_prefill, torch.Tensor) and isinstance(saved_output, torch.Tensor):
                     return OmniPayloadStruct(
                         meta=MetaStruct(finished=finished),
-                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb_cpu), dim=0)),
-                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid_cpu), dim=0)),
+                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, staged_emb), dim=0)),
+                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, staged_hid), dim=0)),
                         ids=IdsStruct(
                             all=save_payload.get("ids", {}).get("all"),
                             prompt=save_payload.get("ids", {}).get("prompt"),
@@ -325,8 +373,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 meta=MetaStruct(
                     finished=finished,
                 ),
-                embed=EmbeddingsStruct(decode=emb_cpu),
-                hidden_states=HiddenStatesStruct(output=hid_cpu),
+                embed=EmbeddingsStruct(decode=staged_emb),
+                hidden_states=HiddenStatesStruct(output=staged_hid),
                 ids=IdsStruct(output=output_token_ids),
                 speaker=speaker,
                 language=language,
@@ -337,8 +385,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             return None
         return OmniPayloadStruct(
             meta=MetaStruct(finished=finished),
-            embed=EmbeddingsStruct(decode=emb_cpu),
-            hidden_states=HiddenStatesStruct(output=hid_cpu),
+            embed=EmbeddingsStruct(decode=staged_emb),
+            hidden_states=HiddenStatesStruct(output=staged_hid),
             speaker=speaker,
             language=language,
         )
@@ -467,20 +515,20 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+    def _maybe_stage_tensor(t: Any) -> torch.Tensor | None:
+        return _stage_payload_tensor(t, transfer_manager) if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                prefill=_stage_payload_tensor(thinker_emb, transfer_manager),
+                tts_bos=_maybe_stage_tensor(thinker_embed.get("tts_bos")),
+                tts_eos=_maybe_stage_tensor(thinker_embed.get("tts_eos")),
+                tts_pad=_maybe_stage_tensor(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            hidden_states=HiddenStatesStruct(output=_stage_payload_tensor(thinker_hid, transfer_manager)),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -520,7 +568,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            embed=EmbeddingsStruct(decode=_stage_payload_tensor(thinker_emb, transfer_manager)),
             speaker=speaker,
             language=language,
         )
@@ -589,12 +637,12 @@ def thinker2talker_full_payload(
 
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb_prefill.detach().cpu(),
-            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
-            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
-            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
+            "prefill": _stage_payload_tensor(thinker_emb_prefill, transfer_manager),
+            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos"), transfer_manager),
+            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos"), transfer_manager),
+            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad"), transfer_manager),
         },
-        "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
+        "hidden_states": {"output": _stage_payload_tensor(thinker_hid_prefill, transfer_manager)},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }

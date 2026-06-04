@@ -6,6 +6,8 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
+import os
+import time
 from contextlib import nullcontext
 from copy import copy
 from dataclasses import replace
@@ -44,6 +46,11 @@ from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
+
+
+def _shm_profile_enabled() -> bool:
+    value = os.environ.get("OMNI_SHM_PROFILE") or os.environ.get("VLLM_OMNI_SHM_PROFILE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 class ExecuteModelState(NamedTuple):
@@ -199,6 +206,41 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if engine_output_type == "audio" and not downstream_req_ids:
             downstream_req_ids = req_ids_output_copy
         return engine_output_type, downstream_req_ids
+
+    def _use_async_shm_pooler_payload(self) -> bool:
+        connector = getattr(self, "_omni_connector", None)
+        return bool(getattr(connector, "async_shm", False))
+
+    def _stage_pooler_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        start = time.perf_counter()
+        original_device = str(tensor.device)
+        shape = tuple(tensor.shape)
+        bytes_ = tensor.numel() * tensor.element_size()
+        tensor = tensor.detach()
+        if self._use_async_shm_pooler_payload():
+            if _shm_profile_enabled():
+                logger.warning(
+                    "OMNI_SHM_PROFILE runner=GPUARModelRunner event=stage_pooler_tensor mode=async_gpu "
+                    "stage=%s device=%s shape=%s bytes=%d elapsed_ms=%.3f",
+                    getattr(self, "_stage_id", None),
+                    original_device,
+                    shape,
+                    bytes_,
+                    (time.perf_counter() - start) * 1000.0,
+                )
+            return tensor
+        cpu_tensor = tensor.to("cpu").contiguous()
+        if _shm_profile_enabled():
+            logger.warning(
+                "OMNI_SHM_PROFILE runner=GPUARModelRunner event=stage_pooler_tensor mode=sync_cpu "
+                "stage=%s device=%s shape=%s bytes=%d elapsed_ms=%.3f",
+                getattr(self, "_stage_id", None),
+                original_device,
+                shape,
+                bytes_,
+                (time.perf_counter() - start) * 1000.0,
+            )
+        return cpu_tensor
 
     def capture_model(self) -> int:
         result = super().capture_model()
@@ -827,6 +869,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self,
         grammar_output: GrammarOutput | None,
     ) -> OmniModelRunnerOutput | AsyncModelRunnerOutput | IntermediateTensors:
+        sample_tokens_start = time.perf_counter()
+        sampling_ms = 0.0
+        bookkeeping_ms = 0.0
+        pooler_payload_ms = 0.0
+        connector_output_ms = 0.0
         kv_extracted_req_ids = getattr(self, "kv_extracted_req_ids", None)
         self.kv_extracted_req_ids = None
 
@@ -879,8 +926,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 if self.input_batch.vocab_size > logits_vocab:
                     smd.prompt_token_ids = smd.prompt_token_ids.clamp(max=logits_vocab)
 
+        sampling_start = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: sample"):
             sampler_output = self._sample(logits, spec_decode_metadata)
+        sampling_ms = (time.perf_counter() - sampling_start) * 1000.0
 
         self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
@@ -942,6 +991,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             else:
                 propose_drafts_after_bookkeeping = input_fits_in_drafter
 
+        bookkeeping_start = time.perf_counter()
         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
             (
                 num_nans_in_logits,
@@ -958,6 +1008,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states,
                 scheduler_output.total_num_scheduled_tokens,
             )
+        bookkeeping_ms = (time.perf_counter() - bookkeeping_start) * 1000.0
 
         if propose_drafts_after_bookkeeping:
             # ngram and other speculative decoding methods use the sampled
@@ -977,6 +1028,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        pooler_payload_start = time.perf_counter()
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         needs_pooler_payload = len(downstream_req_ids) > 0
         downstream_req_id_set = set(downstream_req_ids)
@@ -995,7 +1047,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 int(hidden_states.shape[0]),
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
-                hidden_states_cpu = hidden_states[:num_valid_tokens].detach().to("cpu").contiguous()
+                hidden_states_cpu = self._stage_pooler_tensor(hidden_states[:num_valid_tokens])
             else:
                 req_hidden_states_cpu = {}
         num_scheduled_tokens_np = getattr(self, "_omni_num_scheduled_tokens_np", None)
@@ -1038,7 +1090,27 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 )
             # Otherwise we don't have the mm CPU data yet, so we still need to build it
             if self.omni_prefix_cache is None or combined_multimodal_outputs is None:
-                mm_cpu = build_mm_cpu(flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs)
+                mm_source = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs
+                if self._use_async_shm_pooler_payload() and isinstance(mm_source, dict):
+                    mm_start = time.perf_counter()
+                    mm_cpu = mm_source
+                    if _shm_profile_enabled():
+                        logger.warning(
+                            "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=async_gpu "
+                            "stage=%s elapsed_ms=%.3f",
+                            getattr(self, "_stage_id", None),
+                            (time.perf_counter() - mm_start) * 1000.0,
+                        )
+                else:
+                    mm_start = time.perf_counter()
+                    mm_cpu = build_mm_cpu(mm_source)
+                    if _shm_profile_enabled():
+                        logger.warning(
+                            "OMNI_SHM_PROFILE runner=GPUARModelRunner event=build_mm_payload mode=sync_cpu "
+                            "stage=%s elapsed_ms=%.3f",
+                            getattr(self, "_stage_id", None),
+                            (time.perf_counter() - mm_start) * 1000.0,
+                        )
 
             self._process_additional_information_updates(
                 hidden_states,
@@ -1056,7 +1128,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     start = int(query_start_loc_cpu[idx])
                     sched = int(num_scheduled_tokens_np[idx])
                     end = start + sched
-                    req_hidden_states_cpu[rid] = hidden_states[start:end].detach().to("cpu").contiguous()
+                    req_hidden_states_cpu[rid] = self._stage_pooler_tensor(hidden_states[start:end])
 
             pooler_output = []
             for out_idx, rid in enumerate(req_ids_output_copy):
@@ -1117,12 +1189,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Flatten nested dicts to dotted keys so pooling_output
                 # stays dict[str, torch.Tensor] for msgspec serialization.
                 pooler_output.append(flatten_payload(payload))
+        pooler_payload_ms = (time.perf_counter() - pooler_payload_start) * 1000.0
 
         if pooler_output and self._should_accumulate_full_payload_output():
             for i, rid in enumerate(req_ids_output_copy):
                 req_state = self.requests.get(rid)
                 if req_state is not None and pooler_output[i]:
                     self.accumulate_full_payload_output(rid, pooler_output[i], req_state)
+
+        connector_output_start = time.perf_counter()
+        omni_connector_output = self.get_omni_connector_output()
+        connector_output_ms = (time.perf_counter() - connector_output_start) * 1000.0
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
@@ -1141,10 +1218,29 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats=cudagraph_stats,
             )
             output.kv_extracted_req_ids = kv_extracted_req_ids
-            output.omni_connector_output = self.get_omni_connector_output()
+            output.omni_connector_output = omni_connector_output
             output.routed_experts = routed_experts_lists
 
         if not self.use_async_scheduling:
+            if _shm_profile_enabled():
+                logger.warning(
+                    "OMNI_SHM_PROFILE runner=GPUARModelRunner event=sample_tokens_done return_type=sync "
+                    "stage=%s async_shm=%s reqs=%d downstream=%d needs_pooler=%s engine_output_type=%s "
+                    "seq_len=%d sampling_ms=%.3f bookkeeping_ms=%.3f pooler_payload_ms=%.3f "
+                    "connector_output_ms=%.3f total_ms=%.3f",
+                    getattr(self, "_stage_id", None),
+                    self._use_async_shm_pooler_payload(),
+                    len(req_ids_output_copy),
+                    len(downstream_req_ids),
+                    needs_pooler_payload,
+                    engine_output_type,
+                    seq_len,
+                    sampling_ms,
+                    bookkeeping_ms,
+                    pooler_payload_ms,
+                    connector_output_ms,
+                    (time.perf_counter() - sample_tokens_start) * 1000.0,
+                )
             return output
         with record_function_or_nullcontext("gpu_model_runner: AsyncGPUModelRunnerOutput"):
             async_output = AsyncGPUModelRunnerOutput(
@@ -1163,6 +1259,25 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 async_output.async_copy_ready_event,
             )
 
+        if _shm_profile_enabled():
+            logger.warning(
+                "OMNI_SHM_PROFILE runner=GPUARModelRunner event=sample_tokens_done return_type=async "
+                "stage=%s async_shm=%s reqs=%d downstream=%d needs_pooler=%s engine_output_type=%s "
+                "seq_len=%d sampling_ms=%.3f bookkeeping_ms=%.3f pooler_payload_ms=%.3f "
+                "connector_output_ms=%.3f total_ms=%.3f",
+                getattr(self, "_stage_id", None),
+                self._use_async_shm_pooler_payload(),
+                len(req_ids_output_copy),
+                len(downstream_req_ids),
+                needs_pooler_payload,
+                engine_output_type,
+                seq_len,
+                sampling_ms,
+                bookkeeping_ms,
+                pooler_payload_ms,
+                connector_output_ms,
+                (time.perf_counter() - sample_tokens_start) * 1000.0,
+            )
         return async_output
 
     def _resolve_global_request_id(self, req_id: str) -> str:

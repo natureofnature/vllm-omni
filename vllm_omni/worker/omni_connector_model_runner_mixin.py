@@ -16,6 +16,7 @@ import importlib
 import inspect
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,11 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _shm_profile_enabled() -> bool:
+    value = os.environ.get("OMNI_SHM_PROFILE") or os.environ.get("VLLM_OMNI_SHM_PROFILE", "")
+    return value.lower() in {"1", "true", "yes", "on"}
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -149,6 +155,7 @@ class OmniConnectorModelRunnerMixin:
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
         self._deferred_send_cleanup: set[str] = set()
+        self._recv_first_poll_times: dict[str, float] = {}
         # -- per-cycle output accumulator --
         self._chunk_ready_req_ids: set[str] = set()
         self._chunk_finished_req_ids: set[str] = set()
@@ -319,6 +326,9 @@ class OmniConnectorModelRunnerMixin:
     def _clear_recv_delivery_state(self, req_id: str) -> None:
         self._get_req_chunk.pop(req_id, None)
         self._pending_load_reqs.pop(req_id, None)
+        for key in tuple(self._recv_first_poll_times):
+            if key.startswith(f"{req_id}:"):
+                self._recv_first_poll_times.pop(key, None)
         self._finished_load_reqs.discard(req_id)
         self._chunk_ready_req_ids.discard(req_id)
         self._chunk_finished_req_ids.discard(req_id)
@@ -1009,12 +1019,27 @@ class OmniConnectorModelRunnerMixin:
                 connector_put_key,
                 next_stage_id,
             )
+            prepare_start = time.perf_counter()
+            prepared_payload = self._prepare_connector_payload(payload)
+            prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+            if _shm_profile_enabled():
+                logger.info(
+                    "OMNI_SHM_PROFILE stage=%s event=prepare_full req=%s key=%s async_shm=%s prepare_ms=%.3f",
+                    self._stage_id,
+                    req_id,
+                    connector_put_key,
+                    bool(getattr(self._omni_connector, "async_shm", False)),
+                    prepare_ms,
+                )
+
             task = {
                 "stage_id": self._stage_id,
                 "next_stage_id": next_stage_id,
                 "put_key": connector_put_key,
-                "data": payload,
+                "data": prepared_payload,
                 "request_id": req_id,
+                "_enqueue_time": time.perf_counter(),
+                "_prepare_ms": prepare_ms,
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1161,12 +1186,29 @@ class OmniConnectorModelRunnerMixin:
                 connector_put_key,
             )
 
+        prepare_start = time.perf_counter()
+        prepared_payload = self._prepare_connector_payload(payload_data)
+        prepare_ms = (time.perf_counter() - prepare_start) * 1000.0
+        if _shm_profile_enabled():
+            logger.info(
+                "OMNI_SHM_PROFILE stage=%s event=prepare_chunk req=%s key=%s chunk=%s async_shm=%s prepare_ms=%.3f",
+                self._stage_id,
+                request_id,
+                connector_put_key,
+                chunk_id,
+                bool(getattr(self._omni_connector, "async_shm", False)),
+                prepare_ms,
+            )
+
         task = {
             "stage_id": self._stage_id,
             "next_stage_id": next_stage_id,
             "put_key": connector_put_key,
-            "data": payload_data,
+            "data": prepared_payload,
             "request_id": request_id,
+            "_enqueue_time": time.perf_counter(),
+            "_prepare_ms": prepare_ms,
+            "_chunk_id": chunk_id,
         }
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
@@ -1763,7 +1805,10 @@ class OmniConnectorModelRunnerMixin:
         chunk_id = self._get_req_chunk[req_id]
         external_req_id = self._request_ids_mapping.get(req_id, req_id)
         connector_get_key = f"{external_req_id}_{target_stage_id}_{chunk_id}"
+        recv_profile_key = f"{req_id}:{connector_get_key}"
+        first_poll = self._recv_first_poll_times.setdefault(recv_profile_key, time.perf_counter())
 
+        get_start = time.perf_counter()
         if self._async_chunk:
             result = self._recv_async_chunk_result(
                 connector,
@@ -1778,13 +1823,30 @@ class OmniConnectorModelRunnerMixin:
                 str(self._stage_id),
                 connector_get_key,
             )
+        get_ms = (time.perf_counter() - get_start) * 1000.0
 
         if result is None:
             return False
 
+        wait_ms = (time.perf_counter() - first_poll) * 1000.0
+        self._recv_first_poll_times.pop(recv_profile_key, None)
         payload_data, _size = result
         if not payload_data:
             return False
+        if _shm_profile_enabled():
+            logger.warning(
+                "OMNI_SHM_PROFILE stage=%s event=recv_chunk_ready req=%s key=%s chunk=%s async_chunk=%s "
+                "async_shm=%s get_call_ms=%.3f wait_since_first_poll_ms=%.3f size=%s",
+                self._stage_id,
+                req_id,
+                connector_get_key,
+                chunk_id,
+                self._async_chunk,
+                bool(getattr(connector, "async_shm", False)),
+                get_ms,
+                wait_ms,
+                _size,
+            )
         if isinstance(payload_data, dict):
             logger.info(
                 "[Stage-%s] recv_chunk_result: req=%s ext=%s key=%s keys=%s finished=%s",
@@ -1917,6 +1979,13 @@ class OmniConnectorModelRunnerMixin:
             logger.exception("custom_process_stage_input_func failed for chunk %s", request_id)
             return None
 
+    def _prepare_connector_payload(self, payload: Any) -> Any:
+        connector = getattr(self, "_omni_connector", None)
+        prepare = getattr(connector, "prepare_async_payload", None)
+        if callable(prepare):
+            return prepare(payload)
+        return payload
+
     def _custom_process_supports_is_finished_kwarg(self) -> bool | None:
         """Return whether the custom process hook accepts `is_finished`."""
         if self._custom_process_func is None:
@@ -1966,14 +2035,22 @@ class OmniConnectorModelRunnerMixin:
                 request=task.get("request"),
                 pooling_output=task.get("pooling_output"),
             )
+            payload_data = self._prepare_connector_payload(payload_data)
         put_key = task.get("put_key")
 
+        queue_wait_ms = None
+        enqueue_time = task.get("_enqueue_time")
+        if isinstance(enqueue_time, (int, float)):
+            queue_wait_ms = (time.perf_counter() - enqueue_time) * 1000.0
+
+        put_start = time.perf_counter()
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),
             to_stage=str(task["next_stage_id"]),
             put_key=put_key,
             data=payload_data,
         )
+        put_ms = (time.perf_counter() - put_start) * 1000.0
         logger.info(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],
@@ -1981,6 +2058,22 @@ class OmniConnectorModelRunnerMixin:
             success,
             _size,
         )
+        if _shm_profile_enabled():
+            logger.info(
+                "OMNI_SHM_PROFILE stage=%s event=connector_put req=%s key=%s chunk=%s success=%s async_shm=%s "
+                "prepare_ms=%.3f queue_wait_ms=%s put_return_ms=%.3f size=%s metadata_async=%s",
+                task["stage_id"],
+                request_id,
+                put_key,
+                task.get("_chunk_id"),
+                success,
+                bool(getattr(connector, "async_shm", False)),
+                float(task.get("_prepare_ms") or 0.0),
+                f"{queue_wait_ms:.3f}" if queue_wait_ms is not None else "NA",
+                put_ms,
+                _size,
+                isinstance(_metadata, dict) and bool(_metadata.get("async_shm")),
+            )
 
         if not success:
             return False
