@@ -20,11 +20,12 @@ pytestmark = [pytest.mark.core_model, pytest.mark.benchmark, pytest.mark.cpu]
 class MockResponse:
     """Mock aiohttp response for testing"""
 
-    def __init__(self, status, chunks, delay_between_chunks=0):
+    def __init__(self, status, chunks, delay_between_chunks=0, json_data=None):
         self.status = status
         self.reason = "OK" if status == 200 else "Error"
         self._chunks = chunks
         self._delay = delay_between_chunks
+        self._json_data = json_data
         self.content = self
 
     async def iter_any(self):
@@ -32,6 +33,9 @@ class MockResponse:
             if self._delay > 0:
                 await asyncio.sleep(self._delay)
             yield chunk
+
+    async def json(self):
+        return self._json_data
 
     async def __aenter__(self):
         return self
@@ -43,6 +47,36 @@ class MockResponse:
 def create_sse_chunk(data_dict):
     """Helper to create SSE formatted chunk"""
     return f"data: {json.dumps(data_dict)}\n\n".encode()
+
+
+@pytest.mark.asyncio
+async def test_chat_omni_non_stream_request_parses_json_response(mocker: MockerFixture):
+    request_input = RequestFuncInput(
+        model="test-model",
+        model_name="test-model",
+        prompt="test prompt",
+        api_url="http://test.com/v1/chat/completions",
+        prompt_len=10,
+        output_len=20,
+    )
+    setattr(request_input, "no_stream", True)
+    response_data = {
+        "choices": [{"message": {"content": "final answer"}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3},
+    }
+    mock_response = MockResponse(200, [], json_data=response_data)
+    mock_session = mocker.AsyncMock()
+    mock_session.post = mocker.MagicMock(return_value=mock_response)
+
+    output = await async_request_openai_chat_omni_completions(request_input, mock_session)
+
+    payload = mock_session.post.call_args.kwargs["json"]
+    assert payload["stream"] is False
+    assert "stream_options" not in payload
+    assert output.success is True
+    assert output.generated_text == "final answer"
+    assert output.prompt_len == 7
+    assert output.output_tokens == 3
 
 
 # ============================================================================

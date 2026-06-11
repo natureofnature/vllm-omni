@@ -13,6 +13,7 @@ import wave
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Literal
 
 import aiohttp
@@ -37,6 +38,10 @@ from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
 from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+    OmniInteractDataset,
+    OmniInteractSampleRequest,
+)
 from vllm_omni.benchmarks.data_modules.random_multi_modal_dataset import OmniRandomMultiModalDataset
 from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
     SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
@@ -56,6 +61,7 @@ _AUDIO_CONTINUITY_THRESHOLD_ENV = "VLLM_OMNI_BENCH_AUDIO_CONTINUITY_THRESHOLD_S"
 RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
+_BENCH_NO_STREAM = False
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -137,6 +143,7 @@ def _pcm_s16le_to_seed_tts_wer_bytes(
 get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
+_DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -204,6 +211,43 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     rfi.extra_body = base
 
 
+def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Apply per-request OpenAI fields for OmniInteract."""
+    if not isinstance(sample, OmniInteractSampleRequest):
+        return
+    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
+    if sample.omni_chat_messages is not None:
+        setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+#         audio_urls, video_urls = _omniinteract_media_urls(sample.omni_chat_messages)
+#         logger.info(
+#             "OmniInteract request media: request_id=%s video=%s audio=%s",
+#             getattr(rfi, "request_id", None) or getattr(sample, "request_id", None),
+#             ",".join(video_urls) if video_urls else "None",
+#             ",".join(audio_urls) if audio_urls else "None",
+#         )
+
+
+# def _omniinteract_media_urls(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
+#     audio_urls: list[str] = []
+#     video_urls: list[str] = []
+#     for message in messages:
+#         content = message.get("content") if isinstance(message, dict) else None
+#         if not isinstance(content, list):
+#             continue
+#         for part in content:
+#             if not isinstance(part, dict):
+#                 continue
+#             if part.get("type") == "audio_url":
+#                 audio = part.get("audio_url")
+#                 if isinstance(audio, dict) and audio.get("url"):
+#                     audio_urls.append(str(audio["url"]))
+#             elif part.get("type") == "video_url":
+#                 video = part.get("video_url")
+#                 if isinstance(video, dict) and video.get("url"):
+#                     video_urls.append(str(video["url"]))
+#     return audio_urls, video_urls
+
+
 def _daily_omni_repo_from_args(args) -> str | None:
     """Resolve HuggingFace repo id for Daily-Omni from CLI args.
 
@@ -221,10 +265,36 @@ def _daily_omni_repo_from_args(args) -> str | None:
     return None
 
 
+def _omniinteract_repo_from_args(args) -> str | None:
+    dp = getattr(args, "dataset_path", None)
+    hn = getattr(args, "hf_name", None)
+    if dp in OmniInteractDataset.SUPPORTED_DATASET_PATHS:
+        return dp
+    if hn in OmniInteractDataset.SUPPORTED_DATASET_PATHS:
+        return hn
+    return None
+
+
+def _is_local_omniinteract_path(path: str | None) -> bool:
+    if not path:
+        return False
+    p = Path(path).expanduser()
+    return p.exists() and p.is_dir()
+
+
 def get_samples(args, tokenizer):
+    global _BENCH_NO_STREAM
+    _BENCH_NO_STREAM = bool(getattr(args, "no_stream", False))
+
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
+    )
+    is_omniinteract = (
+        args.dataset_name == "omniinteract"
+        or _is_local_omniinteract_path(getattr(args, "dataset_path", None))
+        or _is_local_omniinteract_path(getattr(args, "omniinteract_root", None))
+        or (args.dataset_name == "hf" and _omniinteract_repo_from_args(args) is not None)
     )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
@@ -236,7 +306,7 @@ def get_samples(args, tokenizer):
 
     # Check if we need to handle omni-related backends/datasets
     is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
-    is_omni_dataset = is_daily_omni or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_dataset = is_daily_omni or is_omniinteract or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -367,6 +437,62 @@ def get_samples(args, tokenizer):
             out_len = getattr(args, "hf_output_len", None)
         if out_len is None:
             out_len = SeedTTSDataset.DEFAULT_OUTPUT_LEN
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+
+    if is_omniinteract:
+        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+            raise ValueError(
+                "OmniInteract requires a multimodal backend that supports video/audio. "
+                f"Got backend={args.backend!r}; use --backend openai-chat-omni."
+            )
+
+        dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
+        omniinteract_root = getattr(args, "omniinteract_root", None)
+        if args.dataset_name == "omniinteract" and not dataset_path and not omniinteract_root:
+            dataset_path = _DEFAULT_OMNIINTERACT_REPO
+        if not dataset_path and not omniinteract_root:
+            raise ValueError(
+                "OmniInteract requires --dataset-path (HF repo id or local directory) "
+                f"or --omniinteract-root (local directory). Default HF repo: {_DEFAULT_OMNIINTERACT_REPO}."
+            )
+
+        subsets_arg = str(getattr(args, "omniinteract_subsets", "1q1a,1q1a_math,1qna"))
+        subsets = [x.strip() for x in subsets_arg.split(",") if x.strip()]
+        if not subsets:
+            subsets = ["1q1a", "1q1a_math", "1qna"]
+
+        logger.info(
+            "Loading OmniInteract dataset: dataset_path=%s, omniinteract_root=%s, subsets=%s",
+            dataset_path,
+            omniinteract_root,
+            subsets,
+        )
+
+        dataset = OmniInteractDataset(
+            dataset_path=dataset_path,
+            data_root=omniinteract_root,
+            random_seed=args.seed,
+            subsets=subsets,
+            inline_local_video=getattr(args, "omniinteract_inline_local_video", False),
+            input_mode=getattr(args, "omniinteract_input_mode", "video"),
+            aura_tts_task_type=getattr(args, "omniinteract_aura_tts_task_type", "Base"),
+            aura_tts_language=getattr(args, "omniinteract_aura_tts_language", "Chinese"),
+            aura_tts_speaker=getattr(args, "omniinteract_aura_tts_speaker", None),
+            aura_tts_ref_audio=getattr(args, "omniinteract_aura_tts_ref_audio", None),
+            aura_tts_ref_text=getattr(args, "omniinteract_aura_tts_ref_text", None),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        if out_len is None:
+            out_len = OmniInteractDataset.DEFAULT_OUTPUT_LEN
         return dataset.sample(
             tokenizer=tokenizer,
             num_requests=args.num_prompts,
@@ -644,6 +770,31 @@ def _image_metrics_from_stage_metrics(metrics: dict[str, Any] | None) -> tuple[i
     return image_count, image_generation_ms, image_pixels, denoise_step_latency_ms
 
 
+def _decode_audio_bytes_for_benchmark(audio_bytes: bytes, response_format: str) -> tuple[float, int]:
+    if not audio_bytes:
+        return 0.0, 0
+    try:
+        if response_format == "wav":
+            with wave.open(io.BytesIO(audio_bytes), "rb") as wav_reader:
+                frames = wav_reader.getnframes()
+                frame_rate = wav_reader.getframerate()
+                return (frames / frame_rate if frame_rate > 0 else 0.0), int(frames)
+
+        from vllm.multimodal.audio import get_audio_duration
+        from vllm.multimodal.media.audio import load_audio
+
+        waveform, sr = load_audio(
+            io.BytesIO(audio_bytes),
+            sr=None,
+            mono=False,
+        )
+        duration_sec = get_audio_duration(y=waveform, sr=sr)
+        return duration_sec, int(duration_sec * sr)
+    except Exception as ex:
+        logger.warning("Failed to decode accumulated audio bytes: %s", ex)
+        return 0.0, 0
+
+
 def _image_generation_ms_from_content(content: Any) -> float:
     if not isinstance(content, list):
         return 0.0
@@ -680,6 +831,7 @@ async def async_request_openai_chat_omni_completions(
         content = _get_chat_content(request_func_input, mm_position=effective_mm_position)
         messages_payload = [{"role": "user", "content": content}]
 
+    stream = not bool(getattr(request_func_input, "no_stream", False))
     payload = {
         "model": request_func_input.model_name if request_func_input.model_name else request_func_input.model,
         "messages": messages_payload,
@@ -698,7 +850,16 @@ async def async_request_openai_chat_omni_completions(
             "continuous_usage_stats": True,
         },
     }
+    if stream:
+        payload["stream_options"] = {
+            "include_usage": True,
+        }
     _update_payload_common(payload, request_func_input)
+    payload["stream"] = stream
+    if stream:
+        payload.setdefault("stream_options", {"include_usage": True})
+    else:
+        payload.pop("stream_options", None)
     # Seed-TTS via chat: voice-clone fields live on the body; ensure audio is streamed.
     if getattr(request_func_input, "seed_tts_row", False):
         if payload.get("modalities") is None:
@@ -760,6 +921,62 @@ async def async_request_openai_chat_omni_completions(
         try:
             async with session.post(url=api_url, json=payload, headers=headers) as response:
                 if response.status == 200:
+                    if not stream:
+                        timestamp = time.perf_counter()
+                        data = await response.json()
+                        text_parts: list[str] = []
+                        nonstream_audio_bytes = bytearray()
+
+                        for choice in data.get("choices") or []:
+                            message = choice.get("message") or {}
+                            content = message.get("content")
+                            if isinstance(content, str) and content:
+                                text_parts.append(content)
+                            audio = message.get("audio")
+                            if isinstance(audio, dict) and audio.get("data"):
+                                try:
+                                    nonstream_audio_bytes.extend(base64.b64decode(audio["data"]))
+                                except Exception as ex:
+                                    logger.warning("Failed to decode non-stream audio payload: %s", ex)
+
+                        output.latency = timestamp - st
+                        output.generated_text = "\n".join(text_parts)
+                        if text_parts:
+                            output.ttft = output.latency
+                            output.text_latency = output.latency
+                        if nonstream_audio_bytes:
+                            output.audio_ttfp = output.latency
+                            audio_generate_time = output.latency
+                            audio_duration_sec, audio_frames = _decode_audio_bytes_for_benchmark(
+                                bytes(nonstream_audio_bytes),
+                                response_format,
+                            )
+                            output.audio_duration = audio_duration_sec
+                            output.audio_frames = audio_frames
+                            output.audio_rtf = (
+                                audio_generate_time / audio_duration_sec if audio_duration_sec > 0 else 0.0
+                            )
+
+                        _update_output_stage_metrics_from_payload(output, data)
+                        (
+                            metrics_image_count,
+                            metrics_image_ms,
+                            metrics_image_pixels,
+                            metrics_denoise_step_ms,
+                        ) = _image_metrics_from_stage_metrics(data.get("metrics"))
+                        output.image_count = max(output.image_count, metrics_image_count)
+                        output.image_generation_time_ms = max(output.image_generation_time_ms, metrics_image_ms)
+                        output.image_pixels = max(output.image_pixels, metrics_image_pixels)
+                        output.denoise_step_latency_ms = max(output.denoise_step_latency_ms, metrics_denoise_step_ms)
+
+                        if usage := data.get("usage"):
+                            if (pt := usage.get("prompt_tokens")) is not None:
+                                output.prompt_len = pt
+                            if output.output_tokens == 0 and (ct := usage.get("completion_tokens")) is not None:
+                                output.output_tokens = ct
+                        output.success = True
+                        break
+
                     handler = StreamedResponseHandler()
                     async for chunk_bytes in response.content.iter_any():
                         # NOTE: Do NOT strip() here; TCP may fragment the SSE messages,
@@ -1377,8 +1594,10 @@ async def benchmark(
         extra_body=test_extra_body,
         chat_messages=test_chat_messages,
     )
+    setattr(test_input, "no_stream", _BENCH_NO_STREAM)
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
+    _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
 
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
@@ -1442,8 +1661,10 @@ async def benchmark(
             extra_body=test_extra_body,
             chat_messages=test_chat_messages,
         )
+        setattr(profile_input, "no_stream", _BENCH_NO_STREAM)
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
+        _attach_omniinteract_to_request_func_input(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler started")
@@ -1527,8 +1748,10 @@ async def benchmark(
             request_id=request_id,
             chat_messages=request.chat_messages,
         )
+        setattr(request_func_input, "no_stream", _BENCH_NO_STREAM)
         _attach_daily_omni_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
+        _attach_omniinteract_to_request_func_input(request, request_func_input)
         tasks.append(
             asyncio.create_task(limited_request_func(request_func_input=request_func_input, session=session, pbar=pbar))
         )
@@ -1617,6 +1840,31 @@ async def benchmark(
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
 
+    from vllm_omni.benchmarks.data_modules.omniinteract_eval import (
+        compute_omniinteract_metrics,
+        print_omniinteract_summary,
+    )
+
+    _omniinteract_eval = os.environ.get("OMNIINTERACT_EVAL", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if _omniinteract_eval:
+        _save_omniinteract_items = os.environ.get("OMNIINTERACT_SAVE_EVAL_ITEMS", "").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        _omniinteract_metrics = compute_omniinteract_metrics(
+            input_requests,
+            outputs,
+            include_per_item=_save_omniinteract_items,
+        )
+        if _omniinteract_metrics is not None:
+            result.update(_omniinteract_metrics)
+            print_omniinteract_summary(_omniinteract_metrics)
+
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
             compute_seed_tts_wer_metrics,
@@ -1700,6 +1948,7 @@ async def benchmark(
             extra_body=test_extra_body,
             chat_messages=test_chat_messages,
         )
+        setattr(profile_input, "no_stream", _BENCH_NO_STREAM)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler stopped")
