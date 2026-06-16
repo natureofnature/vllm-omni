@@ -613,9 +613,7 @@ def run_benchmark(
     ]
 
     serve_args_dict = (server_cfg or {}).get("serve_args_dict")
-    profiler_enabled = isinstance(serve_args_dict, dict) and bool(
-        serve_args_dict.get(_DIFFUSION_PIPELINE_PROFILER_ARG)
-    )
+    profiler_enabled = isinstance(serve_args_dict, dict) and bool(serve_args_dict.get(_DIFFUSION_PIPELINE_PROFILER_ARG))
     if endpoint in _STAGE_METRICS_ENDPOINTS and profiler_enabled:
         cmd.append("--return-stage-metrics")
 
