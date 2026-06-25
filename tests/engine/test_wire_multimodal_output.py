@@ -53,6 +53,23 @@ def test_empty_multimodal_roundtrip():
     assert decoded.outputs[0].multimodal_output is None
 
 
+def test_error_fields_roundtrip():
+    eco = OmniEngineCoreOutput(
+        request_id="req-error",
+        new_token_ids=[],
+        finish_reason=None,
+        error="Connector send failed after retries.",
+        error_status_code=500,
+        error_type="ConnectorSendError",
+    )
+
+    decoded = _roundtrip(OmniEngineCoreOutputs(outputs=[eco]))
+    out = decoded.outputs[0]
+    assert out.error == "Connector send failed after retries."
+    assert out.error_status_code == 500
+    assert out.error_type == "ConnectorSendError"
+
+
 def test_multiple_tensor_keys_roundtrip():
     """Multiple tensor keys survive roundtrip."""
     hidden = torch.randn(10, 4096)

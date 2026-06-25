@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers (PR #2581)."""
+"""Unit tests for Qwen3-Omni streaming thinker→talker / talker→codec helpers."""
 
 from __future__ import annotations
 
@@ -17,6 +17,11 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 @pytest.fixture(autouse=True)
 def _streaming_context() -> SimpleNamespace:
     return SimpleNamespace(bridge_states={})
+
+
+class _TensorCopySentinel:
+    def detach(self):
+        raise AssertionError("tensor copy should not be reached")
 
 
 def test_get_streaming_talker_tokens_first_segment(_streaming_context: SimpleNamespace) -> None:
@@ -103,6 +108,32 @@ def test_streaming_input_prefill_chunk_is_cached() -> None:
     assert torch.equal(cached["hidden_states"]["output"], thinker_hid)
     assert cached["ids"]["all"] == request.all_token_ids
     assert cached["ids"]["prompt"] == request.prompt_token_ids
+    assert cached["meta"]["next_stage_prompt_len"] > 0
+
+
+def test_streaming_input_placeholder_chunk_is_not_sent() -> None:
+    transfer_manager = SimpleNamespace(_pending_streaming_prefills={})
+    request = SimpleNamespace(
+        external_req_id="rt-placeholder",
+        output_token_ids=[],
+        all_token_ids=[151644, 872],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+    thinker_emb = _TensorCopySentinel()
+    thinker_hid = _TensorCopySentinel()
+
+    payload = q3._construct_thinker2talker_streaming_input_async_chunk(
+        False,
+        request,
+        thinker_emb,
+        thinker_hid,
+        transfer_manager,
+    )
+
+    assert payload is None
+    assert transfer_manager._pending_streaming_prefills == {}
 
 
 def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
@@ -124,7 +155,7 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
         additional_information=None,
     )
     thinker_emb = torch.full((1, 3), 3.0)
-    thinker_hid = torch.full((1, 3), 4.0)
+    thinker_hid = _TensorCopySentinel()
 
     payload = q3._construct_thinker2talker_streaming_input_async_chunk(
         False,
@@ -135,11 +166,356 @@ def test_streaming_input_prefill_flushes_with_next_decode_chunk() -> None:
     )
 
     assert payload is not None
-    assert payload.embed.prefill.shape == (3, 3)
-    assert payload.hidden_states.output.shape == (3, 3)
+    assert payload.embed.prefill.shape == (2, 3)
+    assert torch.equal(payload.embed.decode, thinker_emb)
+    assert payload.hidden_states.output.shape == (2, 3)
     assert payload.ids.all == [151644, 872, 100]
     assert payload.ids.prompt == [151644, 872]
+    assert payload.ids.output == [101]
+    assert payload.meta.next_stage_prompt_len > 0
     assert "rt-2" not in transfer_manager._pending_streaming_prefills
+
+
+def test_thinker2talker_async_chunk_holds_prefill_until_output_tokens() -> None:
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={"rt-final": 5},
+        request_payload={},
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-final",
+        output_token_ids=[],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872, 100],
+        num_computed_tokens=156,
+        resumable=True,
+        additional_information=None,
+    )
+    prefill_output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_24": torch.full((3, 2), 2.0),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, prefill_output, request, is_finished=False)
+
+    assert payload is None
+    cached = transfer_manager._pending_streaming_prefills["rt-final"]
+    assert cached["ids"]["prompt"] == [151644, 872, 100]
+    assert cached["meta"]["next_stage_prompt_len"] > 0
+    assert cached["embed"]["prefill"].shape == (3, 2)
+    assert cached["hidden_states"]["output"].shape == (3, 2)
+
+    decode_output = {
+        "hidden_states.layer_0": torch.full((1, 2), 3.0),
+        "hidden_states.layer_24": torch.full((1, 2), 4.0),
+    }
+    request.output_token_ids = []
+    payload = q3.thinker2talker_async_chunk(transfer_manager, decode_output, request, is_finished=False)
+
+    assert payload is None
+    cached = transfer_manager._pending_streaming_prefills["rt-final"]
+    assert torch.equal(cached["embed"]["cached_decode"], torch.full((1, 2), 3.0))
+    assert torch.equal(cached["embed"]["prefill"], torch.ones(3, 2))
+
+    next_decode_output = {
+        "hidden_states.layer_0": torch.full((1, 2), 5.0),
+        "hidden_states.layer_24": torch.full((1, 2), 6.0),
+    }
+    request.output_token_ids = [101]
+    payload = q3.thinker2talker_async_chunk(transfer_manager, next_decode_output, request, is_finished=False)
+
+    assert payload is not None
+    assert payload.embed.prefill.shape == (3, 2)
+    assert torch.equal(payload.embed.decode, torch.full((1, 2), 5.0))
+    assert torch.equal(payload.embed.cached_decode, torch.full((1, 2), 3.0))
+    assert payload.hidden_states.output.shape == (3, 2)
+    assert payload.ids.output == [101]
+    assert payload.meta.next_stage_prompt_len > 0
+    assert "rt-final" not in transfer_manager._pending_streaming_prefills
+
+    finish_payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {q3.ASYNC_FINISH_SENTINEL_KEY: True},
+        request,
+        is_finished=True,
+    )
+    assert finish_payload["meta"]["finished"].item() is True
+
+
+def test_streaming_decode_cache_merges_cumulative_prefix() -> None:
+    cached = torch.tensor([[3.0, 3.0]])
+    cumulative = torch.tensor([[3.0, 3.0], [5.0, 5.0]])
+    merged = q3._merge_streaming_decode_cache(cached, cumulative)
+
+    assert torch.equal(merged, cumulative)
+    assert torch.equal(
+        q3._trim_streaming_decode_prefix(cumulative, cached),
+        torch.tensor([[5.0, 5.0]]),
+    )
+
+
+def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() -> None:
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={"rt-active": 5},
+        request_payload={},
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-active",
+        output_token_ids=[],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872, 100],
+        num_computed_tokens=156,
+        resumable=True,
+        additional_information=None,
+    )
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {
+            "hidden_states.layer_0": torch.ones(3, 2),
+            "hidden_states.layer_24": torch.full((3, 2), 2.0),
+        },
+        request,
+        is_finished=False,
+    )
+    assert payload is None
+
+    request.output_token_ids = [101]
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {
+            "hidden_states.layer_0": torch.full((1, 2), 5.0),
+            "hidden_states.layer_24": torch.full((1, 2), 6.0),
+        },
+        request,
+        is_finished=False,
+    )
+    assert payload is not None
+    assert "rt-active" in transfer_manager._active_streaming_input_request_ids
+    assert "rt-active" not in transfer_manager._pending_streaming_prefills
+
+    request.output_token_ids = []
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {
+            "hidden_states.layer_0": torch.full((1, 2), 9.0),
+            "hidden_states.layer_24": torch.full((1, 2), 10.0),
+        },
+        request,
+        is_finished=False,
+    )
+    assert payload is not None
+    assert torch.equal(payload.embed.decode, torch.full((1, 2), 9.0))
+
+    finish_payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {q3.ASYNC_FINISH_SENTINEL_KEY: True},
+        request,
+        is_finished=True,
+    )
+    assert finish_payload["meta"]["finished"].item() is True
+    assert "rt-active" not in transfer_manager._active_streaming_input_request_ids
+
+
+def test_thinker2talker_async_chunk_caches_new_prefill_while_active() -> None:
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={"rt-active-prefill": 5},
+        request_payload={},
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-active-prefill",
+        output_token_ids=[],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872, 100],
+        num_computed_tokens=156,
+        resumable=True,
+        additional_information=None,
+    )
+
+    assert (
+        q3.thinker2talker_async_chunk(
+            transfer_manager,
+            {
+                "hidden_states.layer_0": torch.ones(3, 2),
+                "hidden_states.layer_24": torch.full((3, 2), 2.0),
+            },
+            request,
+            is_finished=False,
+        )
+        is None
+    )
+
+    request.output_token_ids = [101]
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {
+            "hidden_states.layer_0": torch.full((1, 2), 5.0),
+            "hidden_states.layer_24": torch.full((1, 2), 6.0),
+        },
+        request,
+        is_finished=False,
+    )
+    assert payload is not None
+    assert "rt-active-prefill" in transfer_manager._active_streaming_input_request_ids
+    assert "rt-active-prefill" not in transfer_manager._pending_streaming_prefills
+
+    request.output_token_ids = []
+    request.prompt_token_ids = [151644, 872, 100, 102, 103]
+    request.all_token_ids = [151644, 872, 100, 101, 102, 103]
+    assert (
+        q3.thinker2talker_async_chunk(
+            transfer_manager,
+            {
+                "hidden_states.layer_0": torch.full((2, 2), 11.0),
+                "hidden_states.layer_24": torch.full((2, 2), 12.0),
+            },
+            request,
+            is_finished=False,
+        )
+        is None
+    )
+    cached = transfer_manager._pending_streaming_prefills["rt-active-prefill"]
+    assert torch.equal(cached["embed"]["prefill"], torch.full((2, 2), 11.0))
+
+
+def test_thinker2talker_async_chunk_does_not_cache_plain_multirow_chunk() -> None:
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={"plain": 1},
+        request_payload={},
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="plain",
+        output_token_ids=[],
+        all_token_ids=[151644, 872, 100, 101],
+        prompt_token_ids=[151644, 872, 100],
+        num_computed_tokens=156,
+        resumable=False,
+        additional_information=None,
+    )
+    output = {
+        "hidden_states.layer_0": torch.ones(3, 2),
+        "hidden_states.layer_24": torch.full((3, 2), 2.0),
+    }
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        output,
+        request,
+        is_finished=False,
+    )
+
+    assert payload is None
+    assert transfer_manager._pending_streaming_prefills == {}
+
+
+def test_thinker2talker_finish_flushes_cached_first_payload() -> None:
+    cached_prefill = torch.ones(2, 3)
+    cached_hidden = torch.full((2, 3), 2.0)
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={},
+        request_payload={
+            "rt-finish": {
+                "embed": {"prefill": cached_prefill},
+                "hidden_states": {"output": cached_hidden},
+                "ids": {"all": [151644, 872], "prompt": [151644, 872]},
+                "meta": {"finished": torch.tensor(False)},
+            }
+        },
+        _pending_streaming_prefills={},
+    )
+    request = SimpleNamespace(
+        external_req_id="rt-finish",
+        output_token_ids=[],
+        all_token_ids=[151644, 872],
+        prompt_token_ids=[151644, 872],
+        resumable=True,
+        additional_information=None,
+    )
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager,
+        {q3.ASYNC_FINISH_SENTINEL_KEY: True},
+        request,
+        is_finished=True,
+    )
+
+    assert payload is not None
+    assert payload["meta"]["finished"].item() is True
+    assert torch.equal(payload["embed"]["prefill"], cached_prefill)
+    assert torch.equal(payload["hidden_states"]["output"], cached_hidden)
+    assert payload["ids"]["prompt"] == [151644, 872]
+    assert transfer_manager.request_payload == {}
+    assert transfer_manager.put_req_chunk == {}
+
+
+def test_thinker2talker_finish_ignores_runner_sent_snapshot() -> None:
+    sent_prefill = torch.full((2, 3), 9.0)
+    pending_prefill = torch.ones(2, 3)
+    pending_hidden = torch.full((2, 3), 2.0)
+    request_payload = {
+        "rt-runner": {
+            "embed": {"prefill": sent_prefill},
+            "hidden_states": {"output": torch.full((2, 3), 8.0)},
+            "meta": {"finished": torch.tensor(False)},
+        }
+    }
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={},
+        request_payload=request_payload,
+        _send_side_request_payload=request_payload,
+        _pending_streaming_prefills={
+            "rt-runner": {
+                "embed": {"prefill": pending_prefill},
+                "hidden_states": {"output": pending_hidden},
+                "ids": {"prompt": [151644, 872]},
+                "meta": {"finished": torch.tensor(False)},
+            }
+        },
+        _active_streaming_input_request_ids={"rt-runner"},
+    )
+    request = SimpleNamespace(external_req_id="rt-runner")
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager, {q3.ASYNC_FINISH_SENTINEL_KEY: True}, request, is_finished=True
+    )
+
+    assert torch.equal(payload["embed"]["prefill"], pending_prefill)
+    assert torch.equal(payload["hidden_states"]["output"], pending_hidden)
+    assert payload["meta"]["finished"].item() is True
+    assert transfer_manager.request_payload == {}
+    assert transfer_manager._pending_streaming_prefills == {}
+    assert "rt-runner" not in transfer_manager._active_streaming_input_request_ids
+
+
+def test_thinker2talker_finish_sends_terminal_only_for_runner_snapshot() -> None:
+    request_payload = {
+        "rt-runner-terminal": {
+            "embed": {"prefill": torch.full((2, 3), 9.0)},
+            "hidden_states": {"output": torch.full((2, 3), 8.0)},
+            "meta": {"finished": torch.tensor(False)},
+        }
+    }
+    transfer_manager = SimpleNamespace(
+        put_req_chunk={},
+        request_payload=request_payload,
+        _send_side_request_payload=request_payload,
+        _pending_streaming_prefills={},
+        _active_streaming_input_request_ids={"rt-runner-terminal"},
+    )
+    request = SimpleNamespace(external_req_id="rt-runner-terminal")
+
+    payload = q3.thinker2talker_async_chunk(
+        transfer_manager, {q3.ASYNC_FINISH_SENTINEL_KEY: True}, request, is_finished=True
+    )
+
+    assert set(payload) == {"meta"}
+    assert payload["meta"]["finished"].item() is True
+    assert transfer_manager.request_payload == {}
+    assert transfer_manager._pending_streaming_prefills == {}
+    assert "rt-runner-terminal" not in transfer_manager._active_streaming_input_request_ids
 
 
 def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
@@ -250,6 +626,74 @@ def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
     assert payload["next_stage_prompt_len"] > 0
     assert payload["embed"]["prefill"].shape[0] == 2
     assert payload["hidden_states"]["output"].shape[0] == 2
+
+
+def test_thinker2talker_async_chunk_accepts_flattened_runner_payload() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+        resumable=False,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(2, 2),
+        "hidden_states.layer_24": torch.full((2, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
+
+    assert payload is None
+    assert "thinker" in transfer_manager.request_payload
+    cached = transfer_manager.request_payload["thinker"]
+    assert cached["embed"]["prefill"].shape == (2, 2)
+    assert cached["hidden_states"]["output"].shape == (2, 2)
+
+
+def test_thinker2talker_async_chunk_caches_short_finished_prefill() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+        resumable=False,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(1, 2),
+        "hidden_states.layer_24": torch.full((1, 2), 2.0),
+        "embed.tts_bos": torch.zeros(1, 2),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=True)
+
+    assert payload is None
+    cached = transfer_manager.request_payload["thinker"]
+    assert cached["embed"]["prefill"].shape == (1, 2)
+    assert cached["hidden_states"]["output"].shape == (1, 2)
+    assert cached["meta"]["finished"].item() is True
+
+
+def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={"thinker": 1}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3],
+        all_token_ids=[151644, 872, 3],
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.ones(1, 2),
+        "hidden_states.layer_24": torch.full((1, 2), 2.0),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
+
+    assert payload is not None
+    assert payload.embed.decode.shape == (1, 2)
+    assert payload.meta.finished.item() is False
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:

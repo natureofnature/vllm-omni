@@ -387,6 +387,389 @@ def test_update_intermediate_buffer_accumulates():
     assert torch.allclose(buf["b"], torch.tensor([2.0]))
 
 
+def test_update_intermediate_buffer_preserves_prefill_hidden_across_decode_update():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    prefill_hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+    decode_hidden = torch.tensor([[99.0, 100.0]])
+    decode_a = torch.tensor([[1.0, 2.0]])
+    decode_b = torch.tensor([[3.0, 4.0]])
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {"prefill": torch.zeros(3, 2)},
+            "hidden_states": {"output": prefill_hidden.clone()},
+        },
+    )
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {"decode": decode_a},
+            "hidden_states": {"output": decode_hidden},
+        },
+    )
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {"embed": {"decode": torch.cat([decode_a, decode_b], dim=0)}},
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert torch.equal(buf["hidden_states"]["output"], prefill_hidden)
+    assert torch.equal(buf["embed"]["decode"], torch.cat([decode_a, decode_b], dim=0))
+
+
+def test_update_intermediate_buffer_resets_previous_segment_prefill_state():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    old_prefill = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    old_hidden = old_prefill + 100
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_hidden = new_prefill + 10
+
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {
+            "prefill": old_prefill,
+            "decode": torch.tensor([[9.0, 9.0]]),
+        },
+        "hidden_states": {"output": old_hidden},
+        "ids": {"output": [99]},
+        "meta": {"is_segment_finished": torch.tensor(True)},
+        "model_specific_segment_state": {"stale": True},
+    }
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {"prefill": new_prefill},
+            "hidden_states": {"output": new_hidden},
+            "ids": {"prompt": [1, 2]},
+            "meta": {"finished": torch.tensor(False)},
+        },
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf["omni_final_stage_id"] == 2
+    assert torch.equal(buf["embed"]["prefill"], new_prefill)
+    assert "decode" not in buf["embed"]
+    assert torch.equal(buf["hidden_states"]["output"], new_hidden)
+    assert buf["ids"] == {"prompt": [1, 2]}
+    assert "model_specific_segment_state" not in buf
+    assert buf["meta"]["finished"].item() is False
+
+
+def test_update_intermediate_buffer_replaces_nonprefix_shorter_prefill_state():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    old_prefill = torch.arange(8, dtype=torch.float32).reshape(4, 2)
+    old_hidden = old_prefill + 100
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_hidden = new_prefill + 10
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {"prefill": old_prefill},
+            "hidden_states": {"output": old_hidden},
+        },
+    )
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {"prefill": new_prefill},
+            "hidden_states": {"output": new_hidden},
+        },
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert torch.equal(buf["embed"]["prefill"], new_prefill)
+    assert torch.equal(buf["hidden_states"]["output"], new_hidden)
+
+
+def test_streaming_segment_reset_does_not_require_finished_marker():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    old_decode = torch.tensor([[9.0, 9.0]])
+    old_cached_decode = torch.tensor([[8.0, 8.0]])
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_decode = torch.tensor([[5.0, 6.0]])
+    new_cached_decode = torch.tensor([[7.0, 8.0]])
+    new_hidden = new_prefill + 10
+
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {
+            "prefill": torch.zeros(2, 2),
+            "decode": old_decode,
+            "cached_decode": old_cached_decode,
+        },
+        "hidden_states": {"output": torch.ones(2, 2)},
+        "ids": {"output": [99]},
+        "meta": {"is_segment_finished": torch.tensor(False)},
+        "model_specific_segment_state": {"stale": True},
+    }
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {
+            "embed": {
+                "prefill": new_prefill,
+                "decode": new_decode,
+                "cached_decode": new_cached_decode,
+            },
+            "hidden_states": {"output": new_hidden},
+            "ids": {"prompt": [1, 2]},
+        },
+    )
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf["omni_final_stage_id"] == 2
+    assert torch.equal(buf["embed"]["prefill"], new_prefill)
+    assert torch.equal(buf["embed"]["decode"], new_decode)
+    assert torch.equal(buf["embed"]["cached_decode"], new_cached_decode)
+    assert torch.equal(buf["hidden_states"]["output"], new_hidden)
+    assert buf["ids"] == {"prompt": [1, 2]}
+    assert "model_specific_segment_state" not in buf
+    assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
+    assert "r1" not in runner._segment_runtime_reset_req_ids
+
+
+def test_streaming_input_update_marks_cached_request_resumable():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+
+    assert runner.requests["r1"].resumable is True
+
+
+def test_streaming_input_update_clears_previous_segment_runtime():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {"prefill": torch.ones(2, 2), "decode": torch.ones(1, 2)},
+        "hidden_states": {"output": torch.ones(2, 2)},
+        "ids": {"prompt": [1, 2], "output": [3]},
+        "meta": {
+            "num_processed_tokens": 81,
+            "is_segment_finished": torch.tensor(False),
+        },
+        "model_specific_segment_state": {"stale": True},
+    }
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert buf["omni_final_stage_id"] == 2
+    assert set(buf) == {"omni_final_stage_id", "meta"}
+    assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
+    assert runner.requests["r1"].additional_information_cpu is buf
+    assert runner.requests["r1"].resumable is True
+    assert reset_calls == ["r1"]
+    assert runner._segment_send_watermark_reset_req_ids == {"r1"}
+
+
+def test_segment_send_watermark_reset_uses_resolved_transfer_id():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+    runner._segment_send_watermark_reset_req_ids = {"r1"}
+
+    OmniGPUModelRunner._reset_segment_send_watermark_for_transfer(runner, "r1", "ext-1")
+
+    assert reset_calls == ["r1", "ext-1"]
+    assert runner._segment_send_watermark_reset_req_ids == set()
+
+
+def test_segment_prefill_reset_marks_send_watermark_reset():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {"decode": torch.ones(1, 2)},
+        "meta": {"is_segment_finished": torch.tensor(True)},
+    }
+
+    OmniGPUModelRunner._update_intermediate_buffer(
+        runner,
+        "r1",
+        {"embed": {"prefill": torch.zeros(1, 2)}},
+    )
+
+    assert reset_calls == ["r1"]
+    assert runner._segment_send_watermark_reset_req_ids == {"r1"}
+
+
+def test_store_request_additional_information_marks_resumable_from_meta():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    info = {"meta": {"resumable": torch.tensor(True)}, "embed": {"prefill": torch.ones(1, 2)}}
+
+    OmniGPUModelRunner._store_request_additional_information(runner, "r1", info)
+
+    assert runner.model_intermediate_buffer["r1"] is info
+    assert runner.requests["r1"].additional_information_cpu is info
+    assert runner.requests["r1"].resumable is True
+
+
+def test_sync_local_stage_payloads_preserves_new_decode_after_segment_reset():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    old_decode = torch.tensor([[9.0, 9.0]])
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_decode = torch.tensor([[5.0, 6.0]])
+    new_cached_decode = torch.tensor([[7.0, 8.0]])
+    new_hidden = new_prefill + 10
+
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {"decode": old_decode},
+        "meta": {"is_segment_finished": torch.tensor(False)},
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {
+                "prefill": new_prefill,
+                "decode": new_decode,
+                "cached_decode": new_cached_decode,
+            },
+            "hidden_states": {"output": new_hidden},
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert runner._local_stage_payload_cache == {}
+    assert torch.equal(buf["embed"]["prefill"], new_prefill)
+    assert torch.equal(buf["embed"]["decode"], new_decode)
+    assert torch.equal(buf["embed"]["cached_decode"], new_cached_decode)
+    assert torch.equal(buf["hidden_states"]["output"], new_hidden)
+    assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
+
+
+def _enable_qwen3_talker_async_chunk(runner):
+    runner.vllm_config.model_config = SimpleNamespace(
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="talker",
+        async_chunk=True,
+        stage_connector_config={"name": "SharedMemoryConnector"},
+    )
+
+
+def test_sync_local_stage_payloads_resets_reused_streaming_segment():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+
+    old_decode = torch.tensor([[9.0, 9.0]])
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_decode = torch.tensor([[5.0, 6.0]])
+    new_hidden = new_prefill + 10
+    tts_bos = torch.tensor([[0.1, 0.2]])
+    tts_eos = torch.tensor([[0.3, 0.4]])
+    tts_pad = torch.tensor([[0.5, 0.6]])
+
+    runner.model_intermediate_buffer["r1"] = {
+        "omni_final_stage_id": 2,
+        "embed": {"decode": old_decode, "tts_bos": tts_bos, "tts_eos": tts_eos, "tts_pad": tts_pad},
+        "hidden_states": {"output": torch.ones(2, 2)},
+        "ids": {"output": [99]},
+        "meta": {
+            "is_segment_finished": torch.tensor(False),
+            "num_processed_tokens": 81,
+            "prefill_consumed_text_tokens": 1,
+        },
+        "model_specific_segment_state": {"stale": True},
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {"prefill": new_prefill, "decode": new_decode},
+            "hidden_states": {"output": new_hidden},
+            "ids": {"prompt": [1, 2]},
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert runner._local_stage_payload_cache == {}
+    assert reset_calls == ["r1"]
+    assert runner._segment_send_watermark_reset_req_ids == {"r1"}
+    assert buf["omni_final_stage_id"] == 2
+    assert torch.equal(buf["embed"]["prefill"], new_prefill)
+    assert torch.equal(buf["embed"]["decode"], new_decode)
+    assert torch.equal(buf["embed"]["tts_bos"], tts_bos)
+    assert torch.equal(buf["embed"]["tts_eos"], tts_eos)
+    assert torch.equal(buf["embed"]["tts_pad"], tts_pad)
+    assert torch.equal(buf["hidden_states"]["output"], new_hidden)
+    assert buf["ids"] == {"prompt": [1, 2]}
+    assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
+    assert "model_specific_segment_state" not in buf
+
+
+def test_sync_local_stage_payloads_prefill_does_not_reset_without_async_chunk():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+
+    old_decode = torch.tensor([[9.0, 9.0]])
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"decode": old_decode},
+        "meta": {"is_segment_finished": torch.tensor(False), "num_processed_tokens": 81},
+    }
+    runner._local_stage_payload_cache = {"r1": {"embed": {"prefill": new_prefill}}}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    assert reset_calls == []
+    assert getattr(runner, "_segment_send_watermark_reset_req_ids", set()) == set()
+
+
+def test_sync_local_stage_payloads_decode_only_keeps_current_segment_state():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+    runner.requests["r1"].resumable = True
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+
+    old_decode = torch.tensor([[1.0, 2.0]])
+    new_decode = torch.tensor([[3.0, 4.0]])
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"decode": old_decode},
+        "meta": {"num_processed_tokens": 1},
+    }
+    runner._local_stage_payload_cache = {"r1": {"embed": {"decode": new_decode}}}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert reset_calls == []
+    assert getattr(runner, "_segment_send_watermark_reset_req_ids", set()) == set()
+    assert torch.equal(buf["embed"]["decode"], torch.cat([old_decode, new_decode], dim=0))
+    assert buf["meta"] == {"num_processed_tokens": 1}
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
@@ -522,9 +905,16 @@ def test_full_payload_output_accumulation_hook_matrix():
     assert _make_full_payload_accumulation_runner(model_stage="thinker")._should_accumulate_full_payload_output()
     assert _make_full_payload_accumulation_runner(model_stage="talker")._should_accumulate_full_payload_output()
 
-    # Terminal stage: even if _load_custom_func derived a builder from
-    # custom_process_input_func, final output stages are not producers.
-    runner = _make_full_payload_accumulation_runner(model_stage="code2wav", final_output=True)
+    # Qwen3 thinker is both a text final-output stage and a downstream
+    # talker producer; the explicit next-stage hook is the producer signal.
+    assert _make_full_payload_accumulation_runner(
+        model_stage="thinker", final_output=True
+    )._should_accumulate_full_payload_output()
+
+    # Terminal stage without an explicit producer hook must not accumulate/send.
+    runner = _make_full_payload_accumulation_runner(
+        model_stage="code2wav", final_output=True, custom_process_next_stage_input_func=None
+    )
     assert not runner._should_accumulate_full_payload_output()
 
     # Input-only consumer stage without an explicit producer hook must not

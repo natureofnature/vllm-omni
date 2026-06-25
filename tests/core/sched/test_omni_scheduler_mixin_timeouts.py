@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
+from vllm_omni.outputs import OmniConnectorOutput
 
 
 class _FakeCoordinator:
@@ -98,6 +99,25 @@ def test_process_pending_input_timeouts_disabled_when_timeout_zero(monkeypatch):
     scheduler._process_pending_input_timeouts()
     assert coord.calls == [], "coordinator must not be polled when timeout is disabled"
     assert scheduler.finish_calls == []
+
+
+def test_consume_pending_connector_output_records_send_failure_without_coordinator():
+    req_id = "send-failed"
+    scheduler = _FakeScheduler(requests={req_id: SimpleNamespace(request_id=req_id)}, coordinator=None)
+    scheduler._latest_omni_connector_output = OmniConnectorOutput(send_failed_req_ids={req_id})
+
+    scheduler._consume_pending_connector_output("ar")
+
+    assert len(scheduler.finish_calls) == 1
+    finished_ids, status = scheduler.finish_calls[0]
+    assert finished_ids == {req_id}
+    assert getattr(status, "name", str(status)).endswith("FINISHED_ERROR")
+
+    output = scheduler._make_finished_request_output(req_id)
+    assert output.request_id == req_id
+    assert output.error == "Connector send failed after retries."
+    assert output.error_status_code == 500
+    assert output.error_type == "ConnectorSendError"
 
 
 if __name__ == "__main__":

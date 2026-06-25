@@ -7,10 +7,12 @@ from typing import Any
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.engine import EngineCoreOutput, FinishReason
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
+from vllm_omni.engine import OmniEngineCoreOutput
 
 logger = init_logger(__name__)
 
@@ -23,9 +25,9 @@ _STATS_INTERVAL_S = 1.0
 # never arrives.  Override per-deployment via
 # VLLM_OMNI_INPUT_WAIT_TIMEOUT_S; set <=0 to disable the safety net.
 #
-# Scope: this constant only covers the full-payload coordinator path
-# (``input_coordinator``).  The async-chunk path uses
-# ``chunk_transfer_adapter`` and is not affected by this constant.
+# Scope: this constant only covers full-payload ``WAITING_FOR_INPUT`` waits.
+# Async-chunk requests park in ``WAITING_FOR_CHUNK`` and are intentionally not
+# force-failed by this timeout during normal realtime pauses.
 _INPUT_WAIT_TIMEOUT_RAW = os.environ.get("VLLM_OMNI_INPUT_WAIT_TIMEOUT_S", "600")
 try:
     DEFAULT_INPUT_WAIT_TIMEOUT_S: float = float(_INPUT_WAIT_TIMEOUT_RAW)
@@ -50,6 +52,36 @@ class OmniSchedulerMixin:
     #  Shared scheduler/output helpers (lift the AR / generation duplicates)
     # ------------------------------------------------------------------ #
 
+    def _record_connector_send_failures(self, req_ids: set[str]) -> None:
+        present_ids = {req_id for req_id in req_ids if req_id in self.requests}
+        if not present_ids:
+            return
+        failure_messages = getattr(self, "_omni_connector_send_failure_messages", None)
+        if failure_messages is None:
+            failure_messages = {}
+            self._omni_connector_send_failure_messages = failure_messages
+        for req_id in present_ids:
+            failure_messages[req_id] = "Connector send failed after retries."
+        self.finish_requests(present_ids, RequestStatus.FINISHED_ERROR)
+
+    def _has_connector_send_failure(self, req_id: str) -> bool:
+        failure_messages = getattr(self, "_omni_connector_send_failure_messages", None)
+        return failure_messages is not None and req_id in failure_messages
+
+    def _make_finished_request_output(self, req_id: str) -> EngineCoreOutput:
+        failure_messages = getattr(self, "_omni_connector_send_failure_messages", None)
+        error = failure_messages.pop(req_id, None) if failure_messages is not None else None
+        if error is None:
+            return EngineCoreOutput(req_id, [], finish_reason=FinishReason.ABORT)
+        return OmniEngineCoreOutput(
+            request_id=req_id,
+            new_token_ids=[],
+            finish_reason=FinishReason.ABORT,
+            error=error,
+            error_status_code=500,
+            error_type="ConnectorSendError",
+        )
+
     def _consume_pending_connector_output(self, model_mode: str) -> None:
         """Drain ``self._latest_omni_connector_output`` into the coordinator.
 
@@ -59,13 +91,44 @@ class OmniSchedulerMixin:
         """
         connector_output = getattr(self, "_latest_omni_connector_output", None)
         self._latest_omni_connector_output = None
+        if connector_output and connector_output.send_failed_req_ids:
+            self._record_connector_send_failures(connector_output.send_failed_req_ids)
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
+        if connector_output:
+            chunk_ready_req_ids = connector_output.chunk_ready_req_ids
+            chunk_finished_req_ids = connector_output.chunk_finished_req_ids
+        else:
+            chunk_ready_req_ids = set()
+            chunk_finished_req_ids = set()
         if connector_output and connector_output.request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests, connector_output.request_metadata, model_mode=model_mode
             )
+        if connector_output and connector_output.chunk_segment_finished_req_ids:
+            pending_segment_stop = getattr(self, "_omni_pending_upstream_segment_finished", None)
+            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+            if getattr(model_config, "final_output", False):
+                segment_finished_req_ids = set(connector_output.chunk_segment_finished_req_ids)
+                chunk_ready_req_ids = set(chunk_ready_req_ids)
+                chunk_ready_req_ids.update(segment_finished_req_ids)
+                if pending_segment_stop is not None:
+                    pending_segment_stop.update(segment_finished_req_ids)
+                else:
+                    chunk_finished_req_ids = set(chunk_finished_req_ids)
+                    chunk_finished_req_ids.update(segment_finished_req_ids)
+        # Both calls self-guard on the coordinator's async_chunk mode
+        # (process_pending_chunks returns early when async_chunk is False;
+        # process_pending_full_payload_inputs branches internally), so exactly
+        # one path is live per deployment.  With an empty async allowlist the
+        # coordinator is never in async_chunk mode -> the chunk call is a no-op.
+        input_coordinator.process_pending_chunks(
+            self.waiting,
+            self.running,
+            chunk_ready_req_ids,
+            chunk_finished_req_ids,
+        )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
             self.running,
@@ -86,10 +149,9 @@ class OmniSchedulerMixin:
         ``finish_requests`` to mark expired requests FINISHED_ERROR.
         Disabled when ``DEFAULT_INPUT_WAIT_TIMEOUT_S`` is <= 0.
 
-        Scope: only covers ``input_coordinator`` (full-payload path).
-        Async-chunk requests park in ``chunk_transfer_adapter`` instead
-        and are not handled here -- if a similar safety net is needed
-        for the chunk path, it belongs in the chunk adapter.
+        Scope: only covers full-payload ``WAITING_FOR_INPUT`` requests.
+        Async-chunk ``WAITING_FOR_CHUNK`` requests are not handled here, so
+        normal realtime pauses are not bounded by this timeout.
         """
         if DEFAULT_INPUT_WAIT_TIMEOUT_S <= 0:
             return
@@ -133,7 +195,7 @@ class OmniSchedulerMixin:
         base: SchedulerOutput,
         *,
         finished_requests_needing_kv_transfer: dict | None = None,
-        pending_input_registrations: list[OmniChunkRecvHandle] | None = None,
+        pending_connector_registrations: list[OmniChunkRecvHandle] | None = None,
     ) -> OmniSchedulerOutput:
         """Wrap a base ``SchedulerOutput`` in ``OmniSchedulerOutput``.
 
@@ -143,12 +205,24 @@ class OmniSchedulerMixin:
         """
         base_data = {name: getattr(base, name) for name in SchedulerOutput.__dataclass_fields__}
         input_coordinator = getattr(self, "input_coordinator", None)
-        if pending_input_registrations is None:
-            pending_input_registrations = input_coordinator.pending_input_registrations if input_coordinator else []
+        if pending_connector_registrations is None:
+            pending_connector_registrations = (
+                input_coordinator.pending_connector_registrations if input_coordinator else []
+            )
+        # Drain segment-finished ids recorded by update_from_output for resumable
+        # realtime stops (coordinator stages only); the runner emits one
+        # is_segment_finished terminal per id next cycle, mirroring finished_req_ids.
+        pending_segment = getattr(self, "_omni_pending_segment_finished", None)
+        if pending_segment:
+            segment_finished_req_ids = set(pending_segment)
+            pending_segment.clear()
+        else:
+            segment_finished_req_ids = set()
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
-            pending_input_registrations=pending_input_registrations,
+            pending_connector_registrations=pending_connector_registrations,
+            segment_finished_req_ids=segment_finished_req_ids,
         )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

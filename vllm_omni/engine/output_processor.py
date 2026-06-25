@@ -599,10 +599,24 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         # that would trigger upstream's `assert detokenizer is not None`.
         upstream_outputs: list[EngineCoreOutput] = []
         mm_only_outputs: list[EngineCoreOutput] = []
+        error_outputs: list[OmniRequestOutput] = []
 
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None:
+                continue
+
+            error = getattr(eco, "error", None)
+            if error is not None:
+                error_outputs.append(
+                    OmniRequestOutput.from_error(
+                        req_state.external_req_id,
+                        error,
+                        status_code=getattr(eco, "error_status_code", None),
+                        error_type=getattr(eco, "error_type", None),
+                    )
+                )
+                self._finish_request(req_state)
                 continue
 
             # Accumulate multimodal tensors regardless of path.
@@ -623,11 +637,14 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
         self._process_mm_only_outputs(mm_only_outputs)
 
         # Delegate text/pooling outputs to upstream.
-        return super().process_outputs(
+        processed = super().process_outputs(
             upstream_outputs,
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
+        if error_outputs:
+            processed.request_outputs.extend(error_outputs)
+        return processed
 
     def _process_mm_only_outputs(
         self,

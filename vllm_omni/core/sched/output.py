@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 
 from vllm.v1.core.sched.output import CachedRequestData, NewRequestData, SchedulerOutput
 from vllm.v1.request import Request
@@ -93,4 +93,27 @@ class OmniSchedulerOutput(SchedulerOutput):
     """Scheduler output with omni-specific transfer metadata."""
 
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
-    pending_input_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    pending_connector_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
+    segment_finished_req_ids: set[str] = field(default_factory=set)
+    pending_input_registrations: InitVar[list[OmniChunkRecvHandle] | None] = None
+
+    def __post_init__(self, pending_input_registrations: list[OmniChunkRecvHandle] | None) -> None:
+        if pending_input_registrations is not None:
+            self.pending_connector_registrations = pending_input_registrations
+
+
+def _get_pending_input_registrations(output: OmniSchedulerOutput) -> list[OmniChunkRecvHandle]:
+    return output.pending_connector_registrations
+
+
+def _set_pending_input_registrations(
+    output: OmniSchedulerOutput,
+    value: list[OmniChunkRecvHandle],
+) -> None:
+    output.pending_connector_registrations = value
+
+
+OmniSchedulerOutput.pending_input_registrations = property(
+    _get_pending_input_registrations,
+    _set_pending_input_registrations,
+)
