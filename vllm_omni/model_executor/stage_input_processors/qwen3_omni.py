@@ -350,7 +350,10 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 )
         elif has_active_streaming_input and isinstance(thinker_emb, torch.Tensor):
             return OmniPayloadStruct(
-                meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
+                meta=MetaStruct(
+                    finished=torch.tensor(is_finished, dtype=torch.bool),
+                    prefill_consumed_text_tokens=1,
+                ),
                 embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
                 speaker=extract_speaker_from_request(request),
                 language=extract_language_from_request(request),
@@ -403,6 +406,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                         meta=MetaStruct(
                             finished=finished,
                             next_stage_prompt_len=next_stage_prompt_len,
+                            prefill_consumed_text_tokens=1,
                         ),
                         embed=EmbeddingsStruct(
                             prefill=saved_prefill,
@@ -426,6 +430,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
             return OmniPayloadStruct(
                 meta=MetaStruct(
                     finished=finished,
+                    prefill_consumed_text_tokens=1,
                 ),
                 embed=EmbeddingsStruct(decode=emb_cpu),
                 hidden_states=HiddenStatesStruct(output=hid_cpu),
@@ -437,7 +442,10 @@ def _construct_thinker2talker_streaming_input_async_chunk(
         emb_cpu = thinker_emb.detach().cpu()
         hid_cpu = thinker_hid.detach().cpu()
         return OmniPayloadStruct(
-            meta=MetaStruct(finished=finished),
+            meta=MetaStruct(
+                finished=finished,
+                prefill_consumed_text_tokens=1,
+            ),
             embed=EmbeddingsStruct(decode=emb_cpu),
             hidden_states=HiddenStatesStruct(output=hid_cpu),
             speaker=speaker,
@@ -612,7 +620,10 @@ def thinker2talker_async_chunk(
             ),
             hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
-            meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
+            meta=MetaStruct(
+                finished=torch.tensor(is_finished, dtype=torch.bool),
+                prefill_consumed_text_tokens=1,
+            ),
             speaker=speaker,
             language=language,
         )
@@ -653,7 +664,10 @@ def thinker2talker_async_chunk(
                 thinker_emb.shape,
             )
             return None
-        meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
+        meta = MetaStruct(
+            finished=torch.tensor(is_finished, dtype=torch.bool),
+            prefill_consumed_text_tokens=1,
+        )
         payload = OmniPayloadStruct(
             meta=meta,
             embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),

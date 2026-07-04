@@ -230,6 +230,7 @@ def test_thinker2talker_async_chunk_holds_prefill_until_output_tokens() -> None:
     assert torch.equal(payload.embed.cached_decode, torch.full((1, 2), 3.0))
     assert payload.hidden_states.output.shape == (3, 2)
     assert payload.ids.output == [101]
+    assert payload.meta.prefill_consumed_text_tokens == 1
     assert payload.meta.next_stage_prompt_len > 0
     assert "rt-final" not in transfer_manager._pending_streaming_prefills
 
@@ -307,6 +308,7 @@ def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() ->
     )
     assert payload is not None
     assert torch.equal(payload.embed.decode, torch.full((1, 2), 9.0))
+    assert payload.meta.prefill_consumed_text_tokens == 1
 
     finish_payload = q3.thinker2talker_async_chunk(
         transfer_manager,
@@ -650,6 +652,7 @@ def test_thinker2talker_async_chunk_accepts_flattened_runner_payload() -> None:
     cached = transfer_manager.request_payload["thinker"]
     assert cached["embed"]["prefill"].shape == (2, 2)
     assert cached["hidden_states"]["output"].shape == (2, 2)
+    assert cached["meta"]["prefill_consumed_text_tokens"] == 1
 
 
 def test_thinker2talker_async_chunk_caches_short_finished_prefill() -> None:
@@ -674,6 +677,7 @@ def test_thinker2talker_async_chunk_caches_short_finished_prefill() -> None:
     assert cached["embed"]["prefill"].shape == (1, 2)
     assert cached["hidden_states"]["output"].shape == (1, 2)
     assert cached["meta"]["finished"].item() is True
+    assert cached["meta"]["prefill_consumed_text_tokens"] == 1
 
 
 def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> None:
@@ -694,6 +698,7 @@ def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> No
     assert payload is not None
     assert payload.embed.decode.shape == (1, 2)
     assert payload.meta.finished.item() is False
+    assert payload.meta.prefill_consumed_text_tokens == 1
 
 
 def test_accumulator_replaces_keys_in_replace_set() -> None:

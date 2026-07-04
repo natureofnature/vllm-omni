@@ -26,7 +26,6 @@ def _make_scheduler(
     stage_id: int = 0,
     async_chunk: bool = False,
     model_stage: str = "thinker",
-    final_output: bool = False,
 ) -> OmniARScheduler:
     sched = OmniARScheduler.__new__(OmniARScheduler)
     sched._new_prompt_len_snapshot = {}
@@ -35,7 +34,6 @@ def _make_scheduler(
         model_config=SimpleNamespace(
             stage_id=stage_id,
             async_chunk=async_chunk,
-            final_output=final_output,
             model_arch="Qwen3OmniMoeForConditionalGeneration",
             model_stage=model_stage,
         )
@@ -69,8 +67,8 @@ def test_terminal_only_input_coordinator_request_finishes_without_model_run() ->
     assert sched.input_coordinator.finished_requests == {"req-ready"}
 
 
-def test_final_output_terminal_only_request_runs_terminal_flush_step() -> None:
-    sched = _make_scheduler(stage_id=2, final_output=True)
+def test_final_output_terminal_only_request_finishes_without_model_run() -> None:
+    sched = _make_scheduler(stage_id=2, async_chunk=True, model_stage="code2wav")
     sched.requests = {"req-live": object()}
     sched.input_coordinator = SimpleNamespace(
         _async_chunk=True,
@@ -86,9 +84,9 @@ def test_final_output_terminal_only_request_runs_terminal_flush_step() -> None:
 
     sched._finish_input_coordinator_terminal_only_requests()
 
-    assert finished == []
-    assert sched.input_coordinator.requests_with_ready_chunks == {"req-live", "req-ready"}
-    assert sched.input_coordinator.finished_requests == {"req-live", "req-ready"}
+    assert finished == [(["req-live"], RequestStatus.FINISHED_STOPPED)]
+    assert sched.input_coordinator.requests_with_ready_chunks == {"req-ready"}
+    assert sched.input_coordinator.finished_requests == {"req-ready"}
 
 
 def test_full_payload_input_coordinator_request_is_not_terminal_only() -> None:
@@ -112,39 +110,20 @@ def test_full_payload_input_coordinator_request_is_not_terminal_only() -> None:
     assert sched.input_coordinator.finished_requests == {"req-live"}
 
 
-def test_final_output_segment_only_connector_output_wakes_flush_step() -> None:
-    sched = _make_scheduler(stage_id=2, async_chunk=True, final_output=True)
-    sched.requests = {"req-live": object()}
-    sched.waiting = []
-    sched.running = []
-    sched._omni_pending_upstream_segment_finished = set()
-    sched._latest_omni_connector_output = OmniConnectorOutput(
-        chunk_segment_finished_req_ids={"req-live"},
-    )
-    chunk_calls = []
-    full_payload_calls = []
-
-    def process_pending_chunks(waiting, running, chunk_ready_req_ids, chunk_finished_req_ids):
-        chunk_calls.append((set(chunk_ready_req_ids), set(chunk_finished_req_ids)))
-
-    def process_pending_full_payload_inputs(waiting, running, stage_recv_req_ids):
-        full_payload_calls.append(set(stage_recv_req_ids))
-
+def test_pending_segment_terminal_drops_stale_upstream_ready_state() -> None:
+    sched = _make_scheduler(stage_id=1, async_chunk=True, model_stage="talker")
+    sched._omni_pending_segment_finished = {"req-live"}
     sched.input_coordinator = SimpleNamespace(
-        process_pending_chunks=process_pending_chunks,
-        process_pending_full_payload_inputs=process_pending_full_payload_inputs,
+        requests_with_ready_chunks={"req-live", "req-other"},
     )
 
-    sched._consume_pending_connector_output(model_mode="ar")
+    sched._clear_pending_segment_ready_state()
 
-    assert sched._latest_omni_connector_output is None
-    assert sched._omni_pending_upstream_segment_finished == {"req-live"}
-    assert chunk_calls == [({"req-live"}, set())]
-    assert full_payload_calls == [set()]
+    assert sched.input_coordinator.requests_with_ready_chunks == {"req-other"}
 
 
 def test_segment_ready_connector_output_remains_pending_for_flush_step() -> None:
-    sched = _make_scheduler(stage_id=2, async_chunk=True, final_output=True)
+    sched = _make_scheduler(stage_id=1, async_chunk=True, model_stage="talker")
     sched.requests = {"req-live": object()}
     sched.waiting = []
     sched.running = []
@@ -169,11 +148,12 @@ def test_segment_ready_connector_output_remains_pending_for_flush_step() -> None
     assert chunk_calls == [({"req-live"}, set())]
 
 
-def test_final_output_segment_only_without_pending_set_is_terminal_chunk() -> None:
-    sched = _make_scheduler(stage_id=2, async_chunk=True, final_output=True)
+def test_final_output_segment_only_records_control_signal() -> None:
+    sched = _make_scheduler(stage_id=2, async_chunk=True, model_stage="code2wav")
     sched.requests = {"req-live": object()}
     sched.waiting = []
     sched.running = []
+    sched._omni_pending_upstream_segment_finished = set()
     sched._latest_omni_connector_output = OmniConnectorOutput(
         chunk_segment_finished_req_ids={"req-live"},
     )
@@ -189,7 +169,34 @@ def test_final_output_segment_only_without_pending_set_is_terminal_chunk() -> No
 
     sched._consume_pending_connector_output(model_mode="generation")
 
-    assert chunk_calls == [({"req-live"}, {"req-live"})]
+    assert sched._omni_pending_upstream_segment_finished == {"req-live"}
+    assert chunk_calls == [(set(), set())]
+
+
+def test_generation_segment_ready_records_flush_step() -> None:
+    sched = _make_scheduler(stage_id=2, async_chunk=True, model_stage="code2wav")
+    sched.requests = {"req-live": object()}
+    sched.waiting = []
+    sched.running = []
+    sched._omni_pending_upstream_segment_finished = set()
+    sched._latest_omni_connector_output = OmniConnectorOutput(
+        chunk_ready_req_ids={"req-live"},
+        chunk_segment_finished_req_ids={"req-live"},
+    )
+    chunk_calls = []
+
+    def process_pending_chunks(waiting, running, chunk_ready_req_ids, chunk_finished_req_ids):
+        chunk_calls.append((set(chunk_ready_req_ids), set(chunk_finished_req_ids)))
+
+    sched.input_coordinator = SimpleNamespace(
+        process_pending_chunks=process_pending_chunks,
+        process_pending_full_payload_inputs=lambda waiting, running, stage_recv_req_ids: None,
+    )
+
+    sched._consume_pending_connector_output(model_mode="generation")
+
+    assert sched._omni_pending_upstream_segment_finished == {"req-live"}
+    assert chunk_calls == [({"req-live"}, set())]
 
 
 def _make_request() -> Request:
@@ -232,6 +239,29 @@ def test_stage0_model_runner_final_commit_emits_segment_terminal() -> None:
     assert sched._omni_pending_segment_finished == {session.request_id}
     assert finished == [(session.request_id, RequestStatus.FINISHED_STOPPED)]
     assert sched.has_requests()
+
+
+def test_downstream_model_runner_streaming_update_waits_for_connector_payload() -> None:
+    sched = _make_scheduler(stage_id=1, async_chunk=True, model_stage="talker")
+    reset_req_ids = []
+    sched.input_coordinator = SimpleNamespace(
+        reset_request_segment_state=reset_req_ids.append,
+    )
+    sched.skipped_waiting = []
+    sched.num_waiting_for_streaming_input = 1
+    session = _make_request()
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+
+    sched._update_request_as_session(session, _make_update([10, 20]))
+
+    assert reset_req_ids == [session.request_id]
+    assert session.status == RequestStatus.WAITING
+    assert session.prompt_token_ids == [1, 2, 3]
+    assert list(session._all_token_ids) == [1, 2, 3]
+    assert session.num_prompt_tokens == 3
+    assert sched.num_waiting_for_streaming_input == 0
+    assert session.arrival_time == 200.0
+    assert session.sampling_params.max_tokens == 16
 
 
 def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:

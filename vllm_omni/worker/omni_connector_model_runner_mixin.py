@@ -634,6 +634,7 @@ class OmniConnectorModelRunnerMixin:
         ("meta", "override_keys"),
         ("meta", "next_stage_prompt_len"),
         ("meta", "left_context_size"),
+        ("meta", "prefill_consumed_text_tokens"),
         ("ids", "output"),
         ("embed", "decode_token_start"),
         ("embed", "decode_token_end"),
@@ -1353,8 +1354,9 @@ class OmniConnectorModelRunnerMixin:
             return True
         self._requests_num_chunks_sent[request_id] = confirmed_num_computed_tokens
 
-        had_chunk_entry = request_id in self._put_req_chunk
-        chunk_id = self._put_req_chunk.get(request_id, 0)
+        with self._lock:
+            had_chunk_entry = request_id in self._put_req_chunk
+            chunk_id = self._put_req_chunk.get(request_id, 0)
 
         payload_data = self._build_custom_process_payload(
             request_id=request_id,
@@ -1362,8 +1364,9 @@ class OmniConnectorModelRunnerMixin:
             pooling_output=pooling_output,
         )
         if payload_data is None:
-            if not had_chunk_entry and self._put_req_chunk.get(request_id) == 0:
-                self._put_req_chunk.pop(request_id, None)
+            with self._lock:
+                if not had_chunk_entry and self._put_req_chunk.get(request_id) == 0:
+                    self._put_req_chunk.pop(request_id, None)
             if chunk_id == 0:
                 logger.debug(
                     "[Stage-%s] send_chunk: payload is None for req=%s chunk=%s (process_func=%s)",
@@ -1374,10 +1377,22 @@ class OmniConnectorModelRunnerMixin:
                 )
             return False
 
-        self._put_req_chunk[request_id] += 1
-        next_stage_id = self._next_stage_id
-        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
-
+        snapshot_data = self._snapshot_payload(payload_data)
+        with self._lock:
+            chunk_id = self._put_req_chunk[request_id]
+            self._put_req_chunk[request_id] += 1
+            next_stage_id = self._next_stage_id
+            connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
+            task = {
+                "stage_id": self._stage_id,
+                "next_stage_id": next_stage_id,
+                "put_key": connector_put_key,
+                "data": snapshot_data,
+                "request_id": request_id,
+                "scheduler_request_id": scheduler_request_id,
+            }
+            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
+            self._pending_save_counts[request_id] += 1
         if chunk_id == 0:
             logger.debug(
                 "[Stage-%s] send_chunk: first chunk enqueued, req=%s key=%s",
@@ -1385,18 +1400,6 @@ class OmniConnectorModelRunnerMixin:
                 request_id,
                 connector_put_key,
             )
-
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": next_stage_id,
-            "put_key": connector_put_key,
-            "data": self._snapshot_payload(payload_data),
-            "request_id": request_id,
-            "scheduler_request_id": scheduler_request_id,
-        }
-        with self._lock:
-            self._pending_save_reqs.setdefault(request_id, deque()).append(task)
-            self._pending_save_counts[request_id] += 1
         self._work_available.set()
         return True
 
@@ -1436,18 +1439,19 @@ class OmniConnectorModelRunnerMixin:
                 _m["finished"] = torch.tensor(False, dtype=torch.bool)
                 _m["is_segment_finished"] = torch.tensor(True, dtype=torch.bool)
 
-        chunk_id = self._put_req_chunk[request_id]
-        self._put_req_chunk[request_id] += 1
-        connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
-        task = {
-            "stage_id": self._stage_id,
-            "next_stage_id": self._next_stage_id,
-            "put_key": connector_put_key,
-            "data": self._snapshot_payload(payload_data),
-            "request_id": request_id,
-            "scheduler_request_id": scheduler_request_id,
-        }
+        snapshot_data = self._snapshot_payload(payload_data)
         with self._lock:
+            chunk_id = self._put_req_chunk[request_id]
+            self._put_req_chunk[request_id] += 1
+            connector_put_key = f"{request_id}_{self._stage_id}_{chunk_id}"
+            task = {
+                "stage_id": self._stage_id,
+                "next_stage_id": self._next_stage_id,
+                "put_key": connector_put_key,
+                "data": snapshot_data,
+                "request_id": request_id,
+                "scheduler_request_id": scheduler_request_id,
+            }
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
             self._pending_save_counts[request_id] += 1
             if is_segment_finished:

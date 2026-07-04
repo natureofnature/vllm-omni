@@ -894,11 +894,13 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
-        request_finished = False
-        if finished and self.stage_pools[stage_id].final_output:
-            req_state.finished_final_output_stage_ids.add(stage_id)
+        if self.stage_pools[stage_id].final_output:
             final_output_stage_ids = req_state.final_output_stage_ids or {req_state.final_stage_id}
+            if finished:
+                req_state.finished_final_output_stage_ids.add(stage_id)
             request_finished = final_output_stage_ids.issubset(req_state.finished_final_output_stage_ids)
+        else:
+            request_finished = False
         if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
                 OutputMessage(

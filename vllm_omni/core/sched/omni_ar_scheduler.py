@@ -25,6 +25,7 @@ from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
 from vllm_omni.core.sched.omni_scheduling_coordinator import (
     OmniSchedulingCoordinator,
     uses_async_chunk_coordinator,
+    uses_async_chunk_final_output_stage,
     uses_async_chunk_model_runner_transport,
     uses_full_payload_input_coordinator,
 )
@@ -260,22 +261,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         if not terminal_only_req_ids:
             return
 
-        final_output_req_ids: set[str] = set()
-        if getattr(self.vllm_config.model_config, "final_output", False):
-            final_output_req_ids = {req_id for req_id in terminal_only_req_ids if req_id in self.requests}
-            input_coordinator.requests_with_ready_chunks.update(final_output_req_ids)
-
-        live_req_ids = [
-            req_id for req_id in terminal_only_req_ids if req_id in self.requests and req_id not in final_output_req_ids
-        ]
+        live_req_ids = [req_id for req_id in terminal_only_req_ids if req_id in self.requests]
         if live_req_ids:
             # A connector finish without a ready chunk is a control signal, not
             # model input. Finish it here so the base scheduler never runs the
             # request with a metadata-only payload.
             self.finish_requests(live_req_ids, RequestStatus.FINISHED_STOPPED)
 
-        for req_id in terminal_only_req_ids - final_output_req_ids:
-            input_coordinator.finished_requests.discard(req_id)
+        input_coordinator.finished_requests.difference_update(terminal_only_req_ids)
+
+    def _clear_pending_segment_ready_state(self) -> None:
+        input_coordinator = getattr(self, "input_coordinator", None)
+        pending_segment = getattr(self, "_omni_pending_segment_finished", None)
+        if input_coordinator is None or not pending_segment:
+            return
+        ready_chunks = getattr(input_coordinator, "requests_with_ready_chunks", None)
+        if ready_chunks is None:
+            return
+
+        # A segment terminal is an output control signal to the next stage, not
+        # evidence that this stage already has the next upstream input chunk.
+        # If a real chunk is ready in this cycle, process_pending_chunks() will
+        # add the request back from connector output before base scheduling.
+        ready_chunks.difference_update(pending_segment)
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
@@ -286,6 +294,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)
+        self._clear_pending_segment_ready_state()
         self._consume_pending_connector_output(model_mode="ar")
         self._finish_input_coordinator_terminal_only_requests()
         self._process_pending_input_timeouts()
@@ -506,7 +515,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if (
                 upstream_segment_finished
                 and not stopped
-                and getattr(self.vllm_config.model_config, "final_output", False)
+                and uses_async_chunk_final_output_stage(self.vllm_config.model_config)
             ):
                 # Final-output stages must flush each realtime segment locally.
                 # Intermediate stages keep running so they can forward later
@@ -782,6 +791,20 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 self._free_input_coordinator_request(request_id)
         return finished
 
+    def _resume_downstream_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        session.arrival_time = update.arrival_time
+        session.sampling_params = update.sampling_params
+        if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
+            self.num_waiting_for_streaming_input -= 1
+        session.status = RequestStatus.WAITING
+        skipped_waiting = getattr(self, "skipped_waiting", None)
+        if skipped_waiting is not None and session in skipped_waiting:
+            skipped_waiting.remove_requests((session,))
+            self._enqueue_waiting_request(session)
+
+        if self.log_stats:
+            session.record_event(EngineCoreEventType.QUEUED)
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         """
         Override: Only extend prompt at stage 0, and replace
@@ -800,26 +823,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             session.num_computed_tokens -= session.num_output_placeholders
             session.num_output_placeholders = 0
             session.spec_token_ids = []
+        model_config = self.vllm_config.model_config
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.requests_num_chunks_sent.pop(session.external_req_id, None)
-            if self.vllm_config.model_config.stage_id != 0:
+            if getattr(model_config, "stage_id", 0) != 0:
                 # Downstream async-chunk stages receive real payloads from the
                 # connector. This update only resumes polling for the next segment.
                 self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
                 # Do not replace prompt/additional_information here; the next
                 # upstream chunk will populate them in chunk transfer adapter.
-                session.arrival_time = update.arrival_time
-                session.sampling_params = update.sampling_params
-                if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
-                    self.num_waiting_for_streaming_input -= 1
-                session.status = RequestStatus.WAITING
-                if session in self.skipped_waiting:
-                    self.skipped_waiting.remove_requests((session,))
-                    self._enqueue_waiting_request(session)
-
-                if self.log_stats:
-                    session.record_event(EngineCoreEventType.QUEUED)
+                self._resume_downstream_streaming_session(session, update)
                 return
+        elif getattr(model_config, "stage_id", 0) != 0 and uses_async_chunk_model_runner_transport(model_config):
+            if self.input_coordinator is not None:
+                self.input_coordinator.reset_request_segment_state(session.request_id)
+            self._resume_downstream_streaming_session(session, update)
+            return
         super()._update_request_as_session(session, update)
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False) -> dict[str, Any] | None:

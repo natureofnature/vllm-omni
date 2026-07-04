@@ -1049,6 +1049,32 @@ class TestAsyncChunkRecvRegistration(unittest.TestCase):
         regs_after = [h.request_id for h in coord.pending_connector_registrations]
         self.assertIn("r1", regs_after, "full-payload pass must not drop async-chunk recv registrations")
 
+    def test_reset_request_segment_state_clears_reused_segment_markers(self):
+        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
+        stale_waiting = _make_request("reuse", status=RequestStatus.WAITING_FOR_CHUNK)
+        keep_waiting = _make_request("keep", status=RequestStatus.WAITING_FOR_CHUNK)
+
+        coord._full_payload_input_received.add("reuse")
+        coord.finished_requests.add("reuse")
+        coord.requests_with_ready_chunks.update({"reuse", "keep"})
+        coord._completed_chunk_streams.add("reuse")
+        coord._waiting_since["reuse"] = 1.0
+        coord._waiting_for_input_req_ids.add("reuse")
+        coord._waiting_for_chunk_waiting.extend([stale_waiting, keep_waiting])
+
+        coord.reset_request_segment_state("reuse")
+
+        waiting = MockQueue()
+        coord.restore_queues(waiting, [])
+
+        self.assertEqual([request.request_id for request in waiting._items], ["keep"])
+        self.assertNotIn("reuse", coord._full_payload_input_received)
+        self.assertNotIn("reuse", coord.finished_requests)
+        self.assertNotIn("reuse", coord.requests_with_ready_chunks)
+        self.assertNotIn("reuse", coord._completed_chunk_streams)
+        self.assertNotIn("reuse", coord._waiting_since)
+        self.assertNotIn("reuse", coord._waiting_for_input_req_ids)
+
     def test_free_finished_request_prunes_parked_requests(self):
         coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
         keep_waiting = _make_request("keep-w", status=RequestStatus.WAITING_FOR_CHUNK)

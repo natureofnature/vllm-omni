@@ -8,6 +8,7 @@ GPU or vLLM runtime.
 
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -369,6 +370,45 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         with sender._lock:
             dq = sender._pending_save_reqs.get(request_id)
             return dq[-1] if dq else None
+
+    def test_send_chunk_allocates_contiguous_keys_after_payload_build(self):
+        sender = MixinHost()
+        sender.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0, async_chunk=True))
+        self._quiesce_save_thread(sender)
+        sender._omni_connector = MockConnector(stage_id=0)
+        sender._stage_id = 0
+        sender._async_chunk = True
+
+        barrier = threading.Barrier(2)
+
+        def proc(transfer_manager, pooling_output, request, is_finished=False):
+            barrier.wait(timeout=2)
+            return {"payload": pooling_output}
+
+        sender._custom_process_func = proc
+        req = _make_request("req-1", "ext-1")
+        results: list[bool] = []
+        errors: list[BaseException] = []
+
+        def send(value: int) -> None:
+            try:
+                results.append(sender.send_chunk(req, pooling_output={"v": value}))
+            except BaseException as exc:  # pragma: no cover - asserted below
+                errors.append(exc)
+
+        threads = [threading.Thread(target=send, args=(idx,)) for idx in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertFalse(errors)
+        self.assertEqual(results, [True, True])
+        with sender._lock:
+            keys = [task["put_key"] for task in sender._pending_save_reqs["ext-1"]]
+        self.assertEqual(sorted(keys), ["ext-1_0_0", "ext-1_0_1"])
+        self.assertEqual(sender._put_req_chunk["ext-1"], 2)
+        sender.shutdown_omni_connectors()
 
     def test_send_chunk_records_scheduler_request_id_for_failures(self):
         sender = MixinHost()
@@ -1569,6 +1609,21 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
                     ["embed", "decode_token_end"],
                 ],
             },
+        }
+        self.assertFalse(host._payload_is_consumable(payload))
+        host.shutdown_omni_connectors()
+
+    def test_payload_consumable_ignores_handoff_boundary_only_updates(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        payload = {
+            "meta": {
+                "finished": torch.tensor(False),
+                "prefill_consumed_text_tokens": 1,
+            }
         }
         self.assertFalse(host._payload_is_consumable(payload))
         host.shutdown_omni_connectors()

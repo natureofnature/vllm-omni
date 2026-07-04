@@ -95,6 +95,14 @@ _ASYNC_CHUNK_COORDINATOR_STAGES: frozenset[tuple[str, str]] = frozenset(
 )
 
 
+_ASYNC_CHUNK_FINAL_OUTPUT_STAGES: frozenset[tuple[str, str]] = frozenset(
+    {
+        # Qwen3 Omni code2wav consumes terminal chunks as local audio flush work.
+        ("Qwen3OmniMoeForConditionalGeneration", "code2wav"),
+    }
+)
+
+
 # (model_arch, model_stage) pairs whose async-chunk transport is owned by
 # OmniConnectorModelRunnerMixin rather than the legacy scheduler adapter.
 _ASYNC_CHUNK_MODEL_RUNNER_TRANSPORT_STAGES: frozenset[tuple[str, str]] = frozenset(
@@ -148,6 +156,17 @@ def uses_async_chunk_coordinator(model_config: Any) -> bool:
     if key not in _ASYNC_CHUNK_COORDINATOR_STAGES:
         return False
     return uses_async_chunk_model_runner_transport(model_config)
+
+
+def uses_async_chunk_final_output_stage(model_config: Any) -> bool:
+    """Returns True iff async segment terminals must run a local final flush."""
+    key = (
+        getattr(model_config, "model_arch", None),
+        getattr(model_config, "model_stage", None),
+    )
+    if key not in _ASYNC_CHUNK_FINAL_OUTPUT_STAGES:
+        return False
+    return uses_async_chunk_coordinator(model_config)
 
 
 class OmniSchedulingCoordinator:
@@ -216,7 +235,6 @@ class OmniSchedulingCoordinator:
         """
         if self._stage_id == 0 or not self._async_chunk:
             return
-
         # Retain readiness for requests not yet surfaced into the waiting/running
         # queues: a bg recv can complete before the request appears in a queue,
         # and the connector output clears chunk_ready_req_ids after this cycle.
@@ -345,8 +363,10 @@ class OmniSchedulingCoordinator:
         """Compatibility wrapper for ``process_pending_full_payload_inputs``."""
         self.process_pending_full_payload_inputs(waiting_queue, running_queue, stage_recv_req_ids)
 
-    def free_finished_request(self, request_id: str) -> None:
-        """Prune internal tracking sets for a freed request to prevent unbounded growth."""
+    def reset_request_segment_state(self, request_id: str) -> None:
+        """Clear segment-scoped state before a reused request waits again."""
+        # Realtime input reuses the same request id across segments. A terminal
+        # marker from the prior segment must not make the next segment look ready.
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
@@ -364,6 +384,10 @@ class OmniSchedulingCoordinator:
                 queue_attr,
                 deque(request for request in queue if request.request_id != request_id),
             )
+
+    def free_finished_request(self, request_id: str) -> None:
+        """Prune internal tracking sets for a freed request to prevent unbounded growth."""
+        self.reset_request_segment_state(request_id)
 
     def collect_timed_out_request_ids(
         self,

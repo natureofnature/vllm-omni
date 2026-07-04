@@ -112,3 +112,25 @@ def test_async_chunk_decode_clears_prior_eos_when_new_decode_arrives() -> None:
     assert torch.equal(out, torch.tensor([17.0, 18.0]))
     assert update["_advance_num_processed_tokens"] is True
     assert update["meta"]["eos_emitted"] is False
+
+
+def test_talker_decode_recovers_streaming_reset_handoff_boundary() -> None:
+    model = _make_minimal_omni()
+    seen: dict = {}
+
+    def fake_decode(input_ids, input_embeds, update_dict, payload):
+        seen["num_processed_tokens"] = payload["meta"]["num_processed_tokens"]
+        return torch.zeros(2), torch.tensor(0), update_dict
+
+    model.talker_preprocess_decode = fake_decode
+    payload = {"meta": {"resumable": True}}
+
+    _, _, update = model.talker_preprocess(
+        torch.tensor([0]),
+        torch.ones(1, 2),
+        **payload,
+    )
+
+    assert seen["num_processed_tokens"] == 1
+    assert update["meta"]["decode_flag"] is True
+    assert update["meta"]["prefill_consumed_text_tokens"] == 1

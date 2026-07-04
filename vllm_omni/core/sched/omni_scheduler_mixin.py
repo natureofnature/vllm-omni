@@ -108,16 +108,9 @@ class OmniSchedulerMixin:
             )
         if connector_output and connector_output.chunk_segment_finished_req_ids:
             pending_segment_stop = getattr(self, "_omni_pending_upstream_segment_finished", None)
-            model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
-            if getattr(model_config, "final_output", False):
-                segment_finished_req_ids = set(connector_output.chunk_segment_finished_req_ids)
-                chunk_ready_req_ids = set(chunk_ready_req_ids)
-                chunk_ready_req_ids.update(segment_finished_req_ids)
-                if pending_segment_stop is not None:
-                    pending_segment_stop.update(segment_finished_req_ids)
-                else:
-                    chunk_finished_req_ids = set(chunk_finished_req_ids)
-                    chunk_finished_req_ids.update(segment_finished_req_ids)
+            segment_finished_req_ids = set(connector_output.chunk_segment_finished_req_ids)
+            if pending_segment_stop is not None:
+                pending_segment_stop.update(segment_finished_req_ids)
         # Both calls self-guard on the coordinator's async_chunk mode
         # (process_pending_chunks returns early when async_chunk is False;
         # process_pending_full_payload_inputs branches internally), so exactly
