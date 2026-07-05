@@ -1957,7 +1957,8 @@ class OmniConnectorModelRunnerMixin:
                 continue
 
             if not pollable_ids:
-                self._work_available.wait(timeout=0.05)
+                # The scheduler can drain a staged handoff between wakeups.
+                self._work_available.wait(timeout=0.005)
                 self._work_available.clear()
                 continue
 
