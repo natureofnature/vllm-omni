@@ -367,7 +367,6 @@ def test_build_omni_output_accumulates_full_payload_when_not_async_chunk(monkeyp
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=3,
         num_scheduled_tokens_np=torch.tensor([1, 2], dtype=torch.int32).numpy(),
         query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.long),
     )
@@ -1013,7 +1012,6 @@ def test_build_omni_output_runner_transport_sends_nested_payload(monkeypatch):
         ec_connector_output=None,
         cudagraph_stats=None,
         kv_extracted_req_ids=None,
-        seq_len=1,
         num_scheduled_tokens_np=np.array([1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
     )
