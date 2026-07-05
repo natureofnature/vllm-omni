@@ -1895,13 +1895,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # OmniModelRunnerOutput.pooler_output (which is set to None below).
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
-<<<<<<< HEAD
-        if needs_pooler_payload:
-            mm_seq_len = int(scheduler_output.total_num_scheduled_tokens)
-=======
         async_chunk_send_payloads: list[dict[str, object]] | None = None
         if needs_payload:
->>>>>>> bb2e256c (Refactor Qwen3 Omni async chunk transport)
+            mm_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
             if self.omni_prefix_cache is not None:
                 (
