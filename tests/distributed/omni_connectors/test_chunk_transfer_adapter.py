@@ -866,6 +866,7 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     scheduler._update_request_with_output = mocker.MagicMock(return_value=([], True))
     scheduler._process_kv_transfer_trigger = mocker.MagicMock(return_value=False)
     scheduler._handle_stopped_request = mocker.MagicMock(return_value=True)
+    scheduler._wait_for_upstream_chunk_after_segment_stop = mocker.MagicMock(return_value=False)
     scheduler._free_request = mocker.MagicMock(return_value=None)
     scheduler._get_routed_experts = mocker.MagicMock(return_value=None)
     scheduler.running = [request]
