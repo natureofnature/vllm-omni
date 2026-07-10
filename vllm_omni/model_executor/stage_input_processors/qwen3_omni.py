@@ -654,16 +654,6 @@ def thinker2talker_async_chunk(
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager
             )
-        if thinker_emb.shape[0] > 1:
-            logger.warning(
-                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
-                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
-                chunk_id,
-                request_id,
-                request.num_computed_tokens,
-                thinker_emb.shape,
-            )
-            return None
         meta = MetaStruct(
             finished=torch.tensor(is_finished, dtype=torch.bool),
             prefill_consumed_text_tokens=1,
@@ -718,17 +708,13 @@ def thinker2talker_full_payload(
         output_token_ids = _ensure_list(getattr(request, "output_token_ids", []) or [])
         all_token_ids = list(prompt_token_ids) + list(output_token_ids)
 
-    # The full-payload accumulator includes the decode row that emitted the
-    # stop token. The talker consumes only non-stop rows, so trim that trailing
-    # row before handing off finished requests.
-    if isinstance(thinker_emb, torch.Tensor) and thinker_emb.shape[0] > 0:
-        thinker_emb_prefill = thinker_emb[:-1]
+    prefill_rows = max(len(all_token_ids) - 1, 0)
+    if prefill_rows:
+        thinker_emb_prefill = thinker_emb[-prefill_rows:]
+        thinker_hid_prefill = thinker_hid[-prefill_rows:]
     else:
-        thinker_emb_prefill = thinker_emb
-    if isinstance(thinker_hid, torch.Tensor) and thinker_hid.shape[0] > 0:
-        thinker_hid_prefill = thinker_hid[:-1]
-    else:
-        thinker_hid_prefill = thinker_hid
+        thinker_emb_prefill = thinker_emb[:0]
+        thinker_hid_prefill = thinker_hid[:0]
 
     payload: OmniPayload = {
         "embed": {
@@ -964,46 +950,6 @@ def _code2wav_codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     )
 
 
-def _flush_code2wav_finish_tail(transfer_manager: Any, request: OmniEngineCoreRequest) -> OmniPayloadStruct:
-    """Flush the unsent trailing Code2Wav frames for an async finish sentinel."""
-    chunk_size_config, left_context_size_config, configured_initial_chunk_size = _code2wav_codec_config(
-        transfer_manager
-    )
-    request_id = request.external_req_id
-    length = len(transfer_manager.code_prompt_token_ids.get(request_id, []))
-    chunk_progress_length = length
-    if configured_initial_chunk_size > 0:
-        if length <= configured_initial_chunk_size:
-            chunk_size_config = configured_initial_chunk_size
-        else:
-            chunk_progress_length = length - configured_initial_chunk_size
-
-    chunk_length = chunk_progress_length % chunk_size_config if chunk_size_config else 0
-    finished_flag = torch.tensor(True, dtype=torch.bool)
-    if length == 0 or chunk_length == 0:
-        # Boundary / nothing held: the last full chunk was already sent in-step.
-        return OmniPayloadStruct(meta=MetaStruct(finished=finished_flag))
-
-    context_length = chunk_length
-    if (
-        configured_initial_chunk_size > 0
-        and length > configured_initial_chunk_size
-        and chunk_progress_length <= chunk_size_config
-    ):
-        left_context_size = configured_initial_chunk_size
-        end_index = chunk_progress_length + configured_initial_chunk_size
-    else:
-        left_context_size = max(0, min(chunk_progress_length - context_length, left_context_size_config))
-        end_index = min(chunk_progress_length, left_context_size + context_length)
-    codes = (
-        torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
-    )
-    return OmniPayloadStruct(
-        codes=CodesStruct(audio=codes),
-        meta=MetaStruct(left_context_size=left_context_size, finished=finished_flag),
-    )
-
-
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     multimodal_output: OmniPayload | dict[str, Any],
@@ -1015,40 +961,45 @@ def talker2code2wav_async_chunk(
     """
     if not isinstance(multimodal_output, Mapping):
         return None
-    # Runner finish sentinel: flush the held trailing partial codec as the terminal chunk.
-    if multimodal_output.get(ASYNC_FINISH_SENTINEL_KEY):
-        return _flush_code2wav_finish_tail(transfer_manager, request)
-    multimodal_output = _nested_payload(multimodal_output)
-    talker_codes = multimodal_output.get("codes", {})
-    if not isinstance(talker_codes, dict):
-        return None
-    code_predictor_codes = talker_codes.get("audio")
-    if code_predictor_codes is None:
-        return None
 
-    if code_predictor_codes.numel() == 0:
-        return None
+    terminal_flush = bool(multimodal_output.get(ASYNC_FINISH_SENTINEL_KEY))
+    code_predictor_codes = None
+    if not terminal_flush:
+        multimodal_output = _nested_payload(multimodal_output)
+        talker_codes = multimodal_output.get("codes", {})
+        if not isinstance(talker_codes, dict):
+            return None
+        code_predictor_codes = talker_codes.get("audio")
+        if code_predictor_codes is None:
+            return None
 
-    if not code_predictor_codes.any():
-        return None
+        if code_predictor_codes.numel() == 0:
+            return None
+
+        if not code_predictor_codes.any():
+            return None
+
+        sampling_params = getattr(request, "sampling_params", None)
+        stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
+        stop_token_id = getattr(sampling_params, "stop_token_id", None)
+        if stop_token_id is not None:
+            stop_token_ids.add(stop_token_id)
+        first_codebook = int(code_predictor_codes[0, 0].item())
+        if first_codebook in stop_token_ids:
+            logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
+            return None
+
+    request_id = request.external_req_id
+    if terminal_flush and request_id not in transfer_manager.code_prompt_token_ids:
+        return OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)))
 
     chunk_size_config, left_context_size_config, configured_initial_chunk_size = _code2wav_codec_config(
         transfer_manager
     )
 
-    sampling_params = getattr(request, "sampling_params", None)
-    stop_token_ids = set(getattr(sampling_params, "stop_token_ids", None) or [])
-    stop_token_id = getattr(sampling_params, "stop_token_id", None)
-    if stop_token_id is not None:
-        stop_token_ids.add(stop_token_id)
-    first_codebook = int(code_predictor_codes[0, 0].item())
-    if first_codebook in stop_token_ids:
-        logger.debug("skip stop-token codec frame: first_codebook=%s", first_codebook)
-        return None
-
-    request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
-    transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
+    if code_predictor_codes is not None:
+        transfer_manager.code_prompt_token_ids[request_id].append(code_predictor_codes)
     length = len(transfer_manager.code_prompt_token_ids[request_id])
 
     if configured_initial_chunk_size > 0:
@@ -1058,7 +1009,9 @@ def talker2code2wav_async_chunk(
             length -= configured_initial_chunk_size
 
     chunk_length = length % chunk_size_config
-    if chunk_length != 0 and not is_finished:
+    if chunk_length == 0 and terminal_flush:
+        return OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)))
+    if chunk_length != 0 and not (is_finished or terminal_flush):
         return None
 
     context_length = chunk_length if chunk_length != 0 else chunk_size_config

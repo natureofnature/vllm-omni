@@ -18,7 +18,9 @@ import pytest
 # isort: off
 import vllm_omni  # noqa: F401 - import for side effects (patch vLLM)
 from vllm.sampling_params import SamplingParams
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import CachedRequestData, SchedulerOutput
+from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.engine import EngineCoreEventType
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
@@ -451,12 +453,20 @@ class _FinishOnlyInputCoordinatorStub:
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
         self._completed_chunk_streams: set[str] = set()
+        self.restored = False
+        self.postprocessed = False
 
     def free_finished_request(self, request_id: str) -> None:
         self.freed.append(request_id)
 
     def chunk_stream_completed(self, request_id: str) -> bool:
         return request_id in self.finished_requests or request_id in self._completed_chunk_streams
+
+    def postprocess_scheduler_output(self, _scheduler_output: SchedulerOutput) -> None:
+        self.postprocessed = True
+
+    def restore_queues(self, _waiting, _running) -> None:
+        self.restored = True
 
 
 class _FinishOnlySchedulerStub(OmniGenerationScheduler):
@@ -466,6 +476,8 @@ class _FinishOnlySchedulerStub(OmniGenerationScheduler):
         *,
         has_generation_output: bool = True,
         stop_finished: bool = True,
+        model_stage: str = "code2wav",
+        stage_id: int = 2,
     ) -> None:
         self._async_chunk_coordinator_active = True
         self._pending_finish_reqs: list[Request] = []
@@ -477,8 +489,8 @@ class _FinishOnlySchedulerStub(OmniGenerationScheduler):
         self.vllm_config = SimpleNamespace(
             model_config=SimpleNamespace(
                 model_arch="Qwen3OmniMoeForConditionalGeneration",
-                model_stage="code2wav",
-                stage_id=2,
+                model_stage=model_stage,
+                stage_id=stage_id,
                 async_chunk=True,
             )
         )
@@ -497,8 +509,11 @@ class _FinishOnlySchedulerStub(OmniGenerationScheduler):
         self.finished_req_ids_dict: dict[int, set[str]] = {}
         self.log_stats = False
         self.freed: list[str] = []
+        self.handled_stops = 0
+        self.reenqueued: list[str] = []
 
     def _handle_stopped_request(self, request: Request) -> bool:
+        self.handled_stops += 1
         return self._stop_finished
 
     def _free_request(self, request: Request, delay_free_blocks: bool = False):
@@ -506,8 +521,117 @@ class _FinishOnlySchedulerStub(OmniGenerationScheduler):
         self.requests.pop(request.request_id, None)
         return None
 
+    def _enqueue_waiting_request(self, request: Request) -> None:
+        self.reenqueued.append(request.request_id)
+
     def make_stats(self, *args, **kwargs):
         return None
+
+
+class _ScheduleQueueStub:
+    def __init__(self, requests: list[Request] | None = None) -> None:
+        self._requests = list(requests or [])
+
+    def __bool__(self) -> bool:
+        return bool(self._requests)
+
+    def __len__(self) -> int:
+        return len(self._requests)
+
+    def peek_request(self) -> Request:
+        return self._requests[0]
+
+    def pop_request(self) -> Request:
+        return self._requests.pop(0)
+
+    def prepend_request(self, request: Request) -> None:
+        self._requests.insert(0, request)
+
+    def prepend_requests(self, requests) -> None:
+        while requests:
+            self.prepend_request(requests.pop_request())
+
+    def remove_requests(self, requests: set[Request]) -> None:
+        self._requests = [request for request in self._requests if request not in requests]
+
+
+class _KVBlockStub:
+    def get_block_ids(self):
+        return ([0],)
+
+
+class _ScheduleKVCacheManagerStub:
+    def __init__(self) -> None:
+        self.allocated: list[tuple[str, int]] = []
+
+    def new_step_starts(self) -> None:
+        return None
+
+    def allocate_slots(self, request: Request, num_new_tokens: int, **_kwargs):
+        self.allocated.append((request.request_id, num_new_tokens))
+        return _KVBlockStub()
+
+    def get_num_common_prefix_blocks(self, _request_id: str) -> list[int]:
+        return [0]
+
+    def take_new_block_ids(self):
+        return []
+
+
+class _FinalOnlyScheduleStub(OmniGenerationScheduler):
+    def __init__(self, request: Request, *, in_waiting: bool) -> None:
+        self._async_chunk_coordinator_active = True
+        self._pending_finish_reqs: list[Request] = []
+        self._deferred_terminal_chunk_req_ids: set[str] = set()
+        self._deferred_terminal_request_metadata: dict[str, dict] = {}
+        self._reqs_with_generation_output: set[str] = set()
+        self._omni_pending_upstream_segment_finished: set[str] = set()
+        self.vllm_config = SimpleNamespace(
+            model_config=SimpleNamespace(
+                model_arch="Qwen3OmniMoeForConditionalGeneration",
+                model_stage="code2wav",
+                stage_id=2,
+                async_chunk=True,
+            )
+        )
+        self.requests = {request.request_id: request}
+        self.running = [] if in_waiting else [request]
+        self.waiting = _ScheduleQueueStub([request] if in_waiting else [])
+        self.skipped_waiting = _ScheduleQueueStub()
+        self.input_coordinator = _FinishOnlyInputCoordinatorStub()
+        self.chunk_transfer_adapter = None
+        self.connector = None
+        self.ec_connector = None
+        self.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+        self.max_num_scheduled_tokens = 8
+        self.max_num_running_reqs = 8
+        self._pause_state = PauseState.UNPAUSED
+        self.policy = SchedulingPolicy.FCFS
+        self.num_lookahead_tokens = 0
+        self.kv_cache_manager = _ScheduleKVCacheManagerStub()
+        self.kv_cache_config = SimpleNamespace(kv_cache_groups=[object()])
+        self.use_v2_model_runner = False
+        self.prev_step_scheduled_req_ids: set[str] = set()
+        self.needs_kv_cache_zeroing = False
+        self.finished_req_ids: set[str] = set()
+        self.encoder_cache_manager = SimpleNamespace(get_freed_mm_hashes=lambda: [])
+        self.log_stats = False
+
+    def _consume_pending_connector_output(self, model_mode: str) -> None:
+        return None
+
+    def _process_pending_input_timeouts(self) -> None:
+        return None
+
+    def _make_cached_request_data(self, **_kwargs) -> CachedRequestData:
+        return CachedRequestData.make_empty()
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        for req_id, num_tokens in scheduler_output.num_scheduled_tokens.items():
+            self.requests[req_id].num_computed_tokens += num_tokens
+
+    def _wrap_omni_scheduler_output(self, scheduler_output: SchedulerOutput) -> SchedulerOutput:
+        return scheduler_output
 
 
 def _empty_scheduler_output() -> SchedulerOutput:
@@ -603,6 +727,81 @@ def _other_request_output_with_terminal_signal(request_id: str):
     )
 
 
+class TestAsyncChunkFinalCompletionGuard:
+    def test_completed_final_stream_without_ready_ignores_stale_prompt(self) -> None:
+        request = _make_request(
+            request_id="req-final-no-ready",
+            prompt_token_ids=[0] * 81,
+        )
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        sched.input_coordinator._completed_chunk_streams.add(request.request_id)
+
+        assert sched._async_chunk_final_completed_without_ready(request) is True
+
+    def test_ready_final_stream_still_drains_payload(self) -> None:
+        request = _make_request(request_id="req-final-ready")
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        sched.input_coordinator._completed_chunk_streams.add(request.request_id)
+        sched.input_coordinator.requests_with_ready_chunks.add(request.request_id)
+
+        assert sched._async_chunk_final_completed_without_ready(request) is False
+
+
+class TestAsyncChunkFinalOnlyScheduling:
+    def test_waiting_completed_final_stream_schedules_terminal_placeholder(self) -> None:
+        request = _make_request(request_id="req-final-only-waiting", prompt_token_ids=[])
+        request.status = RequestStatus.WAITING
+        sched = _FinalOnlyScheduleStub(request, in_waiting=True)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {request.request_id: 1}
+        assert sched._pending_finish_reqs == []
+        assert sched.kv_cache_manager.allocated == [(request.request_id, 1)]
+
+    def test_waiting_completed_final_stream_with_output_finishes_without_placeholder(self) -> None:
+        request = _make_request(request_id="req-final-output-waiting", prompt_token_ids=[0] * 81)
+        request.status = RequestStatus.WAITING
+        request.num_computed_tokens = 80
+        sched = _FinalOnlyScheduleStub(request, in_waiting=True)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+        sched._reqs_with_generation_output.add(request.request_id)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {}
+        assert sched._pending_finish_reqs == [request]
+        assert sched.kv_cache_manager.allocated == []
+
+    def test_running_completed_final_stream_schedules_terminal_placeholder(self) -> None:
+        request = _make_request(request_id="req-final-only-running", prompt_token_ids=[1, 2, 3])
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinalOnlyScheduleStub(request, in_waiting=False)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {request.request_id: 1}
+        assert sched._pending_finish_reqs == []
+        assert sched.kv_cache_manager.allocated == [(request.request_id, 1)]
+
+    def test_running_completed_final_stream_with_output_finishes_without_placeholder(self) -> None:
+        request = _make_request(request_id="req-final-output-running", prompt_token_ids=[0] * 81)
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = 80
+        sched = _FinalOnlyScheduleStub(request, in_waiting=False)
+        sched.input_coordinator.finished_requests.add(request.request_id)
+        sched._reqs_with_generation_output.add(request.request_id)
+
+        output = sched.schedule()
+
+        assert output.num_scheduled_tokens == {}
+        assert sched._pending_finish_reqs == [request]
+        assert sched.kv_cache_manager.allocated == []
+
+
 class TestAsyncChunkFinishOnlyOutput:
     def test_multimodal_request_finishes_on_connector_only_terminal(self) -> None:
         request = _make_request(request_id="req-mm-terminal")
@@ -621,6 +820,46 @@ class TestAsyncChunkFinishOnlyOutput:
         assert client_outputs[0].finish_reason.name == "STOP"
         assert sched.freed == [request.request_id]
         assert sched.input_coordinator.freed == [request.request_id]
+
+    def test_connector_only_segment_terminal_marks_pending_finish_output(self) -> None:
+        request = _make_request(request_id="req-mm-segment-terminal")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        model_output = _finish_only_model_output(request.request_id)
+        model_output.omni_connector_output.chunk_segment_finished_req_ids = {request.request_id}
+
+        outputs = sched.update_from_output(
+            _empty_scheduler_output(),
+            model_output,
+        )
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert client_outputs[0].is_segment_finished is True
+        assert request.request_id not in sched._omni_pending_upstream_segment_finished
+
+    def test_intermediate_stage_preserves_upstream_terminal(self) -> None:
+        request = _make_request(request_id="req-talk-terminal")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(
+            request,
+            has_generation_output=False,
+            model_stage="talker",
+            stage_id=1,
+        )
+
+        outputs = sched.update_from_output(
+            _empty_scheduler_output(),
+            _finish_only_model_output(request.request_id),
+        )
+
+        assert outputs.get(request.client_index) is None
+        assert sched._pending_finish_reqs == []
+        assert request.request_id in sched.requests
 
     def test_connector_terminal_with_ready_chunk_waits_for_payload(self) -> None:
         request = _make_request(request_id="req-mm-terminal-codes")
@@ -730,11 +969,37 @@ class TestAsyncChunkFinishOnlyOutput:
         assert client_outputs[0].request_id == request.request_id
         assert client_outputs[0].finish_reason.name == "STOP"
 
+    def test_completed_stream_with_output_finishes_despite_stale_prompt_len(self) -> None:
+        request = _make_request(
+            request_id="req-mm-terminal-stale-prompt",
+            prompt_token_ids=[0] * 81,
+        )
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = 32
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        sched.input_coordinator._completed_chunk_streams.add(request.request_id)
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={request.request_id: 1},
+            scheduled_spec_decode_tokens={},
+            num_invalid_spec_tokens=0,
+        )
+
+        outputs = sched.update_from_output(
+            scheduler_output,
+            _segment_multimodal_model_output(request.request_id),
+        )
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert sched.freed == [request.request_id]
+
     def test_multimodal_request_marks_pending_segment_flush(self) -> None:
         request = _make_request(request_id="req-mm-segment-flush")
         request.status = RequestStatus.RUNNING
         request.num_computed_tokens = len(request.prompt_token_ids)
-        sched = _FinishOnlySchedulerStub(request, has_generation_output=False, stop_finished=False)
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
         sched._omni_pending_upstream_segment_finished.add(request.request_id)
         scheduler_output = SimpleNamespace(
             num_scheduled_tokens={request.request_id: 1},
@@ -752,8 +1017,11 @@ class TestAsyncChunkFinishOnlyOutput:
         assert client_outputs[0].request_id == request.request_id
         assert client_outputs[0].finish_reason.name == "STOP"
         assert client_outputs[0].is_segment_finished is True
+        assert sched.handled_stops == 0
         assert sched.freed == []
+        assert sched.reenqueued == [request.request_id]
         assert request.request_id in sched.requests
+        assert request.status == RequestStatus.WAITING
         assert sched._omni_pending_upstream_segment_finished == set()
 
     def test_multimodal_request_finishes_from_stored_coordinator_terminal(self) -> None:
@@ -808,6 +1076,55 @@ class TestAsyncChunkFinishOnlyOutput:
         assert len(client_outputs) == 1
         assert client_outputs[0].request_id == request.request_id
         assert client_outputs[0].finish_reason.name == "STOP"
+
+    def test_terminal_output_with_segment_finish_does_not_wait_for_next_chunk(self) -> None:
+        request = _make_request(request_id="req-mm-terminal-segment-output")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        sched._omni_pending_upstream_segment_finished.add(request.request_id)
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={request.request_id: 1},
+            scheduled_spec_decode_tokens={},
+            num_invalid_spec_tokens=0,
+        )
+
+        outputs = sched.update_from_output(
+            scheduler_output,
+            _terminal_multimodal_model_output(request.request_id),
+        )
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert client_outputs[0].is_segment_finished is True
+        assert sched.handled_stops == 1
+        assert sched.freed == [request.request_id]
+        assert sched.reenqueued == []
+        assert request.request_id not in sched.requests
+
+    def test_terminal_output_uses_current_cycle_segment_finish_signal(self) -> None:
+        request = _make_request(request_id="req-mm-terminal-current-segment")
+        request.status = RequestStatus.RUNNING
+        request.num_computed_tokens = len(request.prompt_token_ids)
+        sched = _FinishOnlySchedulerStub(request, has_generation_output=False)
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={request.request_id: 1},
+            scheduled_spec_decode_tokens={},
+            num_invalid_spec_tokens=0,
+        )
+        model_output = _terminal_multimodal_model_output(request.request_id)
+        model_output.omni_connector_output.chunk_segment_finished_req_ids = {request.request_id}
+
+        outputs = sched.update_from_output(scheduler_output, model_output)
+
+        client_outputs = outputs[request.client_index].outputs
+        assert len(client_outputs) == 1
+        assert client_outputs[0].request_id == request.request_id
+        assert client_outputs[0].finish_reason.name == "STOP"
+        assert client_outputs[0].is_segment_finished is True
+        assert sched.freed == [request.request_id]
 
     def test_terminal_ready_signal_survives_mixed_batch_output(self) -> None:
         request = _make_request(request_id="req-mm-mixed-terminal")

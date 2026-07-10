@@ -523,6 +523,19 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 self._native_text_metrics_by_request.pop(request_id, None)
         return super().abort_requests(request_ids, internal)
 
+    def _update_streaming_request_state(
+        self,
+        req_state: RequestState,
+        request: EngineCoreRequest,
+        prompt: str | None,
+    ) -> None:
+        if not request.resumable and req_state.input_chunk_queue is None and req_state.queue is None:
+            # StagePool still submits the final update to EngineCore. Keep the
+            # state until its terminal output arrives so it can be materialized.
+            req_state.streaming_input = False
+            return
+        super()._update_streaming_request_state(req_state, request, prompt)
+
     def add_request(
         self,
         request: EngineCoreRequest,
@@ -634,7 +647,7 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 upstream_outputs.append(eco)
 
         # Handle multimodal-only outputs (generation stages) locally.
-        self._process_mm_only_outputs(mm_only_outputs)
+        mm_only_request_outputs = self._process_mm_only_outputs(mm_only_outputs)
 
         # Delegate text/pooling outputs to upstream.
         processed = super().process_outputs(
@@ -642,6 +655,8 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             engine_core_timestamp=engine_core_timestamp,
             iteration_stats=iteration_stats,
         )
+        if mm_only_request_outputs:
+            processed.request_outputs.extend(mm_only_request_outputs)
         if error_outputs:
             processed.request_outputs.extend(error_outputs)
         return processed
@@ -649,12 +664,13 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
     def _process_mm_only_outputs(
         self,
         engine_core_outputs: list[EngineCoreOutput],
-    ) -> None:
+    ) -> list[OmniRequestOutput | PoolingRequestOutput]:
         """Handle outputs from generation stages that have no detokenizer.
 
         These cannot go through upstream process_outputs because it asserts
         detokenizer is not None when pooling_output is None.
         """
+        request_outputs: list[OmniRequestOutput | PoolingRequestOutput] = []
         for eco in engine_core_outputs:
             req_state = self.request_states.get(eco.request_id)
             if req_state is None or not isinstance(req_state, OmniRequestState):
@@ -678,9 +694,11 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             ):
                 if req_state.queue is not None:
                     req_state.queue.put(request_output)
+                request_outputs.append(request_output)
 
             if finish_reason is not None:
                 self._finish_request(req_state)
+        return request_outputs
 
     def _update_stats_from_output(
         self,

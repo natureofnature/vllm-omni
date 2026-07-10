@@ -730,7 +730,7 @@ def _select_processor_funcs(
     input_proc = ps.custom_process_input_func
     if async_chunk and ps.async_chunk_process_next_stage_input_func:
         next_stage_proc = ps.async_chunk_process_next_stage_input_func
-    elif not async_chunk and ps.sync_process_input_func:
+    if ps.sync_process_input_func and (not async_chunk or ps.async_chunk_process_next_stage_input_func):
         input_proc = ps.sync_process_input_func
     return input_proc, next_stage_proc
 

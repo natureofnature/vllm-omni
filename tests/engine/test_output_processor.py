@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Regression tests for OmniRequestState multimodal DELTA drain and consolidation guard."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -12,7 +13,7 @@ from vllm.sampling_params import RequestOutputKind
 from vllm.v1.engine import FinishReason
 
 from vllm_omni.engine.output_modality import OutputModalityNames
-from vllm_omni.engine.output_processor import OmniRequestState
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor, OmniRequestState
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -290,3 +291,40 @@ def test_no_detokenizer_final_only():
     result = s.make_request_output([], None, FinishReason.STOP, None)
     assert result is not None
     assert AUDIO in result.outputs[0].multimodal_output
+
+
+def test_stage_pool_final_streaming_update_waits_for_terminal_output():
+    processor = MultimodalOutputProcessor(
+        tokenizer=None,
+        log_stats=False,
+        engine_core_output_type="audio",
+    )
+    state = _make_no_detok_state(RequestOutputKind.DELTA)
+    state.streaming_input = True
+    state.input_chunk_queue = None
+    processor.request_states[state.request_id] = state
+    processor.external_req_ids[state.external_req_id].append(state.request_id)
+
+    processor._update_streaming_request_state(
+        state,
+        SimpleNamespace(resumable=False),
+        prompt=None,
+    )
+
+    assert processor.request_states[state.request_id] is state
+    assert not state.streaming_input
+
+    terminal_output = SimpleNamespace(
+        request_id=state.request_id,
+        new_token_ids=[],
+        finish_reason=FinishReason.STOP,
+        stop_reason=None,
+        kv_transfer_params=None,
+        routed_experts=None,
+        num_cached_tokens=0,
+    )
+    outputs = processor._process_mm_only_outputs([terminal_output])
+
+    assert len(outputs) == 1
+    assert outputs[0].finished
+    assert state.request_id not in processor.request_states

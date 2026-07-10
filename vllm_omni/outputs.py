@@ -18,6 +18,8 @@ class OmniConnectorOutput:
 
     Attributes:
         chunk_ready_req_ids: Request IDs with newly arrived chunks this cycle.
+        chunk_ready_counts: Number of consumable chunks received per request in
+            this cycle. Used when multiple chunks for one request are coalesced.
         chunk_finished_req_ids: Request IDs whose final chunk has arrived.
         chunk_segment_finished_req_ids: Request IDs whose current realtime segment ended.
         request_metadata: Lightweight scheduling metadata keyed by request ID
@@ -31,6 +33,7 @@ class OmniConnectorOutput:
     """
 
     chunk_ready_req_ids: set[str] = field(default_factory=set)
+    chunk_ready_counts: dict[str, int] = field(default_factory=dict)
     chunk_finished_req_ids: set[str] = field(default_factory=set)
     chunk_segment_finished_req_ids: set[str] = field(default_factory=set)
     request_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)

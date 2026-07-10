@@ -77,6 +77,9 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
 class OmniGPUModelRunner(GPUModelRunner):
     _SEGMENT_RUNTIME_PRESERVED_KEYS: frozenset[str] = frozenset(("omni_final_stage_id",))
     _SEGMENT_RUNTIME_PRESERVED_EMBED_KEYS: frozenset[str] = frozenset(("tts_bos", "tts_eos", "tts_pad"))
+    _SEGMENT_RUNTIME_PROGRESS_META_KEYS: frozenset[str] = frozenset(
+        ("decode_flag", "num_processed_tokens", "eos_emitted")
+    )
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1339,34 +1342,79 @@ class OmniGPUModelRunner(GPUModelRunner):
     def _sync_local_stage_payloads(self) -> None:
         """Move received full-payload stage inputs into model_intermediate_buffer."""
         cache = getattr(self, "_local_stage_payload_cache", None)
+        terminal_cache = getattr(self, "_local_stage_terminal_payload_cache", None)
+        if not cache and not terminal_cache:
+            return
+        lock = getattr(self, "_lock", None)
+        ctx = lock if lock is not None else contextlib.nullcontext()
+        with ctx:
+            if not cache and not terminal_cache:
+                return
+            active_req_ids = set(getattr(self, "requests", {}))
+            pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
+            terminal_staged = {
+                req_id: payload
+                for req_id, payload in (terminal_cache or {}).items()
+                if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+            }
+            for req_id in terminal_staged:
+                terminal_cache.pop(req_id, None)
+            staged = {}
+            deferred = set()
+            for req_id, payload in (cache or {}).items():
+                if req_id in pending or req_id not in active_req_ids or not isinstance(payload, dict):
+                    continue
+                if self._should_defer_local_stage_segment_payload(req_id, payload):
+                    deferred.add(req_id)
+                    continue
+                staged[req_id] = payload
+            for req_id in staged:
+                cache.pop(req_id, None)
+        for req_id, payload in terminal_staged.items():
+            self._update_intermediate_buffer(req_id, payload)
+        for req_id, payload in staged.items():
+            if self._should_reset_local_stage_segment_runtime(req_id, payload):
+                self._update_streaming_input_additional_info(req_id)
+            self._update_intermediate_buffer(req_id, payload)
+        if terminal_staged or staged:
+            work_available = getattr(self, "_work_available", None)
+            if work_available is not None:
+                work_available.set()
+
+    def _promote_ready_local_stage_payloads(self) -> None:
+        """Wake the scheduler once a deferred segment payload is consumable."""
+        cache = getattr(self, "_local_stage_payload_cache", None)
         if not cache:
             return
         lock = getattr(self, "_lock", None)
         ctx = lock if lock is not None else contextlib.nullcontext()
         with ctx:
+            cache = getattr(self, "_local_stage_payload_cache", None)
             if not cache:
                 return
             active_req_ids = set(getattr(self, "requests", {}))
             pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
-            staged = {
-                req_id: payload
+            ready_req_ids = {
+                req_id
                 for req_id, payload in cache.items()
-                if req_id not in pending and req_id in active_req_ids and isinstance(payload, dict)
+                if req_id in active_req_ids
+                and req_id not in pending
+                and isinstance(payload, dict)
+                and not self._should_defer_local_stage_segment_payload(req_id, payload)
             }
-            for req_id in staged:
-                cache.pop(req_id, None)
-        for req_id, payload in staged.items():
-            if self._should_reset_local_stage_segment_runtime(req_id, payload):
-                self._update_streaming_input_additional_info(req_id)
-            self._update_intermediate_buffer(req_id, payload)
-        if staged:
-            work_available = getattr(self, "_work_available", None)
-            if work_available is not None:
-                work_available.set()
+            if not ready_req_ids:
+                return
+            finished_load_reqs = getattr(self, "_finished_load_reqs", None)
+            if isinstance(finished_load_reqs, set):
+                finished_load_reqs.update(ready_req_ids)
+        work_available = getattr(self, "_work_available", None)
+        if work_available is not None:
+            work_available.set()
 
-    def _build_model_kwargs_extra(self) -> dict:
+    def _build_model_kwargs_extra(self, *, sync_local_stage_payloads: bool = True) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
-        self._sync_local_stage_payloads()
+        if sync_local_stage_payloads:
+            self._sync_local_stage_payloads()
         model_kwargs_extra: dict[str, object] = {}
         try:
             buffer_map = self._gather_runtime_additional_information()
@@ -1953,7 +2001,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         **model_kwargs: dict[str, Any],
     ):
         """Inject omni-specific kwargs into forward and cache model output"""
-        model_kwargs_extra = self._build_model_kwargs_extra()
+        model_kwargs_extra = self._build_model_kwargs_extra(
+            sync_local_stage_payloads=not bool(getattr(self.model, "has_preprocess", False))
+        )
         update_decode_metadata = getattr(self.model, "update_decode_step_metadata", None)
         if getattr(self.model, "supports_omni_decode_step_metadata", False) and callable(update_decode_metadata):
             update_decode_metadata(
@@ -2024,6 +2074,16 @@ class OmniGPUModelRunner(GPUModelRunner):
             return incoming_tensor
         if existing_len >= incoming_len and torch.equal(existing_tensor[:incoming_len], incoming_tensor):
             return existing_tensor
+        max_overlap = min(existing_len, incoming_len, 16)
+        for overlap in range(max_overlap, 0, -1):
+            if torch.equal(
+                existing_tensor[-overlap:],
+                incoming_tensor[:overlap],
+            ):
+                return torch.cat(
+                    [existing_tensor, incoming_tensor[overlap:]],
+                    dim=0,
+                )
         return torch.cat([existing_tensor, incoming_tensor], dim=0)
 
     @staticmethod
@@ -2031,6 +2091,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         if isinstance(value, torch.Tensor):
             return value.numel() == 1 and bool(value.item())
         return bool(value)
+
+    @staticmethod
+    def _scalar_int_or_none(value: Any) -> int | None:
+        if isinstance(value, torch.Tensor):
+            if value.numel() != 1:
+                return None
+            return int(value.item())
+        if isinstance(value, (int, np.integer)):
+            return int(value)
+        return None
 
     @staticmethod
     def _has_segment_prefill(upd: dict) -> bool:
@@ -2059,14 +2129,31 @@ class OmniGPUModelRunner(GPUModelRunner):
             return False
         if not self._has_segment_prefill(payload):
             return False
+        meta = payload.get("meta")
+        if isinstance(meta, dict) and (
+            self._truthy_scalar(meta.get("finished")) or self._truthy_scalar(meta.get("is_segment_finished"))
+        ):
+            return False
         if req_id not in self.requests:
             return False
         existing = self.model_intermediate_buffer.get(req_id)
         return isinstance(existing, dict) and self._has_prior_segment_runtime_state(existing)
 
+    def _should_defer_local_stage_segment_payload(self, req_id: str, payload: dict) -> bool:
+        if not self._should_reset_local_stage_segment_runtime(req_id, payload):
+            return False
+        existing = self.model_intermediate_buffer.get(req_id)
+        meta = existing.get("meta") if isinstance(existing, dict) else None
+        return not (isinstance(meta, dict) and self._truthy_scalar(meta.get("eos_emitted")))
+
     @classmethod
     def _should_reset_segment_runtime_buffer(cls, existing: dict, upd: dict, *, reset_pending: bool = False) -> bool:
         if not cls._has_segment_prefill(upd):
+            return False
+        upd_meta = upd.get("meta")
+        if isinstance(upd_meta, dict) and (
+            cls._truthy_scalar(upd_meta.get("finished")) or cls._truthy_scalar(upd_meta.get("is_segment_finished"))
+        ):
             return False
         if reset_pending:
             return True
@@ -2086,6 +2173,20 @@ class OmniGPUModelRunner(GPUModelRunner):
 
         if preserved_embed:
             existing["embed"] = preserved_embed
+
+    @classmethod
+    def _drop_stale_segment_runtime_progress(cls, upd: dict) -> dict:
+        meta = upd.get("meta")
+        if not isinstance(meta, dict):
+            return upd
+        if not any(key in meta for key in cls._SEGMENT_RUNTIME_PROGRESS_META_KEYS):
+            return upd
+        upd = dict(upd)
+        meta = dict(meta)
+        for key in cls._SEGMENT_RUNTIME_PROGRESS_META_KEYS:
+            meta.pop(key, None)
+        upd["meta"] = meta
+        return upd
 
     def _mark_segment_send_watermark_reset(self, req_id: str) -> None:
         reset_req_ids = getattr(self, "_segment_send_watermark_reset_req_ids", None)
@@ -2116,19 +2217,29 @@ class OmniGPUModelRunner(GPUModelRunner):
             meta = existing.get("meta")
             if isinstance(meta, dict):
                 reset_meta = {k: meta[k] for k in ("num_processed_tokens", "resumable") if k in meta}
+        did_reset_segment_runtime = False
         if self._should_reset_segment_runtime_buffer(existing, upd, reset_pending=reset_pending):
             self._mark_segment_send_watermark_reset(req_id)
             self._reset_segment_runtime_buffer(existing)
+            did_reset_segment_runtime = True
             if reset_meta:
                 existing.setdefault("meta", {}).update(reset_meta)
             if reset_req_ids is not None:
                 reset_req_ids.discard(req_id)
         has_segment_prefill = self._has_segment_prefill(upd)
+        if did_reset_segment_runtime and has_segment_prefill:
+            upd = self._drop_stale_segment_runtime_progress(upd)
         for k, v in upd.items():
             if isinstance(v, dict):
                 existing_sub = existing.setdefault(k, {})
                 for qual, val in v.items():
                     existing_val = existing_sub.get(qual)
+                    if k == "meta" and qual == "num_processed_tokens":
+                        existing_progress = self._scalar_int_or_none(existing_val)
+                        incoming_progress = self._scalar_int_or_none(val)
+                        if existing_progress is not None and incoming_progress is not None:
+                            if incoming_progress < existing_progress:
+                                continue
                     if isinstance(existing_val, torch.Tensor) and isinstance(val, torch.Tensor):
                         if k == "embed" and qual == "decode":
                             val = self._merge_runtime_tensor_sequence(existing_val, val, append=True)

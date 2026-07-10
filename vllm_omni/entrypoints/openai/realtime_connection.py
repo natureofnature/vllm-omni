@@ -30,6 +30,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         super().__init__(*args, **kwargs)
         self.engine = cast(AsyncOmni, self.serving.engine_client)
         self._realtime_audio_ref: np.ndarray | None = None
+        self._realtime_audio_chunks_drained = 0
 
     async def start_generation(self):
         await super().start_generation()
@@ -101,11 +102,14 @@ class RealtimeConnection(VllmRealtimeConnection):
         raw_audio = mm.get(key)
         chunks: list[np.ndarray] = []
         if isinstance(raw_audio, (list, tuple)):
-            if len(raw_audio) > 0:
-                arr = self._tensor_to_numpy(raw_audio[-1])
+            start = min(self._realtime_audio_chunks_drained, len(raw_audio))
+            for item in raw_audio[start:]:
+                arr = self._tensor_to_numpy(item)
                 if arr is not None and arr.size > 0:
                     chunks.extend(self._raw_waveform_to_deltas(arr))
+            self._realtime_audio_chunks_drained = len(raw_audio)
         else:
+            self._realtime_audio_chunks_drained = 0
             arr = self._tensor_to_numpy(raw_audio)
             if arr is not None and arr.size > 0:
                 chunks.extend(self._raw_waveform_to_deltas(arr))
@@ -129,6 +133,7 @@ class RealtimeConnection(VllmRealtimeConnection):
         prompt_token_ids_len = 0
         completion_tokens_len = 0
         self._realtime_audio_ref = None
+        self._realtime_audio_chunks_drained = 0
 
         # Coerce cumulative outputs to delta outputs; this ensures
         # we don't emit redundant MM data & drain after emitting.

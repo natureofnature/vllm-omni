@@ -37,6 +37,7 @@ from vllm.v1.worker.gpu_model_runner import (
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm.v1.worker.utils import sanity_check_mm_encoder_outputs
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import uses_full_payload_input_coordinator
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import partition_payload_list
 from vllm_omni.worker.gpu_ar_model_runner import _ensure_tensor_values
@@ -92,6 +93,10 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
                 model_config=self.model_config,
             )
 
+    def _omni_stage_model_config(self) -> Any:
+        model_config = getattr(getattr(self, "vllm_config", None), "model_config", None)
+        return model_config if model_config is not None else getattr(self, "model_config", None)
+
     def _update_request_states(self, scheduler_output: SchedulerOutput):
         # remove requests
         # Some stateful vocoder model may need to clean the state
@@ -138,7 +143,8 @@ class GPUGenerationModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin
         if hasattr(self, "_omni_connector"):
             for request in getattr(scheduler_output, "pending_connector_registrations", []):
                 self.register_chunk_recv(request)
-            self.recv_full_payload_inputs(scheduler_output)
+            if uses_full_payload_input_coordinator(self._omni_stage_model_config()):
+                self.recv_full_payload_inputs(scheduler_output)
             if self._pending_full_payload_send:
                 flush_ids = set(getattr(scheduler_output, "finished_req_ids", set()))
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})

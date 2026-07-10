@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner, _filter_mrope_kwargs_for_model
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -657,6 +658,53 @@ def test_sync_local_stage_payloads_preserves_new_decode_after_segment_reset():
     assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
 
 
+def test_build_model_kwargs_keeps_preprocess_stage_mtp_codes_until_forward():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.requests["r1"].output_token_ids = []
+    runner.model = SimpleNamespace(has_preprocess=True)
+    runner.model_config = SimpleNamespace(has_sampling_extra_args=False)
+    runner._omni_num_scheduled_tokens_np = None
+    runner._omni_query_start_loc_model_kwarg = False
+    runner._local_stage_terminal_payload_cache = {}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    codes = torch.tensor([[1, 2, 3, 4]])
+    runner.model_intermediate_buffer["r1"] = {"codes": {"audio": codes}}
+    runner._local_stage_payload_cache = {"r1": {"embed": {"prefill": torch.ones(1, 4)}}}
+
+    kwargs = OmniGPUModelRunner._build_model_kwargs_extra(runner, sync_local_stage_payloads=False)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert torch.equal(buf["codes"]["audio"], codes)
+    assert "embed" not in buf
+    assert runner._local_stage_payload_cache
+    assert kwargs["model_intermediate_buffer"] == [buf]
+
+
+def test_build_model_kwargs_syncs_local_payload_for_no_preprocess_stage():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.requests["r1"].output_token_ids = []
+    runner.model = SimpleNamespace(has_preprocess=False)
+    runner.model_config = SimpleNamespace(has_sampling_extra_args=False)
+    runner._omni_num_scheduled_tokens_np = None
+    runner._omni_query_start_loc_model_kwarg = False
+    runner._local_stage_terminal_payload_cache = {}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    payload = {"codes": {"audio": torch.tensor([[7, 8]])}}
+    runner._local_stage_payload_cache = {"r1": payload}
+
+    kwargs = OmniGPUModelRunner._build_model_kwargs_extra(runner)
+
+    assert runner._local_stage_payload_cache == {}
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["codes"]["audio"], payload["codes"]["audio"])
+    assert kwargs["model_intermediate_buffer"] == [runner.model_intermediate_buffer["r1"]]
+
+
 def _enable_qwen3_talker_async_chunk(runner):
     runner.vllm_config.model_config = SimpleNamespace(
         model_arch="Qwen3OmniMoeForConditionalGeneration",
@@ -666,7 +714,81 @@ def _enable_qwen3_talker_async_chunk(runner):
     )
 
 
-def test_sync_local_stage_payloads_resets_reused_streaming_segment():
+def test_build_omni_mm_payload_keeps_multi_token_hidden_state_span():
+    runner = object.__new__(GPUARModelRunner)
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+    payload = GPUARModelRunner._build_omni_mm_payload(
+        runner,
+        combined_multimodal_outputs=None,
+        mm_cpu={"hidden_states.layer_0": hidden},
+        rid="r1",
+        idx=0,
+        start=0,
+        end=6,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        seq_len=6,
+        build_flat_payload=True,
+    )
+
+    assert torch.equal(payload["hidden_states.layer_0"], hidden)
+
+
+def test_build_omni_mm_payload_slices_padded_qwen3_hidden_state_span():
+    runner = object.__new__(GPUARModelRunner)
+    runner.model_config = SimpleNamespace(
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker",
+        async_chunk=True,
+    )
+    hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
+
+    payload = GPUARModelRunner._build_omni_mm_payload(
+        runner,
+        combined_multimodal_outputs=None,
+        mm_cpu={"hidden_states.layer_0": hidden},
+        rid="r1",
+        idx=1,
+        start=5,
+        end=6,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        seq_len=7,
+        build_flat_payload=True,
+    )
+
+    assert torch.equal(payload["hidden_states.layer_0"], hidden[5:6])
+
+
+def test_build_omni_mm_payload_keeps_presliced_qwen3_hidden_state_span():
+    runner = object.__new__(GPUARModelRunner)
+    runner.model_config = SimpleNamespace(
+        model_arch="Qwen3OmniMoeForConditionalGeneration",
+        model_stage="thinker",
+        async_chunk=True,
+    )
+    hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
+
+    payload = GPUARModelRunner._build_omni_mm_payload(
+        runner,
+        combined_multimodal_outputs=None,
+        mm_cpu={"hidden_states.layer_0": hidden},
+        rid="r1",
+        idx=1,
+        start=5,
+        end=8,
+        audio_sparse_output=False,
+        sparse_mm_index={},
+        seq_len=10,
+        build_flat_payload=True,
+    )
+
+    assert torch.equal(payload["hidden_states.layer_0"], hidden)
+    assert payload["hidden_states.layer_0"] is not hidden
+
+
+def test_sync_local_stage_payloads_defers_reused_streaming_segment_until_terminal_eos():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     _enable_qwen3_talker_async_chunk(runner)
     reset_calls = []
@@ -699,14 +821,37 @@ def test_sync_local_stage_payloads_resets_reused_streaming_segment():
             "ids": {"prompt": [1, 2]},
         }
     }
+    runner._local_stage_terminal_payload_cache = {}
     runner._full_payload_pending_broadcast_req_ids = set()
+    runner._finished_load_reqs = set()
     runner._lock = None
     runner._work_available = None
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
+    assert runner._local_stage_payload_cache["r1"]["embed"]["prefill"] is new_prefill
+    assert runner._finished_load_reqs == set()
+    assert reset_calls == []
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["embed"]["decode"], old_decode)
+
+    runner._local_stage_terminal_payload_cache = {"r1": {"meta": {"is_segment_finished": torch.tensor(True)}}}
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert runner._local_stage_payload_cache["r1"]["embed"]["prefill"] is new_prefill
+    assert bool(buf["meta"]["is_segment_finished"].item()) is True
+    assert torch.equal(buf["embed"]["decode"], old_decode)
+    assert runner._finished_load_reqs == set()
+    assert reset_calls == []
+
+    buf["meta"]["eos_emitted"] = torch.tensor(True)
+    OmniGPUModelRunner._promote_ready_local_stage_payloads(runner)
+    assert runner._finished_load_reqs == {"r1"}
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
     buf = runner.model_intermediate_buffer["r1"]
     assert runner._local_stage_payload_cache == {}
+    assert runner._local_stage_terminal_payload_cache == {}
     assert reset_calls == ["r1"]
     assert runner._segment_send_watermark_reset_req_ids == {"r1"}
     assert buf["omni_final_stage_id"] == 2
@@ -719,6 +864,195 @@ def test_sync_local_stage_payloads_resets_reused_streaming_segment():
     assert buf["ids"] == {"prompt": [1, 2]}
     assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
     assert "model_specific_segment_state" not in buf
+
+
+def test_sync_local_stage_payloads_reset_drops_stale_decode_progress_meta():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+    runner.reset_segment_send_watermark = lambda req_id: None
+
+    new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    new_decode = torch.tensor([[5.0, 6.0]])
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"decode": torch.tensor([[9.0, 9.0]])},
+        "meta": {
+            "is_segment_finished": torch.tensor(False),
+            "decode_flag": True,
+            "num_processed_tokens": 8,
+            "prefill_consumed_text_tokens": 1,
+            "eos_emitted": torch.tensor(True),
+        },
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {"prefill": new_prefill, "decode": new_decode},
+            "meta": {
+                "decode_flag": True,
+                "num_processed_tokens": 1,
+                "prefill_consumed_text_tokens": 1,
+                "eos_emitted": True,
+            },
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    meta = runner.model_intermediate_buffer["r1"]["meta"]
+    assert "decode_flag" not in meta
+    assert "eos_emitted" not in meta
+    assert meta["num_processed_tokens"] == 0
+    assert meta["prefill_consumed_text_tokens"] == 1
+    assert meta["resumable"] is True
+    assert torch.equal(runner.model_intermediate_buffer["r1"]["embed"]["decode"], new_decode)
+
+
+def test_sync_local_stage_payloads_request_finish_prefill_keeps_decode_progress():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+
+    existing_decode = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    final_prefill = torch.tensor([[9.0, 9.0]])
+    final_cached_decode = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"decode": existing_decode},
+        "meta": {
+            "num_processed_tokens": 2,
+            "prefill_consumed_text_tokens": 1,
+        },
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {
+                "prefill": final_prefill,
+                "cached_decode": final_cached_decode,
+            },
+            "meta": {"finished": torch.tensor(True)},
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert reset_calls == []
+    assert getattr(runner, "_segment_send_watermark_reset_req_ids", set()) == set()
+    assert torch.equal(buf["embed"]["prefill"], final_prefill)
+    assert torch.equal(buf["embed"]["decode"], existing_decode)
+    assert torch.equal(buf["embed"]["cached_decode"], final_cached_decode)
+    assert buf["meta"]["num_processed_tokens"] == 2
+    assert buf["meta"]["prefill_consumed_text_tokens"] == 1
+    assert bool(buf["meta"]["finished"].item()) is True
+
+
+def test_sync_local_stage_payloads_terminal_cache_keeps_forward_progress():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+
+    final_cached_decode = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+            [7.0, 8.0],
+        ]
+    )
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"cached_decode": final_cached_decode[:2]},
+        "meta": {
+            "decode_flag": True,
+            "num_processed_tokens": 3,
+            "prefill_consumed_text_tokens": 1,
+        },
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {
+                "prefill": torch.ones((2, 2)),
+                "cached_decode": final_cached_decode,
+            },
+            "meta": {
+                "decode_flag": True,
+                "num_processed_tokens": torch.tensor(1),
+                "prefill_consumed_text_tokens": 1,
+                "finished": torch.tensor(True),
+                "is_segment_finished": torch.tensor(True),
+            },
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert torch.equal(buf["embed"]["cached_decode"], final_cached_decode)
+    assert buf["meta"]["num_processed_tokens"] == 3
+    assert buf["meta"]["prefill_consumed_text_tokens"] == 1
+    assert bool(buf["meta"]["finished"].item()) is True
+    assert bool(buf["meta"]["is_segment_finished"].item()) is True
+
+
+def test_sync_local_stage_payloads_final_prefill_does_not_reset_after_segment_marker():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    _enable_qwen3_talker_async_chunk(runner)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
+
+    existing_decode = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    final_prefill = torch.tensor([[9.0, 9.0]])
+    final_cached_decode = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+            [5.0, 6.0],
+        ]
+    )
+    runner.model_intermediate_buffer["r1"] = {
+        "embed": {"decode": existing_decode},
+        "meta": {
+            "is_segment_finished": torch.tensor(True),
+            "decode_flag": True,
+            "num_processed_tokens": 2,
+            "prefill_consumed_text_tokens": 1,
+        },
+    }
+    runner._local_stage_payload_cache = {
+        "r1": {
+            "embed": {
+                "prefill": final_prefill,
+                "cached_decode": final_cached_decode,
+            },
+            "meta": {
+                "finished": torch.tensor(True),
+                "is_segment_finished": torch.tensor(True),
+            },
+        }
+    }
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._lock = None
+    runner._work_available = None
+
+    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+
+    buf = runner.model_intermediate_buffer["r1"]
+    assert reset_calls == []
+    assert getattr(runner, "_segment_send_watermark_reset_req_ids", set()) == set()
+    assert torch.equal(buf["embed"]["prefill"], final_prefill)
+    assert torch.equal(buf["embed"]["decode"], existing_decode)
+    assert torch.equal(buf["embed"]["cached_decode"], final_cached_decode)
+    assert buf["meta"]["decode_flag"] is True
+    assert buf["meta"]["num_processed_tokens"] == 2
+    assert buf["meta"]["prefill_consumed_text_tokens"] == 1
+    assert bool(buf["meta"]["finished"].item()) is True
+    assert bool(buf["meta"]["is_segment_finished"].item()) is True
 
 
 def test_sync_local_stage_payloads_prefill_does_not_reset_without_async_chunk():

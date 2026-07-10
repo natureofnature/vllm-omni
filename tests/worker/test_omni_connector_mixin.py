@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayloadStruct
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.omni_connector_model_runner_mixin import (
     OmniConnectorModelRunnerMixin,
@@ -59,12 +60,17 @@ def _make_model_config(
     async_chunk: bool = False,
     worker_type: str = "ar",
     custom_func: str | None = None,
+    model_arch: str | None = None,
+    model_stage: str | None = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
+        stage_id=stage_id,
         stage_connector_config=None,
         async_chunk=async_chunk,
         worker_type=worker_type,
         custom_process_next_stage_input_func=custom_func,
+        model_arch=model_arch,
+        model_stage=model_stage,
     )
 
 
@@ -511,6 +517,48 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         self.assertFalse(bool(data["meta"]["finished"]))
         self.assertTrue(bool(data["meta"]["is_segment_finished"]))
 
+    def test_segment_finish_sentinel_preserves_request_finished(self):
+        sender = MixinHost()
+        sender.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0, async_chunk=True))
+        self._quiesce_save_thread(sender)
+        sender._omni_connector = MockConnector(stage_id=0)
+        sender._stage_id = 0
+        sender._async_chunk = True
+
+        def proc(transfer_manager, pooling_output, request, is_finished=False):
+            return {"meta": {"finished": torch.tensor(False)}}
+
+        sender._custom_process_func = proc
+
+        req = SimpleNamespace(request_id="req-1", req_id="req-1", external_req_id="ext-1", is_finished=lambda: True)
+        self.assertTrue(sender.enqueue_finish_sentinel(req, "ext-1", is_segment_finished=True))
+
+        data = self._last_enqueued_data(sender, "ext-1")
+        self.assertIsNotNone(data)
+        self.assertTrue(bool(data["meta"]["finished"]))
+        self.assertTrue(bool(data["meta"]["is_segment_finished"]))
+
+    def test_segment_finish_sentinel_marks_struct_hook_payload(self):
+        sender = MixinHost()
+        sender.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0, async_chunk=True))
+        self._quiesce_save_thread(sender)
+        sender._omni_connector = MockConnector(stage_id=0)
+        sender._stage_id = 0
+        sender._async_chunk = True
+
+        def proc(transfer_manager, pooling_output, request, is_finished=False):
+            return OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(False, dtype=torch.bool)))
+
+        sender._custom_process_func = proc
+
+        req = SimpleNamespace(request_id="req-1", req_id="req-1", external_req_id="ext-1", is_finished=lambda: True)
+        self.assertTrue(sender.enqueue_finish_sentinel(req, "ext-1", is_segment_finished=True))
+
+        data = self._last_enqueued_data(sender, "ext-1")
+        self.assertIsNotNone(data)
+        self.assertTrue(OmniConnectorModelRunnerMixin._payload_finished(data))
+        self.assertTrue(OmniConnectorModelRunnerMixin._payload_segment_finished(data))
+
     def test_segment_finish_sentinel_cleans_segment_state_at_enqueue(self):
         sender = MixinHost()
         sender.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0, async_chunk=True))
@@ -548,6 +596,41 @@ class TestMixinAsyncChunkSendRecv(unittest.TestCase):
         self.assertEqual(sender._requests_num_chunks_sent["ext-1"], 1)
         self.assertEqual(sender._code_prompt_token_ids["ext-1"], [[9]])
         self.assertEqual(sender._cached_ic["ext-1"], 2)
+
+    def test_cleanup_waits_for_deferred_final_segment_terminal(self):
+        sender = MixinHost()
+        sender.init_omni_connectors(vllm_config=None, model_config=_make_model_config(stage_id=0, async_chunk=True))
+        self._quiesce_save_thread(sender)
+        sender._omni_connector = MockConnector(stage_id=0)
+        sender._stage_id = 0
+        sender._async_chunk = True
+        sender._custom_process_func = lambda transfer_manager, pooling_output, request, is_finished=False: None
+
+        sender._request_ids_mapping["req-1"] = "ext-1"
+        sender._put_req_chunk["ext-1"] = 148
+        sender._requests_num_chunks_sent["ext-1"] = 42
+        sender._send_side_request_snapshot["ext-1"] = object()
+        sender._async_chunk_deferred_final_segments = {"req-1"}
+
+        sender.cleanup_finished_request("req-1")
+
+        self.assertEqual(sender._request_ids_mapping["req-1"], "ext-1")
+        self.assertEqual(sender._put_req_chunk["ext-1"], 148)
+        self.assertIn("req-1", sender._send_cleanup_after_terminal)
+        self.assertIn("ext-1", sender._send_cleanup_after_terminal)
+
+        req = SimpleNamespace(request_id="req-1", req_id="req-1", external_req_id="ext-1", is_finished=lambda: True)
+        self.assertTrue(sender.enqueue_finish_sentinel(req, "ext-1", is_segment_finished=True))
+
+        task = self._last_enqueued_task(sender, "ext-1")
+        self.assertIsNotNone(task)
+        self.assertEqual(task["put_key"], "ext-1_0_148")
+        self.assertTrue(bool(task["data"]["meta"]["finished"]))
+        self.assertTrue(bool(task["data"]["meta"]["is_segment_finished"]))
+        self.assertNotIn("req-1", sender._request_ids_mapping)
+        self.assertNotIn("ext-1", sender._put_req_chunk)
+        self.assertNotIn("req-1", sender._send_cleanup_after_terminal)
+        self.assertNotIn("ext-1", sender._send_cleanup_after_terminal)
 
 
 class TestMixinKVCacheTransfer(unittest.TestCase):
@@ -1504,6 +1587,33 @@ class TestAsyncStagedPayloadMerge(unittest.TestCase):
             )
         )
 
+    def test_deep_merge_dedupes_partial_decode_overlap(self):
+        existing = {
+            "embed": {
+                "decode": torch.tensor(
+                    [
+                        [1.0, 2.0],
+                        [3.0, 4.0],
+                    ]
+                )
+            }
+        }
+        incoming = {
+            "embed": {
+                "decode": torch.tensor(
+                    [
+                        [3.0, 4.0],
+                        [5.0, 6.0],
+                    ]
+                )
+            }
+        }
+
+        _deep_merge_chunk_payload(existing, incoming)
+
+        expected = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]])
+        self.assertTrue(torch.equal(existing["embed"]["decode"], expected))
+
     def test_deep_merge_keeps_prefill_hidden_output_when_decode_hidden_arrives(self):
         prefill_hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
         decode_hidden = torch.tensor([[99.0, 100.0]])
@@ -1560,6 +1670,53 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertTrue(MixinHost._payload_segment_finished(payload))
         self.assertFalse(MixinHost._payload_is_consumable(payload))
 
+    def test_struct_payload_flags_match_dict_payload(self):
+        codes = torch.ones(16, dtype=torch.long)
+        payload = OmniPayloadStruct(
+            codes=CodesStruct(audio=codes),
+            meta=MetaStruct(
+                finished=torch.tensor(False),
+                is_segment_finished=torch.tensor(True),
+                left_context_size=3,
+                next_stage_prompt_len=7,
+            ),
+        )
+
+        self.assertFalse(MixinHost._payload_finished(payload))
+        self.assertTrue(MixinHost._payload_segment_finished(payload))
+        self.assertTrue(MixinHost._payload_is_consumable(payload))
+        self.assertTrue(torch.equal(MixinHost._payload_audio_codes(payload), codes))
+        metadata = MixinHost._extract_scheduling_metadata(payload)
+        self.assertEqual(metadata["next_stage_prompt_len"], 7)
+        self.assertTrue(torch.equal(metadata["code_predictor_codes"], codes))
+        self.assertEqual(metadata["left_context_size"], 3)
+
+    def test_poll_struct_segment_finish_wakes_without_closing_stream(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            OmniPayloadStruct(meta=MetaStruct(finished=torch.tensor(False), is_segment_finished=torch.tensor(True))),
+            1,
+        )
+
+        self.assertTrue(host._poll_single_request("r1"))
+        output = host.get_omni_connector_output()
+
+        self.assertEqual(output.chunk_segment_finished_req_ids, {"r1"})
+        self.assertNotIn("r1", output.chunk_finished_req_ids)
+        self.assertNotIn("r1", host._local_stage_payload_cache)
+        host.shutdown_omni_connectors()
+
     def test_poll_segment_finish_wakes_without_closing_stream(self):
         host = MixinHost()
         host.init_omni_connectors(
@@ -1589,7 +1746,122 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         self.assertIn("r1", host._finished_load_reqs)
         self.assertNotIn("r1", host._chunk_finished_req_ids)
         self.assertNotIn("r1", host._chunk_stream_completed)
-        self.assertIn("r1", host._pending_load_reqs)
+        self.assertNotIn("r1", host._pending_load_reqs)
+        host.shutdown_omni_connectors()
+
+    def test_ar_metadata_only_terminal_stages_local_model_signal(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            {
+                "meta": {
+                    "finished": torch.tensor(False),
+                    "is_segment_finished": torch.tensor(True),
+                    "next_stage_prompt_len": 7,
+                },
+            },
+            1,
+        )
+
+        self.assertTrue(host._poll_single_request("r1"))
+        self.assertNotIn("r1", host._finished_load_reqs)
+        output = host.get_omni_connector_output()
+        terminal = host._local_stage_terminal_payload_cache["r1"]
+
+        self.assertEqual(output.chunk_ready_req_ids, set())
+        self.assertNotIn("r1", output.chunk_finished_req_ids)
+        self.assertEqual(output.chunk_segment_finished_req_ids, {"r1"})
+        self.assertNotIn("r1", host._local_stage_payload_cache)
+        self.assertTrue(bool(terminal["meta"]["is_segment_finished"].item()))
+        self.assertEqual(output.request_metadata["r1"]["next_stage_prompt_len"], 7)
+        host.shutdown_omni_connectors()
+
+    def test_qwen3_talker_terminal_only_payload_drives_eos_decode_step(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host.model = SimpleNamespace(
+            model_arch="Qwen3OmniMoeForConditionalGeneration",
+            model_stage="talker",
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            {
+                "meta": {
+                    "finished": torch.tensor(True),
+                    "is_segment_finished": torch.tensor(True),
+                    "next_stage_prompt_len": 7,
+                },
+            },
+            1,
+        )
+
+        self.assertTrue(host._poll_single_request("r1"))
+        output = host.get_omni_connector_output()
+        staged = host._local_stage_payload_cache["r1"]
+
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(output.chunk_segment_finished_req_ids, {"r1"})
+        self.assertNotIn("finished", staged["meta"])
+        self.assertTrue(bool(staged["meta"]["is_segment_finished"].item()))
+        host.shutdown_omni_connectors()
+
+    def test_ar_consumable_terminal_keeps_request_final_out_of_model_payload(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._pending_load_reqs["r1"] = object()
+        host._omni_connector.get.return_value = (
+            {
+                "embed": {"decode": torch.ones(1, 2)},
+                "meta": {
+                    "finished": torch.tensor(True),
+                    "is_segment_finished": torch.tensor(True),
+                    "next_stage_prompt_len": 7,
+                },
+            },
+            1,
+        )
+
+        self.assertTrue(host._poll_single_request("r1"))
+        output = host.get_omni_connector_output()
+        staged = host._local_stage_payload_cache["r1"]
+
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+        self.assertEqual(output.chunk_segment_finished_req_ids, {"r1"})
+        self.assertTrue(torch.equal(staged["embed"]["decode"], torch.ones(1, 2)))
+        self.assertNotIn("finished", staged["meta"])
+        self.assertTrue(bool(staged["meta"]["is_segment_finished"].item()))
+        self.assertEqual(output.request_metadata["r1"]["next_stage_prompt_len"], 7)
+        self.assertNotIn("r1", host._pending_load_reqs)
         host.shutdown_omni_connectors()
 
     def test_payload_consumable_ignores_token_horizon_only_updates(self):
@@ -1679,6 +1951,44 @@ class TestAsyncPayloadLifecycle(unittest.TestCase):
         output2 = host.get_omni_connector_output()
         self.assertEqual(output2.chunk_ready_req_ids, set())
         self.assertEqual(output2.request_metadata, {"r1": {"next_stage_prompt_len": 7}})
+
+        host.shutdown_omni_connectors()
+
+    def test_ar_coalesced_decode_chunks_report_ready_count(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        host._omni_connector.get.side_effect = [
+            (
+                {
+                    "embed": {"decode": torch.ones(1, 2)},
+                    "meta": {"finished": torch.tensor(False)},
+                },
+                1,
+            ),
+            (
+                {
+                    "embed": {"decode": torch.full((1, 2), 2.0)},
+                    "meta": {"finished": torch.tensor(False)},
+                },
+                1,
+            ),
+        ]
+
+        host._poll_single_request("r1")
+        host._poll_single_request("r1")
+        output = host.get_omni_connector_output()
+
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_ready_counts, {"r1": 2})
 
         host.shutdown_omni_connectors()
 

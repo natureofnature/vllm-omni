@@ -21,6 +21,12 @@ def _make_minimal_omni() -> Qwen3OmniMoeForConditionalGeneration:
     return model
 
 
+def _make_minimal_talker() -> Qwen3OmniMoeForConditionalGeneration:
+    model = _make_minimal_omni()
+    model.model_stage = "talker"
+    return model
+
+
 def test_async_chunk_decode_consumes_cached_handoff_decode() -> None:
     model = _make_minimal_omni()
     payload = {
@@ -95,6 +101,67 @@ def test_async_chunk_decode_uses_accumulated_decode_when_cache_is_prefix() -> No
     assert update["_advance_num_processed_tokens"] is True
 
 
+def test_async_chunk_decode_uses_longer_cache_when_current_decode_is_prefix() -> None:
+    model = _make_minimal_omni()
+    payload = {
+        "embed": {
+            "cached_decode": torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                    [5.0, 6.0],
+                ]
+            ),
+            "decode": torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                ]
+            ),
+        },
+        "meta": {
+            "num_processed_tokens": 3,
+            "prefill_consumed_text_tokens": 1,
+        },
+    }
+    update: dict = {}
+
+    out = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), update)
+
+    assert torch.equal(out, torch.tensor([15.0, 16.0]))
+    assert update["_advance_num_processed_tokens"] is True
+
+
+def test_async_chunk_decode_merges_partial_cached_decode_overlap() -> None:
+    model = _make_minimal_omni()
+    payload = {
+        "embed": {
+            "cached_decode": torch.tensor(
+                [
+                    [1.0, 2.0],
+                    [3.0, 4.0],
+                ]
+            ),
+            "decode": torch.tensor(
+                [
+                    [3.0, 4.0],
+                    [5.0, 6.0],
+                ]
+            ),
+        },
+        "meta": {
+            "num_processed_tokens": 3,
+            "prefill_consumed_text_tokens": 1,
+        },
+    }
+    update: dict = {}
+
+    out = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), update)
+
+    assert torch.equal(out, torch.tensor([15.0, 16.0]))
+    assert update["_advance_num_processed_tokens"] is True
+
+
 def test_async_chunk_decode_clears_prior_eos_when_new_decode_arrives() -> None:
     model = _make_minimal_omni()
     payload = {
@@ -112,6 +179,43 @@ def test_async_chunk_decode_clears_prior_eos_when_new_decode_arrives() -> None:
     assert torch.equal(out, torch.tensor([17.0, 18.0]))
     assert update["_advance_num_processed_tokens"] is True
     assert update["meta"]["eos_emitted"] is False
+
+
+def test_async_chunk_decode_segment_terminal_emits_eos_after_cached_decode() -> None:
+    model = _make_minimal_omni()
+    payload = {
+        "embed": {"cached_decode": torch.tensor([[1.0, 2.0]])},
+        "meta": {
+            "num_processed_tokens": 2,
+            "prefill_consumed_text_tokens": 1,
+            "is_segment_finished": True,
+        },
+    }
+    update: dict = {}
+
+    out = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), update)
+
+    assert torch.equal(out, model.tts_eos_embed)
+    assert update["_advance_num_processed_tokens"] is False
+    assert update["meta"]["eos_emitted"] is True
+
+
+def test_async_chunk_decode_uses_resumable_base_when_handoff_base_missing():
+    model = _make_minimal_omni()
+    payload = {
+        "embed": {"cached_decode": torch.tensor([[1.0, 2.0], [3.0, 4.0]])},
+        "meta": {
+            "decode_flag": True,
+            "num_processed_tokens": 1,
+            "resumable": True,
+        },
+    }
+    update: dict = {}
+
+    out = model._thinker_decode_to_talker_decode(payload, torch.device("cpu"), update)
+
+    assert torch.equal(out, torch.tensor([11.0, 12.0]))
+    assert update["_advance_num_processed_tokens"] is True
 
 
 def test_talker_decode_recovers_streaming_reset_handoff_boundary() -> None:
@@ -134,3 +238,75 @@ def test_talker_decode_recovers_streaming_reset_handoff_boundary() -> None:
     assert seen["num_processed_tokens"] == 1
     assert update["meta"]["decode_flag"] is True
     assert update["meta"]["prefill_consumed_text_tokens"] == 1
+
+
+def test_cache_thinker_decode_merges_partial_overlap():
+    cached = torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.bfloat16)
+    decode = torch.tensor([[3.0, 4.0], [5.0, 6.0]], dtype=torch.bfloat16)
+
+    merged = Qwen3OmniMoeForConditionalGeneration._merge_decode_embed_prefix(cached, decode)
+
+    expected = torch.tensor(
+        [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]],
+        dtype=torch.bfloat16,
+    )
+    assert torch.equal(merged, expected)
+
+
+def test_talker_make_omni_output_preserves_dense_audio_codes() -> None:
+    model = _make_minimal_talker()
+    hidden = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    codes_0 = torch.tensor([[1, 2], [3, 4]])
+    codes_1 = torch.tensor([[5, 6]])
+
+    out = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"request_id": "req-0", "codes": {"audio": codes_0}},
+            {"request_id": "req-1", "codes": {"audio": codes_1}},
+        ],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert torch.equal(
+        out.multimodal_outputs["codes"]["audio"],
+        torch.cat([codes_0, codes_1], dim=0),
+    )
+    assert "meta" not in out.multimodal_outputs
+
+
+def test_talker_make_omni_output_skips_control_step_without_codes() -> None:
+    model = _make_minimal_talker()
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+
+    out = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[{"request_id": "req-0"}, {"request_id": "req-1"}],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert out.multimodal_outputs == {
+        "codes": {"audio": []},
+        "meta": {"req_id": [], "sparse_audio": ["1"]},
+    }
+
+
+def test_talker_make_omni_output_routes_partial_sparse_audio_codes() -> None:
+    model = _make_minimal_talker()
+    hidden = torch.arange(8, dtype=torch.float32).reshape(2, 4)
+    codes = torch.tensor([[7, 8]])
+
+    out = model.make_omni_output(
+        hidden,
+        model_intermediate_buffer=[
+            {"request_id": "req-0", "codes": {"audio": codes}},
+            {"request_id": "req-1"},
+        ],
+    )
+
+    assert torch.equal(out.text_hidden_states, hidden)
+    assert out.multimodal_outputs["meta"] == {
+        "req_id": ["req-0"],
+        "sparse_audio": ["1"],
+    }
+    assert out.multimodal_outputs["codes"]["audio"] == [codes]

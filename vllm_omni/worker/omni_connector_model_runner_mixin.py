@@ -52,12 +52,19 @@ def _strip_trailing_placeholder_tokens(token_ids: list[int] | None) -> list[int]
 class _AsyncChunkRequestAdapter:
     """Expose request fields expected by async-chunk stage processors."""
 
-    __slots__ = ("_inner", "_external_req_id", "_finished")
+    __slots__ = ("_inner", "_external_req_id", "_finished", "_output_token_ids")
 
-    def __init__(self, cached_state: Any, external_req_id: str, finished: bool):
+    def __init__(
+        self,
+        cached_state: Any,
+        external_req_id: str,
+        finished: bool,
+        output_token_ids: list[int] | None = None,
+    ):
         self._inner = cached_state
         self._external_req_id = external_req_id
         self._finished = finished
+        self._output_token_ids = output_token_ids
 
     @property
     def external_req_id(self) -> str:
@@ -77,7 +84,10 @@ class _AsyncChunkRequestAdapter:
 
     @property
     def output_token_ids(self) -> list[int]:
-        return _strip_trailing_placeholder_tokens(self._inner.output_token_ids)
+        token_ids = self._output_token_ids
+        if token_ids is None:
+            token_ids = self._inner.output_token_ids
+        return _strip_trailing_placeholder_tokens(token_ids)
 
     @property
     def all_token_ids(self) -> list[int]:
@@ -91,6 +101,9 @@ class _AsyncChunkRequestAdapter:
         return getattr(self._inner, name)
 
 
+_MAX_TENSOR_SEQUENCE_OVERLAP = 16
+
+
 def _merge_tensor_sequence(
     existing_tensor: torch.Tensor, incoming_tensor: torch.Tensor, *, append: bool
 ) -> torch.Tensor:
@@ -101,6 +114,11 @@ def _merge_tensor_sequence(
         return incoming_tensor
     if existing_len >= incoming_len and torch.equal(existing_tensor[:incoming_len], incoming_tensor):
         return existing_tensor
+    if append:
+        max_overlap = min(existing_len, incoming_len, _MAX_TENSOR_SEQUENCE_OVERLAP)
+        for overlap in range(max_overlap, 0, -1):
+            if torch.equal(existing_tensor[-overlap:], incoming_tensor[:overlap]):
+                return torch.cat([existing_tensor, incoming_tensor[overlap:]], dim=0)
     if append:
         return torch.cat([existing_tensor, incoming_tensor], dim=0)
     if existing_len >= incoming_len:
@@ -150,6 +168,21 @@ def _deep_merge_chunk_payload(existing: dict, incoming: dict) -> None:
             existing[key] = merged
         else:
             existing[key] = value
+
+
+def _drop_upstream_request_finished_for_model(payload: Any) -> Any:
+    """Hide upstream request-final bits from intermediate AR model inputs."""
+    if not isinstance(payload, dict):
+        return payload
+    meta = payload.get("meta")
+    if not isinstance(meta, dict) or "finished" not in meta:
+        return payload
+
+    payload = dict(payload)
+    meta = dict(meta)
+    meta.pop("finished", None)
+    payload["meta"] = meta
+    return payload
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -267,8 +300,10 @@ class OmniConnectorModelRunnerMixin:
         self._pending_save_reqs: dict[str, deque] = {}
         self._pending_save_counts: dict[str, int] = defaultdict(int)
         self._deferred_send_cleanup: set[str] = set()
+        self._send_cleanup_after_terminal: set[str] = set()
         # -- per-cycle output accumulator --
         self._chunk_ready_req_ids: set[str] = set()
+        self._chunk_ready_counts: dict[str, int] = defaultdict(int)
         self._chunk_finished_req_ids: set[str] = set()
         self._chunk_segment_finished_req_ids: set[str] = set()
         self._stage_recv_req_ids: set[str] = set()
@@ -285,6 +320,7 @@ class OmniConnectorModelRunnerMixin:
         # visibility and avoids mixing connector I/O with model runtime
         # ownership.
         self._local_stage_payload_cache: dict[str, dict[str, Any]] = {}
+        self._local_stage_terminal_payload_cache: dict[str, dict[str, Any]] = {}
         # Lightweight scheduling metadata pending delivery to the Scheduler.
         self._local_request_metadata: dict[str, dict[str, Any]] = {}
 
@@ -389,12 +425,18 @@ class OmniConnectorModelRunnerMixin:
                     exc_info=True,
                 )
 
-        ext_id = self._request_ids_mapping.pop(req_id, None)
+        defer_terminal_cleanup = self._should_defer_send_cleanup_until_terminal(req_id)
+        ext_id = self._request_ids_mapping.get(req_id)
+        if not defer_terminal_cleanup:
+            ext_id = self._request_ids_mapping.pop(req_id, None)
         keys_to_clean: list[str] = [req_id]
         if ext_id is not None and ext_id != req_id:
             keys_to_clean.append(ext_id)
 
         with self._lock:
+            if defer_terminal_cleanup:
+                self._send_cleanup_after_terminal.update(keys_to_clean)
+                keys_to_clean = []
             keys_pending = [k for k in keys_to_clean if self._pending_save_counts.get(k, 0)]
             for k in keys_pending:
                 self._deferred_send_cleanup.add(k)
@@ -413,6 +455,34 @@ class OmniConnectorModelRunnerMixin:
             self._kv_completed_transfers.discard(req_id)
             self._kv_triggered_requests.discard(req_id)
         self._cleanup_recv_delivery_state(req_id)
+
+    def _should_defer_send_cleanup_until_terminal(self, req_id: str) -> bool:
+        for attr_name in (
+            "_async_chunk_deferred_finish_only",
+            "_async_chunk_deferred_segment_terminal_ids",
+            "_async_chunk_deferred_final_segments",
+            "_async_chunk_segment_terminal_pending",
+            "_async_chunk_final_segment_pending",
+        ):
+            if req_id in getattr(self, attr_name, set()):
+                return True
+        return False
+
+    def _cleanup_send_state_after_terminal_locked(self, req_id: str, ext_id: str) -> None:
+        if req_id not in self._send_cleanup_after_terminal and ext_id not in self._send_cleanup_after_terminal:
+            return
+
+        mapped_ext_id = self._request_ids_mapping.pop(req_id, None)
+        keys_to_clean = {req_id, ext_id}
+        if mapped_ext_id is not None:
+            keys_to_clean.add(mapped_ext_id)
+        for key in keys_to_clean:
+            self._send_cleanup_after_terminal.discard(key)
+            self._put_req_chunk.pop(key, None)
+            self._send_side_request_snapshot.pop(key, None)
+            self._send_side_request_payload.pop(key, None)
+            self._pending_streaming_prefills.pop(key, None)
+            self._clear_segment_send_state(key)
 
     def drop_inactive_request_delivery_state(self, req_id: str) -> None:
         """Clear recv-side state for inactive requests."""
@@ -471,6 +541,7 @@ class OmniConnectorModelRunnerMixin:
         self._pending_load_reqs.pop(req_id, None)
         self._finished_load_reqs.discard(req_id)
         self._chunk_ready_req_ids.discard(req_id)
+        self._chunk_ready_counts.pop(req_id, None)
         self._chunk_finished_req_ids.discard(req_id)
         self._chunk_segment_finished_req_ids.discard(req_id)
         self._send_failed_req_ids.discard(req_id)
@@ -479,6 +550,7 @@ class OmniConnectorModelRunnerMixin:
         self._full_payload_pending_broadcast_req_ids.discard(req_id)
         self._async_chunk_updated_req_ids.discard(req_id)
         self._local_stage_payload_cache.pop(req_id, None)
+        self._local_stage_terminal_payload_cache.pop(req_id, None)
         self._local_request_metadata.pop(req_id, None)
 
     def prune_inactive_requests(self, active_req_ids: Any) -> set[str]:
@@ -540,6 +612,7 @@ class OmniConnectorModelRunnerMixin:
             "_full_payload_pending_broadcast_req_ids",
             "_async_chunk_updated_req_ids",
             "_local_stage_payload_cache",
+            "_local_stage_terminal_payload_cache",
             "_local_request_metadata",
             "_kv_pending_transfers",
             "_kv_active_transfers",
@@ -587,6 +660,7 @@ class OmniConnectorModelRunnerMixin:
         staged_payload = self._local_stage_payload_cache.get(req_id)
         return (
             self._payload_is_consumable(staged_payload)
+            or req_id in self._local_stage_terminal_payload_cache
             or req_id in self._local_request_metadata
             or req_id in self._finished_load_reqs
         )
@@ -605,12 +679,12 @@ class OmniConnectorModelRunnerMixin:
     def _extract_scheduling_metadata(cls, payload: OmniPayload) -> dict[str, Any]:
         """Extract only the fields the scheduler needs from a full payload."""
         extracted: dict[str, Any] = {}
-        meta = payload.get("meta") if isinstance(payload, dict) else None
-        meta = meta if isinstance(meta, dict) else {}
+        meta = cls._payload_child(payload, "meta")
 
-        if "next_stage_prompt_len" in meta:
-            extracted["next_stage_prompt_len"] = meta["next_stage_prompt_len"]
-        elif "next_stage_prompt_len" in payload:
+        next_stage_prompt_len = cls._payload_child(meta, "next_stage_prompt_len")
+        if next_stage_prompt_len is not None:
+            extracted["next_stage_prompt_len"] = next_stage_prompt_len
+        elif isinstance(payload, dict) and "next_stage_prompt_len" in payload:
             logger.warning_once(
                 "legacy flat 'next_stage_prompt_len' key in payload; expected 'meta.next_stage_prompt_len'"
             )
@@ -620,9 +694,10 @@ class OmniConnectorModelRunnerMixin:
         if audio_codes is not None:
             extracted["code_predictor_codes"] = audio_codes
 
-        if "left_context_size" in meta:
-            extracted["left_context_size"] = meta["left_context_size"]
-        elif "left_context_size" in payload:
+        left_context_size = cls._payload_child(meta, "left_context_size")
+        if left_context_size is not None:
+            extracted["left_context_size"] = left_context_size
+        elif isinstance(payload, dict) and "left_context_size" in payload:
             logger.warning_once("legacy flat 'left_context_size' key in payload; expected 'meta.left_context_size'")
 
         return extracted
@@ -639,6 +714,24 @@ class OmniConnectorModelRunnerMixin:
         ("embed", "decode_token_start"),
         ("embed", "decode_token_end"),
     }
+
+    @staticmethod
+    def _payload_child(payload: Any, key: str) -> Any:
+        if isinstance(payload, dict):
+            return payload.get(key)
+        return getattr(payload, key, None)
+
+    @staticmethod
+    def _payload_items(payload: Any) -> list[tuple[str, Any]]:
+        if isinstance(payload, dict):
+            return list(payload.items())
+        struct_fields = getattr(payload, "__struct_fields__", None)
+        if struct_fields is not None:
+            return [(field, getattr(payload, field, None)) for field in struct_fields]
+        dataclass_fields = getattr(payload, "__dataclass_fields__", None)
+        if isinstance(dataclass_fields, dict):
+            return [(field, getattr(payload, field, None)) for field in dataclass_fields]
+        return []
 
     @staticmethod
     def _payload_value_has_content(value: Any) -> bool:
@@ -658,34 +751,26 @@ class OmniConnectorModelRunnerMixin:
 
     @staticmethod
     def _payload_finished(payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        if "finished" in payload:
+        if isinstance(payload, dict) and "finished" in payload:
             logger.warning_once("legacy flat finished key in payload; expected meta.finished")
-        meta = payload.get("meta")
-        if not isinstance(meta, dict):
-            return False
-        return OmniConnectorModelRunnerMixin._payload_truthy_scalar(meta.get("finished"))
+        meta = OmniConnectorModelRunnerMixin._payload_child(payload, "meta")
+        return OmniConnectorModelRunnerMixin._payload_truthy_scalar(
+            OmniConnectorModelRunnerMixin._payload_child(meta, "finished")
+        )
 
     @staticmethod
     def _payload_segment_finished(payload: Any) -> bool:
-        if not isinstance(payload, dict):
-            return False
-        meta = payload.get("meta")
-        if not isinstance(meta, dict):
-            return False
-        return OmniConnectorModelRunnerMixin._payload_truthy_scalar(meta.get("is_segment_finished"))
+        meta = OmniConnectorModelRunnerMixin._payload_child(payload, "meta")
+        return OmniConnectorModelRunnerMixin._payload_truthy_scalar(
+            OmniConnectorModelRunnerMixin._payload_child(meta, "is_segment_finished")
+        )
 
     @staticmethod
     def _payload_audio_codes(payload: Any) -> Any:
-        if not isinstance(payload, dict):
-            return None
-        if "code_predictor_codes" in payload:
+        if isinstance(payload, dict) and "code_predictor_codes" in payload:
             logger.warning_once("legacy flat 'code_predictor_codes' key in payload; expected 'codes.audio'")
-        codes = payload.get("codes")
-        if isinstance(codes, dict):
-            return codes.get("audio")
-        return None
+        codes = OmniConnectorModelRunnerMixin._payload_child(payload, "codes")
+        return OmniConnectorModelRunnerMixin._payload_child(codes, "audio")
 
     @classmethod
     def _payload_is_consumable(cls, payload: OmniPayload | None) -> bool:
@@ -696,12 +781,12 @@ class OmniConnectorModelRunnerMixin:
         any newly visible thinker decode embeds should not force a placeholder-only
         talker decode step.
         """
-        if not isinstance(payload, dict) or not payload:
+        if payload is None or not cls._payload_items(payload):
             return False
 
-        embed = payload.get("embed")
-        if isinstance(embed, dict):
-            decode_embeddings = embed.get("decode")
+        embed = cls._payload_child(payload, "embed")
+        if embed is not None:
+            decode_embeddings = cls._payload_child(embed, "decode")
             if isinstance(decode_embeddings, torch.Tensor):
                 if decode_embeddings.ndim == 0:
                     return True
@@ -715,9 +800,10 @@ class OmniConnectorModelRunnerMixin:
                 return len(audio_codes) > 0
             return True
 
-        for key, value in payload.items():
-            if isinstance(value, dict):
-                for sk, sv in value.items():
+        for key, value in cls._payload_items(payload):
+            nested_items = cls._payload_items(value)
+            if nested_items:
+                for sk, sv in nested_items:
                     if (key, sk) in cls._NON_CONSUMABLE_PAYLOAD_KEYS:
                         continue
                     if cls._payload_value_has_content(sv):
@@ -853,12 +939,14 @@ class OmniConnectorModelRunnerMixin:
             "chunk_finished": set(self._chunk_finished_req_ids),
             "chunk_segment_finished": set(self._chunk_segment_finished_req_ids),
             "send_failed": send_failed_req_ids,
+            "chunk_ready_counts": dict(self._chunk_ready_counts),
         }
 
         self._async_chunk_updated_req_ids.clear()
         self._finished_load_reqs.clear()
         self._chunk_finished_req_ids.clear()
         self._chunk_segment_finished_req_ids.clear()
+        self._chunk_ready_counts.clear()
         self._send_failed_req_ids.clear()
         self._local_request_metadata.clear()
         self._work_available.set()
@@ -929,6 +1017,32 @@ class OmniConnectorModelRunnerMixin:
         if model_config is not None:
             return model_config
         return getattr(getattr(self, "vllm_config", None), "model_config", None)
+
+    def _is_qwen3_omni_talker_stage(self) -> bool:
+        model_config = self._get_model_config()
+        model = getattr(self, "model", None)
+
+        model_stage = getattr(model_config, "model_stage", None) or getattr(model, "model_stage", None)
+        model_arch = getattr(model_config, "model_arch", None) or getattr(model, "model_arch", None)
+        if model_arch is None and model is not None:
+            model_arch = getattr(getattr(model, "config", None), "model_arch", None)
+        if model_arch is None and model is not None and "qwen3_omni" in type(model).__module__:
+            model_arch = "Qwen3OmniMoeForConditionalGeneration"
+
+        return model_arch == "Qwen3OmniMoeForConditionalGeneration" and model_stage == "talker"
+
+    def _should_consume_ar_terminal_control_payload(
+        self,
+        payload: OmniPayload | None,
+        *,
+        incoming_payload_consumable: bool,
+    ) -> bool:
+        """Let Qwen3 Talker consume upstream terminal metadata as an EOS step."""
+        if incoming_payload_consumable or self._model_mode != "ar":
+            return False
+        if not self._is_qwen3_omni_talker_stage():
+            return False
+        return self._payload_finished(payload) or self._payload_segment_finished(payload)
 
     def _should_accumulate_full_payload_output(self) -> bool:
         """Gate send-side full-payload output accumulation only.
@@ -1119,7 +1233,7 @@ class OmniConnectorModelRunnerMixin:
         if not (finished_req_ids & pending_req_ids):
             return
 
-        logger.info(
+        logger.debug(
             "[Stage-%s] flush_full_payload_outputs: finished_req_ids=%s, pending=%s",
             self._stage_id,
             finished_req_ids,
@@ -1413,6 +1527,13 @@ class OmniConnectorModelRunnerMixin:
             return True
         raw_req_id = getattr(request, "request_id", None) or getattr(request, "req_id", None)
         scheduler_request_id = raw_req_id or request_id
+        is_finished_fn = getattr(request, "is_finished", None)
+        request_finished = False
+        if callable(is_finished_fn):
+            try:
+                request_finished = bool(is_finished_fn())
+            except Exception:
+                request_finished = False
 
         # The marker lets model hooks distinguish terminal flush calls from
         # ordinary empty adapter calls.
@@ -1424,19 +1545,19 @@ class OmniConnectorModelRunnerMixin:
         if payload_data is None:
             payload_data = {
                 "meta": {
-                    "finished": torch.tensor(not is_segment_finished, dtype=torch.bool),
+                    "finished": torch.tensor(True if not is_segment_finished else request_finished, dtype=torch.bool),
                     "is_segment_finished": torch.tensor(is_segment_finished, dtype=torch.bool),
                 }
             }
         elif is_segment_finished:
-            # Realtime segments flush their tail without finishing the request.
+            # A realtime segment can also be the final request segment.
             _meta = getattr(payload_data, "meta", None)
             if _meta is not None:
-                _meta.finished = torch.tensor(False, dtype=torch.bool)
+                _meta.finished = torch.tensor(request_finished, dtype=torch.bool)
                 _meta.is_segment_finished = torch.tensor(True, dtype=torch.bool)
             elif isinstance(payload_data, dict):
                 _m = payload_data.setdefault("meta", {})
-                _m["finished"] = torch.tensor(False, dtype=torch.bool)
+                _m["finished"] = torch.tensor(request_finished, dtype=torch.bool)
                 _m["is_segment_finished"] = torch.tensor(True, dtype=torch.bool)
 
         snapshot_data = self._snapshot_payload(payload_data)
@@ -1456,6 +1577,8 @@ class OmniConnectorModelRunnerMixin:
             self._pending_save_counts[request_id] += 1
             if is_segment_finished:
                 self._clear_segment_send_state(request_id)
+            if request_finished:
+                self._cleanup_send_state_after_terminal_locked(str(scheduler_request_id), request_id)
         self._work_available.set()
         return True
 
@@ -1814,6 +1937,10 @@ class OmniConnectorModelRunnerMixin:
         if not hasattr(self, "_lock"):
             return OmniConnectorOutput()
 
+        promote_ready_payloads = getattr(self, "_promote_ready_local_stage_payloads", None)
+        if callable(promote_ready_payloads):
+            promote_ready_payloads()
+
         tp_group = self._get_local_tp_group()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
@@ -1828,6 +1955,7 @@ class OmniConnectorModelRunnerMixin:
                 chunk_segment_finished = set()
                 send_failed = set()
                 request_metadata = {}
+                chunk_ready_counts = {}
             else:
                 if not self.is_data_transfer_rank():
                     self._apply_async_chunk_fanout_packet(fanout_packet)
@@ -1836,6 +1964,7 @@ class OmniConnectorModelRunnerMixin:
                 chunk_segment_finished = set(fanout_packet.get("chunk_segment_finished", set()))
                 send_failed = set(fanout_packet.get("send_failed", set()))
                 request_metadata = dict(fanout_packet["request_metadata"])
+                chunk_ready_counts = dict(fanout_packet.get("chunk_ready_counts", {}))
         else:
             with self._lock:
                 newly_finished = set(self._finished_load_reqs)
@@ -1848,6 +1977,8 @@ class OmniConnectorModelRunnerMixin:
                 self._send_failed_req_ids.clear()
                 request_metadata = dict(self._local_request_metadata)
                 self._local_request_metadata.clear()
+                chunk_ready_counts = dict(self._chunk_ready_counts)
+                self._chunk_ready_counts.clear()
                 # Release any send-side accumulated payload only after the
                 # terminal chunk. Ordinary wake-ups may still arrive before the
                 # model side has consumed the staged payload.
@@ -1864,6 +1995,7 @@ class OmniConnectorModelRunnerMixin:
 
         output = OmniConnectorOutput(
             chunk_ready_req_ids=set(self._chunk_ready_req_ids),
+            chunk_ready_counts=chunk_ready_counts,
             chunk_finished_req_ids=chunk_finished,
             chunk_segment_finished_req_ids=chunk_segment_finished,
             request_metadata=request_metadata,
@@ -1892,6 +2024,7 @@ class OmniConnectorModelRunnerMixin:
     def _connector_output_has_signals(output: OmniConnectorOutput) -> bool:
         return bool(
             output.chunk_ready_req_ids
+            or output.chunk_ready_counts
             or output.chunk_finished_req_ids
             or output.chunk_segment_finished_req_ids
             or output.request_metadata
@@ -2116,7 +2249,9 @@ class OmniConnectorModelRunnerMixin:
             incoming_payload_consumable = self._payload_is_consumable(payload_data)
 
             if self._model_mode == "ar":
-                payload_consumable = incoming_payload_consumable
+                payload_consumable = incoming_payload_consumable or self._should_consume_ar_terminal_control_payload(
+                    payload_data, incoming_payload_consumable=incoming_payload_consumable
+                )
             else:
                 # codes.audio may be a multi-element tensor -> use a numel/len
                 # check, never `or []` / `not new_ids` (bool(tensor) raises
@@ -2168,7 +2303,18 @@ class OmniConnectorModelRunnerMixin:
                     self._chunk_stream_completed.add(req_id)
                 if is_segment_finished:
                     self._chunk_segment_finished_req_ids.add(req_id)
+                if is_finished or is_segment_finished:
+                    logger.debug(
+                        "Async chunk terminal received: stage=%s req=%s finished=%s segment_finished=%s consumable=%s",
+                        self._stage_id,
+                        req_id,
+                        is_finished,
+                        is_segment_finished,
+                        payload_consumable,
+                    )
                 if payload_consumable:
+                    if self._model_mode == "ar" and (is_finished or is_segment_finished):
+                        payload_data = _drop_upstream_request_finished_for_model(payload_data)
                     # Nested chunk payloads must be deep-merged so prefill/decode
                     # subkeys survive across chunks.
                     existing = self._local_stage_payload_cache.get(req_id)
@@ -2180,10 +2326,19 @@ class OmniConnectorModelRunnerMixin:
                     self._async_chunk_updated_req_ids.add(req_id)
                     self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
                     self._finished_load_reqs.add(req_id)
+                    self._chunk_ready_counts[req_id] += 1
                 else:
                     metadata = self._extract_scheduling_metadata(payload_data)
                     if metadata:
                         self.put_local_request_metadata(req_id, metadata)
+                    if self._model_mode == "ar" and (is_finished or is_segment_finished):
+                        terminal_meta: dict[str, Any] = {}
+                        if is_finished:
+                            terminal_meta["finished"] = torch.tensor(True, dtype=torch.bool)
+                        if is_segment_finished:
+                            terminal_meta["is_segment_finished"] = torch.tensor(True, dtype=torch.bool)
+                        if terminal_meta:
+                            self._local_stage_terminal_payload_cache[req_id] = {"meta": terminal_meta}
                 if is_finished and not payload_consumable:
                     logger.debug(
                         "[Stage-%s] finish sentinel arrived for req=%s without new consumable payload",
@@ -2196,7 +2351,7 @@ class OmniConnectorModelRunnerMixin:
                         self._stage_id,
                         req_id,
                     )
-                if is_finished:
+                if is_finished or is_segment_finished:
                     self._pending_load_reqs.pop(req_id, None)
         else:
             # full_payload_mode: the complete payload arrives in a single get(),
@@ -2332,7 +2487,6 @@ class OmniConnectorModelRunnerMixin:
             success,
             _size,
         )
-
         if not success:
             return False
 

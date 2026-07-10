@@ -382,7 +382,7 @@ def test_thinker2talker_async_chunk_caches_new_prefill_while_active() -> None:
     assert torch.equal(cached["embed"]["prefill"], torch.full((2, 2), 11.0))
 
 
-def test_thinker2talker_async_chunk_does_not_cache_plain_multirow_chunk() -> None:
+def test_thinker2talker_async_chunk_sends_plain_multirow_decode_span() -> None:
     transfer_manager = SimpleNamespace(
         put_req_chunk={"plain": 1},
         request_payload={},
@@ -409,7 +409,8 @@ def test_thinker2talker_async_chunk_does_not_cache_plain_multirow_chunk() -> Non
         is_finished=False,
     )
 
-    assert payload is None
+    assert payload is not None
+    assert torch.equal(payload.embed.decode, output["hidden_states.layer_0"])
     assert transfer_manager._pending_streaming_prefills == {}
 
 
@@ -698,6 +699,28 @@ def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> No
     assert payload is not None
     assert payload.embed.decode.shape == (1, 2)
     assert payload.meta.finished.item() is False
+    assert payload.meta.prefill_consumed_text_tokens == 1
+
+
+def test_thinker2talker_async_chunk_decode_keeps_multi_token_span() -> None:
+    transfer_manager = SimpleNamespace(put_req_chunk={"thinker": 1}, request_payload={})
+    request = SimpleNamespace(
+        external_req_id="thinker",
+        prompt_token_ids=[151644, 872],
+        output_token_ids=[3, 4, 5],
+        all_token_ids=[151644, 872, 3, 4, 5],
+        resumable=False,
+        num_computed_tokens=4,
+    )
+    pooling_output = {
+        "hidden_states.layer_0": torch.arange(6, dtype=torch.float32).reshape(3, 2),
+        "hidden_states.layer_24": torch.full((3, 2), 2.0),
+    }
+
+    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
+
+    assert payload is not None
+    assert torch.equal(payload.embed.decode, pooling_output["hidden_states.layer_0"])
     assert payload.meta.prefill_consumed_text_tokens == 1
 
 

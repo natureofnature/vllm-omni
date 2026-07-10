@@ -11,6 +11,9 @@ from vllm.v1.engine import EngineCoreOutput, FinishReason
 from vllm.v1.metrics.stats import SchedulerStats
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_scheduling_coordinator import (
+    uses_async_chunk_final_output_stage,
+)
 from vllm_omni.core.sched.output import OmniChunkRecvHandle, OmniSchedulerOutput
 from vllm_omni.engine import OmniEngineCoreOutput
 
@@ -93,24 +96,60 @@ class OmniSchedulerMixin:
         self._latest_omni_connector_output = None
         if connector_output and connector_output.send_failed_req_ids:
             self._record_connector_send_failures(connector_output.send_failed_req_ids)
+        if connector_output and (
+            connector_output.chunk_finished_req_ids
+            or connector_output.chunk_segment_finished_req_ids
+            or connector_output.chunk_ready_req_ids
+        ):
+            logger.debug(
+                "Async chunk scheduler input: ready=%s finished=%s segment_finished=%s",
+                connector_output.chunk_ready_req_ids,
+                connector_output.chunk_finished_req_ids,
+                connector_output.chunk_segment_finished_req_ids,
+            )
         input_coordinator = getattr(self, "input_coordinator", None)
         if input_coordinator is None:
             return
         if connector_output:
             chunk_ready_req_ids = connector_output.chunk_ready_req_ids
+            chunk_ready_counts = getattr(connector_output, "chunk_ready_counts", {})
             chunk_finished_req_ids = connector_output.chunk_finished_req_ids
         else:
             chunk_ready_req_ids = set()
+            chunk_ready_counts = {}
             chunk_finished_req_ids = set()
         if connector_output and connector_output.request_metadata:
             input_coordinator.update_request_metadata(
                 self.requests, connector_output.request_metadata, model_mode=model_mode
             )
+        final_output_async_chunk_stage = uses_async_chunk_final_output_stage(self.vllm_config.model_config)
+        continue_local_decode = model_mode == "ar" and not final_output_async_chunk_stage
+        if chunk_finished_req_ids:
+            if continue_local_decode:
+                for request_id in chunk_finished_req_ids:
+                    request = self.requests.get(request_id)
+                    if request is not None:
+                        request.resumable = False
+            else:
+                pending_upstream_finished = getattr(self, "_omni_pending_upstream_finished", None)
+                if pending_upstream_finished is not None:
+                    pending_upstream_finished.update(chunk_finished_req_ids)
         if connector_output and connector_output.chunk_segment_finished_req_ids:
             pending_segment_stop = getattr(self, "_omni_pending_upstream_segment_finished", None)
             segment_finished_req_ids = set(connector_output.chunk_segment_finished_req_ids)
-            if pending_segment_stop is not None:
+            if pending_segment_stop is not None and not continue_local_decode:
                 pending_segment_stop.update(segment_finished_req_ids)
+            local_segment_stop = getattr(self, "_omni_pending_segment_finished", None)
+            if local_segment_stop is not None and not final_output_async_chunk_stage and not continue_local_decode:
+                # Non-AR intermediate stages forward the upstream boundary.
+                local_segment_stop.update(segment_finished_req_ids)
+            mark_segments_completed = getattr(input_coordinator, "mark_chunk_segments_completed", None)
+            if mark_segments_completed is not None:
+                if continue_local_decode:
+                    mark_segments_completed(segment_finished_req_ids, continue_local_decode=True)
+                else:
+                    mark_segments_completed(segment_finished_req_ids)
+        local_chunk_finished_req_ids = chunk_finished_req_ids
         # Both calls self-guard on the coordinator's async_chunk mode
         # (process_pending_chunks returns early when async_chunk is False;
         # process_pending_full_payload_inputs branches internally), so exactly
@@ -120,7 +159,8 @@ class OmniSchedulerMixin:
             self.waiting,
             self.running,
             chunk_ready_req_ids,
-            chunk_finished_req_ids,
+            local_chunk_finished_req_ids,
+            chunk_ready_counts=chunk_ready_counts,
         )
         input_coordinator.process_pending_full_payload_inputs(
             self.waiting,
@@ -211,11 +251,18 @@ class OmniSchedulerMixin:
             pending_segment.clear()
         else:
             segment_finished_req_ids = set()
+        pending_upstream_finished = getattr(self, "_omni_pending_upstream_finished", None)
+        if pending_upstream_finished:
+            upstream_finished_req_ids = set(pending_upstream_finished)
+            pending_upstream_finished.clear()
+        else:
+            upstream_finished_req_ids = set()
         return OmniSchedulerOutput(
             **base_data,
             finished_requests_needing_kv_transfer=finished_requests_needing_kv_transfer or {},
             pending_connector_registrations=pending_connector_registrations,
             segment_finished_req_ids=segment_finished_req_ids,
+            upstream_finished_req_ids=upstream_finished_req_ids,
         )
 
     def make_stats(self, *args, **kwargs) -> SchedulerStats | None:

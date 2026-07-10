@@ -185,7 +185,10 @@ class OmniSchedulingCoordinator:
 
         self.finished_requests: set[str] = set()
         self.requests_with_ready_chunks: set[str] = set()
+        self._ready_chunk_counts: dict[str, int] = {}
         self._completed_chunk_streams: set[str] = set()
+        self._completed_chunk_segments: set[str] = set()
+        self._segment_flush_pending: set[str] = set()
         self._full_payload_input_received: set[str] = set()
 
         self._waiting_for_chunk_waiting: deque[Any] = deque()
@@ -214,6 +217,20 @@ class OmniSchedulingCoordinator:
         """Return whether no more async chunks are expected for the request."""
         return request_id in self.finished_requests or request_id in self._completed_chunk_streams
 
+    def mark_chunk_segments_completed(self, request_ids: set[str], *, continue_local_decode: bool = False) -> None:
+        """Release stages after their upstream streaming segment completes."""
+        if self._stage_id == 0 or not self._async_chunk:
+            return
+        if continue_local_decode:
+            self._completed_chunk_segments.update(request_ids)
+            self._segment_flush_pending.difference_update(request_ids)
+        else:
+            self._segment_flush_pending.update(request_ids)
+
+    def complete_local_segment(self, request_id: str) -> None:
+        """Stop local draining after an intermediate stage emits its own EOS."""
+        self._completed_chunk_segments.discard(request_id)
+
     # ------------------------------------------------------------------ #
     #  Core scheduling methods
     # ------------------------------------------------------------------ #
@@ -224,6 +241,8 @@ class OmniSchedulingCoordinator:
         running_queue: list[Request],
         chunk_ready_req_ids: set[str],
         chunk_finished_req_ids: set[str],
+        *,
+        chunk_ready_counts: dict[str, int] | None = None,
     ) -> None:
         """Transition requests whose chunks have arrived.
 
@@ -240,7 +259,13 @@ class OmniSchedulingCoordinator:
         # and the connector output clears chunk_ready_req_ids after this cycle.
         # Without an unconditional retain, that first ready signal is lost during
         # the queue scan below and the request hangs in WAITING_FOR_CHUNK forever.
-        self.requests_with_ready_chunks.update(chunk_ready_req_ids)
+        self._add_ready_chunks(chunk_ready_req_ids, chunk_ready_counts)
+        # A streaming segment terminal releases the local flush step, but it is
+        # not the end of the request. If the same request id receives another
+        # non-final chunk, the new segment must be schedulable again.
+        non_final_ready_req_ids = chunk_ready_req_ids - chunk_finished_req_ids
+        self._completed_chunk_streams.difference_update(non_final_ready_req_ids)
+        self._segment_flush_pending.difference_update(chunk_ready_req_ids)
 
         terminal_ready_req_ids = chunk_ready_req_ids.intersection(chunk_finished_req_ids)
         self.finished_requests.update(chunk_finished_req_ids - terminal_ready_req_ids)
@@ -370,7 +395,10 @@ class OmniSchedulingCoordinator:
         self._full_payload_input_received.discard(request_id)
         self.finished_requests.discard(request_id)
         self.requests_with_ready_chunks.discard(request_id)
+        self._ready_chunk_counts.pop(request_id, None)
         self._completed_chunk_streams.discard(request_id)
+        self._completed_chunk_segments.discard(request_id)
+        self._segment_flush_pending.discard(request_id)
         self._waiting_since.pop(request_id, None)
         self._waiting_for_input_req_ids.discard(request_id)
         for queue_attr in (
@@ -449,16 +477,33 @@ class OmniSchedulingCoordinator:
         running_queue: list[Request],
     ) -> None:
         """Return waiting-for-chunk/input requests to scheduling queues."""
-        for request in self._waiting_for_chunk_waiting:
+        waiting_req_ids = {request.request_id for request in waiting_queue}
+        running_req_ids = {request.request_id for request in running_queue}
+
+        def restore_waiting_request(request: Request) -> None:
+            request_id = request.request_id
+            if request_id in waiting_req_ids or request_id in running_req_ids:
+                return
             waiting_queue.add_request(request)
+            waiting_req_ids.add(request_id)
+
+        def restore_running_request(request: Request) -> None:
+            request_id = request.request_id
+            if request_id in waiting_req_ids or request_id in running_req_ids:
+                return
+            running_queue.append(request)
+            running_req_ids.add(request_id)
+
+        for request in self._waiting_for_chunk_waiting:
+            restore_waiting_request(request)
         self._waiting_for_chunk_waiting = deque()
 
-        if self._waiting_for_chunk_running:
-            running_queue.extend(self._waiting_for_chunk_running)
+        for request in self._waiting_for_chunk_running:
+            restore_running_request(request)
         self._waiting_for_chunk_running = deque()
 
         for request in self._waiting_for_input:
-            waiting_queue.add_request(request)
+            restore_waiting_request(request)
         self._waiting_for_input = deque()
 
     @staticmethod
@@ -583,6 +628,11 @@ class OmniSchedulingCoordinator:
                     continue
                 if request.request_id in self._completed_chunk_streams:
                     continue
+                if request.request_id in self._completed_chunk_segments:
+                    continue
+                if request.request_id in self._segment_flush_pending:
+                    self._segment_flush_pending.discard(request.request_id)
+                    continue
                 if request.status == RequestStatus.WAITING_FOR_INPUT:
                     continue
                 if request.request_id in chunk_ready_req_ids:
@@ -608,16 +658,49 @@ class OmniSchedulingCoordinator:
                     request.status = target_status
                     self._waiting_since.pop(request.request_id, None)
                     continue
+                if request.request_id in self._completed_chunk_segments:
+                    request.status = target_status
+                    self._waiting_since.pop(request.request_id, None)
+                    continue
+                if request.request_id in self._segment_flush_pending:
+                    request.status = target_status
+                    self._segment_flush_pending.discard(request.request_id)
+                    self._waiting_since.pop(request.request_id, None)
+                    continue
             queue.remove(request)
             waiting_for_chunk_list.append(request)
+
+    def _add_ready_chunks(
+        self,
+        request_ids: set[str],
+        ready_counts: dict[str, int] | None,
+    ) -> None:
+        for request_id in request_ids:
+            count = 1
+            if ready_counts is not None:
+                count = max(1, int(ready_counts.get(request_id, 1)))
+            self._ready_chunk_counts[request_id] = self._ready_chunk_counts.get(request_id, 0) + count
+            self.requests_with_ready_chunks.add(request_id)
+
+    def _consume_ready_chunk(self, request_id: str | None) -> None:
+        if request_id is None:
+            return
+        count = self._ready_chunk_counts.get(request_id)
+        if count is None:
+            self.requests_with_ready_chunks.discard(request_id)
+            return
+        if count <= 1:
+            self._ready_chunk_counts.pop(request_id, None)
+            self.requests_with_ready_chunks.discard(request_id)
+            return
+        self._ready_chunk_counts[request_id] = count - 1
+        self.requests_with_ready_chunks.add(request_id)
 
     def _clear_chunk_ready(self, scheduler_output: Any) -> None:
         if scheduler_output.scheduled_new_reqs:
             for req_data in scheduler_output.scheduled_new_reqs:
-                self.requests_with_ready_chunks.discard(
-                    getattr(req_data, "req_id", None),
-                )
+                self._consume_ready_chunk(getattr(req_data, "req_id", None))
 
         if scheduler_output.scheduled_cached_reqs:
             for req_id in scheduler_output.scheduled_cached_reqs.req_ids:
-                self.requests_with_ready_chunks.discard(req_id)
+                self._consume_ready_chunk(req_id)

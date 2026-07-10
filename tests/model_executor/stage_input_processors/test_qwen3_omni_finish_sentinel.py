@@ -1,11 +1,8 @@
-"""code2wav async finish-sentinel terminal flush.
+"""code2wav async finish-sentinel terminal handling.
 
-The producer runner sends every in-step codec chunk with ``finished=False`` and
-emits a separate finish sentinel next cycle (empty payload + the
-``ASYNC_FINISH_SENTINEL_KEY`` marker the legacy adapter never sets).  On that
-marker, ``talker2code2wav_async_chunk`` must flush the trailing partial codec
-chunk that the live ``is_finished`` branch would otherwise have flushed, reusing
-the same context math, without re-appending.
+The runner marks terminal real codec payloads with ``is_finished=True`` so the
+normal code2wav branch can flush any trailing partial chunk.  The later sentinel
+is a control-only marker and must not rebuild audio from cached history.
 """
 
 from types import SimpleNamespace
@@ -66,26 +63,55 @@ def test_talker2code2wav_async_chunk_accepts_flat_payload():
     assert torch.equal(out.codes.audio, frame.transpose(0, 1).reshape(-1))
 
 
-def test_finish_sentinel_flushes_partial_tail():
-    # 6 frames accumulated, chunk size 4 -> a 2-frame partial tail is still held.
-    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 7)]}, chunk_frames=4, left_frames=25)
+def test_finished_real_payload_flushes_partial_tail():
+    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 6)]}, chunk_frames=4, left_frames=25)
+    tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
+    frame = torch.tensor([[6]])
 
-    out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=True)
+    out = talker2code2wav_async_chunk(tm, {"codes": {"audio": frame}}, req, is_finished=True)
 
     assert out is not None
     assert bool(out.meta.finished) is True
-    # context_length = 6 % 4 = 2; left = min(6-2, 25) = 4; end_index = min(6, 4+2) = 6.
     assert out.meta.left_context_size == 4
     assert isinstance(out.codes.audio, torch.Tensor)
-    # 6 single-codebook frames -> flattened length 6.
     assert out.codes.audio.numel() == 6
+
+
+def test_finished_real_payload_flushes_partial_tail_after_initial_chunk():
+    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 6)]}, chunk_frames=25, initial_frames=4)
+    tm.put_req_chunk = {"r": 1}
+    req = SimpleNamespace(external_req_id="r")
+    frame = torch.tensor([[6]])
+
+    out = talker2code2wav_async_chunk(tm, {"codes": {"audio": frame}}, req, is_finished=True)
+
+    assert out is not None
+    assert bool(out.meta.finished) is True
+    assert out.meta.left_context_size == 4
+    assert isinstance(out.codes.audio, torch.Tensor)
+    assert out.codes.audio.numel() == 6
+
+
+def test_finish_sentinel_flushes_partial_tail_without_finishing_request():
+    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 4)]}, chunk_frames=4, left_frames=25)
+    tm.put_req_chunk = {"r": 0}
+    req = SimpleNamespace(external_req_id="r")
+
+    out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=False)
+
+    assert out is not None
+    assert bool(out.meta.finished) is False
+    assert out.meta.left_context_size == 0
+    assert isinstance(out.codes.audio, torch.Tensor)
+    assert out.codes.audio.numel() == 3
 
 
 def test_finish_sentinel_on_chunk_boundary_emits_flag_only():
     # 4 frames, chunk size 4 -> the last full chunk was already sent in-step;
     # no unsent tail, so the sentinel must NOT re-send codec (flag only).
     tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 5)]}, chunk_frames=4)
+    tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
 
     out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=True)
@@ -118,6 +144,7 @@ def test_non_sentinel_empty_call_is_unchanged():
 
 def test_finish_sentinel_on_initial_chunk_boundary_emits_flag_only():
     tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 5)]}, chunk_frames=25, initial_frames=4)
+    tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
     out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=True)
 
@@ -126,8 +153,9 @@ def test_finish_sentinel_on_initial_chunk_boundary_emits_flag_only():
     assert out.codes is None, "initial-boundary finish must not re-send the initial chunk"
 
 
-def test_finish_sentinel_flushes_partial_tail_after_initial_chunk():
+def test_finish_sentinel_after_initial_partial_flushes_tail():
     tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 7)]}, chunk_frames=25, initial_frames=4)
+    tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
     out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=True)
 
@@ -136,3 +164,18 @@ def test_finish_sentinel_flushes_partial_tail_after_initial_chunk():
     assert out.meta.left_context_size == 4
     assert isinstance(out.codes.audio, torch.Tensor)
     assert out.codes.audio.numel() == 6
+
+
+def test_finished_real_payload_flushes_regular_chunk_after_initial_boundary():
+    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 29)]}, chunk_frames=25, initial_frames=4)
+    tm.put_req_chunk = {"r": 1}
+    req = SimpleNamespace(external_req_id="r")
+    frame = torch.tensor([[29]])
+
+    out = talker2code2wav_async_chunk(tm, {"codes": {"audio": frame}}, req, is_finished=True)
+
+    assert out is not None
+    assert bool(out.meta.finished) is True
+    assert out.meta.left_context_size == 4
+    assert isinstance(out.codes.audio, torch.Tensor)
+    assert out.codes.audio.numel() == 29

@@ -95,6 +95,7 @@ class OmniSchedulerOutput(SchedulerOutput):
     finished_requests_needing_kv_transfer: dict[str, dict] = field(default_factory=dict)
     pending_connector_registrations: list[OmniChunkRecvHandle] = field(default_factory=list)
     segment_finished_req_ids: set[str] = field(default_factory=set)
+    upstream_finished_req_ids: set[str] = field(default_factory=set)
     pending_input_registrations: InitVar[list[OmniChunkRecvHandle] | None] = None
 
     def __post_init__(self, pending_input_registrations: list[OmniChunkRecvHandle] | None) -> None:

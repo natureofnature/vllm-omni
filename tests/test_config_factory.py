@@ -1983,6 +1983,8 @@ class TestSentinelDefaultPrecedence:
             .yaml_engine_args["custom_process_next_stage_input_func"]
             .endswith("talker2code2wav_async_chunk")
         )
+        assert async_stages[1].custom_process_input_func is not None
+        assert async_stages[1].custom_process_input_func.endswith("thinker2talker_token_only")
 
         sync_stages = merge_pipeline_deploy(pipeline, DeployConfig(async_chunk=False))
         assert (

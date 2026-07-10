@@ -513,7 +513,6 @@ class Qwen3OmniMoeForConditionalGeneration(
                 logger.debug("No additional_information provided to code2wav stage.")
             left_context_size = _normalize_code2wav_left_context_sizes(left_context_size, seq_token_counts)
             audio_tensors = self.generate_audio(codes, left_context_size, seq_token_counts)
-
             return audio_tensors
 
         # Fallback (shouldn't reach here)
@@ -575,10 +574,29 @@ class Qwen3OmniMoeForConditionalGeneration(
             if "runtime_additional_information" in kwargs and "model_intermediate_buffer" not in kwargs:
                 logger.warning_once("runtime_additional_information is deprecated, use model_intermediate_buffer")
             code_predictor_codes = [info.get("codes", {}).get("audio") for info in info_dicts]
-            audio_codes = torch.cat(code_predictor_codes, dim=0)
-            multimodal_outputs: OmniPayload = {"codes": {"audio": audio_codes}}
-            span_len = audio_codes.shape[0]
-            talker_hidden = talker_hidden[:span_len]
+            if code_predictor_codes and all(isinstance(code, torch.Tensor) for code in code_predictor_codes):
+                audio_codes = torch.cat(code_predictor_codes, dim=0)
+                multimodal_outputs: OmniPayload = {"codes": {"audio": audio_codes}}
+                span_len = audio_codes.shape[0]
+                talker_hidden = talker_hidden[:span_len]
+                return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
+
+            ready_req_ids: list[str] = []
+            ready_audio_codes: list[torch.Tensor] = []
+            for info, code in zip(info_dicts, code_predictor_codes, strict=True):
+                if not isinstance(code, torch.Tensor):
+                    continue
+                request_id = info.get("request_id")
+                if not isinstance(request_id, str):
+                    logger.warning("Skipping sparse audio payload without request id.")
+                    continue
+                ready_req_ids.append(request_id)
+                ready_audio_codes.append(code)
+
+            multimodal_outputs = {
+                "codes": {"audio": ready_audio_codes},
+                "meta": {"req_id": ready_req_ids, "sparse_audio": ["1"]},
+            }
             return OmniOutput(text_hidden_states=talker_hidden, multimodal_outputs=multimodal_outputs)
         elif self.model_stage == "code2wav":
             audio_tensors = model_outputs
@@ -973,6 +991,29 @@ class Qwen3OmniMoeForConditionalGeneration(
 
         return req_input_ids[start_index:end_index], req_embeds[start_index:end_index], update_dict
 
+    @staticmethod
+    def _merge_decode_embed_prefix(
+        cached_decode_embed: torch.Tensor,
+        current_decode_embed: torch.Tensor,
+    ) -> torch.Tensor:
+        cached_len = int(cached_decode_embed.shape[0])
+        current_len = int(current_decode_embed.shape[0])
+        if current_len >= cached_len and torch.equal(current_decode_embed[:cached_len], cached_decode_embed):
+            return current_decode_embed
+        if cached_len >= current_len and torch.equal(cached_decode_embed[:current_len], current_decode_embed):
+            return cached_decode_embed
+        max_overlap = min(cached_len, current_len, 16)
+        for overlap in range(max_overlap, 0, -1):
+            if torch.equal(
+                cached_decode_embed[-overlap:],
+                current_decode_embed[:overlap],
+            ):
+                return torch.cat(
+                    [cached_decode_embed, current_decode_embed[overlap:]],
+                    dim=0,
+                )
+        return torch.cat([cached_decode_embed, current_decode_embed], dim=0)
+
     def _talker_cache_thinker_decode_embeds(
         self,
         embed: Embeddings,
@@ -993,8 +1034,9 @@ class Qwen3OmniMoeForConditionalGeneration(
                 thinker_decode_embeds = thinker_decode_embeds.to(
                     device=self._module_device(self.talker), dtype=torch.bfloat16
                 )
-                update_dict.setdefault("embed", {})["cached_decode"] = torch.cat(
-                    [cached_thinker_decode_embeds, thinker_decode_embeds], dim=0
+                update_dict.setdefault("embed", {})["cached_decode"] = self._merge_decode_embed_prefix(
+                    cached_thinker_decode_embeds,
+                    thinker_decode_embeds,
                 )
         update_dict.setdefault("embed", {})["decode"] = None
 
@@ -1102,13 +1144,7 @@ class Qwen3OmniMoeForConditionalGeneration(
                 device=current_decode_embed.device,
                 dtype=current_decode_embed.dtype,
             )
-            cached_len = int(cached_decode_embed.shape[0])
-            if current_decode_embed.shape[0] >= cached_len and torch.equal(
-                current_decode_embed[:cached_len], cached_decode_embed
-            ):
-                thinker_decode_embed = current_decode_embed
-            else:
-                thinker_decode_embed = torch.cat([cached_decode_embed, current_decode_embed], dim=0)
+            thinker_decode_embed = self._merge_decode_embed_prefix(cached_decode_embed, current_decode_embed)
         elif isinstance(cached_decode_embed, torch.Tensor):
             thinker_decode_embed = cached_decode_embed
         else:
@@ -1116,7 +1152,11 @@ class Qwen3OmniMoeForConditionalGeneration(
         start_index = meta.get("num_processed_tokens", 0)
         # cached_decode is the prefix of the cumulative decode sequence; consume
         # by absolute index so repeated async syncs cannot drop handoff rows.
-        base = meta.get("prefill_consumed_text_tokens", 0)
+        base = meta.get("prefill_consumed_text_tokens")
+        if base is None and meta.get("resumable", False):
+            base = 1
+        if base is None:
+            base = 0
         avail = thinker_decode_embed.shape[0] if isinstance(thinker_decode_embed, torch.Tensor) else 0
         idx = start_index - base
 
@@ -1128,7 +1168,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             return self.talker.text_projection(thinker_embed).to(device)
 
         # No (more) thinker decode embed available at this index yet.
-        if bool(meta.get("finished", False)) and idx >= avail:
+        stream_terminal = bool(meta.get("finished", False)) or bool(meta.get("is_segment_finished", False))
+        if stream_terminal and idx >= avail:
             # Thinker finished and the talker consumed everything: emit one EOS
             # then pad. Do not advance past the terminal token.
             if meta.get("eos_emitted", False):
