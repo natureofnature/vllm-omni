@@ -910,16 +910,34 @@ class OmniConnectorModelRunnerMixin:
             )
         return results or None
 
+    def _drain_ready_load_reqs_locked(self) -> tuple[set[str], dict[str, int]]:
+        """Drain only received chunks that may wake the scheduler."""
+        candidates = set(self._finished_load_reqs)
+        select_ready = getattr(self, "_select_ready_local_stage_payload_req_ids", None)
+        if callable(select_ready):
+            ready = candidates & set(select_ready(candidates))
+        else:
+            ready = candidates
+
+        self._finished_load_reqs.difference_update(ready)
+        ready_counts = {}
+        for req_id in ready:
+            count = self._chunk_ready_counts.pop(req_id, None)
+            if count is not None:
+                ready_counts[req_id] = count
+        return ready, ready_counts
+
     def _collect_async_chunk_fanout_packet_locked(self) -> dict[str, Any] | None:
+        newly_finished, chunk_ready_counts = self._drain_ready_load_reqs_locked()
         payload_req_ids = set(self._async_chunk_updated_req_ids)
-        payload_req_ids.update(self._finished_load_reqs)
+        payload_req_ids.update(newly_finished)
         payload_req_ids.update(self._chunk_finished_req_ids)
         payload_req_ids.update(self._chunk_segment_finished_req_ids)
         payload_req_ids.update(self._local_request_metadata)
         send_failed_req_ids = set(self._send_failed_req_ids)
         if not (
             payload_req_ids
-            or self._finished_load_reqs
+            or newly_finished
             or self._chunk_finished_req_ids
             or self._chunk_segment_finished_req_ids
             or self._local_request_metadata
@@ -935,18 +953,16 @@ class OmniConnectorModelRunnerMixin:
         packet = {
             "staged_payloads": staged_payloads,
             "request_metadata": dict(self._local_request_metadata),
-            "newly_finished": set(self._finished_load_reqs),
+            "newly_finished": newly_finished,
             "chunk_finished": set(self._chunk_finished_req_ids),
             "chunk_segment_finished": set(self._chunk_segment_finished_req_ids),
             "send_failed": send_failed_req_ids,
-            "chunk_ready_counts": dict(self._chunk_ready_counts),
+            "chunk_ready_counts": chunk_ready_counts,
         }
 
         self._async_chunk_updated_req_ids.clear()
-        self._finished_load_reqs.clear()
         self._chunk_finished_req_ids.clear()
         self._chunk_segment_finished_req_ids.clear()
-        self._chunk_ready_counts.clear()
         self._send_failed_req_ids.clear()
         self._local_request_metadata.clear()
         self._work_available.set()
@@ -1937,10 +1953,6 @@ class OmniConnectorModelRunnerMixin:
         if not hasattr(self, "_lock"):
             return OmniConnectorOutput()
 
-        promote_ready_payloads = getattr(self, "_promote_ready_local_stage_payloads", None)
-        if callable(promote_ready_payloads):
-            promote_ready_payloads()
-
         tp_group = self._get_local_tp_group()
         if self._async_chunk and tp_group is not None and getattr(tp_group, "world_size", 1) > 1:
             if self.is_data_transfer_rank():
@@ -1967,8 +1979,7 @@ class OmniConnectorModelRunnerMixin:
                 chunk_ready_counts = dict(fanout_packet.get("chunk_ready_counts", {}))
         else:
             with self._lock:
-                newly_finished = set(self._finished_load_reqs)
-                self._finished_load_reqs.clear()
+                newly_finished, chunk_ready_counts = self._drain_ready_load_reqs_locked()
                 chunk_finished = set(self._chunk_finished_req_ids)
                 self._chunk_finished_req_ids.clear()
                 chunk_segment_finished = set(self._chunk_segment_finished_req_ids)
@@ -1977,8 +1988,6 @@ class OmniConnectorModelRunnerMixin:
                 self._send_failed_req_ids.clear()
                 request_metadata = dict(self._local_request_metadata)
                 self._local_request_metadata.clear()
-                chunk_ready_counts = dict(self._chunk_ready_counts)
-                self._chunk_ready_counts.clear()
                 # Release any send-side accumulated payload only after the
                 # terminal chunk. Ordinary wake-ups may still arrive before the
                 # model side has consumed the staged payload.

@@ -1339,18 +1339,19 @@ class OmniGPUModelRunner(GPUModelRunner):
             req_token_spans.append((start_offset, start_offset + sched_tokens))
         return req_token_spans
 
-    def _sync_local_stage_payloads(self) -> None:
+    def _sync_local_stage_payloads(self, request_ids: set[str] | None = None, *, terminal_only: bool = False) -> None:
         """Move received full-payload stage inputs into model_intermediate_buffer."""
         cache = getattr(self, "_local_stage_payload_cache", None)
         terminal_cache = getattr(self, "_local_stage_terminal_payload_cache", None)
-        if not cache and not terminal_cache:
+        if (terminal_only or not cache) and not terminal_cache:
             return
         lock = getattr(self, "_lock", None)
         ctx = lock if lock is not None else contextlib.nullcontext()
         with ctx:
-            if not cache and not terminal_cache:
+            if (terminal_only or not cache) and not terminal_cache:
                 return
             active_req_ids = set(getattr(self, "requests", {}))
+            payload_req_ids = active_req_ids if request_ids is None else active_req_ids & request_ids
             pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
             terminal_staged = {
                 req_id: payload
@@ -1361,8 +1362,9 @@ class OmniGPUModelRunner(GPUModelRunner):
                 terminal_cache.pop(req_id, None)
             staged = {}
             deferred = set()
-            for req_id, payload in (cache or {}).items():
-                if req_id in pending or req_id not in active_req_ids or not isinstance(payload, dict):
+            payload_items = () if terminal_only else (cache or {}).items()
+            for req_id, payload in payload_items:
+                if req_id in pending or req_id not in payload_req_ids or not isinstance(payload, dict):
                     continue
                 if self._should_defer_local_stage_segment_payload(req_id, payload):
                     deferred.add(req_id)
@@ -1381,40 +1383,22 @@ class OmniGPUModelRunner(GPUModelRunner):
             if work_available is not None:
                 work_available.set()
 
-    def _promote_ready_local_stage_payloads(self) -> None:
-        """Wake the scheduler once a deferred segment payload is consumable."""
-        cache = getattr(self, "_local_stage_payload_cache", None)
-        if not cache:
-            return
-        lock = getattr(self, "_lock", None)
-        ctx = lock if lock is not None else contextlib.nullcontext()
-        with ctx:
-            cache = getattr(self, "_local_stage_payload_cache", None)
-            if not cache:
-                return
-            active_req_ids = set(getattr(self, "requests", {}))
-            pending = set(getattr(self, "_full_payload_pending_broadcast_req_ids", set()))
-            ready_req_ids = {
-                req_id
-                for req_id, payload in cache.items()
-                if req_id in active_req_ids
-                and req_id not in pending
-                and isinstance(payload, dict)
-                and not self._should_defer_local_stage_segment_payload(req_id, payload)
-            }
-            if not ready_req_ids:
-                return
-            finished_load_reqs = getattr(self, "_finished_load_reqs", None)
-            if isinstance(finished_load_reqs, set):
-                finished_load_reqs.update(ready_req_ids)
-        work_available = getattr(self, "_work_available", None)
-        if work_available is not None:
-            work_available.set()
+    def _select_ready_local_stage_payload_req_ids(self, request_ids: set[str]) -> set[str]:
+        """Return received chunks that can wake the scheduler."""
+        cache = getattr(self, "_local_stage_payload_cache", {}) or {}
+        active_req_ids = set(getattr(self, "requests", {}))
+        return {
+            req_id
+            for req_id in request_ids
+            if req_id not in active_req_ids
+            or not isinstance(cache.get(req_id), dict)
+            or not self._should_defer_local_stage_segment_ready(req_id, cache[req_id])
+        }
 
     def _build_model_kwargs_extra(self, *, sync_local_stage_payloads: bool = True) -> dict:
         """Build extra keyword arguments passed to the model for this step."""
         if sync_local_stage_payloads:
-            self._sync_local_stage_payloads()
+            self._sync_local_stage_payloads(set(self.input_batch.req_ids))
         model_kwargs_extra: dict[str, object] = {}
         try:
             buffer_map = self._gather_runtime_additional_information()
@@ -1749,14 +1733,14 @@ class OmniGPUModelRunner(GPUModelRunner):
                 # reads it.  The legacy adapter async-chunk path still carries the
                 # payload in additional_information, so it needs no extra sync.
                 if uses_async_chunk_coordinator(self.vllm_config.model_config):
-                    self._sync_local_stage_payloads()
+                    self._sync_local_stage_payloads(set(scheduler_output.num_scheduled_tokens))
             else:
                 # In full-payload (non-async-chunk) mode, connector-delivered
                 # stage payloads must override any earlier engine-level
                 # additional_information written by the legacy
                 # custom_process_input_func codec, so talker_preprocess reads
                 # the full thinker payload.
-                self._sync_local_stage_payloads()
+                self._sync_local_stage_payloads(set(scheduler_output.num_scheduled_tokens))
 
         if hasattr(self.model, "has_preprocess") and self.model.has_preprocess:
             preprocess_device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -2140,6 +2124,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         return isinstance(existing, dict) and self._has_prior_segment_runtime_state(existing)
 
     def _should_defer_local_stage_segment_payload(self, req_id: str, payload: dict) -> bool:
+        """Keep a new segment cached until its scheduler state is installed."""
+        return self._should_reset_local_stage_segment_runtime(req_id, payload)
+
+    def _should_defer_local_stage_segment_ready(self, req_id: str, payload: dict) -> bool:
+        """Keep a new segment parked until the prior local segment reaches EOS."""
         if not self._should_reset_local_stage_segment_runtime(req_id, payload):
             return False
         existing = self.model_intermediate_buffer.get(req_id)

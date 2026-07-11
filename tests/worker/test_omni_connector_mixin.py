@@ -814,6 +814,31 @@ class TestFinishedLoadReqsDrain(unittest.TestCase):
 
         host.shutdown_omni_connectors()
 
+    def test_deferred_ready_chunks_retain_counts_until_publishable(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(),
+        )
+        host._select_ready_local_stage_payload_req_ids = lambda req_ids: req_ids - {"req-1"}
+        host._finished_load_reqs.update({"req-1", "req-2"})
+        host._chunk_ready_counts.update({"req-1": 2, "req-2": 1})
+
+        output1 = host.get_omni_connector_output()
+        self.assertEqual(output1.chunk_ready_req_ids, {"req-2"})
+        self.assertEqual(output1.chunk_ready_counts, {"req-2": 1})
+        self.assertEqual(host._finished_load_reqs, {"req-1"})
+        self.assertEqual(host._chunk_ready_counts, {"req-1": 2})
+
+        host._select_ready_local_stage_payload_req_ids = lambda req_ids: req_ids
+        output2 = host.get_omni_connector_output()
+        self.assertEqual(output2.chunk_ready_req_ids, {"req-1"})
+        self.assertEqual(output2.chunk_ready_counts, {"req-1": 2})
+        self.assertEqual(host._finished_load_reqs, set())
+        self.assertEqual(host._chunk_ready_counts, {})
+
+        host.shutdown_omni_connectors()
+
 
 class TestLoadCustomFuncSelection(unittest.TestCase):
     def test_skips_non_payload_stage_input_processors_for_full_payload_mode(self):

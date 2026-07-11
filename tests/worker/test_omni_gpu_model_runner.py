@@ -835,7 +835,7 @@ def test_sync_local_stage_payloads_defers_reused_streaming_segment_until_termina
     assert torch.equal(runner.model_intermediate_buffer["r1"]["embed"]["decode"], old_decode)
 
     runner._local_stage_terminal_payload_cache = {"r1": {"meta": {"is_segment_finished": torch.tensor(True)}}}
-    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+    OmniGPUModelRunner._sync_local_stage_payloads(runner, terminal_only=True)
 
     buf = runner.model_intermediate_buffer["r1"]
     assert runner._local_stage_payload_cache["r1"]["embed"]["prefill"] is new_prefill
@@ -843,11 +843,15 @@ def test_sync_local_stage_payloads_defers_reused_streaming_segment_until_termina
     assert torch.equal(buf["embed"]["decode"], old_decode)
     assert runner._finished_load_reqs == set()
     assert reset_calls == []
+    assert OmniGPUModelRunner._select_ready_local_stage_payload_req_ids(runner, {"r1"}) == set()
 
     buf["meta"]["eos_emitted"] = torch.tensor(True)
-    OmniGPUModelRunner._promote_ready_local_stage_payloads(runner)
-    assert runner._finished_load_reqs == {"r1"}
-    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+    assert OmniGPUModelRunner._select_ready_local_stage_payload_req_ids(runner, {"r1"}) == {"r1"}
+    OmniGPUModelRunner._sync_local_stage_payloads(runner, set())
+    assert "r1" in runner._local_stage_payload_cache
+
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+    OmniGPUModelRunner._sync_local_stage_payloads(runner, {"r1"})
 
     buf = runner.model_intermediate_buffer["r1"]
     assert runner._local_stage_payload_cache == {}
@@ -898,7 +902,8 @@ def test_sync_local_stage_payloads_reset_drops_stale_decode_progress_meta():
     runner._lock = None
     runner._work_available = None
 
-    OmniGPUModelRunner._sync_local_stage_payloads(runner)
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+    OmniGPUModelRunner._sync_local_stage_payloads(runner, {"r1"})
 
     meta = runner.model_intermediate_buffer["r1"]["meta"]
     assert "decode_flag" not in meta

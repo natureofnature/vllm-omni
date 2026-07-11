@@ -284,7 +284,7 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     return runner
 
 
-def test_execute_model_registers_pending_connector_registrations(monkeypatch):
+def test_execute_model_snapshots_terminal_before_update_then_materializes_payload(monkeypatch):
     runner = object.__new__(GPUARModelRunner)
     runner.execute_model_state = None
     runner.routed_experts_initialized = False
@@ -299,12 +299,20 @@ def test_execute_model_registers_pending_connector_registrations(monkeypatch):
     runner.recv_full_payload_inputs = lambda scheduler_output: None
     runner._pending_full_payload_send = {}
     runner.requests = {}
-    runner.model_config = SimpleNamespace(async_chunk=False)
+    runner.model_config = SimpleNamespace(async_chunk=True)
     runner.speculative_config = None
     runner.synchronize_input_prep = nullcontext
-    runner._update_states = lambda scheduler_output: None
+    events = []
+
+    def update_states(scheduler_output):
+        assert runner._async_chunk_deferred_finish_only == {"r1"}
+        events.append("update")
+
+    runner._update_states = update_states
+    runner._sync_local_stage_payloads = lambda *, terminal_only=False: events.append(("sync", terminal_only))
+    runner._flush_async_chunk_deferred_sentinels = lambda: events.append("flush")
     runner.parallel_config = SimpleNamespace(distributed_executor_backend="mp", data_parallel_size=1)
-    runner.vllm_config = SimpleNamespace()
+    runner.vllm_config = SimpleNamespace(model_config=runner.model_config)
     runner.attach_omni_connector_output = lambda output: output
     registered = []
     request = SimpleNamespace(request_id="r1")
@@ -313,14 +321,18 @@ def test_execute_model_registers_pending_connector_registrations(monkeypatch):
     monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.has_kv_transfer_group", lambda: False)
     monkeypatch.setattr("vllm_omni.worker.gpu_ar_model_runner.has_ec_transfer", lambda: False)
     monkeypatch.setattr(
-        "vllm_omni.worker.gpu_ar_model_runner.uses_async_chunk_model_runner_transport",
+        "vllm_omni.worker.gpu_ar_model_runner.uses_full_payload_input_coordinator",
         lambda model_config: False,
+    )
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.uses_async_chunk_model_runner_transport",
+        lambda model_config: True,
     )
 
     scheduler_output = SimpleNamespace(
         pending_connector_registrations=[request],
         finished_requests_needing_kv_transfer={},
-        finished_req_ids=set(),
+        finished_req_ids={"r1"},
         total_num_scheduled_tokens=0,
         scheduled_spec_decode_tokens={},
         num_scheduled_tokens={},
@@ -330,6 +342,7 @@ def test_execute_model_registers_pending_connector_registrations(monkeypatch):
     GPUARModelRunner.execute_model(runner, scheduler_output)
 
     assert registered == [request]
+    assert events == ["update", ("sync", True), "flush"]
 
 
 def test_build_omni_output_uses_snapshots_and_connector_after_accumulation(monkeypatch):
@@ -1240,6 +1253,114 @@ def test_final_request_after_segment_terminal_waits_for_talker_eos():
     assert runner._async_chunk_final_segment_pending == set()
 
 
+def test_local_finished_talker_terminal_bypasses_eos_and_retries():
+    runner = object.__new__(GPUARModelRunner)
+    runner.model_config = SimpleNamespace(model_stage="talker")
+    runner.model_intermediate_buffer = {
+        "local-1": {
+            "meta": {
+                "is_segment_finished": torch.tensor(True),
+                "eos_emitted": torch.tensor(False),
+            }
+        }
+    }
+    runner._request_ids_mapping = {"local-1": "ext-1"}
+    runner._send_side_request_snapshot = {}
+    runner._async_chunk_segment_terminal_sent = set()
+    runner._async_chunk_segment_terminal_pending = set()
+    runner._async_chunk_final_segment_pending = set()
+    runner._async_chunk_local_finished_pending = {"local-1"}
+    attempts = []
+    outcomes = iter((False, True))
+
+    def enqueue(request, ext_id, *, is_segment_finished=False):
+        queued = next(outcomes)
+        attempts.append((ext_id, is_segment_finished, request.is_finished(), queued))
+        return queued
+
+    runner.enqueue_finish_sentinel = enqueue
+
+    GPUARModelRunner._send_async_chunk_segment_sentinels(
+        runner,
+        {"local-1"},
+        final_req_ids={"local-1"},
+    )
+
+    assert attempts == [("ext-1", True, True, False)]
+    assert runner._async_chunk_segment_terminal_pending == {"local-1"}
+    assert runner._async_chunk_final_segment_pending == {"local-1"}
+    assert runner._async_chunk_local_finished_pending == {"local-1"}
+    assert runner._async_chunk_segment_terminal_sent == set()
+
+    GPUARModelRunner._send_async_chunk_segment_sentinels(runner, set())
+    GPUARModelRunner._send_async_chunk_segment_sentinels(runner, set())
+
+    assert attempts[-1] == ("ext-1", True, True, True)
+    assert len(attempts) == 2
+    assert runner._async_chunk_segment_terminal_pending == set()
+    assert runner._async_chunk_final_segment_pending == set()
+    assert runner._async_chunk_local_finished_pending == set()
+    assert runner._async_chunk_segment_terminal_sent == {"ext-1"}
+
+
+def test_local_finished_finish_only_retries_on_next_flush():
+    runner = object.__new__(GPUARModelRunner)
+    runner.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            async_chunk=True,
+            model_arch="Qwen3OmniMoeForConditionalGeneration",
+            model_stage="talker",
+            stage_connector_config={"name": "SharedMemoryConnector"},
+        )
+    )
+    runner.model_config = runner.vllm_config.model_config
+    runner._local_stage_terminal_payload_cache = {}
+    runner._request_ids_mapping = {"local-1": "ext-1"}
+    runner._put_req_chunk = {"ext-1": 1}
+    runner._send_side_request_payload = {}
+    runner._pending_streaming_prefills = {}
+    runner._send_side_request_snapshot = {}
+    runner._async_chunk_segment_terminal_pending = set()
+    runner._async_chunk_final_segment_pending = set()
+    runner._async_chunk_local_finished_pending = {"local-1"}
+    attempts = []
+    outcomes = iter((False, True))
+
+    def enqueue(request, ext_id):
+        queued = next(outcomes)
+        attempts.append((ext_id, request.is_finished(), queued))
+        return queued
+
+    runner.enqueue_finish_sentinel = enqueue
+
+    GPUARModelRunner._flush_async_chunk_deferred_sentinels(
+        runner,
+        finish_only_req_ids={"local-1"},
+        segment_terminal_req_ids=set(),
+        final_segment_req_ids=set(),
+        local_finished_req_ids={"local-1"},
+    )
+
+    assert attempts == [("ext-1", True, False)]
+    assert runner._async_chunk_local_finished_pending == {"local-1"}
+
+    GPUARModelRunner._flush_async_chunk_deferred_sentinels(
+        runner,
+        finish_only_req_ids=set(),
+        segment_terminal_req_ids=set(),
+        final_segment_req_ids=set(),
+        local_finished_req_ids=set(),
+    )
+    assert len(attempts) == 1
+
+    for _ in range(2):
+        GPUARModelRunner._flush_async_chunk_deferred_sentinels(runner)
+
+    assert attempts[-1] == ("ext-1", True, True)
+    assert len(attempts) == 2
+    assert runner._async_chunk_local_finished_pending == set()
+
+
 def test_upstream_finished_waits_for_local_segment_terminal():
     runner = object.__new__(GPUARModelRunner)
     runner._request_ids_mapping = {"local-1": "ext-1"}
@@ -1320,6 +1441,41 @@ def test_deferred_final_segment_pending_flushes_after_segment_terminal():
     assert runner._async_chunk_final_segment_pending == set()
 
 
+def test_deferred_final_segment_dispatches_without_other_terminal_signal(monkeypatch):
+    runner = _make_async_output_runner()
+    runner.model_config.model_stage = "talker"
+    runner._local_stage_terminal_payload_cache = {}
+    runner._request_ids_mapping = {"r1": "ext-r1"}
+    runner._send_side_request_snapshot = {}
+    runner._async_chunk_segment_terminal_sent = set()
+    runner._async_chunk_segment_terminal_pending = set()
+    runner._async_chunk_final_segment_pending = set()
+    runner._async_chunk_local_finished_pending = {"r1"}
+    sent = []
+
+    runner.enqueue_finish_sentinel = (
+        lambda request, ext_id, *, is_segment_finished=False: sent.append(
+            (ext_id, request.is_finished(), is_segment_finished)
+        )
+        or True
+    )
+    monkeypatch.setattr(
+        "vllm_omni.worker.gpu_ar_model_runner.uses_async_chunk_model_runner_transport",
+        lambda model_config: True,
+    )
+
+    GPUARModelRunner._flush_async_chunk_deferred_sentinels(
+        runner,
+        finish_only_req_ids=set(),
+        segment_terminal_req_ids=set(),
+        final_segment_req_ids={"r1"},
+        local_finished_req_ids={"r1"},
+    )
+
+    assert sent == [("ext-r1", True, True)]
+    assert runner._async_chunk_local_finished_pending == set()
+
+
 def test_segment_terminal_guard_clears_when_new_decode_resets_eos():
     runner = object.__new__(GPUARModelRunner)
     runner._async_chunk_segment_terminal_sent = {"ext-1"}
@@ -1329,29 +1485,53 @@ def test_segment_terminal_guard_clears_when_new_decode_resets_eos():
     assert "ext-1" not in runner._async_chunk_segment_terminal_sent
 
 
-def test_build_omni_output_runner_transport_sends_nested_payload(monkeypatch):
+def test_build_omni_output_sends_freed_request_payload_before_finish_sentinel(monkeypatch):
     runner = _make_async_output_runner(engine_output_type="latent")
     runner._custom_process_func = object()
-    runner.model_config.model_stage = "thinker"
+    runner.model_config.model_stage = "talker"
     runner._request_ids_mapping = {"r1": "ext-r1"}
     runner._send_side_request_snapshot = {}
-    runner.model_intermediate_buffer = {}
-    runner.requests = {
-        "r1": SimpleNamespace(
-            req_id="r1",
-            external_req_id="ext-r1",
-            prompt_token_ids=[1],
-            output_token_ids=[2],
-            additional_information_cpu={"omni_final_stage_id": 1},
-        )
+    runner.model_intermediate_buffer = {
+        "r1": {
+            "meta": {
+                "is_segment_finished": torch.tensor(True),
+                "eos_emitted": torch.tensor(True),
+            }
+        }
     }
+    runner._local_stage_terminal_payload_cache = {"r1": {"meta": {"finished": True}}}
+
+    def fail_if_builder_syncs_connector_payloads():
+        raise AssertionError("background output builder must not materialize connector payloads")
+
+    runner._sync_local_stage_payloads = fail_if_builder_syncs_connector_payloads
+    runner._async_chunk_segment_terminal_sent = set()
+    runner._async_chunk_segment_terminal_pending = set()
+    runner._async_chunk_final_segment_pending = set()
+    runner._async_chunk_local_finished_pending = {"r1"}
+    runner._async_chunk_deferred_finish_only = {"r1"}
+    request_state = SimpleNamespace(
+        req_id="r1",
+        external_req_id="ext-r1",
+        prompt_token_ids=[1],
+        output_token_ids=[2],
+        additional_information_cpu={"omni_final_stage_id": 1},
+    )
+    runner.requests = {}
     sent = []
+    events = []
 
     def send_chunk(request, pooling_output):
         sent.append((request, pooling_output))
+        events.append(("payload", request.is_finished()))
+        return True
+
+    def enqueue_finish_sentinel(request, ext_id, *, is_segment_finished=False):
+        events.append(("sentinel", request.is_finished(), is_segment_finished))
         return True
 
     runner.send_chunk = send_chunk
+    runner.enqueue_finish_sentinel = enqueue_finish_sentinel
     runner._snapshot_request_for_send = lambda request, ext_id: SimpleNamespace(
         request_id=request.request_id,
         req_id=request.req_id,
@@ -1377,11 +1557,13 @@ def test_build_omni_output_runner_transport_sends_nested_payload(monkeypatch):
         scheduler_output=SimpleNamespace(
             total_num_scheduled_tokens=1,
             num_scheduled_tokens={"r1": 1},
+            finished_req_ids={"r1"},
         ),
         hidden_states=torch.tensor([[1.0, 2.0]], dtype=torch.float32),
         staged_hidden_states_cpu=None,
         multimodal_outputs={"codes": {"audio": torch.tensor([[7, 8]], dtype=torch.long)}},
         req_ids_output_copy=["r1"],
+        request_states_output_copy=[request_state],
         req_id_to_index_output_copy={"r1": 0},
         valid_sampled_token_ids=[[]],
         async_sampled_token_ids=None,
@@ -1394,6 +1576,10 @@ def test_build_omni_output_runner_transport_sends_nested_payload(monkeypatch):
         kv_extracted_req_ids=None,
         num_scheduled_tokens_np=np.array([1], dtype=np.int32),
         query_start_loc_cpu=torch.tensor([0], dtype=torch.long),
+        async_chunk_deferred_finish_only={"r1"},
+        async_chunk_deferred_segment_terminals=set(),
+        async_chunk_deferred_final_segments=set(),
+        async_chunk_local_finished={"r1"},
     )
 
     assert output.multimodal_outputs is None
@@ -1405,3 +1591,8 @@ def test_build_omni_output_runner_transport_sends_nested_payload(monkeypatch):
     assert "codes.audio" not in payload
     assert torch.equal(payload["codes"]["audio"], torch.tensor([[7, 8]], dtype=torch.long))
     assert runner._send_side_request_snapshot["ext-r1"].is_finished() is False
+    assert events == [
+        ("payload", False),
+        ("sentinel", True, True),
+    ]
+    assert runner._async_chunk_local_finished_pending == set()

@@ -378,6 +378,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._async_chunk_segment_terminal_sent: set[str] = set()
         self._async_chunk_segment_terminal_pending: set[str] = set()
         self._async_chunk_final_segment_pending: set[str] = set()
+        self._async_chunk_local_finished_pending: set[str] = set()
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -504,16 +505,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             return str(external_req_id)
         return req_id
 
-    def _send_async_chunk_finish_sentinels(self, finished_req_ids: set[str]) -> None:
+    def _send_async_chunk_finish_sentinels(
+        self,
+        finished_req_ids: set[str],
+        local_finished_req_ids: set[str] | None = None,
+    ) -> None:
+        local_finished = self._async_chunk_local_finished_pending_ids()
         for rid in finished_req_ids:
             ext_id = self._request_ids_mapping.get(rid) or self._resolve_transfer_request_id(rid)
             has_sent_chunk = ext_id in self._put_req_chunk
             has_cached_payload = ext_id in self._send_side_request_payload or ext_id in self._pending_streaming_prefills
             if not has_sent_chunk and not has_cached_payload:
                 if not self._request_needs_downstream_stage_payload(rid):
+                    local_finished.discard(rid)
                     continue
             snapshot = self._send_side_request_snapshot.get(ext_id)
-            if not self._async_chunk_segment_terminal_ready(rid):
+            if not self._async_chunk_terminal_ready(rid, local_finished_req_ids):
                 self._async_chunk_segment_terminal_pending_ids().add(rid)
                 self._async_chunk_final_segment_pending_ids().add(rid)
                 continue
@@ -523,6 +530,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             else:
                 request = SimpleNamespace(request_id=rid, req_id=rid, external_req_id=ext_id, is_finished=lambda: True)
             queued = self.enqueue_finish_sentinel(request, ext_id)
+            if queued:
+                local_finished.discard(rid)
             logger.debug(
                 "Qwen3 async chunk request finish sentinel queued: req=%s ext=%s queued=%s",
                 rid,
@@ -568,6 +577,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             pending = self._async_chunk_final_segment_pending = set()
         return pending
 
+    def _async_chunk_local_finished_pending_ids(self) -> set[str]:
+        pending = getattr(self, "_async_chunk_local_finished_pending", None)
+        if pending is None:
+            pending = self._async_chunk_local_finished_pending = set()
+        return pending
+
+    def _async_chunk_terminal_ready(self, req_id: str, local_finished_req_ids: set[str] | None = None) -> bool:
+        local_finished = (
+            self._async_chunk_local_finished_pending_ids() if local_finished_req_ids is None else local_finished_req_ids
+        )
+        return req_id in local_finished or self._async_chunk_segment_terminal_ready(req_id)
+
     def _record_async_chunk_upstream_finished(self, req_ids: set[str]) -> set[str]:
         sent = self._async_chunk_segment_terminal_sent_ids()
         final_pending = self._async_chunk_final_segment_pending_ids()
@@ -591,18 +612,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return True
 
     def _send_async_chunk_segment_sentinels(
-        self, segment_finished_req_ids: set[str], final_req_ids: set[str] | None = None
+        self,
+        segment_finished_req_ids: set[str],
+        final_req_ids: set[str] | None = None,
+        local_finished_req_ids: set[str] | None = None,
     ) -> None:
         sent = self._async_chunk_segment_terminal_sent_ids()
         pending = self._async_chunk_segment_terminal_pending_ids()
         pending.update(segment_finished_req_ids)
         final_pending = self._async_chunk_final_segment_pending_ids()
+        local_finished = self._async_chunk_local_finished_pending_ids()
         if final_req_ids:
             final_pending.update(final_req_ids)
 
         for rid in list(pending):
             ext_id = self._request_ids_mapping.get(rid) or self._resolve_transfer_request_id(rid)
-            ready = self._async_chunk_segment_terminal_ready(rid)
+            ready = self._async_chunk_terminal_ready(rid, local_finished_req_ids)
             if ext_id in sent:
                 if rid in final_pending and not ready:
                     continue
@@ -622,6 +647,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         ext_id,
                         queued,
                     )
+                    if not queued:
+                        continue
+                    local_finished.discard(rid)
                 pending.discard(rid)
                 final_pending.discard(rid)
                 continue
@@ -646,6 +674,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 sent.add(ext_id)
                 pending.discard(rid)
                 final_pending.discard(rid)
+                if request_finished:
+                    local_finished.discard(rid)
 
     def _flush_async_chunk_deferred_sentinels(
         self,
@@ -653,31 +683,45 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         finish_only_req_ids: set[str] | None = None,
         segment_terminal_req_ids: set[str] | None = None,
         final_segment_req_ids: set[str] | None = None,
+        local_finished_req_ids: set[str] | None = None,
     ) -> None:
         if not uses_async_chunk_model_runner_transport(self._omni_stage_model_config()):
             return
-        if getattr(self, "_local_stage_terminal_payload_cache", None):
-            self._sync_local_stage_payloads()
-
         using_explicit_signals = (
-            finish_only_req_ids is not None or segment_terminal_req_ids is not None or final_segment_req_ids is not None
+            finish_only_req_ids is not None
+            or segment_terminal_req_ids is not None
+            or final_segment_req_ids is not None
+            or local_finished_req_ids is not None
         )
         if using_explicit_signals:
             deferred_async_finish_only = set(finish_only_req_ids or ())
             deferred_segment_terminal_ids = set(segment_terminal_req_ids or ())
             deferred_final_segments = set(final_segment_req_ids or ())
+            local_finished = set(local_finished_req_ids or ())
         else:
             deferred_async_finish_only = set(getattr(self, "_async_chunk_deferred_finish_only", set()))
             deferred_segment_terminal_ids = set(getattr(self, "_async_chunk_deferred_segment_terminal_ids", set()))
             deferred_final_segments = set(getattr(self, "_async_chunk_deferred_final_segments", set()))
+            local_finished = set(getattr(self, "_async_chunk_local_finished_pending", set()))
         pending_final_segments = set(getattr(self, "_async_chunk_final_segment_pending", set()))
-        if deferred_async_finish_only:
-            self._send_async_chunk_finish_sentinels(deferred_async_finish_only)
         pending_segments = set(getattr(self, "_async_chunk_segment_terminal_pending", set()))
-        if deferred_segment_terminal_ids or pending_segments or pending_final_segments:
+        segment_dispatch_ids = (
+            deferred_segment_terminal_ids | deferred_final_segments | pending_segments | pending_final_segments
+        )
+        deferred_async_finish_only.difference_update(segment_dispatch_ids)
+        deferred_async_finish_only.update(local_finished - segment_dispatch_ids)
+        if deferred_async_finish_only:
+            self._send_async_chunk_finish_sentinels(
+                deferred_async_finish_only,
+                local_finished_req_ids=local_finished,
+            )
+        if segment_dispatch_ids:
             final_segments = deferred_final_segments | pending_final_segments
-            segment_terminal_ids = deferred_segment_terminal_ids | pending_final_segments
-            self._send_async_chunk_segment_sentinels(segment_terminal_ids, final_req_ids=final_segments)
+            self._send_async_chunk_segment_sentinels(
+                segment_dispatch_ids,
+                final_req_ids=final_segments,
+                local_finished_req_ids=local_finished,
+            )
         if not using_explicit_signals:
             self._async_chunk_deferred_finish_only = set()
             self._async_chunk_deferred_segment_terminal_ids = set()
@@ -794,6 +838,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             self._async_chunk_segment_terminal_pending.clear()
         if hasattr(self, "_async_chunk_final_segment_pending"):
             self._async_chunk_final_segment_pending.clear()
+        if hasattr(self, "_async_chunk_local_finished_pending"):
+            self._async_chunk_local_finished_pending.clear()
 
         # 5. Release all CUDA graphs unconditionally (upstream only does this
         #    on ROCm; on CUDA the graphs are only freed by Python GC during
@@ -1324,7 +1370,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._async_chunk_deferred_segment_terminal_ids = set()
         self._async_chunk_deferred_final_segments = set()
 
-        if hasattr(self, "_omni_connector"):
+        has_omni_connector = hasattr(self, "_omni_connector")
+        async_chunk_transport = has_omni_connector and uses_async_chunk_model_runner_transport(
+            self._omni_stage_model_config()
+        )
+        if has_omni_connector:
             for request in getattr(scheduler_output, "pending_connector_registrations", []):
                 self.register_chunk_recv(request)
             if uses_full_payload_input_coordinator(self._omni_stage_model_config()):
@@ -1334,27 +1384,26 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
-            if uses_async_chunk_model_runner_transport(self._omni_stage_model_config()):
-                # Metadata-only upstream terminals are staged by the connector
-                # receive loop. Make them visible before deciding whether this
-                # stage may forward its own segment/final sentinel.
-                if getattr(self, "_local_stage_terminal_payload_cache", None):
-                    self._sync_local_stage_payloads()
 
-                async_finished = set(getattr(scheduler_output, "finished_req_ids", set()))
-                segment_finished = set(getattr(scheduler_output, "segment_finished_req_ids", set()))
-                pending_segments = set(getattr(self, "_async_chunk_segment_terminal_pending", set()))
-                upstream_finished = set(getattr(scheduler_output, "upstream_finished_req_ids", set()))
-                upstream_final_ready = set()
-                if upstream_finished:
-                    upstream_final_ready = self._record_async_chunk_upstream_finished(upstream_finished)
-                segment_terminal_ids = set(segment_finished)
-                segment_terminal_ids.update(upstream_final_ready)
-                final_segments = async_finished & (segment_finished | pending_segments)
-                final_segments.update(upstream_final_ready)
-                self._async_chunk_deferred_finish_only = async_finished - final_segments
-                self._async_chunk_deferred_segment_terminal_ids = segment_terminal_ids
-                self._async_chunk_deferred_final_segments = final_segments
+        if async_chunk_transport:
+            # Snapshot terminal work before _update_states() can release the
+            # request's send watermark. Received payloads are materialized only
+            # after that update, below, so request metadata cannot overwrite them.
+            async_finished = set(getattr(scheduler_output, "finished_req_ids", set()))
+            self._async_chunk_local_finished_pending_ids().update(async_finished)
+            segment_finished = set(getattr(scheduler_output, "segment_finished_req_ids", set()))
+            pending_segments = set(getattr(self, "_async_chunk_segment_terminal_pending", set()))
+            upstream_finished = set(getattr(scheduler_output, "upstream_finished_req_ids", set()))
+            upstream_final_ready = set()
+            if upstream_finished:
+                upstream_final_ready = self._record_async_chunk_upstream_finished(upstream_finished)
+            segment_terminal_ids = set(segment_finished)
+            segment_terminal_ids.update(upstream_final_ready)
+            final_segments = async_finished & (segment_finished | pending_segments)
+            final_segments.update(upstream_final_ready)
+            self._async_chunk_deferred_finish_only = async_finished - final_segments
+            self._async_chunk_deferred_segment_terminal_ids = segment_terminal_ids
+            self._async_chunk_deferred_final_segments = final_segments
 
         if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
             self.omni_prefix_cache.commit_deferred_mm_outputs(
@@ -1391,6 +1440,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+            if async_chunk_transport:
+                # Make connector terminal metadata visible before sentinel dispatch.
+                self._sync_local_stage_payloads(terminal_only=True)
 
             # Notify model of finished requests for state cleanup
             if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
@@ -2062,9 +2115,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         async_chunk_deferred_finish_only: set[str] | None = None,
         async_chunk_deferred_segment_terminals: set[str] | None = None,
         async_chunk_deferred_final_segments: set[str] | None = None,
+        async_chunk_local_finished: set[str] | None = None,
+        request_states_output_copy: list[Any | None] | None = None,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
+        if request_states_output_copy is None:
+            request_states_output_copy = [self.requests.get(rid) for rid in req_ids_output_copy]
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = self._resolve_sparse_mm_routing(
@@ -2207,21 +2264,18 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if pooler_inter and needs_full_payload_accumulation:
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
                 for i, rid in enumerate(req_ids_output_copy):
-                    req_state = self.requests.get(rid)
+                    req_state = request_states_output_copy[i]
                     if req_state is not None and pooler_inter[i]:
                         self.accumulate_full_payload_output(rid, pooler_inter[i], req_state)
 
         if async_chunk_send_payloads is not None:
             with record_function_or_nullcontext("omni_output_builder:send_async_chunks"):
-                if getattr(self, "_local_stage_terminal_payload_cache", None):
-                    self._sync_local_stage_payloads()
-
                 async_finished = set(getattr(scheduler_output, "finished_req_ids", set()))
                 for i, rid in enumerate(req_ids_output_copy):
                     payload = async_chunk_send_payloads[i]
                     if rid not in downstream_req_id_set or not payload:
                         continue
-                    req_state = self.requests.get(rid)
+                    req_state = request_states_output_copy[i]
                     if req_state is None:
                         continue
                     ext_id = self._resolve_transfer_request_id(rid)
@@ -2229,7 +2283,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     if self._should_skip_async_chunk_payload_after_segment_terminal(rid, ext_id):
                         continue
                     is_terminal = self._async_chunk_payload_is_terminal(rid, async_finished)
-                    if is_terminal and not self._async_chunk_segment_terminal_ready(rid):
+                    # Keep the final data and terminal flush as two ordered connector tasks.
+                    if is_terminal:
                         self._async_chunk_segment_terminal_pending_ids().add(rid)
                         self._async_chunk_final_segment_pending_ids().add(rid)
                         self._async_chunk_deferred_finish_only.discard(rid)
@@ -2252,6 +2307,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             finish_only_req_ids=async_chunk_deferred_finish_only,
             segment_terminal_req_ids=async_chunk_deferred_segment_terminals,
             final_segment_req_ids=async_chunk_deferred_final_segments,
+            local_finished_req_ids=async_chunk_local_finished,
         )
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
@@ -2438,6 +2494,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         query_start_loc_cpu = self._snapshot_query_start_loc_cpu()
         scheduler_output_snapshot = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
         req_ids_output_snapshot = list(req_ids_output_copy)
+        request_states_output_snapshot = [self.requests.get(rid) for rid in req_ids_output_snapshot]
         req_id_to_index_output_snapshot = dict(req_id_to_index_output_copy)
         valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
         invalid_req_indices_snapshot = list(invalid_req_indices)
@@ -2449,6 +2506,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         async_chunk_deferred_finish_only_snapshot = set(getattr(self, "_async_chunk_deferred_finish_only", set()))
         async_chunk_deferred_segment_snapshot = set(getattr(self, "_async_chunk_deferred_segment_terminal_ids", set()))
         async_chunk_deferred_final_snapshot = set(getattr(self, "_async_chunk_deferred_final_segments", set()))
+        async_chunk_local_finished_snapshot = set(getattr(self, "_async_chunk_local_finished_pending", set()))
 
         use_async_omni_output = self._should_use_async_omni_output()
         omni_postprocess_already_applied = False
@@ -2499,6 +2557,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     staged_hidden_states_cpu=output_tensor_snapshot.staged_hidden_states_cpu,
                     multimodal_outputs=output_tensor_snapshot.multimodal_outputs,
                     req_ids_output_copy=req_ids_output_snapshot,
+                    request_states_output_copy=request_states_output_snapshot,
                     req_id_to_index_output_copy=req_id_to_index_output_snapshot,
                     valid_sampled_token_ids=valid_sampled_token_ids_snapshot,
                     async_sampled_token_ids=async_sampled_token_ids_snapshot,
@@ -2515,6 +2574,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     async_chunk_deferred_finish_only=async_chunk_deferred_finish_only_snapshot,
                     async_chunk_deferred_segment_terminals=async_chunk_deferred_segment_snapshot,
                     async_chunk_deferred_final_segments=async_chunk_deferred_final_snapshot,
+                    async_chunk_local_finished=async_chunk_local_finished_snapshot,
                 )
 
         if not use_async_omni_output:
