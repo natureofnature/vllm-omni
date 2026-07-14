@@ -22,6 +22,9 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
   Omni dataset extensions include `daily-omni`, `omniinteract`, `seed-tts`,
   `seed-tts-text`, `seed-tts-design`, `ttsd`, and `sound-effect`.
+  For OmniInteract model profiles and complete MiniCPM-o 4.5, AURA, and custom
+  model examples, see
+  [`benchmarks/omniinteract/README.md`](../../../benchmarks/omniinteract/README.md).
 
 - `--num-prompts`
   The total number of requests to send, an integer.

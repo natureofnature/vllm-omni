@@ -218,6 +218,8 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+
+
 #         audio_urls, video_urls = _omniinteract_media_urls(sample.omni_chat_messages)
 #         logger.info(
 #             "OmniInteract request media: request_id=%s video=%s audio=%s",
@@ -468,10 +470,12 @@ def get_samples(args, tokenizer):
             subsets = ["1q1a", "1q1a_math", "1qna"]
 
         logger.info(
-            "Loading OmniInteract dataset: dataset_path=%s, omniinteract_root=%s, subsets=%s",
+            "Loading OmniInteract dataset: dataset_path=%s, omniinteract_root=%s, subsets=%s, model_special_config=%s",
             dataset_path,
             omniinteract_root,
             subsets,
+            getattr(args, "omniinteract_model_special_config", None)
+            or getattr(args, "omniinteract_input_mode", "video"),
         )
 
         dataset = OmniInteractDataset(
@@ -480,6 +484,7 @@ def get_samples(args, tokenizer):
             random_seed=args.seed,
             subsets=subsets,
             inline_local_video=getattr(args, "omniinteract_inline_local_video", False),
+            model_special_config=getattr(args, "omniinteract_model_special_config", None),
             input_mode=getattr(args, "omniinteract_input_mode", "video"),
             aura_tts_task_type=getattr(args, "omniinteract_aura_tts_task_type", "Base"),
             aura_tts_language=getattr(args, "omniinteract_aura_tts_language", "Chinese"),

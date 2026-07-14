@@ -7,6 +7,7 @@ import json
 import sys
 import tarfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -38,6 +39,9 @@ from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (  # noqa: E4
 from vllm_omni.benchmarks.data_modules.omniinteract_eval import (  # noqa: E402
     compute_omniinteract_metrics,
     print_omniinteract_summary,
+)
+from vllm_omni.benchmarks.patch.patch import (  # noqa: E402
+    _attach_omniinteract_to_request_func_input,
 )
 
 
@@ -183,6 +187,38 @@ def test_omniinteract_dataset_builds_chat_requests(omniinteract_root: Path, mock
     assert req.omni_extra_body == {"mm_processor_kwargs": {"use_audio_in_video": True}}
 
 
+def test_omniinteract_dataset_minicpm_profile_sends_question_audio_once(omniinteract_root: Path, mock_tokenizer):
+    audio_dir = omniinteract_root / "1q1a" / "audios"
+    audio_dir.mkdir()
+    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
+    ds = OmniInteractDataset(
+        dataset_path=str(omniinteract_root),
+        random_seed=0,
+        disable_shuffle=True,
+        model_special_config="minicpmo_4_5",
+    )
+
+    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+
+    assert req.omni_chat_messages is not None
+    user_content = req.omni_chat_messages[1]["content"]
+    assert [item["type"] for item in user_content] == ["audio_url", "video_url"]
+    assert all(item["type"] != "text" for item in user_content)
+    assert req.omni_extra_body == {
+        "modalities": ["text", "audio"],
+        "mm_processor_kwargs": {"use_audio_in_video": False},
+        "chat_template_kwargs": {"use_tts_template": True},
+    }
+    request_input = SimpleNamespace(extra_body={"mm_processor_kwargs": {"global_processor_flag": True}})
+    _attach_omniinteract_to_request_func_input(req, request_input)
+    assert request_input.extra_body["mm_processor_kwargs"] == {
+        "global_processor_flag": True,
+        "use_audio_in_video": False,
+    }
+    assert request_input.extra_body["chat_template_kwargs"] == {"use_tts_template": True}
+    assert request_input.omni_chat_messages == req.omni_chat_messages
+
+
 def test_omniinteract_dataset_aura_mode_sends_audio_and_video(omniinteract_root: Path, mock_tokenizer):
     audio_dir = omniinteract_root / "1q1a" / "audios"
     audio_dir.mkdir()
@@ -242,19 +278,17 @@ def test_omniinteract_dataset_aura_mode_passes_custom_voice_speaker(omniinteract
     assert "tts_ref_text" not in additional_info
 
 
-def test_omniinteract_dataset_aura_mode_requires_base_tts_refs(omniinteract_root: Path, mock_tokenizer):
+def test_omniinteract_dataset_aura_mode_requires_base_tts_refs(omniinteract_root: Path):
     audio_dir = omniinteract_root / "1q1a" / "audios"
     audio_dir.mkdir()
     (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-        input_mode="aura",
-    )
-
     with pytest.raises(ValueError, match="requires both"):
-        ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+        OmniInteractDataset(
+            dataset_path=str(omniinteract_root),
+            random_seed=0,
+            disable_shuffle=True,
+            input_mode="aura",
+        )
 
 
 def test_omniinteract_eval_counts_exact_and_soft_match():
@@ -283,6 +317,8 @@ def test_omniinteract_eval_counts_exact_and_soft_match():
     assert m["omniinteract_exact_count"] == 0
     assert m["omniinteract_soft_count"] == 1
     assert m["omniinteract_ia_qtf1"] == 1.0
+    assert m["omniinteract_profiles"] == ["clip"]
+    assert m["omniinteract_official_compatible"] is False
     assert "omniinteract_ids" in m
     assert "omniinteract_nccs" in m
 

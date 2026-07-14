@@ -76,6 +76,8 @@ def compute_omniinteract_metrics(
     if not all(isinstance(r, OmniInteractSampleRequest) for r in input_requests):
         return None
 
+    profiles = sorted({r.omniinteract_profile for r in input_requests})
+    official_compatible = all(r.omniinteract_official_compatible for r in input_requests)
     exact = 0
     soft = 0
     evaluated = 0
@@ -285,6 +287,8 @@ def compute_omniinteract_metrics(
 
     out: dict[str, Any] = {
         "omniinteract_evaluated": evaluated,
+        "omniinteract_profiles": profiles,
+        "omniinteract_official_compatible": official_compatible,
         "omniinteract_request_failed": failed,
         "omniinteract_exact_match": _safe_ratio(exact, evaluated),
         "omniinteract_soft_match": _safe_ratio(soft, evaluated),
@@ -328,7 +332,8 @@ def compute_omniinteract_metrics(
         },
         "omniinteract_nccs": nccs,
         "omniinteract_metric_note": (
-            "IA-QTF1/IDS/NCCS are estimated from per-request benchmark outputs. "
+            "IA-QTF1/IDS/NCCS are estimated from per-request benchmark outputs and are not "
+            "official-compatible unless omniinteract_official_compatible=true. "
             "IDS CSM_SR/CSM_AS require continuous-turn spill timing; they are N/A "
             "unless outputs provide omniinteract_spill_seconds/spill_seconds."
         ),
@@ -352,6 +357,13 @@ def print_omniinteract_summary(metrics: dict[str, Any]) -> None:
     ):
         return
     print("{s:{c}^{n}}".format(s=" OmniInteract QA metrics ", n=50, c="="))
+    print("{:<40} {:<10}".format("Profiles:", ",".join(metrics.get("omniinteract_profiles") or ["unknown"])))
+    print(
+        "{:<40} {:<10}".format(
+            "Official compatible:",
+            str(bool(metrics.get("omniinteract_official_compatible", False))).lower(),
+        )
+    )
     print("{:<40} {:<10}".format("Evaluated:", metrics.get("omniinteract_evaluated", 0)))
     if metrics.get("omniinteract_ia_qtf1") is not None:
         print("{:<40} {:<10.4f}".format("IA-QTF1 (estimated):", float(metrics.get("omniinteract_ia_qtf1"))))

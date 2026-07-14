@@ -6,10 +6,9 @@ https://huggingface.co/datasets/lucky-lance/OmniInteract
 This loader flattens per-QA annotation entries into independent benchmark
 requests. For ``1q1a`` / ``1q1a_math`` each request uses the per-QA
 ``subvideos/{video}_{qa_idx}.mp4`` clip together with the matching
-``audios/{video}_{qa_idx}.wav`` when present. The default ``video`` input mode
-sends one ``video_url`` (native audio in the video stream) plus a text question.
-The ``aura`` input mode sends only ``audio_url`` + ``video_url`` so ASR receives
-the spoken question while AURA receives the subvideo clip.
+``audios/{video}_{qa_idx}.wav`` when present. A model special config controls
+media order, question-text inclusion, and request-body fields without coupling
+the dataset timeline to a particular serving protocol.
 """
 
 from __future__ import annotations
@@ -20,6 +19,7 @@ import logging
 import os
 import shutil
 import tarfile
+from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -28,17 +28,15 @@ from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
 
+from vllm_omni.benchmarks.adapters.omniinteract import (
+    OmniInteractModelSpecialConfig,
+    load_model_special_config,
+)
+
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
 OmniInteractInputMode = Literal["video", "aura"]
-
-DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT = (
-    "You are answering OmniInteract audio-visual QA tasks. Use the ASR transcript "
-    "of the user's spoken question together with the video frames. Answer the "
-    "question directly and concisely in the same language as the question. "
-    "Do not output '<|silent|>'."
-)
 
 
 def _is_remote_or_data_url(value: str) -> bool:
@@ -59,6 +57,8 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_scene_type: str = ""
     omniinteract_nested_group_id: int | None = None
     omniinteract_nested_role: str = ""
+    omniinteract_profile: str = "clip"
+    omniinteract_official_compatible: bool = False
     omni_extra_body: dict[str, Any] | None = None
     omni_chat_messages: list[dict[str, Any]] | None = None
 
@@ -78,68 +78,6 @@ class _OmniInteractEntry:
     scene_type: str = "multi_turn"
     nested_group_id: int | None = None
     nested_role: str = ""
-
-
-def aura_sampling_params_list() -> list[dict[str, Any]]:
-    return [
-        {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "max_tokens": 256, "seed": 42},
-        {
-            "temperature": 0.5,
-            "top_p": 1.0,
-            "top_k": -1,
-            "max_tokens": 256,
-            "seed": 42,
-            "repetition_penalty": 1.0,
-        },
-        {
-            "temperature": 0.9,
-            "top_k": 50,
-            "max_tokens": 4096,
-            "seed": 42,
-            "detokenize": False,
-            "repetition_penalty": 1.05,
-            "stop_token_ids": [2150],
-        },
-        {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": -1,
-            "max_tokens": 65536,
-            "seed": 42,
-            "repetition_penalty": 1.0,
-        },
-    ]
-
-
-def aura_extra_body(
-    *,
-    tts_task_type: str,
-    tts_language: str,
-    tts_speaker: str | None = None,
-    tts_ref_audio: str | None = None,
-    tts_ref_text: str | None = None,
-) -> dict[str, Any]:
-    additional_information: dict[str, Any] = {
-        "aura_system_prompt": DEFAULT_AURA_SYSTEM_PROMPT_FOR_OMNIINTERACT,
-        "tts_task_type": tts_task_type,
-        "tts_language": tts_language,
-    }
-    if tts_task_type == "Base":
-        if not tts_ref_audio or not tts_ref_text:
-            raise ValueError(
-                "OmniInteract AURA Base TTS requires both --omniinteract-aura-tts-ref-audio "
-                "and --omniinteract-aura-tts-ref-text."
-            )
-        additional_information["tts_ref_audio"] = tts_ref_audio
-        additional_information["tts_ref_text"] = tts_ref_text
-    elif tts_speaker:
-        additional_information["tts_speaker"] = tts_speaker
-    return {
-        "modalities": ["text", "audio"],
-        "mm_processor_kwargs": {"use_audio_in_video": False},
-        "sampling_params_list": aura_sampling_params_list(),
-        "additional_information": additional_information,
-    }
 
 
 def _parse_time_seconds(value: Any) -> float | None:
@@ -336,6 +274,7 @@ class OmniInteractDataset(BenchmarkDataset):
         data_root: str | None = None,
         subsets: list[OmniInteractSubset] | None = None,
         inline_local_video: bool = False,
+        model_special_config: str | dict[str, Any] | OmniInteractModelSpecialConfig | None = None,
         input_mode: OmniInteractInputMode = "video",
         aura_tts_task_type: str = "Base",
         aura_tts_language: str = "Chinese",
@@ -348,12 +287,29 @@ class OmniInteractDataset(BenchmarkDataset):
         self.data_root_input = Path(data_root).expanduser().resolve() if data_root else None
         self.subsets = list(subsets or ["1q1a", "1q1a_math", "1qna"])
         self.inline_local_video = inline_local_video
-        self.input_mode = input_mode
-        self.aura_tts_task_type = aura_tts_task_type
-        self.aura_tts_language = aura_tts_language
-        self.aura_tts_speaker = aura_tts_speaker
-        self.aura_tts_ref_audio = self._normalize_aura_ref_audio(aura_tts_ref_audio)
-        self.aura_tts_ref_text = aura_tts_ref_text
+        if model_special_config is None and input_mode == "aura":
+            additional_information: dict[str, Any] = {
+                "tts_task_type": aura_tts_task_type,
+                "tts_language": aura_tts_language,
+            }
+            if aura_tts_task_type == "Base":
+                ref_audio = self._normalize_aura_ref_audio(aura_tts_ref_audio)
+                if not ref_audio or not aura_tts_ref_text:
+                    raise ValueError(
+                        "OmniInteract AURA Base TTS requires both --omniinteract-aura-tts-ref-audio "
+                        "and --omniinteract-aura-tts-ref-text."
+                    )
+                if ref_audio:
+                    additional_information["tts_ref_audio"] = ref_audio
+                if aura_tts_ref_text:
+                    additional_information["tts_ref_text"] = aura_tts_ref_text
+            elif aura_tts_speaker:
+                additional_information["tts_speaker"] = aura_tts_speaker
+            model_special_config = {
+                "preset": "aura",
+                "extra_body": {"additional_information": additional_information},
+            }
+        self.model_special_config = load_model_special_config(model_special_config)
         self._data_root: Path | None = None
         self._entries: list[_OmniInteractEntry] = []
 
@@ -363,6 +319,12 @@ class OmniInteractDataset(BenchmarkDataset):
             **kwargs,
         )
         self.load_data()
+        logger.info(
+            "OmniInteract model special config: name=%s content_order=%s extra_body_keys=%s",
+            self.model_special_config.name,
+            self.model_special_config.content_order,
+            sorted(self.model_special_config.extra_body),
+        )
 
     def _resolve_data_root(self) -> Path:
         if self._data_root is not None:
@@ -528,23 +490,28 @@ class OmniInteractDataset(BenchmarkDataset):
 
     def _build_messages(
         self,
-        e: _OmniInteractEntry,
+        question_prompt: str,
         video_payload: dict[str, Any],
         audio_payload: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        if audio_payload is not None and self.input_mode == "aura":
-            content: list[dict[str, Any]] = [audio_payload, video_payload]
-        else:
-            content = [video_payload, {"type": "text", "text": self._question_prompt(e)}]
-            if audio_payload is not None:
-                content = [audio_payload, *content]
+        payloads: dict[str, dict[str, Any] | None] = {
+            "audio": audio_payload,
+            "video": video_payload,
+            "question": {"type": "text", "text": question_prompt},
+        }
+        content: list[dict[str, Any]] = []
+        for kind in self.model_special_config.content_order:
+            item = payloads[kind]
+            if item is None:
+                raise ValueError(f"OmniInteract profile {self.model_special_config.name!r} requires unavailable media.")
+            content.append(item)
         return [
             {
                 "role": "system",
                 "content": [
                     {
                         "type": "text",
-                        "text": "You are a helpful multimodal assistant that understands video and audio.",
+                        "text": self.model_special_config.system_prompt,
                     }
                 ],
             },
@@ -573,31 +540,25 @@ class OmniInteractDataset(BenchmarkDataset):
                 break
             if not entry.video_path.is_file():
                 continue
-            if self.input_mode == "aura":
-                prompt = entry.question_text
-            else:
-                prompt = self._question_prompt(entry)
-            payload = self._video_payload(entry.video_path)
-            audio_payload = None
-            extra_body = {"mm_processor_kwargs": {"use_audio_in_video": True}}
-            if self.input_mode == "aura":
-                if entry.audio_path is None or not entry.audio_path.is_file():
-                    logger.warning(
-                        "Skipping OmniInteract row without synthesized audio for AURA mode: subset=%s video=%s audio=%s",
-                        entry.subset,
-                        entry.video_rel,
-                        entry.audio_path,
-                    )
-                    continue
-                audio_payload = self._audio_payload(entry.audio_path)
-                extra_body = aura_extra_body(
-                    tts_task_type=self.aura_tts_task_type,
-                    tts_language=self.aura_tts_language,
-                    tts_speaker=self.aura_tts_speaker,
-                    tts_ref_audio=self.aura_tts_ref_audio,
-                    tts_ref_text=self.aura_tts_ref_text,
+            if self.model_special_config.requires_audio and (
+                entry.audio_path is None or not entry.audio_path.is_file()
+            ):
+                logger.warning(
+                    "Skipping OmniInteract row without required audio: profile=%s subset=%s video=%s audio=%s",
+                    self.model_special_config.name,
+                    entry.subset,
+                    entry.video_rel,
+                    entry.audio_path,
                 )
-            messages = self._build_messages(entry, payload, audio_payload)
+                continue
+            question_prompt = self._question_prompt(entry)
+            prompt = question_prompt if "question" in self.model_special_config.content_order else entry.question_text
+            audio_payload = None
+            if self.model_special_config.requires_audio:
+                assert entry.audio_path is not None
+                audio_payload = self._audio_payload(entry.audio_path)
+            payload = self._video_payload(entry.video_path)
+            messages = self._build_messages(question_prompt, payload, audio_payload)
             prompt_len = len(tok.encode(prompt))
             out.append(
                 OmniInteractSampleRequest(
@@ -616,7 +577,7 @@ class OmniInteractDataset(BenchmarkDataset):
                     omniinteract_scene_type=entry.scene_type,
                     omniinteract_nested_group_id=entry.nested_group_id,
                     omniinteract_nested_role=entry.nested_role,
-                    omni_extra_body=extra_body,
+                    omni_extra_body=deepcopy(self.model_special_config.extra_body),
                     omni_chat_messages=messages,
                 )
             )
