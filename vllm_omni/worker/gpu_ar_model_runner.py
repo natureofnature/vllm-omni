@@ -9,7 +9,8 @@ from __future__ import annotations
 import gc
 import threading
 from collections.abc import Callable, Mapping, Sequence
-from contextlib import nullcontext
+from concurrent.futures import Future
+from contextlib import contextmanager, nullcontext
 from copy import copy
 from dataclasses import replace
 from types import SimpleNamespace
@@ -92,6 +93,40 @@ def _resolve_async_output_token_ids(
         num_to_replace = min(len(sampled_token_ids), num_placeholders)
         token_ids[first_placeholder : first_placeholder + num_to_replace] = sampled_token_ids[:num_to_replace]
     return _strip_async_placeholder_token_ids(token_ids)
+
+
+def _snapshot_request_state_for_async_output(request_state: Any | None) -> Any | None:
+    """Freeze request progress consumed by an asynchronous output builder."""
+    if request_state is None:
+        return None
+
+    snapshot = copy(request_state)
+    prompt_token_ids = getattr(request_state, "prompt_token_ids", None)
+    snapshot.prompt_token_ids = list(prompt_token_ids) if prompt_token_ids is not None else None
+    snapshot.output_token_ids = list(getattr(request_state, "output_token_ids", []) or [])
+    return snapshot
+
+
+@contextmanager
+def _ordered_async_output_build(
+    predecessor: Future[None] | None,
+    completion: Future[None] | None,
+):
+    if completion is None:
+        yield
+        return
+
+    assert predecessor is not None
+    try:
+        predecessor.result()
+        yield
+    except BaseException as exc:
+        if not completion.done():
+            completion.set_exception(exc)
+        raise
+    else:
+        if not completion.done():
+            completion.set_result(None)
 
 
 def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
@@ -186,6 +221,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         *,
         model_runner_output_builder: Callable[[], OmniModelRunnerOutput],
         cuda_device: torch.device | int | str | None = None,
+        builder_completion: Future[None] | None = None,
         **kwargs: Any,
     ) -> None:
         sampled_token_ids = kwargs.pop("sampled_token_ids")
@@ -224,6 +260,7 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
         self._background_exception: BaseException | None = None
         self._background_thread: threading.Thread | None = None
         self._cuda_device = cuda_device
+        self._builder_completion = builder_completion
 
     def start_background_builder(self) -> None:
         if self._background_thread is not None or self._model_runner_output is not None:
@@ -249,6 +286,9 @@ class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
             self._build_model_runner_output_once()
         except BaseException as exc:  # noqa: BLE001 - re-raised by get_output().
             self._background_exception = exc
+            completion = getattr(self, "_builder_completion", None)
+            if completion is not None and not completion.done():
+                completion.set_exception(exc)
 
     def get_output(self) -> OmniModelRunnerOutput:
         background_thread = getattr(self, "_background_thread", None)
@@ -379,6 +419,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._async_chunk_segment_terminal_pending: set[str] = set()
         self._async_chunk_final_segment_pending: set[str] = set()
         self._async_chunk_local_finished_pending: set[str] = set()
+        self._async_output_builder_tail: Future[None] = Future()
+        self._async_output_builder_tail.set_result(None)
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -2494,7 +2536,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         query_start_loc_cpu = self._snapshot_query_start_loc_cpu()
         scheduler_output_snapshot = self._snapshot_scheduler_output_for_async_omni_output(scheduler_output)
         req_ids_output_snapshot = list(req_ids_output_copy)
-        request_states_output_snapshot = [self.requests.get(rid) for rid in req_ids_output_snapshot]
+        if uses_async_chunk_model_runner_transport(self._omni_stage_model_config()):
+            request_states_output_snapshot = [
+                _snapshot_request_state_for_async_output(self.requests.get(rid)) for rid in req_ids_output_snapshot
+            ]
+        else:
+            request_states_output_snapshot = [self.requests.get(rid) for rid in req_ids_output_snapshot]
         req_id_to_index_output_snapshot = dict(req_id_to_index_output_copy)
         valid_sampled_token_ids_snapshot = [list(token_ids) for token_ids in valid_sampled_token_ids]
         invalid_req_indices_snapshot = list(invalid_req_indices)
@@ -2509,6 +2556,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         async_chunk_local_finished_snapshot = set(getattr(self, "_async_chunk_local_finished_pending", set()))
 
         use_async_omni_output = self._should_use_async_omni_output()
+        order_async_chunk_output = use_async_omni_output and uses_async_chunk_model_runner_transport(
+            self._omni_stage_model_config()
+        )
+        builder_predecessor = self._async_output_builder_tail if order_async_chunk_output else None
+        builder_completion: Future[None] | None = Future() if order_async_chunk_output else None
         omni_postprocess_already_applied = False
         if use_async_omni_output:
             omni_postprocess_already_applied = self._maybe_run_eager_omni_postprocess_before_async_output(
@@ -2550,7 +2602,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if output_tensor_snapshot.async_payload is not None:
                 with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
                     output_tensor_snapshot.async_payload.wait()
-            with record_function_or_nullcontext("omni_output_builder:total"):
+            with (
+                _ordered_async_output_build(builder_predecessor, builder_completion),
+                record_function_or_nullcontext("omni_output_builder:total"),
+            ):
                 return self._build_omni_model_runner_output_from_snapshot(
                     scheduler_output=scheduler_output_snapshot,
                     hidden_states=output_tensor_snapshot.hidden_states,
@@ -2595,6 +2650,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 async_output = async_output_cls(
                     model_runner_output_builder=output_builder,
                     cuda_device=self.device,
+                    builder_completion=builder_completion,
                     **async_output_kwargs,
                 )
                 async_output_for_payload = cast(OmniAsyncGPUModelRunnerOutput, async_output)
@@ -2612,6 +2668,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         if use_async_omni_output:
             cast(OmniAsyncGPUModelRunnerOutput, async_output).start_background_builder()
+            if builder_completion is not None:
+                self._async_output_builder_tail = builder_completion
 
         return async_output
 

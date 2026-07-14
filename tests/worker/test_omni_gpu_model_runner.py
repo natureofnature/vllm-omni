@@ -493,6 +493,8 @@ def test_update_intermediate_buffer_replaces_nonprefix_shorter_prefill_state():
 
 def test_streaming_segment_reset_does_not_require_finished_marker():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    reset_calls = []
+    runner.reset_segment_send_watermark = reset_calls.append
     old_decode = torch.tensor([[9.0, 9.0]])
     old_cached_decode = torch.tensor([[8.0, 8.0]])
     new_prefill = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
@@ -514,6 +516,15 @@ def test_streaming_segment_reset_does_not_require_finished_marker():
     }
 
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
+
+    reset_buf = runner.model_intermediate_buffer["r1"]
+    assert set(reset_buf) == {"omni_final_stage_id", "meta"}
+    assert reset_buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
+    assert runner.requests["r1"].additional_information_cpu is reset_buf
+    assert runner.requests["r1"].resumable is True
+    assert reset_calls == ["r1"]
+    assert runner._segment_send_watermark_reset_req_ids == {"r1"}
+
     OmniGPUModelRunner._update_intermediate_buffer(
         runner,
         "r1",
@@ -538,42 +549,6 @@ def test_streaming_segment_reset_does_not_require_finished_marker():
     assert "model_specific_segment_state" not in buf
     assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
     assert "r1" not in runner._segment_runtime_reset_req_ids
-
-
-def test_streaming_input_update_marks_cached_request_resumable():
-    runner = _make_runner(req_ids=("r1",), hidden_size=4)
-
-    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
-
-    assert runner.requests["r1"].resumable is True
-
-
-def test_streaming_input_update_clears_previous_segment_runtime():
-    runner = _make_runner(req_ids=("r1",), hidden_size=4)
-    reset_calls = []
-    runner.reset_segment_send_watermark = reset_calls.append
-    runner.model_intermediate_buffer["r1"] = {
-        "omni_final_stage_id": 2,
-        "embed": {"prefill": torch.ones(2, 2), "decode": torch.ones(1, 2)},
-        "hidden_states": {"output": torch.ones(2, 2)},
-        "ids": {"prompt": [1, 2], "output": [3]},
-        "meta": {
-            "num_processed_tokens": 81,
-            "is_segment_finished": torch.tensor(False),
-        },
-        "model_specific_segment_state": {"stale": True},
-    }
-
-    OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
-
-    buf = runner.model_intermediate_buffer["r1"]
-    assert buf["omni_final_stage_id"] == 2
-    assert set(buf) == {"omni_final_stage_id", "meta"}
-    assert buf["meta"] == {"num_processed_tokens": 0, "resumable": True}
-    assert runner.requests["r1"].additional_information_cpu is buf
-    assert runner.requests["r1"].resumable is True
-    assert reset_calls == ["r1"]
-    assert runner._segment_send_watermark_reset_req_ids == {"r1"}
 
 
 def test_segment_send_watermark_reset_uses_resolved_transfer_id():
@@ -642,9 +617,7 @@ def test_sync_local_stage_payloads_preserves_new_decode_after_segment_reset():
             "hidden_states": {"output": new_hidden},
         }
     }
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
@@ -665,10 +638,7 @@ def test_build_model_kwargs_keeps_preprocess_stage_mtp_codes_until_forward():
     runner.model_config = SimpleNamespace(has_sampling_extra_args=False)
     runner._omni_num_scheduled_tokens_np = None
     runner._omni_query_start_loc_model_kwarg = False
-    runner._local_stage_terminal_payload_cache = {}
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     codes = torch.tensor([[1, 2, 3, 4]])
     runner.model_intermediate_buffer["r1"] = {"codes": {"audio": codes}}
@@ -690,10 +660,7 @@ def test_build_model_kwargs_syncs_local_payload_for_no_preprocess_stage():
     runner.model_config = SimpleNamespace(has_sampling_extra_args=False)
     runner._omni_num_scheduled_tokens_np = None
     runner._omni_query_start_loc_model_kwarg = False
-    runner._local_stage_terminal_payload_cache = {}
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     payload = {"codes": {"audio": torch.tensor([[7, 8]])}}
     runner._local_stage_payload_cache = {"r1": payload}
@@ -714,75 +681,65 @@ def _enable_qwen3_talker_async_chunk(runner):
     )
 
 
-def test_build_omni_mm_payload_keeps_multi_token_hidden_state_span():
-    runner = object.__new__(GPUARModelRunner)
-    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+def _prepare_local_stage_payload_sync(runner):
+    runner._local_stage_terminal_payload_cache = {}
+    runner._full_payload_pending_broadcast_req_ids = set()
+    runner._finished_load_reqs = set()
+    runner._lock = None
+    runner._work_available = None
 
-    payload = GPUARModelRunner._build_omni_mm_payload(
+
+def _build_flat_hidden_payload(
+    hidden: torch.Tensor,
+    *,
+    idx: int,
+    start: int,
+    end: int,
+    seq_len: int,
+    qwen3_thinker: bool = False,
+):
+    runner = object.__new__(GPUARModelRunner)
+    if qwen3_thinker:
+        runner.model_config = SimpleNamespace(
+            model_arch="Qwen3OmniMoeForConditionalGeneration",
+            model_stage="thinker",
+            async_chunk=True,
+        )
+    return GPUARModelRunner._build_omni_mm_payload(
         runner,
         combined_multimodal_outputs=None,
         mm_cpu={"hidden_states.layer_0": hidden},
         rid="r1",
-        idx=0,
-        start=0,
-        end=6,
+        idx=idx,
+        start=start,
+        end=end,
         audio_sparse_output=False,
         sparse_mm_index={},
-        seq_len=6,
+        seq_len=seq_len,
         build_flat_payload=True,
     )
+
+
+def test_build_omni_mm_payload_keeps_multi_token_hidden_state_span():
+    hidden = torch.arange(12, dtype=torch.float32).reshape(6, 2)
+
+    payload = _build_flat_hidden_payload(hidden, idx=0, start=0, end=6, seq_len=6)
 
     assert torch.equal(payload["hidden_states.layer_0"], hidden)
 
 
 def test_build_omni_mm_payload_slices_padded_qwen3_hidden_state_span():
-    runner = object.__new__(GPUARModelRunner)
-    runner.model_config = SimpleNamespace(
-        model_arch="Qwen3OmniMoeForConditionalGeneration",
-        model_stage="thinker",
-        async_chunk=True,
-    )
     hidden = torch.arange(16, dtype=torch.float32).reshape(8, 2)
 
-    payload = GPUARModelRunner._build_omni_mm_payload(
-        runner,
-        combined_multimodal_outputs=None,
-        mm_cpu={"hidden_states.layer_0": hidden},
-        rid="r1",
-        idx=1,
-        start=5,
-        end=6,
-        audio_sparse_output=False,
-        sparse_mm_index={},
-        seq_len=7,
-        build_flat_payload=True,
-    )
+    payload = _build_flat_hidden_payload(hidden, idx=1, start=5, end=6, seq_len=7, qwen3_thinker=True)
 
     assert torch.equal(payload["hidden_states.layer_0"], hidden[5:6])
 
 
 def test_build_omni_mm_payload_keeps_presliced_qwen3_hidden_state_span():
-    runner = object.__new__(GPUARModelRunner)
-    runner.model_config = SimpleNamespace(
-        model_arch="Qwen3OmniMoeForConditionalGeneration",
-        model_stage="thinker",
-        async_chunk=True,
-    )
     hidden = torch.arange(6, dtype=torch.float32).reshape(3, 2)
 
-    payload = GPUARModelRunner._build_omni_mm_payload(
-        runner,
-        combined_multimodal_outputs=None,
-        mm_cpu={"hidden_states.layer_0": hidden},
-        rid="r1",
-        idx=1,
-        start=5,
-        end=8,
-        audio_sparse_output=False,
-        sparse_mm_index={},
-        seq_len=10,
-        build_flat_payload=True,
-    )
+    payload = _build_flat_hidden_payload(hidden, idx=1, start=5, end=8, seq_len=10, qwen3_thinker=True)
 
     assert torch.equal(payload["hidden_states.layer_0"], hidden)
     assert payload["hidden_states.layer_0"] is not hidden
@@ -821,11 +778,7 @@ def test_sync_local_stage_payloads_defers_reused_streaming_segment_until_termina
             "ids": {"prompt": [1, 2]},
         }
     }
-    runner._local_stage_terminal_payload_cache = {}
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._finished_load_reqs = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
@@ -898,9 +851,7 @@ def test_sync_local_stage_payloads_reset_drops_stale_decode_progress_meta():
             },
         }
     }
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, "r1")
     OmniGPUModelRunner._sync_local_stage_payloads(runner, {"r1"})
@@ -939,9 +890,7 @@ def test_sync_local_stage_payloads_request_finish_prefill_keeps_decode_progress(
             "meta": {"finished": torch.tensor(True)},
         }
     }
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
@@ -991,9 +940,7 @@ def test_sync_local_stage_payloads_terminal_cache_keeps_forward_progress():
             },
         }
     }
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
@@ -1041,9 +988,7 @@ def test_sync_local_stage_payloads_final_prefill_does_not_reset_after_segment_ma
             },
         }
     }
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
@@ -1072,9 +1017,7 @@ def test_sync_local_stage_payloads_prefill_does_not_reset_without_async_chunk():
         "meta": {"is_segment_finished": torch.tensor(False), "num_processed_tokens": 81},
     }
     runner._local_stage_payload_cache = {"r1": {"embed": {"prefill": new_prefill}}}
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 
@@ -1096,9 +1039,7 @@ def test_sync_local_stage_payloads_decode_only_keeps_current_segment_state():
         "meta": {"num_processed_tokens": 1},
     }
     runner._local_stage_payload_cache = {"r1": {"embed": {"decode": new_decode}}}
-    runner._full_payload_pending_broadcast_req_ids = set()
-    runner._lock = None
-    runner._work_available = None
+    _prepare_local_stage_payload_sync(runner)
 
     OmniGPUModelRunner._sync_local_stage_payloads(runner)
 

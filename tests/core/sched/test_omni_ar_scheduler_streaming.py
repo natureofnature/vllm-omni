@@ -440,43 +440,46 @@ def test_downstream_model_runner_streaming_update_waits_for_connector_payload() 
     assert session.sampling_params.max_tokens == 16
 
 
-def test_stage0_streaming_update_discards_outstanding_async_placeholder_token() -> None:
+@pytest.mark.parametrize(
+    ("num_placeholders", "spec_token_ids", "expected_prompt", "expected_discard"),
+    [
+        pytest.param(
+            1,
+            [-1],
+            [1, 2, 3, 7, 8, 10, 20],
+            1,
+            id="discard-outstanding-placeholder",
+        ),
+        pytest.param(
+            0,
+            [],
+            [1, 2, 3, 7, 8, 9, 10, 20],
+            0,
+            id="keep-all-computed-tokens",
+        ),
+    ],
+)
+def test_stage0_streaming_update_rebuilds_prompt(
+    num_placeholders: int,
+    spec_token_ids: list[int],
+    expected_prompt: list[int],
+    expected_discard: int,
+) -> None:
     sched = _make_scheduler(stage_id=0)
     session = _make_request()
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.append_output_token_ids([7, 8, 9])
     session.num_computed_tokens = 6
-    session.num_output_placeholders = 1
-    session.spec_token_ids = [-1]
+    session.num_output_placeholders = num_placeholders
+    session.spec_token_ids = spec_token_ids
 
     sched._update_request_as_session(session, _make_update([10, 20]))
 
-    assert session.async_tokens_to_discard == 1
+    assert getattr(session, "async_tokens_to_discard", 0) == expected_discard
     assert session.num_output_placeholders == 0
     assert session.spec_token_ids == []
-    # The async placeholder makes token 9 unconfirmed, so only 7 and 8 are
-    # carried into the next streaming prompt before the new chunk tokens.
-    assert session.prompt_token_ids == [1, 2, 3, 7, 8, 10, 20]
-    assert list(session._all_token_ids) == [1, 2, 3, 7, 8, 10, 20]
+    assert session.prompt_token_ids == expected_prompt
+    assert list(session._all_token_ids) == expected_prompt
     assert session._output_token_ids == []
-    assert session.num_prompt_tokens == 7
-    assert sched._new_prompt_len_snapshot[session.request_id] == 2
-
-
-def test_stage0_streaming_update_keeps_all_computed_tokens_without_placeholder() -> None:
-    sched = _make_scheduler(stage_id=0)
-    session = _make_request()
-    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
-    session.append_output_token_ids([7, 8, 9])
-    session.num_computed_tokens = 6
-    session.num_output_placeholders = 0
-
-    sched._update_request_as_session(session, _make_update([10, 20]))
-
-    assert getattr(session, "async_tokens_to_discard", 0) == 0
-    assert session.num_output_placeholders == 0
-    assert session.prompt_token_ids == [1, 2, 3, 7, 8, 9, 10, 20]
-    assert list(session._all_token_ids) == [1, 2, 3, 7, 8, 9, 10, 20]
-    assert session._output_token_ids == []
-    assert session.num_prompt_tokens == 8
+    assert session.num_prompt_tokens == len(expected_prompt)
     assert sched._new_prompt_len_snapshot[session.request_id] == 2

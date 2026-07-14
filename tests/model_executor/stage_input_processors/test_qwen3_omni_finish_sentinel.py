@@ -7,6 +7,7 @@ is a control-only marker and must not rebuild audio from cached history.
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from vllm_omni.data_entry_keys import ASYNC_FINISH_SENTINEL_KEY
@@ -63,23 +64,17 @@ def test_talker2code2wav_async_chunk_accepts_flat_payload():
     assert torch.equal(out.codes.audio, frame.transpose(0, 1).reshape(-1))
 
 
-def test_finished_real_payload_flushes_partial_tail():
-    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 6)]}, chunk_frames=4, left_frames=25)
-    tm.put_req_chunk = {"r": 1}
-    req = SimpleNamespace(external_req_id="r")
-    frame = torch.tensor([[6]])
-
-    out = talker2code2wav_async_chunk(tm, {"codes": {"audio": frame}}, req, is_finished=True)
-
-    assert out is not None
-    assert bool(out.meta.finished) is True
-    assert out.meta.left_context_size == 4
-    assert isinstance(out.codes.audio, torch.Tensor)
-    assert out.codes.audio.numel() == 6
-
-
-def test_finished_real_payload_flushes_partial_tail_after_initial_chunk():
-    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 6)]}, chunk_frames=25, initial_frames=4)
+@pytest.mark.parametrize(
+    ("chunk_frames", "initial_frames"),
+    [(4, None), (25, 4)],
+    ids=["regular-chunk", "initial-chunk"],
+)
+def test_finished_real_payload_flushes_partial_tail(chunk_frames: int, initial_frames: int | None):
+    tm = _tm(
+        {"r": [torch.tensor([[i]]) for i in range(1, 6)]},
+        chunk_frames=chunk_frames,
+        initial_frames=initial_frames,
+    )
     tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
     frame = torch.tensor([[6]])
@@ -107,10 +102,13 @@ def test_finish_sentinel_flushes_partial_tail_without_finishing_request():
     assert out.codes.audio.numel() == 3
 
 
-def test_finish_sentinel_on_chunk_boundary_emits_flag_only():
-    # 4 frames, chunk size 4 -> the last full chunk was already sent in-step;
-    # no unsent tail, so the sentinel must NOT re-send codec (flag only).
-    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 5)]}, chunk_frames=4)
+@pytest.mark.parametrize(
+    "chunk_config",
+    [{"chunk_frames": 4}, {"chunk_frames": 25, "initial_frames": 4}],
+    ids=["regular-chunk", "initial-chunk"],
+)
+def test_finish_sentinel_on_chunk_boundary_emits_flag_only(chunk_config: dict[str, int]):
+    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 5)]}, **chunk_config)
     tm.put_req_chunk = {"r": 1}
     req = SimpleNamespace(external_req_id="r")
 
@@ -140,17 +138,6 @@ def test_non_sentinel_empty_call_is_unchanged():
 
     assert talker2code2wav_async_chunk(tm, {"codes": {}}, req, is_finished=True) is None
     assert talker2code2wav_async_chunk(tm, {}, req, is_finished=True) is None
-
-
-def test_finish_sentinel_on_initial_chunk_boundary_emits_flag_only():
-    tm = _tm({"r": [torch.tensor([[i]]) for i in range(1, 5)]}, chunk_frames=25, initial_frames=4)
-    tm.put_req_chunk = {"r": 1}
-    req = SimpleNamespace(external_req_id="r")
-    out = talker2code2wav_async_chunk(tm, _sentinel_payload(), req, is_finished=True)
-
-    assert out is not None
-    assert bool(out.meta.finished) is True
-    assert out.codes is None, "initial-boundary finish must not re-send the initial chunk"
 
 
 def test_finish_sentinel_after_initial_partial_flushes_tail():

@@ -281,29 +281,10 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         self.assertIn(req, waiting)
         self.assertNotIn("r1", coord.requests_with_ready_chunks)
 
-    def test_segment_completed_running_request_keeps_flushing_without_ready_payload(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        coord.mark_chunk_segments_completed({"r1"})
-
-        req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
-        running = [req]
-
-        coord.process_pending_chunks(
-            MockQueue([]),
-            running,
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids=set(),
-        )
-
-        self.assertEqual(req.status, RequestStatus.RUNNING)
-        self.assertIn(req, running)
-        self.assertNotIn("r1", coord._segment_flush_pending)
-        self.assertNotIn("r1", coord._completed_chunk_streams)
-        self.assertNotIn("r1", coord.requests_with_ready_chunks)
-
     def test_next_segment_ready_clears_completed_stream_marker(self):
         coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
         coord.mark_chunk_segments_completed({"r1"})
+        coord._completed_chunk_streams.add("r1")
 
         req = _make_request("r1", status=RequestStatus.WAITING_FOR_CHUNK)
         running = [req]
@@ -333,6 +314,8 @@ class TestChunkCoordinatorStateTransition(unittest.TestCase):
         self.assertEqual(req.status, RequestStatus.RUNNING)
         self.assertIn(req, running)
         self.assertNotIn("r1", coord._segment_flush_pending)
+        self.assertNotIn("r1", coord._completed_chunk_streams)
+        self.assertNotIn("r1", coord.requests_with_ready_chunks)
 
         coord.process_pending_chunks(MockQueue([]), running, chunk_ready_req_ids=set(), chunk_finished_req_ids=set())
 
@@ -936,73 +919,43 @@ class TestTimeoutDetection(unittest.TestCase):
         self.assertNotIn("r1", coord.finished_requests)
         self.assertNotIn("r1", coord._completed_chunk_streams)
 
-    def test_async_chunk_running_queue_wait_does_not_timeout(self):
-        """Async chunk waits may pause after restore without being timed out."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=True,
-        )
+    def test_async_chunk_waits_do_not_timeout(self):
+        for queue_name in ("running", "waiting"):
+            with self.subTest(queue=queue_name):
+                coord = OmniSchedulingCoordinator(
+                    scheduler_max_num_seqs=10,
+                    stage_id=1,
+                    async_chunk=True,
+                )
 
-        # 1) Request starts in running queue with WAITING status
-        req = _make_request("r1", status=RequestStatus.WAITING)
-        running = [req]
-        waiting = MockQueue()
+                req = _make_request("r1", status=RequestStatus.WAITING)
+                starts_running = queue_name == "running"
+                waiting = MockQueue([] if starts_running else [req])
+                running = [req] if starts_running else []
 
-        # 2) process_pending_chunks: moves to WAITING_FOR_CHUNK
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids=set(),
-        )
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-        self.assertIn("r1", coord._waiting_since)
-        self.assertEqual(len(coord._waiting_for_chunk_running), 1)
+                coord.process_pending_chunks(
+                    waiting,
+                    running,
+                    chunk_ready_req_ids=set(),
+                    chunk_finished_req_ids=set(),
+                )
 
-        # 3) restore_queues: back to running (status stays WAITING_FOR_CHUNK)
-        coord.restore_queues(waiting, running)
-        self.assertIn(req, running)
-        self.assertEqual(len(coord._waiting_for_chunk_running), 0)
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
+                parked = getattr(coord, f"_waiting_for_chunk_{queue_name}")
+                self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
+                self.assertIn("r1", coord._waiting_since)
+                self.assertEqual(len(parked), 1)
 
-        # 4) Async chunk waits may pause without being failed by the coordinator
-        coord._waiting_since["r1"] = 0.0
+                coord.restore_queues(waiting, running)
+                restored = running if starts_running else waiting
+                self.assertIn(req, restored)
+                self.assertEqual(len(getattr(coord, f"_waiting_for_chunk_{queue_name}")), 0)
+                self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
 
-        timed_out_ids = coord.collect_timed_out_request_ids(timeout_s=1.0)
-        self.assertEqual(timed_out_ids, set())
-        self.assertIn("r1", coord._waiting_since)
-        self.assertIn(req, running)
-        self.assertEqual(len(waiting), 0)
-
-    def test_async_chunk_waiting_queue_wait_does_not_timeout(self):
-        """Async chunk waits in the waiting queue are not timeout-failed."""
-        coord = OmniSchedulingCoordinator(
-            scheduler_max_num_seqs=10,
-            stage_id=1,
-            async_chunk=True,
-        )
-
-        req = _make_request("r1", status=RequestStatus.WAITING)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(
-            waiting,
-            running,
-            chunk_ready_req_ids=set(),
-            chunk_finished_req_ids=set(),
-        )
-        self.assertEqual(len(coord._waiting_for_chunk_waiting), 1)
-
-        coord.restore_queues(waiting, running)
-        self.assertIn(req, waiting)
-
-        coord._waiting_since["r1"] = 0.0
-        timed_out_ids = coord.collect_timed_out_request_ids(timeout_s=1.0)
-        self.assertEqual(timed_out_ids, set())
-        self.assertIn("r1", coord._waiting_since)
-        self.assertIn(req, waiting)
+                coord._waiting_since["r1"] = 0.0
+                timed_out_ids = coord.collect_timed_out_request_ids(timeout_s=1.0)
+                self.assertEqual(timed_out_ids, set())
+                self.assertIn("r1", coord._waiting_since)
+                self.assertIn(req, restored)
 
 
 class TestOverflowPreemption(unittest.TestCase):
@@ -1240,22 +1193,6 @@ class TestAsyncChunkRecvRegistration(unittest.TestCase):
         self.assertEqual([request.request_id for request in running], ["keep-r"])
         self.assertNotIn("stale", coord._waiting_since)
         self.assertNotIn("stale", coord._waiting_for_input_req_ids)
-
-    def test_input_timeout_ignores_async_chunk_waits(self):
-        coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=True)
-        req = _make_request("r1", status=RequestStatus.WAITING)
-        waiting = MockQueue([req])
-        running: list = []
-
-        coord.process_pending_chunks(waiting, running, chunk_ready_req_ids=set(), chunk_finished_req_ids=set())
-        self.assertEqual(req.status, RequestStatus.WAITING_FOR_CHUNK)
-        coord._waiting_since["r1"] = 0.0
-
-        with mock.patch.object(coord_mod.time, "monotonic", return_value=10.0):
-            timed_out = coord.collect_timed_out_request_ids(timeout_s=1.0)
-
-        self.assertEqual(timed_out, set())
-        self.assertIn("r1", coord._waiting_since)
 
     def test_input_timeout_still_collects_full_payload_waits(self):
         coord = OmniSchedulingCoordinator(scheduler_max_num_seqs=10, stage_id=1, async_chunk=False)

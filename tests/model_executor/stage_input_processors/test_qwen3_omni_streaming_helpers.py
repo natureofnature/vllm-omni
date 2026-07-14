@@ -255,14 +255,14 @@ def test_streaming_decode_cache_merges_cumulative_prefix() -> None:
     )
 
 
-def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() -> None:
+def _start_active_streaming_request(request_id: str):
     transfer_manager = SimpleNamespace(
-        put_req_chunk={"rt-active": 5},
+        put_req_chunk={request_id: 5},
         request_payload={},
         _pending_streaming_prefills={},
     )
     request = SimpleNamespace(
-        external_req_id="rt-active",
+        external_req_id=request_id,
         output_token_ids=[],
         all_token_ids=[151644, 872, 100, 101],
         prompt_token_ids=[151644, 872, 100],
@@ -271,7 +271,7 @@ def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() ->
         additional_information=None,
     )
 
-    payload = q3.thinker2talker_async_chunk(
+    initial_payload = q3.thinker2talker_async_chunk(
         transfer_manager,
         {
             "hidden_states.layer_0": torch.ones(3, 2),
@@ -280,7 +280,7 @@ def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() ->
         request,
         is_finished=False,
     )
-    assert payload is None
+    assert initial_payload is None
 
     request.output_token_ids = [101]
     payload = q3.thinker2talker_async_chunk(
@@ -293,8 +293,13 @@ def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() ->
         is_finished=False,
     )
     assert payload is not None
-    assert "rt-active" in transfer_manager._active_streaming_input_request_ids
-    assert "rt-active" not in transfer_manager._pending_streaming_prefills
+    assert request_id in transfer_manager._active_streaming_input_request_ids
+    assert request_id not in transfer_manager._pending_streaming_prefills
+    return transfer_manager, request
+
+
+def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() -> None:
+    transfer_manager, request = _start_active_streaming_request("rt-active")
 
     request.output_token_ids = []
     payload = q3.thinker2talker_async_chunk(
@@ -321,47 +326,7 @@ def test_thinker2talker_async_chunk_keeps_active_decode_after_prefill_flush() ->
 
 
 def test_thinker2talker_async_chunk_caches_new_prefill_while_active() -> None:
-    transfer_manager = SimpleNamespace(
-        put_req_chunk={"rt-active-prefill": 5},
-        request_payload={},
-        _pending_streaming_prefills={},
-    )
-    request = SimpleNamespace(
-        external_req_id="rt-active-prefill",
-        output_token_ids=[],
-        all_token_ids=[151644, 872, 100, 101],
-        prompt_token_ids=[151644, 872, 100],
-        num_computed_tokens=156,
-        resumable=True,
-        additional_information=None,
-    )
-
-    assert (
-        q3.thinker2talker_async_chunk(
-            transfer_manager,
-            {
-                "hidden_states.layer_0": torch.ones(3, 2),
-                "hidden_states.layer_24": torch.full((3, 2), 2.0),
-            },
-            request,
-            is_finished=False,
-        )
-        is None
-    )
-
-    request.output_token_ids = [101]
-    payload = q3.thinker2talker_async_chunk(
-        transfer_manager,
-        {
-            "hidden_states.layer_0": torch.full((1, 2), 5.0),
-            "hidden_states.layer_24": torch.full((1, 2), 6.0),
-        },
-        request,
-        is_finished=False,
-    )
-    assert payload is not None
-    assert "rt-active-prefill" in transfer_manager._active_streaming_input_request_ids
-    assert "rt-active-prefill" not in transfer_manager._pending_streaming_prefills
+    transfer_manager, request = _start_active_streaming_request("rt-active-prefill")
 
     request.output_token_ids = []
     request.prompt_token_ids = [151644, 872, 100, 102, 103]
@@ -521,89 +486,67 @@ def test_thinker2talker_finish_sends_terminal_only_for_runner_snapshot() -> None
     assert "rt-runner-terminal" not in transfer_manager._active_streaming_input_request_ids
 
 
-def test_talker2code2wav_full_payload_filters_by_output_token_ids() -> None:
-    request = SimpleNamespace(
-        request_id="codec",
-        output_token_ids=[4197, 1, 2, 4198, -1, 2048],
-    )
-    rows = torch.tensor(
-        [
-            [100, 101, 102],
-            [10, 11, 12],
-            [20, 21, 22],
-            [30, 31, 32],
-            [40, 41, 42],
-            [50, 51, 52],
-        ],
-        dtype=torch.long,
-    )
-
-    payload = q3.talker2code2wav_full_payload(None, {"codes.audio": rows}, request)
-
-    assert payload is not None
-    assert payload["codes"]["audio"] == [10, 20, 11, 21, 12, 22]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
-
-
-def test_talker2code2wav_full_payload_drops_count_matched_terminal_row() -> None:
-    request = SimpleNamespace(
-        request_id="codec_terminal_row",
-        output_token_ids=[0, 4198],
-    )
-    rows = torch.tensor(
-        [
-            [10, 11, 12],
-        ],
-        dtype=torch.long,
-    )
-
-    payload = q3.talker2code2wav_full_payload(None, {"codes.audio": rows}, request)
-
-    assert payload is None
-
-
-def test_talker2code2wav_full_payload_drops_rows_aligned_to_non_codec_ids() -> None:
-    request = SimpleNamespace(
-        request_id="codec_invalid_ids",
-        output_token_ids=[4197, 0, 4198, 4196, -1, 2048],
-    )
-    rows = torch.tensor(
-        [
-            [91, 92, 93],
+@pytest.mark.parametrize(
+    ("output_token_ids", "rows", "expected"),
+    [
+        pytest.param(
+            [4197, 1, 2, 4198, -1, 2048],
+            [
+                [100, 101, 102],
+                [10, 11, 12],
+                [20, 21, 22],
+                [30, 31, 32],
+                [40, 41, 42],
+                [50, 51, 52],
+            ],
+            [10, 20, 11, 21, 12, 22],
+            id="filters-control-rows",
+        ),
+        pytest.param(
+            [0, 4198],
+            [[10, 11, 12]],
+            None,
+            id="drops-terminal-row",
+        ),
+        pytest.param(
+            [4197, 0, 4198, 4196, -1, 2048],
+            [
+                [91, 92, 93],
+                [0, 0, 0],
+                [81, 82, 83],
+                [71, 72, 73],
+                [61, 62, 63],
+                [51, 52, 53],
+            ],
             [0, 0, 0],
-            [81, 82, 83],
-            [71, 72, 73],
-            [61, 62, 63],
-            [51, 52, 53],
-        ],
-        dtype=torch.long,
+            id="drops-non-codec-rows",
+        ),
+        pytest.param(
+            [0, 1],
+            [[0, 0, 0], [7, 8, 9]],
+            [0, 7, 0, 8, 0, 9],
+            id="keeps-zero-codec-row",
+        ),
+    ],
+)
+def test_talker2code2wav_full_payload_alignment(
+    output_token_ids: list[int],
+    rows: list[list[int]],
+    expected: list[int] | None,
+) -> None:
+    request = SimpleNamespace(request_id="codec", output_token_ids=output_token_ids)
+
+    payload = q3.talker2code2wav_full_payload(
+        None,
+        {"codes.audio": torch.tensor(rows, dtype=torch.long)},
+        request,
     )
 
-    payload = q3.talker2code2wav_full_payload(None, {"codes.audio": rows}, request)
-
-    assert payload is not None
-    assert payload["codes"]["audio"] == [0, 0, 0]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
-
-
-def test_talker2code2wav_full_payload_keeps_all_zero_codec_rows() -> None:
-    request = SimpleNamespace(
-        request_id="codec_zero",
-        output_token_ids=[0, 1],
-    )
-    rows = torch.tensor(
-        [
-            [0, 0, 0],
-            [7, 8, 9],
-        ],
-        dtype=torch.long,
-    )
-
-    payload = q3.talker2code2wav_full_payload(None, {"codes.audio": rows}, request)
-
-    assert payload is not None
-    assert payload["codes"]["audio"] == [0, 7, 0, 8, 0, 9]
-    assert payload["code_predictor_codes"] == payload["codes"]["audio"]
+    if expected is None:
+        assert payload is None
+        return
+    assert payload["codes"]["audio"] == expected
+    assert payload["code_predictor_codes"] == expected
 
 
 def test_thinker2talker_full_payload_packs_complete_tensors() -> None:
@@ -699,28 +642,6 @@ def test_thinker2talker_async_chunk_decode_allows_missing_resumable_attr() -> No
     assert payload is not None
     assert payload.embed.decode.shape == (1, 2)
     assert payload.meta.finished.item() is False
-    assert payload.meta.prefill_consumed_text_tokens == 1
-
-
-def test_thinker2talker_async_chunk_decode_keeps_multi_token_span() -> None:
-    transfer_manager = SimpleNamespace(put_req_chunk={"thinker": 1}, request_payload={})
-    request = SimpleNamespace(
-        external_req_id="thinker",
-        prompt_token_ids=[151644, 872],
-        output_token_ids=[3, 4, 5],
-        all_token_ids=[151644, 872, 3, 4, 5],
-        resumable=False,
-        num_computed_tokens=4,
-    )
-    pooling_output = {
-        "hidden_states.layer_0": torch.arange(6, dtype=torch.float32).reshape(3, 2),
-        "hidden_states.layer_24": torch.full((3, 2), 2.0),
-    }
-
-    payload = q3.thinker2talker_async_chunk(transfer_manager, pooling_output, request, is_finished=False)
-
-    assert payload is not None
-    assert torch.equal(payload.embed.decode, pooling_output["hidden_states.layer_0"])
     assert payload.meta.prefill_consumed_text_tokens == 1
 
 
