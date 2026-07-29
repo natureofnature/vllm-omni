@@ -212,22 +212,22 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
 
 
 def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Apply per-request OpenAI fields for OmniInteract."""
+    """Attach OmniInteract duplex session media and pacing options."""
     if not isinstance(sample, OmniInteractSampleRequest):
         return
-    if getattr(sample, "omniinteract_realtime_turns", None):
-        setattr(rfi, "omniinteract_session_key", sample.omniinteract_session_key)
-        setattr(rfi, "omniinteract_video_path", sample.omniinteract_video_path)
-        setattr(rfi, "omniinteract_realtime_turns", sample.omniinteract_realtime_turns)
-        setattr(rfi, "omniinteract_realtime_chunk_ms", sample.omniinteract_realtime_chunk_ms)
-        setattr(rfi, "omniinteract_realtime_video_fps", sample.omniinteract_realtime_video_fps)
-        setattr(rfi, "omniinteract_realtime_ref_audio", sample.omniinteract_realtime_ref_audio)
-        setattr(rfi, "omniinteract_realtime_pace", sample.omniinteract_realtime_pace)
-        setattr(rfi, "omniinteract_realtime_timeout_s", sample.omniinteract_realtime_timeout_s)
-        return
-    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
-    if sample.omni_chat_messages is not None:
-        setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+    setattr(rfi, "omniinteract_session_key", sample.omniinteract_session_key)
+    setattr(rfi, "omniinteract_video_path", sample.omniinteract_video_path)
+    setattr(rfi, "omniinteract_slots", sample.omniinteract_slots)
+    setattr(rfi, "omniinteract_subset", sample.omniinteract_subset)
+    setattr(rfi, "omniinteract_video", sample.omniinteract_video)
+    setattr(rfi, "omniinteract_scene_type", sample.omniinteract_scene_type)
+    setattr(rfi, "omniinteract_realtime_chunk_ms", sample.omniinteract_realtime_chunk_ms)
+    setattr(rfi, "omniinteract_realtime_video_fps", sample.omniinteract_realtime_video_fps)
+    setattr(rfi, "omniinteract_realtime_ref_audio", sample.omniinteract_realtime_ref_audio)
+    setattr(rfi, "omniinteract_realtime_pace", sample.omniinteract_realtime_pace)
+    setattr(rfi, "omniinteract_realtime_timeout_s", sample.omniinteract_realtime_timeout_s)
+    if sample.omni_extra_body:
+        rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -428,10 +428,10 @@ def get_samples(args, tokenizer):
         )
 
     if is_omniinteract:
-        if args.backend not in ["openai-chat-omni", "daily-omni", "minicpmo-realtime"]:
+        if args.backend != "minicpmo-realtime":
             raise ValueError(
-                "OmniInteract requires a multimodal backend that supports video/audio. "
-                f"Got backend={args.backend!r}; use --backend openai-chat-omni or minicpmo-realtime."
+                "OmniInteract full-duplex evaluation requires --backend minicpmo-realtime "
+                f"(got backend={args.backend!r})."
             )
 
         dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -449,12 +449,11 @@ def get_samples(args, tokenizer):
         if not subsets:
             subsets = ["1q1a", "1q1a_math", "1qna"]
 
-        model_special_config = getattr(args, "omniinteract_model_special_config", None)
-        if model_special_config is None and args.backend == "minicpmo-realtime":
-            model_special_config = "minicpmo_4_5_realtime"
+        model_special_config = getattr(args, "omniinteract_model_special_config", None) or "minicpmo_4_5_realtime"
 
         logger.info(
-            "Loading OmniInteract dataset: dataset_path=%s, omniinteract_root=%s, subsets=%s, model_special_config=%s",
+            "Loading OmniInteract duplex sessions: dataset_path=%s, "
+            "omniinteract_root=%s, subsets=%s, model_special_config=%s",
             dataset_path,
             omniinteract_root,
             subsets,
@@ -466,7 +465,6 @@ def get_samples(args, tokenizer):
             data_root=omniinteract_root,
             random_seed=args.seed,
             subsets=subsets,
-            inline_local_video=getattr(args, "omniinteract_inline_local_video", False),
             model_special_config=model_special_config,
             disable_shuffle=getattr(args, "disable_shuffle", False),
         )
@@ -482,19 +480,16 @@ def get_samples(args, tokenizer):
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
         )
-        if args.backend == "minicpmo-realtime":
-            for sample in samples:
-                if not isinstance(sample, OmniInteractSampleRequest):
-                    continue
-                sample.omniinteract_realtime_chunk_ms = int(getattr(args, "omniinteract_realtime_chunk_ms", 200) or 200)
-                sample.omniinteract_realtime_video_fps = float(
-                    getattr(args, "omniinteract_realtime_video_fps", 1.0) or 1.0
-                )
-                sample.omniinteract_realtime_ref_audio = getattr(args, "omniinteract_realtime_ref_audio", None)
-                sample.omniinteract_realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
-                sample.omniinteract_realtime_timeout_s = float(
-                    getattr(args, "omniinteract_realtime_timeout_s", 120.0) or 120.0
-                )
+        for sample in samples:
+            if not isinstance(sample, OmniInteractSampleRequest):
+                continue
+            sample.omniinteract_realtime_chunk_ms = int(getattr(args, "omniinteract_realtime_chunk_ms", 200) or 200)
+            sample.omniinteract_realtime_video_fps = float(getattr(args, "omniinteract_realtime_video_fps", 1.0) or 1.0)
+            sample.omniinteract_realtime_ref_audio = getattr(args, "omniinteract_realtime_ref_audio", None)
+            sample.omniinteract_realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
+            sample.omniinteract_realtime_timeout_s = float(
+                getattr(args, "omniinteract_realtime_timeout_s", 120.0) or 120.0
+            )
         return samples
     if args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
@@ -1467,29 +1462,29 @@ def _flatten_omniinteract_realtime_for_eval(
     flat_requests: list[SampleRequest] = []
     flat_outputs: list[MixRequestFuncOutput] = []
     for request, output in zip(input_requests, outputs, strict=True):
-        turns = getattr(request, "omniinteract_realtime_turns", None)
         turn_outputs = getattr(output, "omniinteract_turn_outputs", None)
-        if not isinstance(request, OmniInteractSampleRequest) or not turns or not turn_outputs:
+        if not isinstance(request, OmniInteractSampleRequest) or not turn_outputs:
             flat_requests.append(request)
             flat_outputs.append(output)
             continue
-        for turn, turn_output in zip(turns, turn_outputs, strict=True):
+        for turn_output in turn_outputs:
+            turn_index = turn_output.get("turn_index", 0)
             flat_requests.append(
                 OmniInteractSampleRequest(
-                    prompt=turn.question_text,
+                    prompt=str(turn_output.get("question_text") or request.prompt),
                     prompt_len=0,
                     expected_output_len=0,
-                    request_id=f"{request.request_id}:{turn.turn_index}",
-                    omniinteract_gold_answer=turn.gold_answer,
-                    omniinteract_subset=turn.subset,
-                    omniinteract_question_type=turn.question_type,
-                    omniinteract_video=turn.video_rel,
-                    omniinteract_question_time=turn.question_time,
-                    omniinteract_answer_time=turn.answer_time,
-                    omniinteract_is_interrupted=turn.is_interrupted,
-                    omniinteract_scene_type=turn.scene_type,
-                    omniinteract_nested_group_id=turn.nested_group_id,
-                    omniinteract_nested_role=turn.nested_role,
+                    request_id=f"{request.request_id}:{turn_index}",
+                    omniinteract_gold_answer=str(turn_output.get("gold_answer") or ""),
+                    omniinteract_subset=str(turn_output.get("subset") or request.omniinteract_subset),
+                    omniinteract_question_type=str(turn_output.get("question_type") or ""),
+                    omniinteract_video=str(turn_output.get("video") or request.omniinteract_video),
+                    omniinteract_question_time=str(turn_output.get("question_time") or ""),
+                    omniinteract_answer_time=str(turn_output.get("answer_time") or ""),
+                    omniinteract_is_interrupted=turn_output.get("is_interrupted"),
+                    omniinteract_scene_type=str(turn_output.get("scene_type") or request.omniinteract_scene_type),
+                    omniinteract_nested_group_id=turn_output.get("nested_group_id"),
+                    omniinteract_nested_role=str(turn_output.get("nested_role") or ""),
                     omniinteract_profile="realtime",
                     omniinteract_official_compatible=False,
                 )
@@ -1510,6 +1505,7 @@ async def async_request_minicpmo_realtime(
     from pathlib import Path
 
     from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
+        OmniInteractQASlotView,
         run_omniinteract_realtime_session,
         summarize_turn_metrics,
     )
@@ -1517,12 +1513,12 @@ async def async_request_minicpmo_realtime(
     output = MixRequestFuncOutput()
     output.prompt_len = request_func_input.prompt_len
     output.start_time = time.perf_counter()
-    turns = getattr(request_func_input, "omniinteract_realtime_turns", None)
+    slots = getattr(request_func_input, "omniinteract_slots", None) or []
     video_path = getattr(request_func_input, "omniinteract_video_path", None)
     session_key = getattr(request_func_input, "omniinteract_session_key", None) or request_func_input.request_id
-    if not turns or not video_path:
+    if not video_path:
         output.success = False
-        output.error = "OmniInteract realtime request is missing session media paths."
+        output.error = "OmniInteract realtime request is missing session video path."
         if pbar:
             pbar.update(1)
         return output
@@ -1532,13 +1528,35 @@ async def async_request_minicpmo_realtime(
     ref_audio = getattr(request_func_input, "omniinteract_realtime_ref_audio", None)
     realtime_pacing = bool(getattr(request_func_input, "omniinteract_realtime_pace", True))
     timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 120.0) or 120.0)
+    subset = getattr(request_func_input, "omniinteract_subset", "") or ""
+    video_rel = getattr(request_func_input, "omniinteract_video", "") or ""
+    scene_type = getattr(request_func_input, "omniinteract_scene_type", "") or ""
+    slot_views = [
+        OmniInteractQASlotView(
+            slot_index=int(getattr(slot, "slot_index", idx)),
+            question_text=str(getattr(slot, "question_text", "") or ""),
+            answer_text=str(getattr(slot, "answer_text", "") or ""),
+            question_time=str(getattr(slot, "question_time", "") or ""),
+            answer_time=str(getattr(slot, "answer_time", "") or ""),
+            question_type=str(getattr(slot, "question_type", "") or ""),
+            is_interrupted=getattr(slot, "is_interrupted", None),
+            nested_group_id=getattr(slot, "nested_group_id", None),
+            nested_role=str(getattr(slot, "nested_role", "") or ""),
+            question_time_s=getattr(slot, "question_time_s", None),
+            answer_time_s=getattr(slot, "answer_time_s", None),
+            subset=subset,
+            video_rel=video_rel,
+            scene_type=scene_type,
+        )
+        for idx, slot in enumerate(slots)
+    ]
 
     try:
         session_result = await run_omniinteract_realtime_session(
             api_url=request_func_input.api_url,
             model=request_func_input.model_name or request_func_input.model,
             video_path=Path(video_path),
-            turns=turns,
+            slots=slot_views,
             session_key=str(session_key),
             ref_audio=ref_audio,
             chunk_ms=chunk_ms,

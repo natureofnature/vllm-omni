@@ -1,26 +1,27 @@
-"""OmniInteract dataset loader for ``vllm bench serve --omni``.
+"""OmniInteract full-duplex dataset loader for ``vllm bench serve --omni``.
 
-OmniInteract is a streaming audio-visual QA benchmark:
-https://huggingface.co/datasets/lucky-lance/OmniInteract
+OmniInteract evaluates continuous streaming interaction over full videos:
+https://github.com/Lucky-Lance/OmniInteract
 
-This loader flattens per-QA annotation entries into independent benchmark
-requests. For ``1q1a`` / ``1q1a_math`` each request uses the per-QA
-``subvideos/{video}_{qa_idx}.mp4`` clip together with the matching
-``audios/{video}_{qa_idx}.wav`` when present. A model special config controls
-media order, question-text inclusion, and request-body fields without coupling
-the dataset timeline to a particular serving protocol.
+One benchmark request is one full-video duplex session:
+
+- ``1q1a`` / ``1q1a_math``: each ``video_json_map.json`` entry becomes one session
+  over the full source video, with all annotation QA slots attached for eval.
+- ``1qna``: each ``videos_bench/**/*.mp4`` becomes one continuous session with
+  its matching annotation slots.
+
+This matches the official MiniCPM-o batch path, which streams second-by-second
+PCM/frames from the full video rather than independent clip requests.
 """
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import os
 import shutil
 import tarfile
-from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -32,16 +33,32 @@ from vllm_omni.benchmarks.adapters.omniinteract import (
     OmniInteractModelSpecialConfig,
     load_model_special_config,
 )
-from vllm_omni.benchmarks.data_modules.omniinteract_realtime import OmniInteractRealtimeTurn
 
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
 
 
+@dataclass(frozen=True)
+class OmniInteractQASlot:
+    """Ground-truth interaction slot inside a continuous video session."""
+
+    slot_index: int
+    question_text: str
+    answer_text: str
+    question_time: str = ""
+    answer_time: str = ""
+    question_type: str = ""
+    is_interrupted: bool | None = None
+    nested_group_id: int | None = None
+    nested_role: str = ""
+    question_time_s: float | None = None
+    answer_time_s: float | None = None
+
+
 @dataclass
 class OmniInteractSampleRequest(SampleRequest):
-    """``SampleRequest`` carrying OmniInteract labels and request fields."""
+    """One full-video duplex session plus attached QA slots."""
 
     omniinteract_gold_answer: str = ""
     omniinteract_subset: str = ""
@@ -53,35 +70,26 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_scene_type: str = ""
     omniinteract_nested_group_id: int | None = None
     omniinteract_nested_role: str = ""
-    omniinteract_profile: str = "clip"
+    omniinteract_profile: str = "realtime"
     omniinteract_official_compatible: bool = False
     omniinteract_session_key: str = ""
     omniinteract_video_path: str = ""
-    omniinteract_realtime_turns: list[OmniInteractRealtimeTurn] | None = None
+    omniinteract_slots: list[OmniInteractQASlot] = field(default_factory=list)
     omniinteract_realtime_chunk_ms: int = 200
     omniinteract_realtime_video_fps: float = 1.0
     omniinteract_realtime_ref_audio: str | None = None
     omniinteract_realtime_pace: bool = True
     omniinteract_realtime_timeout_s: float = 120.0
     omni_extra_body: dict[str, Any] | None = None
-    omni_chat_messages: list[dict[str, Any]] | None = None
 
 
 @dataclass
-class _OmniInteractEntry:
+class _OmniInteractSession:
     subset: str
     video_rel: str
     video_path: Path
-    question_text: str
-    answer_text: str
-    question_time: str
-    answer_time: str
-    question_type: str
-    is_interrupted: bool | None
-    audio_path: Path | None = None
-    scene_type: str = "multi_turn"
-    nested_group_id: int | None = None
-    nested_role: str = ""
+    scene_type: str
+    slots: list[OmniInteractQASlot]
 
 
 def _parse_time_seconds(value: Any) -> float | None:
@@ -142,6 +150,39 @@ def _infer_nested_roles(ann: list[dict[str, Any]]) -> dict[int, tuple[int, str]]
     return nested_meta
 
 
+def _slots_from_annotation(
+    ann: list[dict[str, Any]],
+    *,
+    scene_type: str,
+) -> list[OmniInteractQASlot]:
+    nested_meta = _infer_nested_roles(ann) if scene_type == "nested" else {}
+    slots: list[OmniInteractQASlot] = []
+    for qa_idx, qa in enumerate(ann):
+        q = str(qa.get("question_text") or "").strip()
+        a = str(qa.get("answer_text") or "").strip()
+        if not q or not a:
+            continue
+        nested_group_id, nested_role = nested_meta.get(qa_idx, (None, ""))
+        question_time = str(qa.get("question_time") or "").strip()
+        answer_time = str(qa.get("answer_time") or "").strip()
+        slots.append(
+            OmniInteractQASlot(
+                slot_index=qa_idx,
+                question_text=q,
+                answer_text=a,
+                question_time=question_time,
+                answer_time=answer_time,
+                question_type=str(qa.get("question_type") or "").strip(),
+                is_interrupted=qa.get("is_interrupted"),
+                nested_group_id=nested_group_id,
+                nested_role=nested_role,
+                question_time_s=_parse_time_seconds(question_time),
+                answer_time_s=_parse_time_seconds(answer_time),
+            )
+        )
+    return slots
+
+
 def _hf_cache_root() -> Path:
     return Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface")).expanduser().resolve()
 
@@ -152,7 +193,6 @@ def _tar_fingerprint(tar_path: Path) -> str:
 
 
 def _resolve_data_dir_under(root: Path) -> Path:
-    """Return the OmniInteract data root that contains 1q1a/1q1a_math/1qna."""
     probe = root / "1q1a"
     if probe.is_dir():
         return root
@@ -163,7 +203,6 @@ def _resolve_data_dir_under(root: Path) -> Path:
 
 
 def _extract_tar_archive(tar_path: Path, cache_root: Path) -> Path:
-    """Extract ``data.tar.gz`` under ``cache_root`` and return the data root."""
     extracted_root = cache_root / "extracted"
     marker = cache_root / ".extracted"
     fp = _tar_fingerprint(tar_path)
@@ -188,18 +227,15 @@ def _extract_tar_archive(tar_path: Path, cache_root: Path) -> Path:
 
 
 def _ensure_extracted_data_dir(root: Path) -> Path:
-    """Resolve a local directory to extracted OmniInteract data (auto-extract if needed)."""
     try:
         return _resolve_data_dir_under(root)
     except FileNotFoundError:
         pass
-
     for name in ("data.tar.gz", "data.tar"):
         tar_path = root / name
         if tar_path.is_file():
             cache_root = root / ".vllm_omni_omniinteract_extracted"
             return _extract_tar_archive(tar_path, cache_root)
-
     raise FileNotFoundError(
         f"Could not locate OmniInteract data under {root}. "
         "Expected extracted 1q1a/ (or data/1q1a/) or data.tar.gz in that directory."
@@ -211,31 +247,20 @@ def resolve_omniinteract_root(
     *,
     explicit_root: str | Path | None = None,
 ) -> Path:
-    """Return OmniInteract data root from a local path or HF dataset repo id.
-
-    Resolution order:
-    1. ``explicit_root`` (--omniinteract-root)
-    2. Local directory ``dataset_path`` (--dataset-path)
-    3. HF dataset repo id via ``dataset_path`` / ``--hf-name``
-    """
     if explicit_root:
         root = Path(explicit_root).expanduser().resolve()
         if not root.is_dir():
             raise FileNotFoundError(f"--omniinteract-root is not a directory: {root}")
         return _ensure_extracted_data_dir(root)
-
     if not dataset_path:
         raise ValueError("OmniInteract requires --dataset-path (HF repo id or local directory) or --omniinteract-root.")
-
     p = Path(dataset_path).expanduser()
     if p.exists() and p.is_dir():
         return _ensure_extracted_data_dir(p.resolve())
-
     return ensure_omniinteract_data_dir(dataset_path.strip())
 
 
 def ensure_omniinteract_data_dir(repo_id: str) -> Path:
-    """Download/extract ``data.tar.gz`` from HF and return extracted data root."""
     rid = (repo_id or "").strip()
     if not rid:
         raise ValueError("repo_id is required for OmniInteract HF download")
@@ -249,7 +274,6 @@ def ensure_omniinteract_data_dir(repo_id: str) -> Path:
 
     safe = rid.replace("/", "__").replace("\\", "_")
     cache_root = _hf_cache_root() / "vllm_omni" / "omniinteract_media" / safe
-
     tar_path: Path | None = None
     for name in ("data.tar.gz", "data.tar"):
         try:
@@ -259,12 +283,11 @@ def ensure_omniinteract_data_dir(repo_id: str) -> Path:
             continue
     if tar_path is None or not tar_path.is_file():
         raise FileNotFoundError(f"Could not download data.tar.gz from dataset repo {rid!r}.")
-
     return _extract_tar_archive(tar_path, cache_root)
 
 
 class OmniInteractDataset(BenchmarkDataset):
-    """OmniInteract audio+video QA dataset."""
+    """OmniInteract full-video duplex sessions."""
 
     SUPPORTED_DATASET_PATHS: set[str] = {"lucky-lance/OmniInteract"}
     DEFAULT_HF_DATASET_ID = "lucky-lance/OmniInteract"
@@ -277,17 +300,22 @@ class OmniInteractDataset(BenchmarkDataset):
         random_seed: int = 0,
         data_root: str | None = None,
         subsets: list[OmniInteractSubset] | None = None,
-        inline_local_video: bool = False,
         model_special_config: str | dict[str, Any] | OmniInteractModelSpecialConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
         self.data_root_input = Path(data_root).expanduser().resolve() if data_root else None
         self.subsets = list(subsets or ["1q1a", "1q1a_math", "1qna"])
-        self.inline_local_video = inline_local_video
         self.model_special_config = load_model_special_config(model_special_config)
         self._data_root: Path | None = None
-        self._entries: list[_OmniInteractEntry] = []
+        self._sessions: list[_OmniInteractSession] = []
+
+        # Drop unused clip-only kwargs from older callers.
+        kwargs.pop("inline_local_video", None)
+        kwargs.pop("input_mode", None)
+        for key in list(kwargs):
+            if key.startswith("aura_"):
+                kwargs.pop(key)
 
         super().__init__(
             dataset_path=self.dataset_path,
@@ -296,10 +324,10 @@ class OmniInteractDataset(BenchmarkDataset):
         )
         self.load_data()
         logger.info(
-            "OmniInteract model special config: name=%s content_order=%s extra_body_keys=%s",
+            "OmniInteract duplex config: name=%s sessions=%d subsets=%s",
             self.model_special_config.name,
-            self.model_special_config.content_order,
-            sorted(self.model_special_config.extra_body),
+            len(self._sessions),
+            self.subsets,
         )
 
     def _resolve_data_root(self) -> Path:
@@ -317,12 +345,12 @@ class OmniInteractDataset(BenchmarkDataset):
         with open(path, encoding="utf-8") as f:
             return json.load(f)
 
-    def _iter_subset_entries(self, data_root: Path, subset: OmniInteractSubset) -> list[_OmniInteractEntry]:
-        entries: list[_OmniInteractEntry] = []
+    def _iter_subset_sessions(self, data_root: Path, subset: OmniInteractSubset) -> list[_OmniInteractSession]:
+        sessions: list[_OmniInteractSession] = []
         subset_root = data_root / subset
         if not subset_root.is_dir():
             logger.warning("Subset directory does not exist: %s", subset_root)
-            return entries
+            return sessions
 
         if subset in ("1q1a", "1q1a_math"):
             map_path = subset_root / "video_json_map.json"
@@ -333,187 +361,75 @@ class OmniInteractDataset(BenchmarkDataset):
                 scene_type = str(item.get("scene_type") or "multi_turn").strip().lower() or "multi_turn"
                 if not video_rel or not ann_rel:
                     continue
+                video_path = subset_root / video_rel
                 ann_path = subset_root / ann_rel
-                if not ann_path.is_file():
+                if not video_path.is_file() or not ann_path.is_file():
                     continue
                 ann = self._read_json(ann_path)
                 if not isinstance(ann, list):
                     continue
-                nested_meta = _infer_nested_roles(ann) if scene_type == "nested" else {}
-                video_stem = Path(video_rel).stem
-                for qa_idx, qa in enumerate(ann):
-                    q = str(qa.get("question_text") or "").strip()
-                    a = str(qa.get("answer_text") or "").strip()
-                    if not q or not a:
-                        continue
-                    subvideo_rel = f"subvideos/{video_stem}_{qa_idx}.mp4"
-                    subvideo_path = subset_root / subvideo_rel
-                    if not subvideo_path.is_file():
-                        continue
-                    audio_path = subset_root / "audios" / f"{video_stem}_{qa_idx}.wav"
-                    nested_group_id, nested_role = nested_meta.get(qa_idx, (None, ""))
-                    entries.append(
-                        _OmniInteractEntry(
-                            subset=subset,
-                            video_rel=subvideo_rel,
-                            video_path=subvideo_path,
-                            question_text=q,
-                            answer_text=a,
-                            question_time=str(qa.get("question_time") or "").strip(),
-                            answer_time=str(qa.get("answer_time") or "").strip(),
-                            question_type=str(qa.get("question_type") or "").strip(),
-                            is_interrupted=qa.get("is_interrupted"),
-                            audio_path=audio_path,
-                            scene_type=scene_type,
-                            nested_group_id=nested_group_id,
-                            nested_role=nested_role,
-                        )
+                slots = _slots_from_annotation(ann, scene_type=scene_type)
+                if not slots:
+                    continue
+                sessions.append(
+                    _OmniInteractSession(
+                        subset=subset,
+                        video_rel=video_rel,
+                        video_path=video_path,
+                        scene_type=scene_type,
+                        slots=slots,
                     )
-            return entries
+                )
+            return sessions
 
+        # Official OmniInteract 1qna: one continuous session per videos_bench mp4.
         ann_root = subset_root / "annotations"
         video_root = subset_root / "videos_bench"
         if not ann_root.is_dir() or not video_root.is_dir():
-            return entries
-        for ann_path in sorted(ann_root.rglob("*.json")):
-            rel = ann_path.relative_to(ann_root)
-            video_path = (video_root / rel).with_suffix(".mp4")
-            if not video_path.is_file():
+            return sessions
+        for video_path in sorted(video_root.rglob("*.mp4")):
+            rel = video_path.relative_to(video_root)
+            ann_path = (ann_root / rel).with_suffix(".json")
+            if not ann_path.is_file():
                 continue
             ann = self._read_json(ann_path)
             if not isinstance(ann, list):
                 continue
-            video_rel = str(video_path.relative_to(subset_root))
-            for qa_idx, qa in enumerate(ann):
-                q = str(qa.get("question_text") or "").strip()
-                a = str(qa.get("answer_text") or "").strip()
-                if not q or not a:
-                    continue
-                audio_path = subset_root / "audios" / rel.parent / f"{rel.stem}_{qa_idx}.wav"
-                entries.append(
-                    _OmniInteractEntry(
-                        subset=subset,
-                        video_rel=video_rel,
-                        video_path=video_path,
-                        question_text=q,
-                        answer_text=a,
-                        question_time=str(qa.get("question_time") or "").strip(),
-                        answer_time=str(qa.get("answer_time") or "").strip(),
-                        question_type=str(qa.get("question_type") or "").strip(),
-                        is_interrupted=qa.get("is_interrupted"),
-                        audio_path=audio_path,
-                        scene_type="1qna",
-                    )
+            slots = _slots_from_annotation(ann, scene_type="1qna")
+            if not slots:
+                continue
+            sessions.append(
+                _OmniInteractSession(
+                    subset=subset,
+                    video_rel=str(video_path.relative_to(subset_root)),
+                    video_path=video_path,
+                    scene_type="1qna",
+                    slots=slots,
                 )
-        return entries
+            )
+        return sessions
 
     def load_data(self) -> None:
         root = self._resolve_data_root()
-        all_entries: list[_OmniInteractEntry] = []
+        all_sessions: list[_OmniInteractSession] = []
         for subset in self.subsets:
-            all_entries.extend(self._iter_subset_entries(root, subset))
-        if not all_entries:
-            raise ValueError(f"No OmniInteract QA entries found under {root} (subsets={self.subsets})")
+            all_sessions.extend(self._iter_subset_sessions(root, subset))
+        if not all_sessions:
+            raise ValueError(f"No OmniInteract duplex sessions found under {root} (subsets={self.subsets})")
         if not getattr(self, "disable_shuffle", False):
             import random
 
             rng = random.Random(self.random_seed)
-            rng.shuffle(all_entries)
-        self._entries = all_entries
-        self.data = self._entries
-        logger.info("Loaded OmniInteract: root=%s subsets=%s rows=%d", root, self.subsets, len(all_entries))
-
-    @staticmethod
-    def _question_prompt(e: _OmniInteractEntry) -> str:
-        return (
-            "You are given a video with its original audio. "
-            "Answer the question concisely based on the observed visual and spoken content.\n"
-            f"Question time: {e.question_time or 'N/A'}\n"
-            f"Expected answer time: {e.answer_time or 'N/A'}\n"
-            f"Question: {e.question_text}\n"
-            "Answer:"
+            rng.shuffle(all_sessions)
+        self._sessions = all_sessions
+        self.data = self._sessions
+        logger.info(
+            "Loaded OmniInteract duplex sessions: root=%s subsets=%s sessions=%d slots=%d",
+            root,
+            self.subsets,
+            len(all_sessions),
+            sum(len(session.slots) for session in all_sessions),
         )
-
-    def _video_payload(self, video_path: Path) -> dict[str, Any]:
-        p = video_path.expanduser().resolve()
-        if self.inline_local_video:
-            raw = p.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-            return {"type": "video_url", "video_url": {"url": f"data:video/mp4;base64,{b64}"}}
-        return {"type": "video_url", "video_url": {"url": p.as_uri()}}
-
-    def _audio_payload(self, audio_path: Path) -> dict[str, Any]:
-        p = audio_path.expanduser().resolve()
-        if self.inline_local_video:
-            raw = p.read_bytes()
-            b64 = base64.b64encode(raw).decode("ascii")
-            return {"type": "audio_url", "audio_url": {"url": f"data:audio/wav;base64,{b64}"}}
-        return {"type": "audio_url", "audio_url": {"url": p.as_uri()}}
-
-    @staticmethod
-    def _realtime_session_key(entry: _OmniInteractEntry) -> str:
-        if entry.subset == "1qna":
-            return f"{entry.subset}:{entry.video_path}"
-        return f"{entry.subset}:{entry.video_path}:{entry.question_time}:{entry.answer_time}"
-
-    def _group_realtime_entries(self, entries: list[_OmniInteractEntry]) -> list[list[_OmniInteractEntry]]:
-        from collections import OrderedDict
-
-        groups: OrderedDict[str, list[_OmniInteractEntry]] = OrderedDict()
-        for entry in entries:
-            groups.setdefault(self._realtime_session_key(entry), []).append(entry)
-        return list(groups.values())
-
-    def _build_realtime_turn(self, entry: _OmniInteractEntry, turn_index: int) -> OmniInteractRealtimeTurn:
-        assert entry.audio_path is not None
-        return OmniInteractRealtimeTurn(
-            turn_index=turn_index,
-            audio_path=entry.audio_path,
-            gold_answer=entry.answer_text,
-            question_text=entry.question_text,
-            question_type=entry.question_type,
-            question_time=entry.question_time,
-            answer_time=entry.answer_time,
-            is_interrupted=entry.is_interrupted,
-            nested_group_id=entry.nested_group_id,
-            nested_role=entry.nested_role,
-            subset=entry.subset,
-            video_rel=entry.video_rel,
-            scene_type=entry.scene_type,
-        )
-
-    def _build_messages(
-        self,
-        question_prompt: str,
-        video_payload: dict[str, Any],
-        audio_payload: dict[str, Any] | None = None,
-    ) -> list[dict[str, Any]]:
-        payloads: dict[str, dict[str, Any] | None] = {
-            "audio": audio_payload,
-            "video": video_payload,
-            "question": {"type": "text", "text": question_prompt},
-        }
-        content: list[dict[str, Any]] = []
-        for kind in self.model_special_config.content_order:
-            item = payloads[kind]
-            if item is None:
-                raise ValueError(f"OmniInteract profile {self.model_special_config.name!r} requires unavailable media.")
-            content.append(item)
-        return [
-            {
-                "role": "system",
-                "content": [
-                    {
-                        "type": "text",
-                        "text": self.model_special_config.system_prompt,
-                    }
-                ],
-            },
-            {
-                "role": "user",
-                "content": content,
-            },
-        ]
 
     def sample(
         self,
@@ -526,75 +442,15 @@ class OmniInteractDataset(BenchmarkDataset):
     ) -> list[SampleRequest]:
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
-        if self.model_special_config.is_realtime:
-            return self._sample_realtime_sessions(
-                tokenizer=tokenizer,
-                num_requests=num_requests,
-                output_len=output_len,
-                request_id_prefix=request_id_prefix,
-                no_oversample=no_oversample,
-            )
-        return self._sample_clip_requests(
-            tokenizer=tokenizer,
-            num_requests=num_requests,
-            output_len=output_len,
-            request_id_prefix=request_id_prefix,
-            no_oversample=no_oversample,
-        )
-
-    def _sample_clip_requests(
-        self,
-        *,
-        tokenizer: TokenizerLike,
-        num_requests: int,
-        output_len: int,
-        request_id_prefix: str,
-        no_oversample: bool,
-    ) -> list[SampleRequest]:
-        out: list[SampleRequest] = []
         tok = get_cached_tokenizer(tokenizer)
-
-        for i, entry in enumerate(self._entries):
+        out: list[SampleRequest] = []
+        for session_index, session in enumerate(self._sessions):
             if len(out) >= num_requests:
                 break
-            request = self._build_clip_request(entry, tok, output_len=output_len, request_id=f"{request_id_prefix}{i}")
-            if request is not None:
-                out.append(request)
-
-        self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
-        return out
-
-    def _sample_realtime_sessions(
-        self,
-        *,
-        tokenizer: TokenizerLike,
-        num_requests: int,
-        output_len: int,
-        request_id_prefix: str,
-        no_oversample: bool,
-    ) -> list[SampleRequest]:
-        out: list[SampleRequest] = []
-        tok = get_cached_tokenizer(tokenizer)
-        eligible_entries = [
-            entry
-            for entry in self._entries
-            if entry.video_path.is_file() and entry.audio_path is not None and entry.audio_path.is_file()
-        ]
-        for skipped in self._entries:
-            if skipped.video_path.is_file() and (skipped.audio_path is None or not skipped.audio_path.is_file()):
-                logger.warning(
-                    "Skipping OmniInteract realtime row without required audio: subset=%s video=%s audio=%s",
-                    skipped.subset,
-                    skipped.video_rel,
-                    skipped.audio_path,
-                )
-
-        for session_index, session_entries in enumerate(self._group_realtime_entries(eligible_entries)):
-            if len(out) >= num_requests:
-                break
-            head = session_entries[0]
-            turns = [self._build_realtime_turn(entry, turn_index) for turn_index, entry in enumerate(session_entries)]
-            prompt = head.question_text or head.answer_text or "omniinteract realtime session"
+            if not session.video_path.is_file():
+                continue
+            head = session.slots[0]
+            prompt = f"OmniInteract duplex session: {session.subset}/{session.video_rel}"
             out.append(
                 OmniInteractSampleRequest(
                     prompt=prompt,
@@ -603,70 +459,22 @@ class OmniInteractDataset(BenchmarkDataset):
                     multi_modal_data=None,
                     request_id=f"{request_id_prefix}{session_index}",
                     omniinteract_gold_answer=head.answer_text,
-                    omniinteract_subset=head.subset,
+                    omniinteract_subset=session.subset,
                     omniinteract_question_type=head.question_type,
-                    omniinteract_video=head.video_rel,
+                    omniinteract_video=session.video_rel,
                     omniinteract_question_time=head.question_time,
                     omniinteract_answer_time=head.answer_time,
                     omniinteract_is_interrupted=head.is_interrupted,
-                    omniinteract_scene_type=head.scene_type,
+                    omniinteract_scene_type=session.scene_type,
                     omniinteract_nested_group_id=head.nested_group_id,
                     omniinteract_nested_role=head.nested_role,
                     omniinteract_profile="realtime",
                     omniinteract_official_compatible=False,
-                    omniinteract_session_key=self._realtime_session_key(head),
-                    omniinteract_video_path=str(head.video_path.resolve()),
-                    omniinteract_realtime_turns=turns,
+                    omniinteract_session_key=f"{session.subset}:{session.video_rel}",
+                    omniinteract_video_path=str(session.video_path.resolve()),
+                    omniinteract_slots=list(session.slots),
+                    omni_extra_body=dict(self.model_special_config.extra_body),
                 )
             )
-
         self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
         return out
-
-    def _build_clip_request(
-        self,
-        entry: _OmniInteractEntry,
-        tok: TokenizerLike,
-        *,
-        output_len: int,
-        request_id: str,
-    ) -> OmniInteractSampleRequest | None:
-        if not entry.video_path.is_file():
-            return None
-        if self.model_special_config.requires_audio and (entry.audio_path is None or not entry.audio_path.is_file()):
-            logger.warning(
-                "Skipping OmniInteract row without required audio: profile=%s subset=%s video=%s audio=%s",
-                self.model_special_config.name,
-                entry.subset,
-                entry.video_rel,
-                entry.audio_path,
-            )
-            return None
-        question_prompt = self._question_prompt(entry)
-        prompt = question_prompt if "question" in self.model_special_config.content_order else entry.question_text
-        audio_payload = None
-        if self.model_special_config.requires_audio:
-            assert entry.audio_path is not None
-            audio_payload = self._audio_payload(entry.audio_path)
-        payload = self._video_payload(entry.video_path)
-        messages = self._build_messages(question_prompt, payload, audio_payload)
-        return OmniInteractSampleRequest(
-            prompt=prompt,
-            prompt_len=len(tok.encode(prompt)),
-            expected_output_len=output_len,
-            multi_modal_data=None,
-            request_id=request_id,
-            omniinteract_gold_answer=entry.answer_text,
-            omniinteract_subset=entry.subset,
-            omniinteract_question_type=entry.question_type,
-            omniinteract_video=entry.video_rel,
-            omniinteract_question_time=entry.question_time,
-            omniinteract_answer_time=entry.answer_time,
-            omniinteract_is_interrupted=entry.is_interrupted,
-            omniinteract_scene_type=entry.scene_type,
-            omniinteract_nested_group_id=entry.nested_group_id,
-            omniinteract_nested_role=entry.nested_role,
-            omniinteract_profile="clip",
-            omni_extra_body=deepcopy(self.model_special_config.extra_body),
-            omni_chat_messages=messages,
-        )

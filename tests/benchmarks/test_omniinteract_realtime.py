@@ -55,6 +55,7 @@ def test_compute_turn_metrics_uses_stage0_engine_metrics():
         collector,
         response_id="resp-a",
         turn_start_s=9.5,
+        stream_start_s=9.0,
     )
 
     assert metrics.ttft_s == pytest.approx(0.15)

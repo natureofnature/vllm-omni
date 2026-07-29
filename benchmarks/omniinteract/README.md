@@ -1,86 +1,50 @@
-# OmniInteract Serving Benchmark
+# OmniInteract Full-Duplex Serving Benchmark
 
-OmniInteract evaluates audio-visual question answering over video clips. The
-vLLM-Omni integration uses `vllm bench serve --omni` and keeps dataset timing
-and labels independent from model-specific request formats.
+OmniInteract evaluates continuous audio-visual interaction over full videos
+([Lucky-Lance/OmniInteract](https://github.com/Lucky-Lance/OmniInteract)).
+vLLM-Omni integrates it as a **full-duplex only** path:
 
-The current implementation is a **clip profile**:
+- one benchmark request = one continuous full-video duplex session
+- `1q1a` / `1q1a_math`: full source video from `video_json_map.json`
+- `1qna`: one continuous session per `videos_bench/**/*.mp4` with matching
+  annotation slots (same layout as official MiniCPM-o batch inference)
+- media is streamed as paced PCM + sampled frames over `--backend minicpmo-realtime`
+- static/clip OpenAI-chat evaluation is removed
 
-- `1q1a` and `1q1a_math` use `subvideos/<video>_<qa>.mp4`.
-- Models that consume a spoken question use the matching
-  `audios/<video>_<qa>.wav`.
-- `1qna` is flattened into independent requests; it is not a continuous
-  session.
-- IA-QTF1, IDS, and NCCS are estimates from independent requests. Results are
-  emitted with `omniinteract_profiles=["clip"]` and
-  `omniinteract_official_compatible=false`.
-
-Continuous media-clock streaming, interruption, and nested-session evaluation
-are separate follow-up work.
+QA slots stay attached for optional proxy metrics (`--omniinteract-eval`).
+Official OmniInteract LLM-judge scoring remains external.
 
 ## Requirements
 
-Install vLLM-Omni and prepare the
-[`lucky-lance/OmniInteract`](https://huggingface.co/datasets/lucky-lance/OmniInteract)
-dataset. `--dataset-path` may be:
+Install vLLM-Omni and prepare
+[`lucky-lance/OmniInteract`](https://huggingface.co/datasets/lucky-lance/OmniInteract).
+`--dataset-path` may be:
 
 - the Hugging Face dataset ID;
 - a local directory containing `data.tar.gz`; or
 - an extracted directory containing `1q1a/`, `1q1a_math/`, and `1qna/`.
 
-Profiles whose `content_order` contains `audio` require synthesized question
-WAV files. Missing WAV rows are skipped with a warning.
-
-By default requests contain `file://` media URLs. Start the server with an
-appropriate `--allowed-local-media-path`, or pass
-`--omniinteract-inline-local-video` to embed MP4/WAV data in each request.
+Server must expose MiniCPM-o full duplex over WebSocket `/v1/realtime`.
 
 ## Model special config
-
-All request differences are selected with:
 
 ```text
 --omniinteract-model-special-config <preset | inline-json | json-file>
 ```
 
-Built-in presets:
+Built-in preset (aliases map here too):
 
-| Preset | User content | Important request fields |
-|---|---|---|
-| `video` | video + text question | `use_audio_in_video=true` |
-| `minicpmo_4_5` | question audio + video | text/audio output, `use_audio_in_video=false`, MiniCPM TTS template |
-| `minicpmo_4_5_realtime` | paced PCM + sampled video frames | native full-duplex WebSocket via `--backend minicpmo-realtime` |
+| Preset | Meaning |
+|---|---|
+| `minicpmo_4_5_realtime` | Native full-duplex WebSocket profile (`modalities` + TTS template) |
 
-The JSON schema is:
-
-```json
-{
-  "preset": "video",
-  "name": "my-model",
-  "content_order": ["audio", "video"],
-  "system_prompt": "You are a helpful audio-visual assistant.",
-  "extra_body": {
-    "modalities": ["text", "audio"],
-    "mm_processor_kwargs": {
-      "use_audio_in_video": false
-    }
-  }
-}
-```
-
-Rules:
-
-- `preset` supplies defaults; all other fields are optional overrides.
-- Nested `extra_body` objects are deep-merged with preset defaults.
-- `content_order` must include `video` and at least one question carrier:
-  `audio` or `question`.
-- Model config cannot mark a clip run as official-compatible.
+Aliases: `realtime`, `minicpm`, `minicpmo`, `minicpm-o-4.5`, `minicpmo_4_5`.
 
 ## Example: MiniCPM-o 4.5 full duplex
 
-Use the native realtime backend for paced PCM/video input and per-turn metrics:
-
 ```bash
+DATASET_ROOT=/data/models/datasets/OmniInteract
+
 vllm bench serve --omni \
   --host 127.0.0.1 \
   --port 8099 \
@@ -89,7 +53,7 @@ vllm bench serve --omni \
   --model openbmb/MiniCPM-o-4_5 \
   --dataset-name omniinteract \
   --dataset-path "${DATASET_ROOT}" \
-  --omniinteract-subsets 1q1a,1q1a_math \
+  --omniinteract-subsets 1q1a,1q1a_math,1qna \
   --omniinteract-model-special-config minicpmo_4_5_realtime \
   --omniinteract-realtime-chunk-ms 200 \
   --omniinteract-realtime-video-fps 1 \
@@ -102,171 +66,47 @@ vllm bench serve --omni \
   --result-dir ./omniinteract_results
 ```
 
-Result JSON includes `omniinteract_realtime_turn_metrics` with per-session-turn
-`ttft_s`, `tpot_s`, and `rtf`, plus optional OmniInteract QA metrics when
-`--omniinteract-eval` is enabled.
-
-## Example: MiniCPM-o 4.5 HTTP clip mode
-
-Start the default two-GPU server:
-
-```bash
-DATASET_ROOT=/data/models/datasets/OmniInteract
-
-vllm serve openbmb/MiniCPM-o-4_5 --omni \
-  --trust-remote-code \
-  --host 0.0.0.0 \
-  --port 8099 \
-  --allowed-local-media-path "${DATASET_ROOT}"
-```
-
-Run a performance benchmark:
-
-```bash
-vllm bench serve --omni \
-  --host 127.0.0.1 \
-  --port 8099 \
-  --backend openai-chat-omni \
-  --endpoint /v1/chat/completions \
-  --model openbmb/MiniCPM-o-4_5 \
-  --dataset-name omniinteract \
-  --dataset-path "${DATASET_ROOT}" \
-  --omniinteract-subsets 1q1a,1q1a_math \
-  --omniinteract-model-special-config minicpmo_4_5 \
-  --num-prompts 32 \
-  --num-warmups 2 \
-  --max-concurrency 1 \
-  --no-oversample \
-  --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration \
-  --print-stage \
-  --save-result \
-  --result-dir ./omniinteract_results \
-  --result-filename minicpmo_4_5_c1.json
-```
-
-Add `--omniinteract-eval` for proxy QA metrics:
-
-```bash
-vllm bench serve --omni \
-  --host 127.0.0.1 \
-  --port 8099 \
-  --backend openai-chat-omni \
-  --endpoint /v1/chat/completions \
-  --model openbmb/MiniCPM-o-4_5 \
-  --dataset-name omniinteract \
-  --dataset-path "${DATASET_ROOT}" \
-  --omniinteract-subsets 1q1a,1q1a_math \
-  --omniinteract-model-special-config minicpmo_4_5 \
-  --num-prompts 32 \
-  --max-concurrency 1 \
-  --no-oversample \
-  --omniinteract-eval \
-  --omniinteract-save-eval-items \
-  --save-result \
-  --save-detailed \
-  --result-dir ./omniinteract_results \
-  --result-filename minicpmo_4_5_eval.json
-```
-
-The MiniCPM preset sends each spoken question exactly once as `audio_url`,
-followed by `video_url`. It does not duplicate the question transcript in the
-user message. Its merged request body contains:
-
-```json
-{
-  "modalities": ["text", "audio"],
-  "mm_processor_kwargs": {
-    "use_audio_in_video": false
-  },
-  "chat_template_kwargs": {
-    "use_tts_template": true
-  }
-}
-```
-
-## Example: native video-audio model
-
-For a model that reads the original audio track from the video and receives
-the question as text:
-
-```bash
-vllm bench serve --omni \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --backend openai-chat-omni \
-  --endpoint /v1/chat/completions \
-  --model "${MODEL}" \
-  --dataset-name omniinteract \
-  --dataset-path "${DATASET_ROOT}" \
-  --omniinteract-subsets 1q1a,1q1a_math \
-  --omniinteract-model-special-config video \
-  --num-prompts 32 \
-  --max-concurrency 1 \
-  --no-oversample
-```
-
-## Example: custom model JSON file
-
-Create `my-model.json`:
-
-```json
-{
-  "preset": "minicpmo_4_5",
-  "name": "my-audio-video-model",
-  "system_prompt": "Answer the spoken question using the video.",
-  "extra_body": {
-    "chat_template_kwargs": {
-      "custom_template_flag": true
-    },
-    "custom_request_option": "value"
-  }
-}
-```
-
-Then invoke:
+`1qna`-only:
 
 ```bash
 vllm bench serve --omni \
   ... \
-  --omniinteract-model-special-config ./my-model.json
+  --omniinteract-subsets 1qna \
+  --num-prompts 8
 ```
 
-The custom fields are delivered as top-level OpenAI request fields after
-merging with any run-level `--extra-body`.
+Result JSON includes `omniinteract_realtime_turn_metrics` with per-response
+`ttft_s`, `tpot_s`, and `rtf`, plus optional OmniInteract QA metrics when
+`--omniinteract-eval` is enabled. Eval flattens matched/unmatched slots inside
+each continuous session.
 
 ## Important options
 
 | Option | Description |
 |---|---|
 | `--omniinteract-root` | Explicit local extracted dataset root |
-| `--omniinteract-subsets` | Comma-separated subset list |
-| `--omniinteract-inline-local-video` | Embed local video and audio as data URLs |
+| `--omniinteract-subsets` | Comma-separated subset list (`1q1a`, `1q1a_math`, `1qna`) |
 | `--omniinteract-model-special-config` | Preset, inline JSON, or JSON file |
-| `--omniinteract-eval` | Compute proxy QA and estimated interaction metrics |
-| `--omniinteract-save-eval-items` | Include per-request evaluation rows |
-| `--no-oversample` | Do not duplicate rows when fewer samples are available |
+| `--omniinteract-realtime-chunk-ms` | PCM append chunk size |
+| `--omniinteract-realtime-video-fps` | Frame sampling rate while streaming |
+| `--omniinteract-realtime-ref-audio` | Reference WAV for voice cloning |
+| `--omniinteract-realtime-no-pace` | Disable realtime pacing |
+| `--omniinteract-realtime-timeout-s` | Per-session timeout |
+| `--omniinteract-eval` | Compute proxy QA / interaction metrics |
+| `--omniinteract-save-eval-items` | Include per-slot evaluation rows |
+| `--no-oversample` | Do not duplicate sessions when fewer samples exist |
 
 ## Result interpretation
 
-- **TTFT/TPOT/ITL:** text-generation latency.
-- **E2EL:** complete request latency.
-- **Audio TTFP:** first audio packet observed by the benchmark client. A model
-  that returns one complete WAV does not provide true streaming TTFP.
-- **Audio RTF:** inference time divided by produced audio duration.
-- **Exact/soft match:** clip-level QA proxy.
-- **IA-QTF1/IDS/NCCS:** estimated for clip runs and not directly comparable to
-  official continuous-session OmniInteract results.
-
-Use performance-only runs for latency/throughput comparisons. Enable evaluation
-only when the additional per-request scoring output is needed.
+- **Session latency / TTFT / TPOT / RTF:** duplex session and per-response metrics.
+- **Exact/soft match / IA-QTF1 / IDS / NCCS:** proxy metrics after flattening
+  session responses onto annotation slots by video time. Not identical to
+  official OmniInteract LLM-judge scoring.
 
 ## Troubleshooting
 
-- **No requests sampled:** verify the selected subset contains generated
-  `subvideos/`; audio profiles also require matching `audios/` WAV files.
-- **Server cannot open `file://` media:** configure
-  `--allowed-local-media-path` or use `--omniinteract-inline-local-video`.
-- **AURA Base TTS fails:** provide both `tts_ref_audio` and `tts_ref_text`.
-- **Empty MiniCPM audio:** confirm the server uses the MiniCPM-o 4.5 deploy
-  config and the request contains `chat_template_kwargs.use_tts_template=true`.
-- **Result marked non-official:** expected for the current clip profile.
+- **No sessions sampled:** verify subset maps/videos exist. `1qna` needs
+  `videos_bench/**/*.mp4` plus matching `annotations/**/*.json`.
+- **Backend rejected:** OmniInteract requires `--backend minicpmo-realtime`.
+- **Empty audio extract:** ensure `ffmpeg` can decode the source MP4 audio track.
+- **Timeouts on long 1qna videos:** raise `--omniinteract-realtime-timeout-s`.

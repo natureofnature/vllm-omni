@@ -2931,7 +2931,7 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
         )
 
     def get_default_audio_pool_step(self) -> int:
-        return int(getattr(self.get_hf_config(), "audio_pool_step", 5))
+        return getattr(self.get_hf_config(), "audio_pool_step", 5)
 
     def get_default_audio_sampling_rate(self) -> int:
         return 16000
@@ -2981,45 +2981,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
     def get_hf_config(self):
         return self.ctx.get_hf_config()
 
-    def _align_processor_audio_pool_step(self, hf_processor: object) -> None:
-        """Keep processor placeholder math aligned with model AvgPool.
-
-        vLLM's vendored MiniCPMOProcessor uses kwarg ``pool_step`` (default 2),
-        while HF MiniCPM-o 4.5 preprocessor_config / model config use
-        ``audio_pool_step`` (=5). Loading the vendored processor leaves
-        pool_step=2, which expands audio placeholders to ~2.5x the encoder
-        output length and crashes embedding merge (e.g. 60 embeds vs 150
-        placeholders).
-        """
-        pool_step = self.get_default_audio_pool_step()
-        prev = getattr(hf_processor, "pool_step", None)
-        if prev == pool_step:
-            logger.debug(
-                "MiniCPM-o audio pool_step already aligned: processor=%s config=%s",
-                prev,
-                pool_step,
-            )
-            return
-
-        setattr(hf_processor, "pool_step", pool_step)
-        # HF remote processor may also expose this name.
-        if hasattr(hf_processor, "audio_pool_step"):
-            hf_processor.audio_pool_step = pool_step
-
-        if prev is None:
-            logger.info(
-                "Set MiniCPM-o processor.pool_step=%s from config.audio_pool_step",
-                pool_step,
-            )
-        else:
-            logger.warning(
-                "Overriding MiniCPM-o processor.pool_step %s -> %s "
-                "(config.audio_pool_step) so audio placeholders match "
-                "encoder pooled length",
-                prev,
-                pool_step,
-            )
-
     def get_hf_processor(self, **kwargs: object):
         # When skip_tokenizer_init=True (e.g. in worker), ctx.tokenizer is None.
         # HF MiniCPM processor requires a tokenizer; use get_tokenizer() which loads lazily.
@@ -3034,8 +2995,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             )
         else:
             hf_processor = self.ctx.get_hf_processor(**kwargs)
-
-        self._align_processor_audio_pool_step(hf_processor)
 
         # NumPy arrays are considered as Iterable but not Sequence in
         # https://github.com/huggingface/transformers/blob/main/src/transformers/image_transforms.py#L428
@@ -4393,31 +4352,10 @@ class MiniCPMO45OmniLLMForConditionalGeneration(nn.Module, SupportsMultiModal, S
         for i in range(len(audio_feature_lens_raw)):
             target_audio_embeds_lst = list[torch.Tensor]()
             for _ in range(len(audio_feature_lens_raw[i])):
-                expected = int(num_audio_tokens[idx])
-                available = int(audio_embeds[idx].shape[0])
-                if available < expected:
-                    logger.error(
-                        "MiniCPM-o audio embed length shortfall: idx=%s "
-                        "feature_lens=%s pool_step=%s expected_tokens=%s "
-                        "pooled_seq_len=%s (placeholder/encoder mismatch?)",
-                        idx,
-                        int(audio_feature_lens[idx]),
-                        self.config.audio_pool_step,
-                        expected,
-                        available,
-                    )
-                target_audio_embeds_lst.append(audio_embeds[idx, :expected, :])
+                target_audio_embeds_lst.append(audio_embeds[idx, : num_audio_tokens[idx], :])
                 idx += 1
 
-            merged = torch.cat(target_audio_embeds_lst)
-            logger.debug(
-                "MiniCPM-o audio embeds ready: item=%s tokens=%s dim=%s pool_step=%s",
-                i,
-                merged.shape[0],
-                merged.shape[-1] if merged.ndim > 1 else None,
-                self.config.audio_pool_step,
-            )
-            final_audio_embeds.append(merged)
+            final_audio_embeds.append(torch.cat(target_audio_embeds_lst))
 
         return final_audio_embeds
 

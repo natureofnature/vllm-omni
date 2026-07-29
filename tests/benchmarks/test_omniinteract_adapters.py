@@ -1,4 +1,4 @@
-"""Tests for model-neutral OmniInteract request profiles."""
+"""Tests for OmniInteract duplex request profiles."""
 
 from __future__ import annotations
 
@@ -17,33 +17,26 @@ from vllm_omni.entrypoints.cli.benchmark.cli_args import add_omniinteract_cli_ar
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_minicpm_profile_uses_separate_audio_video_and_tts_template():
+def test_realtime_profile_is_default_and_supports_aliases():
     config = load_model_special_config("minicpmo_4_5")
-
-    assert config.content_order == ("audio", "video")
-    assert config.requires_audio
-    assert config.is_realtime is False
+    assert config.name == "minicpmo_4_5_realtime"
+    assert config.system_prompt == "Streaming Omni Conversation."
     assert config.extra_body == {
         "modalities": ["text", "audio"],
-        "mm_processor_kwargs": {"use_audio_in_video": False},
         "chat_template_kwargs": {"use_tts_template": True},
     }
 
-
-def test_realtime_profile_is_marked_as_realtime():
-    config = load_model_special_config("minicpmo_4_5_realtime")
-
-    assert config.is_realtime is True
-    assert config.content_order == ("audio", "video")
+    aliased = load_model_special_config("realtime")
+    assert aliased.name == "minicpmo_4_5_realtime"
 
 
 def test_cli_accepts_unified_model_special_config():
     parser = argparse.ArgumentParser()
     add_omniinteract_cli_args(parser)
 
-    args = parser.parse_args(["--omniinteract-model-special-config", "minicpmo_4_5"])
+    args = parser.parse_args(["--omniinteract-model-special-config", "minicpmo_4_5_realtime"])
 
-    assert args.omniinteract_model_special_config == "minicpmo_4_5"
+    assert args.omniinteract_model_special_config == "minicpmo_4_5_realtime"
 
 
 def test_custom_profile_loads_from_json_file_and_deep_merges(tmp_path: Path):
@@ -51,10 +44,10 @@ def test_custom_profile_loads_from_json_file_and_deep_merges(tmp_path: Path):
     config_path.write_text(
         json.dumps(
             {
-                "preset": "video",
-                "name": "custom-video",
+                "preset": "minicpmo_4_5_realtime",
+                "name": "custom-realtime",
                 "extra_body": {
-                    "mm_processor_kwargs": {"custom_processor_flag": True},
+                    "chat_template_kwargs": {"custom_template_flag": True},
                     "custom_request_field": "value",
                 },
             }
@@ -64,11 +57,10 @@ def test_custom_profile_loads_from_json_file_and_deep_merges(tmp_path: Path):
 
     config = load_model_special_config(str(config_path))
 
-    assert config.name == "custom-video"
-    assert config.content_order == ("video", "question")
-    assert config.extra_body["mm_processor_kwargs"] == {
-        "use_audio_in_video": True,
-        "custom_processor_flag": True,
+    assert config.name == "custom-realtime"
+    assert config.extra_body["chat_template_kwargs"] == {
+        "use_tts_template": True,
+        "custom_template_flag": True,
     }
     assert config.extra_body["custom_request_field"] == "value"
 
@@ -77,9 +69,8 @@ def test_custom_profile_loads_from_json_file_and_deep_merges(tmp_path: Path):
     ("raw", "match"),
     [
         ('{"preset": "unknown"}', "Unknown OmniInteract model preset"),
-        ('{"preset": "video", "content_order": ["video", "bad"]}', "content_order"),
-        ('{"preset": "video", "content_order": ["video"]}', "audio.*question"),
-        ('{"preset": "video", "extra_body": []}', "extra_body"),
+        ('{"preset": "minicpmo_4_5_realtime", "content_order": ["video"]}', "Unknown OmniInteract"),
+        ('{"preset": "minicpmo_4_5_realtime", "extra_body": []}', "extra_body"),
     ],
 )
 def test_model_special_config_rejects_invalid_values(raw: str, match: str):
@@ -87,13 +78,12 @@ def test_model_special_config_rejects_invalid_values(raw: str, match: str):
         load_model_special_config(raw)
 
 
-def test_typed_model_special_config_is_validated():
+def test_typed_model_special_config_is_accepted():
     config = OmniInteractModelSpecialConfig(
-        name="invalid",
-        content_order=("video", "unknown"),
-        system_prompt="system",
-        extra_body={},
+        name="custom",
+        system_prompt="Streaming Omni Conversation.",
+        extra_body={"modalities": ["text", "audio"]},
     )
-
-    with pytest.raises(ValueError, match="content_order"):
-        load_model_special_config(config)
+    loaded = load_model_special_config(config)
+    assert loaded.name == "custom"
+    assert loaded.extra_body == {"modalities": ["text", "audio"]}

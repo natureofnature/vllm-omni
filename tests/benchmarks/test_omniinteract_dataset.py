@@ -1,4 +1,4 @@
-"""Unit tests for OmniInteract benchmark data/eval modules."""
+"""Unit tests for OmniInteract duplex dataset/eval modules."""
 
 from __future__ import annotations
 
@@ -45,16 +45,11 @@ from vllm_omni.benchmarks.patch.patch import (  # noqa: E402
 )
 
 
-@pytest.fixture()
-def omniinteract_root(tmp_path: Path) -> Path:
-    root = tmp_path / "data"
-    # 1q1a subset
+def _write_minimal_1q1a_tree(root: Path) -> None:
     s1 = root / "1q1a"
     (s1 / "videos").mkdir(parents=True)
     (s1 / "annotations").mkdir(parents=True)
-    (s1 / "subvideos").mkdir(parents=True)
     (s1 / "videos" / "0001.mp4").write_bytes(b"fake-mp4")
-    (s1 / "subvideos" / "0001_0.mp4").write_bytes(b"fake-subvideo")
     (s1 / "annotations" / "0001.json").write_text(
         json.dumps(
             [
@@ -86,12 +81,20 @@ def omniinteract_root(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
 
-    # empty subset dirs to satisfy default subset list
+
+def _write_empty_optional_subsets(root: Path) -> None:
     (root / "1q1a_math" / "videos").mkdir(parents=True)
     (root / "1q1a_math" / "annotations").mkdir(parents=True)
     (root / "1q1a_math" / "video_json_map.json").write_text(json.dumps({"total": 0, "entries": []}), encoding="utf-8")
     (root / "1qna" / "videos_bench").mkdir(parents=True)
     (root / "1qna" / "annotations").mkdir(parents=True)
+
+
+@pytest.fixture()
+def omniinteract_root(tmp_path: Path) -> Path:
+    root = tmp_path / "data"
+    _write_minimal_1q1a_tree(root)
+    _write_empty_optional_subsets(root)
     return root
 
 
@@ -105,45 +108,6 @@ def mock_tokenizer(mocker):
     tok.vocab_size = 1
     tok.__len__.return_value = 1
     return tok
-
-
-def _write_minimal_1q1a_tree(root: Path) -> None:
-    s1 = root / "1q1a"
-    (s1 / "videos").mkdir(parents=True)
-    (s1 / "annotations").mkdir(parents=True)
-    (s1 / "subvideos").mkdir(parents=True)
-    (s1 / "videos" / "0001.mp4").write_bytes(b"fake-mp4")
-    (s1 / "subvideos" / "0001_0.mp4").write_bytes(b"fake-subvideo")
-    (s1 / "annotations" / "0001.json").write_text(
-        json.dumps(
-            [
-                {
-                    "question_time": "00:01",
-                    "question_text": "What color is the cup?",
-                    "answer_time": "00:04",
-                    "answer_text": "red",
-                    "question_type": "realtime",
-                    "is_interrupted": False,
-                }
-            ]
-        ),
-        encoding="utf-8",
-    )
-    (s1 / "video_json_map.json").write_text(
-        json.dumps(
-            {
-                "total": 1,
-                "entries": [
-                    {
-                        "video": "videos/0001.mp4",
-                        "annotation": "annotations/0001.json",
-                        "scene_type": "multi_turn",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
 
 
 def test_resolve_omniinteract_root_from_local_dataset_path(tmp_path: Path):
@@ -166,7 +130,7 @@ def test_resolve_omniinteract_root_extracts_local_tarball(tmp_path: Path):
     assert (resolved / "1q1a" / "video_json_map.json").is_file()
 
 
-def test_omniinteract_dataset_builds_chat_requests(omniinteract_root: Path, mock_tokenizer):
+def test_omniinteract_dataset_builds_full_video_duplex_sessions(omniinteract_root: Path, mock_tokenizer):
     ds = OmniInteractDataset(
         dataset_path=str(omniinteract_root),
         random_seed=0,
@@ -179,68 +143,81 @@ def test_omniinteract_dataset_builds_chat_requests(omniinteract_root: Path, mock
     assert req.omniinteract_subset == "1q1a"
     assert req.omniinteract_gold_answer == "red"
     assert req.omniinteract_scene_type == "multi_turn"
-    assert req.omniinteract_video == "subvideos/0001_0.mp4"
-    assert req.omni_chat_messages is not None
-    user_msg = req.omni_chat_messages[1]["content"]
-    assert user_msg[0]["type"] == "video_url"
-    assert user_msg[1]["type"] == "text"
-    assert req.omni_extra_body == {"mm_processor_kwargs": {"use_audio_in_video": True}}
-
-
-def test_omniinteract_dataset_minicpm_profile_sends_question_audio_once(omniinteract_root: Path, mock_tokenizer):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-        model_special_config="minicpmo_4_5",
-    )
-
-    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
-
-    assert req.omni_chat_messages is not None
-    user_content = req.omni_chat_messages[1]["content"]
-    assert [item["type"] for item in user_content] == ["audio_url", "video_url"]
-    assert all(item["type"] != "text" for item in user_content)
+    assert req.omniinteract_video == "videos/0001.mp4"
+    assert req.omniinteract_profile == "realtime"
+    assert len(req.omniinteract_slots) == 1
+    assert req.omniinteract_slots[0].answer_text == "red"
+    assert req.omniinteract_video_path.endswith("videos/0001.mp4")
     assert req.omni_extra_body == {
         "modalities": ["text", "audio"],
-        "mm_processor_kwargs": {"use_audio_in_video": False},
         "chat_template_kwargs": {"use_tts_template": True},
     }
-    request_input = SimpleNamespace(extra_body={"mm_processor_kwargs": {"global_processor_flag": True}})
-    _attach_omniinteract_to_request_func_input(req, request_input)
-    assert request_input.extra_body["mm_processor_kwargs"] == {
-        "global_processor_flag": True,
-        "use_audio_in_video": False,
-    }
-    assert request_input.extra_body["chat_template_kwargs"] == {"use_tts_template": True}
-    assert request_input.omni_chat_messages == req.omni_chat_messages
 
 
-def test_omniinteract_dataset_realtime_profile_builds_session_with_turns(omniinteract_root: Path, mock_tokenizer):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
+def test_omniinteract_dataset_attaches_realtime_session_fields(omniinteract_root: Path, mock_tokenizer):
     ds = OmniInteractDataset(
         dataset_path=str(omniinteract_root),
         random_seed=0,
         disable_shuffle=True,
         model_special_config="minicpmo_4_5_realtime",
     )
-
     [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
-
-    assert req.omniinteract_profile == "realtime"
-    assert req.omniinteract_realtime_turns is not None
-    assert len(req.omniinteract_realtime_turns) == 1
-    assert req.omniinteract_video_path.endswith("0001_0.mp4")
-    assert req.omniinteract_realtime_turns[0].gold_answer == "red"
     request_input = SimpleNamespace(extra_body=None)
     _attach_omniinteract_to_request_func_input(req, request_input)
-    assert request_input.omniinteract_realtime_turns == req.omniinteract_realtime_turns
+    assert request_input.omniinteract_slots == req.omniinteract_slots
     assert request_input.omniinteract_video_path == req.omniinteract_video_path
+    assert request_input.omniinteract_subset == "1q1a"
+    assert request_input.omniinteract_video == "videos/0001.mp4"
+
+
+def test_omniinteract_1qna_loads_continuous_videos_bench_sessions(tmp_path: Path, mock_tokenizer):
+    root = tmp_path / "data"
+    _write_empty_optional_subsets(root)
+    (root / "1q1a" / "videos").mkdir(parents=True, exist_ok=True)
+    (root / "1q1a" / "annotations").mkdir(parents=True, exist_ok=True)
+    (root / "1q1a" / "video_json_map.json").write_text(json.dumps({"total": 0, "entries": []}), encoding="utf-8")
+
+    video = root / "1qna" / "videos_bench" / "scene_a" / "clip.mp4"
+    video.parent.mkdir(parents=True, exist_ok=True)
+    video.write_bytes(b"fake-1qna-mp4")
+    ann = root / "1qna" / "annotations" / "scene_a" / "clip.json"
+    ann.parent.mkdir(parents=True, exist_ok=True)
+    ann.write_text(
+        json.dumps(
+            [
+                {
+                    "question_time": "00:02",
+                    "question_text": "What happens next?",
+                    "answer_time": "00:05",
+                    "answer_text": "a jump",
+                    "question_type": "realtime",
+                    "is_interrupted": False,
+                },
+                {
+                    "question_time": "00:08",
+                    "question_text": "And then?",
+                    "answer_time": "00:10",
+                    "answer_text": "a fall",
+                    "question_type": "realtime",
+                    "is_interrupted": False,
+                },
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    ds = OmniInteractDataset(
+        dataset_path=str(root),
+        random_seed=0,
+        disable_shuffle=True,
+        subsets=["1qna"],
+    )
+    [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+    assert req.omniinteract_subset == "1qna"
+    assert req.omniinteract_scene_type == "1qna"
+    assert req.omniinteract_video.endswith("videos_bench/scene_a/clip.mp4")
+    assert len(req.omniinteract_slots) == 2
+    assert [slot.answer_text for slot in req.omniinteract_slots] == ["a jump", "a fall"]
 
 
 def test_omniinteract_eval_counts_exact_and_soft_match():
@@ -254,6 +231,7 @@ def test_omniinteract_eval_counts_exact_and_soft_match():
         omniinteract_subset="1q1a",
         omniinteract_question_type="realtime",
         omniinteract_video="videos/0001.mp4",
+        omniinteract_profile="realtime",
     )
 
     class _Out:
@@ -269,7 +247,7 @@ def test_omniinteract_eval_counts_exact_and_soft_match():
     assert m["omniinteract_exact_count"] == 0
     assert m["omniinteract_soft_count"] == 1
     assert m["omniinteract_ia_qtf1"] == 1.0
-    assert m["omniinteract_profiles"] == ["clip"]
+    assert m["omniinteract_profiles"] == ["realtime"]
     assert m["omniinteract_official_compatible"] is False
     assert "omniinteract_ids" in m
     assert "omniinteract_nccs" in m
@@ -317,6 +295,7 @@ def test_omniinteract_ids_csm_uses_spill_timing_when_available():
             omniinteract_question_type="realtime",
             omniinteract_video="videos/0001.mp4",
             omniinteract_is_interrupted=True,
+            omniinteract_profile="realtime",
         ),
         OmniInteractSampleRequest(
             prompt="q",
@@ -329,6 +308,7 @@ def test_omniinteract_ids_csm_uses_spill_timing_when_available():
             omniinteract_question_type="realtime",
             omniinteract_video="videos/0002.mp4",
             omniinteract_is_interrupted=True,
+            omniinteract_profile="realtime",
         ),
     ]
 
@@ -351,15 +331,12 @@ def test_omniinteract_ids_csm_uses_spill_timing_when_available():
     assert exp_interruption["interrupted_with_spill_timing_count"] == 2
 
 
-def test_omniinteract_dataset_infers_nested_roles(tmp_path: Path, mock_tokenizer):
+def test_omniinteract_dataset_infers_nested_roles_in_one_session(tmp_path: Path, mock_tokenizer):
     root = tmp_path / "nested_data"
     s1 = root / "1q1a"
     (s1 / "videos").mkdir(parents=True)
     (s1 / "annotations").mkdir(parents=True)
-    (s1 / "subvideos").mkdir(parents=True)
     (s1 / "videos" / "0002.mp4").write_bytes(b"fake-mp4")
-    (s1 / "subvideos" / "0002_0.mp4").write_bytes(b"fake-subvideo-0")
-    (s1 / "subvideos" / "0002_1.mp4").write_bytes(b"fake-subvideo-1")
     (s1 / "annotations" / "0002.json").write_text(
         json.dumps(
             [
@@ -398,16 +375,13 @@ def test_omniinteract_dataset_infers_nested_roles(tmp_path: Path, mock_tokenizer
         ),
         encoding="utf-8",
     )
-    (root / "1q1a_math" / "videos").mkdir(parents=True)
-    (root / "1q1a_math" / "annotations").mkdir(parents=True)
-    (root / "1q1a_math" / "video_json_map.json").write_text(json.dumps({"total": 0, "entries": []}), encoding="utf-8")
-    (root / "1qna" / "videos_bench").mkdir(parents=True)
-    (root / "1qna" / "annotations").mkdir(parents=True)
+    _write_empty_optional_subsets(root)
 
-    ds = OmniInteractDataset(dataset_path=str(root), random_seed=0, disable_shuffle=True)
-    reqs = ds.sample(mock_tokenizer, num_requests=2, no_oversample=True)
-    assert len(reqs) == 2
-    assert reqs[0].omniinteract_scene_type == "nested"
-    assert reqs[1].omniinteract_scene_type == "nested"
-    roles = {reqs[0].omniinteract_nested_role, reqs[1].omniinteract_nested_role}
+    ds = OmniInteractDataset(dataset_path=str(root), random_seed=0, disable_shuffle=True, subsets=["1q1a"])
+    reqs = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
+    assert len(reqs) == 1
+    req = reqs[0]
+    assert req.omniinteract_scene_type == "nested"
+    assert len(req.omniinteract_slots) == 2
+    roles = {slot.nested_role for slot in req.omniinteract_slots}
     assert roles == {"outer", "inner"}

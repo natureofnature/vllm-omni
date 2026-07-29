@@ -1,4 +1,4 @@
-"""OmniInteract full-duplex realtime helpers for MiniCPM-o 4.5."""
+"""OmniInteract full-duplex realtime helpers for continuous video sessions."""
 
 from __future__ import annotations
 
@@ -6,6 +6,8 @@ import asyncio
 import base64
 import io
 import math
+import shutil
+import subprocess
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -18,24 +20,23 @@ from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
     RealtimeEventCollector,
     build_realtime_url,
-    read_pcm16_wav,
+    wait_for,
 )
 
 
 @dataclass(frozen=True)
-class OmniInteractRealtimeTurn:
-    """One user turn inside a duplex OmniInteract session."""
-
-    turn_index: int
-    audio_path: Path
-    gold_answer: str
-    question_text: str = ""
-    question_type: str = ""
+class OmniInteractQASlotView:
+    slot_index: int
+    question_text: str
+    answer_text: str
     question_time: str = ""
     answer_time: str = ""
+    question_type: str = ""
     is_interrupted: bool | None = None
     nested_group_id: int | None = None
     nested_role: str = ""
+    question_time_s: float | None = None
+    answer_time_s: float | None = None
     subset: str = ""
     video_rel: str = ""
     scene_type: str = ""
@@ -45,6 +46,7 @@ class OmniInteractRealtimeTurn:
 class OmniInteractRealtimeTurnMetrics:
     turn_index: int
     response_id: str | None
+    video_time_s: float = 0.0
     ttft_s: float = 0.0
     tpot_s: float = 0.0
     rtf: float = 0.0
@@ -58,6 +60,7 @@ class OmniInteractRealtimeTurnMetrics:
         return {
             "turn_index": self.turn_index,
             "response_id": self.response_id,
+            "video_time_s": self.video_time_s,
             "ttft_s": self.ttft_s,
             "tpot_s": self.tpot_s,
             "rtf": self.rtf,
@@ -105,14 +108,41 @@ def _ref_audio_data_url(path: str | None) -> str | None:
     return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
+def extract_pcm16_from_video(video_path: Path) -> bytes:
+    """Extract mono 16 kHz PCM16 from a video, matching OmniInteract MiniCPM-o."""
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg is required to extract OmniInteract duplex audio from video")
+    cmd = [
+        "ffmpeg",
+        "-loglevel",
+        "error",
+        "-i",
+        str(video_path),
+        "-vn",
+        "-f",
+        "s16le",
+        "-acodec",
+        "pcm_s16le",
+        "-ac",
+        "1",
+        "-ar",
+        str(PCM16_SAMPLE_RATE),
+        "pipe:1",
+    ]
+    proc = subprocess.run(cmd, capture_output=True, check=False)
+    if proc.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to extract audio from {video_path}: {proc.stderr.decode('utf-8', 'ignore')}")
+    return proc.stdout
+
+
 def sample_video_jpeg_frames(video_path: Path, fps: float) -> list[str]:
-    """Sample a subvideo into base64 JPEG frames at approximately ``fps``."""
+    """Sample one JPEG frame per ``1/fps`` seconds in presentation order."""
     if fps <= 0:
         raise ValueError("video fps must be positive")
     try:
         import imageio.v3 as iio
         from PIL import Image
-    except ImportError as exc:  # pragma: no cover - optional benchmark dependency
+    except ImportError as exc:  # pragma: no cover
         raise ImportError(
             "OmniInteract realtime video sampling requires imageio and Pillow. Install with: pip install imageio pillow"
         ) from exc
@@ -129,6 +159,8 @@ def sample_video_jpeg_frames(video_path: Path, fps: float) -> list[str]:
         if idx % step != 0:
             continue
         image = Image.fromarray(frame)
+        # Keep frames small enough for realtime append validation.
+        image.thumbnail((640, 640))
         buffer = io.BytesIO()
         image.save(buffer, format="JPEG", quality=85)
         frames_b64.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
@@ -142,11 +174,7 @@ def _transcript_for_response(collector: RealtimeEventCollector, response_id: str
     for event in collector.events:
         if collector.response_id(event) != response_id:
             continue
-        event_type = event.get("type")
-        if event_type not in {
-            "response.audio_transcript.delta",
-            "response.output_text.delta",
-        }:
+        if event.get("type") not in {"response.audio_transcript.delta", "response.output_text.delta"}:
             continue
         delta = event.get("delta")
         if isinstance(delta, str) and delta:
@@ -180,6 +208,7 @@ def compute_turn_metrics(
     *,
     response_id: str | None,
     turn_start_s: float,
+    stream_start_s: float,
 ) -> OmniInteractRealtimeTurnMetrics:
     metrics = OmniInteractRealtimeTurnMetrics(turn_index=0, response_id=response_id)
     if response_id is None:
@@ -195,8 +224,6 @@ def compute_turn_metrics(
     sample_rate = collector.output_sample_rate_hz or 24_000
 
     for event, received_at_s in zip(collector.events, collector.event_received_at_s, strict=True):
-        if received_at_s < turn_start_s:
-            continue
         if collector.response_id(event) != response_id:
             continue
         event_type = event.get("type")
@@ -212,6 +239,8 @@ def compute_turn_metrics(
         if isinstance(stage0, dict):
             stage0_metrics = stage0
 
+    origin = response_created_at_s if response_created_at_s is not None else turn_start_s
+    metrics.video_time_s = max(0.0, origin - stream_start_s)
     metrics.generated_text = _transcript_for_response(collector, response_id)
     metrics.audio_duration_s = len(audio_bytes) / (sample_rate * PCM16_BYTES_PER_SAMPLE)
     metrics.response_generation_s = (
@@ -227,14 +256,37 @@ def compute_turn_metrics(
         if tpot_ms > 0:
             metrics.tpot_s = tpot_ms / 1000.0
     if metrics.ttft_s <= 0 and first_text_at_s is not None:
-        metrics.ttft_s = max(0.0, first_text_at_s - turn_start_s)
+        metrics.ttft_s = max(0.0, first_text_at_s - origin)
     elif metrics.ttft_s <= 0 and first_audio_at_s is not None:
-        metrics.ttft_s = max(0.0, first_audio_at_s - turn_start_s)
-
+        metrics.ttft_s = max(0.0, first_audio_at_s - origin)
     if metrics.audio_duration_s > 0 and metrics.response_generation_s > 0:
         metrics.rtf = metrics.response_generation_s / metrics.audio_duration_s
     metrics.success = bool(metrics.generated_text.strip() or metrics.audio_duration_s > 0)
     return metrics
+
+
+def _match_slot(
+    slots: list[OmniInteractQASlotView],
+    *,
+    video_time_s: float,
+    used: set[int],
+) -> OmniInteractQASlotView | None:
+    candidates: list[tuple[float, OmniInteractQASlotView]] = []
+    for slot in slots:
+        if slot.slot_index in used:
+            continue
+        q_s = slot.question_time_s
+        a_s = slot.answer_time_s
+        if q_s is None:
+            continue
+        if a_s is not None and q_s <= video_time_s <= a_s:
+            candidates.append((0.0, slot))
+        elif video_time_s >= q_s:
+            candidates.append((video_time_s - q_s, slot))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1].slot_index))
+    return candidates[0][1]
 
 
 async def _stream_pcm16_with_video(
@@ -263,6 +315,7 @@ async def _stream_pcm16_with_video(
             "duration_ms": duration_ms,
             "audio_end_ms": audio_end_ms,
         }
+        # Official MiniCPM-o cadence: one camera frame per ~1 s of audio.
         if video_frames and audio_end_ms > frames_sent * 1000:
             frame_index = min(frames_sent, len(video_frames) - 1)
             payload["video_frames"] = [video_frames[frame_index]]
@@ -272,25 +325,19 @@ async def _stream_pcm16_with_video(
             await asyncio.sleep(duration_ms / 1000)
 
 
-async def _wait_for_response_done(
+async def _drain_active_responses(
     collector: RealtimeEventCollector,
     *,
-    before_created: int,
     timeout_s: float,
-) -> str | None:
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
-        if collector.count("response.created") > before_created:
-            response_id = collector.response_ids[before_created]
-            done_for_response = sum(
-                1
-                for event in collector.events
-                if event.get("type") == "response.done" and collector.response_id(event) == response_id
-            )
-            if done_for_response > 0:
-                return response_id
-        await asyncio.sleep(0.02)
-    raise TimeoutError("Timed out waiting for response.done")
+        created = collector.count("response.created")
+        done = collector.count("response.done")
+        if created <= done:
+            return
+        await asyncio.sleep(0.05)
+    raise TimeoutError("Timed out waiting for active duplex responses to finish")
 
 
 async def run_omniinteract_realtime_session(
@@ -298,19 +345,21 @@ async def run_omniinteract_realtime_session(
     api_url: str,
     model: str,
     video_path: Path,
-    turns: list[OmniInteractRealtimeTurn],
     session_key: str,
+    slots: list[OmniInteractQASlotView],
     ref_audio: str | None = None,
     chunk_ms: int = 200,
     video_fps: float = 1.0,
     realtime_pacing: bool = True,
     timeout_s: float = 120.0,
 ) -> OmniInteractRealtimeSessionResult:
-    if not turns:
-        raise ValueError("OmniInteract realtime session requires at least one turn")
-
     result = OmniInteractRealtimeSessionResult(session_key=session_key)
     session_start = time.monotonic()
+    pcm16 = extract_pcm16_from_video(video_path)
+    if not pcm16:
+        result.error = f"No audio extracted from video: {video_path}"
+        result.latency_s = time.monotonic() - session_start
+        return result
     video_frames = sample_video_jpeg_frames(video_path, video_fps)
     ws_url = build_realtime_url(http_url_to_ws_url(api_url), model, session_id=session_key)
 
@@ -322,70 +371,90 @@ async def run_omniinteract_realtime_session(
                 session_id=session_key,
                 timeout_s=timeout_s,
             )
-            for turn in turns:
-                turn_start_s = time.monotonic()
-                before_created = client.events.count("response.created")
-                pcm16 = read_pcm16_wav(turn.audio_path)
-                await _stream_pcm16_with_video(
-                    client,
-                    pcm16,
-                    chunk_ms=chunk_ms,
-                    realtime=realtime_pacing,
-                    video_frames=video_frames,
+            stream_start_s = time.monotonic()
+            before_created = client.events.count("response.created")
+            await _stream_pcm16_with_video(
+                client,
+                pcm16,
+                chunk_ms=chunk_ms,
+                realtime=realtime_pacing,
+                video_frames=video_frames,
+            )
+            await client.commit()
+            try:
+                await wait_for(
+                    lambda: any(event.get("type") == "input_audio_buffer.committed" for event in client.events.events),
+                    timeout_s=timeout_s,
+                    label="input_audio_buffer.committed",
                 )
-                await client.commit()
-                try:
-                    response_id = await _wait_for_response_done(
-                        client.events,
-                        before_created=before_created,
-                        timeout_s=timeout_s,
-                    )
-                except TimeoutError as exc:
-                    turn_metrics = OmniInteractRealtimeTurnMetrics(
-                        turn_index=turn.turn_index,
-                        response_id=None,
-                        error=str(exc),
-                    )
-                    result.turn_metrics.append(turn_metrics)
-                    result.turn_outputs.append(
-                        {
-                            "turn_index": turn.turn_index,
-                            "gold_answer": turn.gold_answer,
-                            "generated_text": "",
-                            "success": False,
-                            "error": str(exc),
-                            **turn_metrics.as_dict(),
-                        }
-                    )
-                    continue
+                await _drain_active_responses(client.events, timeout_s=timeout_s)
+            except TimeoutError as exc:
+                result.error = str(exc)
 
+            used_slots: set[int] = set()
+            response_ids = client.events.response_ids[before_created:]
+            for turn_index, response_id in enumerate(response_ids):
                 turn_metrics = compute_turn_metrics(
                     client.events,
                     response_id=response_id,
-                    turn_start_s=turn_start_s,
+                    turn_start_s=stream_start_s,
+                    stream_start_s=stream_start_s,
                 )
-                turn_metrics.turn_index = turn.turn_index
+                turn_metrics.turn_index = turn_index
                 result.turn_metrics.append(turn_metrics)
+                matched = _match_slot(slots, video_time_s=turn_metrics.video_time_s, used=used_slots)
+                if matched is not None:
+                    used_slots.add(matched.slot_index)
                 result.turn_outputs.append(
                     {
-                        "turn_index": turn.turn_index,
-                        "gold_answer": turn.gold_answer,
+                        "turn_index": turn_index,
+                        "question_text": matched.question_text if matched else "",
+                        "gold_answer": matched.answer_text if matched else "",
                         "generated_text": turn_metrics.generated_text,
                         "success": turn_metrics.success,
-                        "subset": turn.subset,
-                        "question_type": turn.question_type,
-                        "video": turn.video_rel,
-                        "scene_type": turn.scene_type,
-                        "nested_group_id": turn.nested_group_id,
-                        "nested_role": turn.nested_role,
-                        "question_time": turn.question_time,
-                        "answer_time": turn.answer_time,
-                        "is_interrupted": turn.is_interrupted,
+                        "subset": matched.subset if matched else (slots[0].subset if slots else ""),
+                        "question_type": matched.question_type if matched else "",
+                        "video": matched.video_rel if matched else (slots[0].video_rel if slots else ""),
+                        "scene_type": matched.scene_type if matched else (slots[0].scene_type if slots else ""),
+                        "nested_group_id": matched.nested_group_id if matched else None,
+                        "nested_role": matched.nested_role if matched else "",
+                        "question_time": matched.question_time if matched else "",
+                        "answer_time": matched.answer_time if matched else "",
+                        "is_interrupted": matched.is_interrupted if matched else None,
+                        "matched_slot_index": matched.slot_index if matched else None,
                         **turn_metrics.as_dict(),
                     }
                 )
-                await client.acknowledge_playback()
 
+            # Unmatched GT slots become FN rows for soft QA metrics.
+            for slot in slots:
+                if slot.slot_index in used_slots:
+                    continue
+                result.turn_outputs.append(
+                    {
+                        "turn_index": len(result.turn_outputs),
+                        "question_text": slot.question_text,
+                        "gold_answer": slot.answer_text,
+                        "generated_text": "",
+                        "success": False,
+                        "error": "no_response_matched_slot",
+                        "subset": slot.subset,
+                        "question_type": slot.question_type,
+                        "video": slot.video_rel,
+                        "scene_type": slot.scene_type,
+                        "nested_group_id": slot.nested_group_id,
+                        "nested_role": slot.nested_role,
+                        "question_time": slot.question_time,
+                        "answer_time": slot.answer_time,
+                        "is_interrupted": slot.is_interrupted,
+                        "matched_slot_index": slot.slot_index,
+                        "ttft_s": 0.0,
+                        "tpot_s": 0.0,
+                        "rtf": 0.0,
+                    }
+                )
+
+            await client.acknowledge_playback()
             await client.close_session(timeout_s=timeout_s)
     except Exception as exc:
         result.error = str(exc)
@@ -394,7 +463,7 @@ async def run_omniinteract_realtime_session(
         return result
 
     result.latency_s = time.monotonic() - session_start
-    result.success = all(metric.success for metric in result.turn_metrics) and not result.error
+    result.success = (not result.error) and any(metric.success for metric in result.turn_metrics)
     if result.turn_metrics:
         result.ttft_s = result.turn_metrics[0].ttft_s
         tpots = [metric.tpot_s for metric in result.turn_metrics if metric.tpot_s > 0]
@@ -411,6 +480,7 @@ def summarize_turn_metrics(turn_metrics: list[OmniInteractRealtimeTurnMetrics]) 
             "omniinteract_realtime_turn_ttft_mean_s": None,
             "omniinteract_realtime_turn_tpot_mean_s": None,
             "omniinteract_realtime_turn_rtf_mean": None,
+            "omniinteract_realtime_turn_metrics": [],
         }
 
     def _mean(values: list[float]) -> float | None:
@@ -424,22 +494,3 @@ def summarize_turn_metrics(turn_metrics: list[OmniInteractRealtimeTurnMetrics]) 
         "omniinteract_realtime_turn_rtf_mean": _mean([metric.rtf for metric in turn_metrics]),
         "omniinteract_realtime_turn_metrics": [metric.as_dict() for metric in turn_metrics],
     }
-
-
-def flatten_realtime_eval_pairs(
-    session_results: list[OmniInteractRealtimeSessionResult],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Return flattened per-turn request/output dicts for OmniInteract QA eval."""
-    requests: list[dict[str, Any]] = []
-    outputs: list[dict[str, Any]] = []
-    for session in session_results:
-        for turn_output in session.turn_outputs:
-            requests.append(turn_output)
-            outputs.append(
-                {
-                    "success": bool(turn_output.get("success")),
-                    "generated_text": str(turn_output.get("generated_text") or ""),
-                    "error": str(turn_output.get("error") or ""),
-                }
-            )
-    return requests, outputs

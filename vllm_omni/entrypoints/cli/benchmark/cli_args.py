@@ -177,23 +177,16 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "--omniinteract-subsets",
         type=str,
         default="1q1a,1q1a_math,1qna",
-        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'.",
-    )
-    group.add_argument(
-        "--omniinteract-inline-local-video",
-        action="store_true",
-        default=False,
-        help="Embed local MP4/WAV as data URLs instead of file://. Useful when server lacks "
-        "--allowed-local-media-path; increases request body size.",
+        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'. "
+        "Each request is one continuous full-video duplex session.",
     )
     group.add_argument(
         "--omniinteract-model-special-config",
         type=str,
         default=None,
         help=(
-            "Model-specific OmniInteract request profile. Accepts a built-in preset "
-            "('video', 'minicpmo_4_5', or 'minicpmo_4_5_realtime'), an inline JSON object, "
-            "or a JSON file path."
+            "Model-specific OmniInteract duplex request profile. Accepts a built-in preset "
+            "('minicpmo_4_5_realtime' / aliases), an inline JSON object, or a JSON file path."
         ),
     )
     group.add_argument(
