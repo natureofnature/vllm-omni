@@ -32,15 +32,11 @@ from vllm_omni.benchmarks.adapters.omniinteract import (
     OmniInteractModelSpecialConfig,
     load_model_special_config,
 )
+from vllm_omni.benchmarks.data_modules.omniinteract_realtime import OmniInteractRealtimeTurn
 
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
-OmniInteractInputMode = Literal["video", "aura"]
-
-
-def _is_remote_or_data_url(value: str) -> bool:
-    return value.startswith(("http://", "https://", "data:"))
 
 
 @dataclass
@@ -59,6 +55,14 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_nested_role: str = ""
     omniinteract_profile: str = "clip"
     omniinteract_official_compatible: bool = False
+    omniinteract_session_key: str = ""
+    omniinteract_video_path: str = ""
+    omniinteract_realtime_turns: list[OmniInteractRealtimeTurn] | None = None
+    omniinteract_realtime_chunk_ms: int = 200
+    omniinteract_realtime_video_fps: float = 1.0
+    omniinteract_realtime_ref_audio: str | None = None
+    omniinteract_realtime_pace: bool = True
+    omniinteract_realtime_timeout_s: float = 120.0
     omni_extra_body: dict[str, Any] | None = None
     omni_chat_messages: list[dict[str, Any]] | None = None
 
@@ -275,40 +279,12 @@ class OmniInteractDataset(BenchmarkDataset):
         subsets: list[OmniInteractSubset] | None = None,
         inline_local_video: bool = False,
         model_special_config: str | dict[str, Any] | OmniInteractModelSpecialConfig | None = None,
-        input_mode: OmniInteractInputMode = "video",
-        aura_tts_task_type: str = "Base",
-        aura_tts_language: str = "Chinese",
-        aura_tts_speaker: str | None = None,
-        aura_tts_ref_audio: str | None = None,
-        aura_tts_ref_text: str | None = None,
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
         self.data_root_input = Path(data_root).expanduser().resolve() if data_root else None
         self.subsets = list(subsets or ["1q1a", "1q1a_math", "1qna"])
         self.inline_local_video = inline_local_video
-        if model_special_config is None and input_mode == "aura":
-            additional_information: dict[str, Any] = {
-                "tts_task_type": aura_tts_task_type,
-                "tts_language": aura_tts_language,
-            }
-            if aura_tts_task_type == "Base":
-                ref_audio = self._normalize_aura_ref_audio(aura_tts_ref_audio)
-                if not ref_audio or not aura_tts_ref_text:
-                    raise ValueError(
-                        "OmniInteract AURA Base TTS requires both --omniinteract-aura-tts-ref-audio "
-                        "and --omniinteract-aura-tts-ref-text."
-                    )
-                if ref_audio:
-                    additional_information["tts_ref_audio"] = ref_audio
-                if aura_tts_ref_text:
-                    additional_information["tts_ref_text"] = aura_tts_ref_text
-            elif aura_tts_speaker:
-                additional_information["tts_speaker"] = aura_tts_speaker
-            model_special_config = {
-                "preset": "aura",
-                "extra_body": {"additional_information": additional_information},
-            }
         self.model_special_config = load_model_special_config(model_special_config)
         self._data_root: Path | None = None
         self._entries: list[_OmniInteractEntry] = []
@@ -475,18 +451,36 @@ class OmniInteractDataset(BenchmarkDataset):
         return {"type": "audio_url", "audio_url": {"url": p.as_uri()}}
 
     @staticmethod
-    def _normalize_aura_ref_audio(ref_audio: str | None) -> str | None:
-        if ref_audio is None:
-            return None
-        value = ref_audio.strip()
-        if not value:
-            return None
-        if _is_remote_or_data_url(value):
-            return value
-        path = Path(value).expanduser()
-        if not path.is_file():
-            raise ValueError(f"--omniinteract-aura-tts-ref-audio does not exist: {value}")
-        return str(path.resolve())
+    def _realtime_session_key(entry: _OmniInteractEntry) -> str:
+        if entry.subset == "1qna":
+            return f"{entry.subset}:{entry.video_path}"
+        return f"{entry.subset}:{entry.video_path}:{entry.question_time}:{entry.answer_time}"
+
+    def _group_realtime_entries(self, entries: list[_OmniInteractEntry]) -> list[list[_OmniInteractEntry]]:
+        from collections import OrderedDict
+
+        groups: OrderedDict[str, list[_OmniInteractEntry]] = OrderedDict()
+        for entry in entries:
+            groups.setdefault(self._realtime_session_key(entry), []).append(entry)
+        return list(groups.values())
+
+    def _build_realtime_turn(self, entry: _OmniInteractEntry, turn_index: int) -> OmniInteractRealtimeTurn:
+        assert entry.audio_path is not None
+        return OmniInteractRealtimeTurn(
+            turn_index=turn_index,
+            audio_path=entry.audio_path,
+            gold_answer=entry.answer_text,
+            question_text=entry.question_text,
+            question_type=entry.question_type,
+            question_time=entry.question_time,
+            answer_time=entry.answer_time,
+            is_interrupted=entry.is_interrupted,
+            nested_group_id=entry.nested_group_id,
+            nested_role=entry.nested_role,
+            subset=entry.subset,
+            video_rel=entry.video_rel,
+            scene_type=entry.scene_type,
+        )
 
     def _build_messages(
         self,
@@ -532,55 +526,147 @@ class OmniInteractDataset(BenchmarkDataset):
     ) -> list[SampleRequest]:
         if output_len is None:
             output_len = self.DEFAULT_OUTPUT_LEN
+        if self.model_special_config.is_realtime:
+            return self._sample_realtime_sessions(
+                tokenizer=tokenizer,
+                num_requests=num_requests,
+                output_len=output_len,
+                request_id_prefix=request_id_prefix,
+                no_oversample=no_oversample,
+            )
+        return self._sample_clip_requests(
+            tokenizer=tokenizer,
+            num_requests=num_requests,
+            output_len=output_len,
+            request_id_prefix=request_id_prefix,
+            no_oversample=no_oversample,
+        )
+
+    def _sample_clip_requests(
+        self,
+        *,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int,
+        request_id_prefix: str,
+        no_oversample: bool,
+    ) -> list[SampleRequest]:
         out: list[SampleRequest] = []
         tok = get_cached_tokenizer(tokenizer)
 
         for i, entry in enumerate(self._entries):
             if len(out) >= num_requests:
                 break
-            if not entry.video_path.is_file():
-                continue
-            if self.model_special_config.requires_audio and (
-                entry.audio_path is None or not entry.audio_path.is_file()
-            ):
+            request = self._build_clip_request(entry, tok, output_len=output_len, request_id=f"{request_id_prefix}{i}")
+            if request is not None:
+                out.append(request)
+
+        self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
+        return out
+
+    def _sample_realtime_sessions(
+        self,
+        *,
+        tokenizer: TokenizerLike,
+        num_requests: int,
+        output_len: int,
+        request_id_prefix: str,
+        no_oversample: bool,
+    ) -> list[SampleRequest]:
+        out: list[SampleRequest] = []
+        tok = get_cached_tokenizer(tokenizer)
+        eligible_entries = [
+            entry
+            for entry in self._entries
+            if entry.video_path.is_file() and entry.audio_path is not None and entry.audio_path.is_file()
+        ]
+        for skipped in self._entries:
+            if skipped.video_path.is_file() and (skipped.audio_path is None or not skipped.audio_path.is_file()):
                 logger.warning(
-                    "Skipping OmniInteract row without required audio: profile=%s subset=%s video=%s audio=%s",
-                    self.model_special_config.name,
-                    entry.subset,
-                    entry.video_rel,
-                    entry.audio_path,
+                    "Skipping OmniInteract realtime row without required audio: subset=%s video=%s audio=%s",
+                    skipped.subset,
+                    skipped.video_rel,
+                    skipped.audio_path,
                 )
-                continue
-            question_prompt = self._question_prompt(entry)
-            prompt = question_prompt if "question" in self.model_special_config.content_order else entry.question_text
-            audio_payload = None
-            if self.model_special_config.requires_audio:
-                assert entry.audio_path is not None
-                audio_payload = self._audio_payload(entry.audio_path)
-            payload = self._video_payload(entry.video_path)
-            messages = self._build_messages(question_prompt, payload, audio_payload)
-            prompt_len = len(tok.encode(prompt))
+
+        for session_index, session_entries in enumerate(self._group_realtime_entries(eligible_entries)):
+            if len(out) >= num_requests:
+                break
+            head = session_entries[0]
+            turns = [self._build_realtime_turn(entry, turn_index) for turn_index, entry in enumerate(session_entries)]
+            prompt = head.question_text or head.answer_text or "omniinteract realtime session"
             out.append(
                 OmniInteractSampleRequest(
                     prompt=prompt,
-                    prompt_len=prompt_len,
+                    prompt_len=len(tok.encode(prompt)),
                     expected_output_len=output_len,
                     multi_modal_data=None,
-                    request_id=f"{request_id_prefix}{i}",
-                    omniinteract_gold_answer=entry.answer_text,
-                    omniinteract_subset=entry.subset,
-                    omniinteract_question_type=entry.question_type,
-                    omniinteract_video=entry.video_rel,
-                    omniinteract_question_time=entry.question_time,
-                    omniinteract_answer_time=entry.answer_time,
-                    omniinteract_is_interrupted=entry.is_interrupted,
-                    omniinteract_scene_type=entry.scene_type,
-                    omniinteract_nested_group_id=entry.nested_group_id,
-                    omniinteract_nested_role=entry.nested_role,
-                    omni_extra_body=deepcopy(self.model_special_config.extra_body),
-                    omni_chat_messages=messages,
+                    request_id=f"{request_id_prefix}{session_index}",
+                    omniinteract_gold_answer=head.answer_text,
+                    omniinteract_subset=head.subset,
+                    omniinteract_question_type=head.question_type,
+                    omniinteract_video=head.video_rel,
+                    omniinteract_question_time=head.question_time,
+                    omniinteract_answer_time=head.answer_time,
+                    omniinteract_is_interrupted=head.is_interrupted,
+                    omniinteract_scene_type=head.scene_type,
+                    omniinteract_nested_group_id=head.nested_group_id,
+                    omniinteract_nested_role=head.nested_role,
+                    omniinteract_profile="realtime",
+                    omniinteract_official_compatible=False,
+                    omniinteract_session_key=self._realtime_session_key(head),
+                    omniinteract_video_path=str(head.video_path.resolve()),
+                    omniinteract_realtime_turns=turns,
                 )
             )
 
         self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)
         return out
+
+    def _build_clip_request(
+        self,
+        entry: _OmniInteractEntry,
+        tok: TokenizerLike,
+        *,
+        output_len: int,
+        request_id: str,
+    ) -> OmniInteractSampleRequest | None:
+        if not entry.video_path.is_file():
+            return None
+        if self.model_special_config.requires_audio and (entry.audio_path is None or not entry.audio_path.is_file()):
+            logger.warning(
+                "Skipping OmniInteract row without required audio: profile=%s subset=%s video=%s audio=%s",
+                self.model_special_config.name,
+                entry.subset,
+                entry.video_rel,
+                entry.audio_path,
+            )
+            return None
+        question_prompt = self._question_prompt(entry)
+        prompt = question_prompt if "question" in self.model_special_config.content_order else entry.question_text
+        audio_payload = None
+        if self.model_special_config.requires_audio:
+            assert entry.audio_path is not None
+            audio_payload = self._audio_payload(entry.audio_path)
+        payload = self._video_payload(entry.video_path)
+        messages = self._build_messages(question_prompt, payload, audio_payload)
+        return OmniInteractSampleRequest(
+            prompt=prompt,
+            prompt_len=len(tok.encode(prompt)),
+            expected_output_len=output_len,
+            multi_modal_data=None,
+            request_id=request_id,
+            omniinteract_gold_answer=entry.answer_text,
+            omniinteract_subset=entry.subset,
+            omniinteract_question_type=entry.question_type,
+            omniinteract_video=entry.video_rel,
+            omniinteract_question_time=entry.question_time,
+            omniinteract_answer_time=entry.answer_time,
+            omniinteract_is_interrupted=entry.is_interrupted,
+            omniinteract_scene_type=entry.scene_type,
+            omniinteract_nested_group_id=entry.nested_group_id,
+            omniinteract_nested_role=entry.nested_role,
+            omniinteract_profile="clip",
+            omni_extra_body=deepcopy(self.model_special_config.extra_body),
+            omni_chat_messages=messages,
+        )

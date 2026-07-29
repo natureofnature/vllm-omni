@@ -49,7 +49,7 @@ Built-in presets:
 |---|---|---|
 | `video` | video + text question | `use_audio_in_video=true` |
 | `minicpmo_4_5` | question audio + video | text/audio output, `use_audio_in_video=false`, MiniCPM TTS template |
-| `aura` | question audio + video | AURA sampling stages and TTS `additional_information` |
+| `minicpmo_4_5_realtime` | paced PCM + sampled video frames | native full-duplex WebSocket via `--backend minicpmo-realtime` |
 
 The JSON schema is:
 
@@ -75,10 +75,38 @@ Rules:
 - `content_order` must include `video` and at least one question carrier:
   `audio` or `question`.
 - Model config cannot mark a clip run as official-compatible.
-- `--omniinteract-input-mode` and `--omniinteract-aura-tts-*` remain
-  deprecated AURA compatibility options. Prefer the unified config.
 
-## Example: MiniCPM-o 4.5
+## Example: MiniCPM-o 4.5 full duplex
+
+Use the native realtime backend for paced PCM/video input and per-turn metrics:
+
+```bash
+vllm bench serve --omni \
+  --host 127.0.0.1 \
+  --port 8099 \
+  --backend minicpmo-realtime \
+  --endpoint /v1/realtime \
+  --model openbmb/MiniCPM-o-4_5 \
+  --dataset-name omniinteract \
+  --dataset-path "${DATASET_ROOT}" \
+  --omniinteract-subsets 1q1a,1q1a_math \
+  --omniinteract-model-special-config minicpmo_4_5_realtime \
+  --omniinteract-realtime-chunk-ms 200 \
+  --omniinteract-realtime-video-fps 1 \
+  --omniinteract-realtime-ref-audio /path/to/ref.wav \
+  --num-prompts 32 \
+  --max-concurrency 1 \
+  --no-oversample \
+  --omniinteract-eval \
+  --save-result \
+  --result-dir ./omniinteract_results
+```
+
+Result JSON includes `omniinteract_realtime_turn_metrics` with per-session-turn
+`ttft_s`, `tpot_s`, and `rtf`, plus optional OmniInteract QA metrics when
+`--omniinteract-eval` is enabled.
+
+## Example: MiniCPM-o 4.5 HTTP clip mode
 
 Start the default two-GPU server:
 
@@ -155,66 +183,6 @@ user message. Its merged request body contains:
   }
 }
 ```
-
-## Example: AURA CustomVoice
-
-The AURA preset defaults to Base TTS. For CustomVoice, override
-`additional_information` in the unified config:
-
-```bash
-AURA_CONFIG='{
-  "preset": "aura",
-  "extra_body": {
-    "additional_information": {
-      "tts_task_type": "CustomVoice",
-      "tts_language": "English",
-      "tts_speaker": "Vivian"
-    }
-  }
-}'
-
-vllm bench serve --omni \
-  --host 127.0.0.1 \
-  --port 8666 \
-  --backend openai-chat-omni \
-  --endpoint /v1/chat/completions \
-  --model /data/models/AURA \
-  --dataset-name omniinteract \
-  --dataset-path "${DATASET_ROOT}" \
-  --omniinteract-subsets 1q1a,1q1a_math \
-  --omniinteract-model-special-config "${AURA_CONFIG}" \
-  --num-prompts 32 \
-  --max-concurrency 1 \
-  --no-oversample \
-  --percentile-metrics ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration \
-  --print-stage
-```
-
-For Base TTS, supply `tts_ref_audio` and `tts_ref_text` in the same
-`additional_information` object. A JSON file is easier to maintain:
-
-```json
-{
-  "preset": "aura",
-  "extra_body": {
-    "additional_information": {
-      "tts_task_type": "Base",
-      "tts_language": "English",
-      "tts_ref_audio": "/data/voices/reference.wav",
-      "tts_ref_text": "Reference transcript."
-    }
-  }
-}
-```
-
-```bash
-vllm bench serve --omni \
-  ... \
-  --omniinteract-model-special-config ./aura-base.json
-```
-
-Paths inside `extra_body` are passed to the server unchanged. Use paths that
-are valid in the server process or use URLs understood by that model.
 
 ## Example: native video-audio model
 

@@ -10,23 +10,18 @@ from pathlib import Path
 from typing import Any
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful multimodal assistant that understands video and audio."
-DEFAULT_AURA_SYSTEM_PROMPT = (
-    "You are answering OmniInteract audio-visual QA tasks. Use the ASR transcript "
-    "of the user's spoken question together with the video frames. Answer the "
-    "question directly and concisely in the same language as the question. "
-    "Do not output '<|silent|>'."
-)
 
 _CONTENT_TYPES = frozenset({"audio", "video", "question"})
 _CONFIG_KEYS = frozenset({"preset", "name", "content_order", "system_prompt", "extra_body"})
 _PRESET_ALIASES = {
     "video": "video",
     "video_native": "video",
-    "aura": "aura",
     "minicpm": "minicpmo_4_5",
     "minicpmo": "minicpmo_4_5",
     "minicpm-o-4.5": "minicpmo_4_5",
     "minicpmo_4_5": "minicpmo_4_5",
+    "realtime": "minicpmo_4_5_realtime",
+    "minicpmo_4_5_realtime": "minicpmo_4_5_realtime",
 }
 
 
@@ -43,36 +38,9 @@ class OmniInteractModelSpecialConfig:
     def requires_audio(self) -> bool:
         return "audio" in self.content_order
 
-
-def aura_sampling_params_list() -> list[dict[str, Any]]:
-    return [
-        {"temperature": 0.0, "top_p": 1.0, "top_k": -1, "max_tokens": 256, "seed": 42},
-        {
-            "temperature": 0.5,
-            "top_p": 1.0,
-            "top_k": -1,
-            "max_tokens": 256,
-            "seed": 42,
-            "repetition_penalty": 1.0,
-        },
-        {
-            "temperature": 0.9,
-            "top_k": 50,
-            "max_tokens": 4096,
-            "seed": 42,
-            "detokenize": False,
-            "repetition_penalty": 1.05,
-            "stop_token_ids": [2150],
-        },
-        {
-            "temperature": 0.0,
-            "top_p": 1.0,
-            "top_k": -1,
-            "max_tokens": 65536,
-            "seed": 42,
-            "repetition_penalty": 1.0,
-        },
-    ]
+    @property
+    def is_realtime(self) -> bool:
+        return self.name.endswith("_realtime") or self.name == "minicpmo_4_5_realtime"
 
 
 def _preset_data(name: str) -> dict[str, Any]:
@@ -91,7 +59,7 @@ def _preset_data(name: str) -> dict[str, Any]:
             "content_order": ["video", "question"],
             "extra_body": {"mm_processor_kwargs": {"use_audio_in_video": True}},
         }
-    if canonical_name == "minicpmo_4_5":
+    if canonical_name in {"minicpmo_4_5", "minicpmo_4_5_realtime"}:
         return {
             **common,
             "content_order": ["audio", "video"],
@@ -101,20 +69,7 @@ def _preset_data(name: str) -> dict[str, Any]:
                 "chat_template_kwargs": {"use_tts_template": True},
             },
         }
-    return {
-        **common,
-        "content_order": ["audio", "video"],
-        "extra_body": {
-            "modalities": ["text", "audio"],
-            "mm_processor_kwargs": {"use_audio_in_video": False},
-            "sampling_params_list": aura_sampling_params_list(),
-            "additional_information": {
-                "aura_system_prompt": DEFAULT_AURA_SYSTEM_PROMPT,
-                "tts_task_type": "Base",
-                "tts_language": "Chinese",
-            },
-        },
-    }
+    raise ValueError(f"Unsupported OmniInteract preset: {canonical_name}")
 
 
 def _deep_merge(base: Mapping[str, Any], override: Mapping[str, Any]) -> dict[str, Any]:

@@ -16,6 +16,7 @@ by ``add_omni_args``.
 """
 
 import argparse
+import os
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -162,8 +163,86 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments for the OmniInteract benchmark dataset."""
+    group = parser.add_argument_group("OmniInteract Dataset Options")
+    group.add_argument(
+        "--omniinteract-root",
+        type=str,
+        default=None,
+        help="Local OmniInteract extracted data root (contains 1q1a/1q1a_math/1qna, or a parent with data/). "
+        "If omitted, benchmark downloads data.tar.gz from --dataset-path/--hf-name (default lucky-lance/OmniInteract).",
+    )
+    group.add_argument(
+        "--omniinteract-subsets",
+        type=str,
+        default="1q1a,1q1a_math,1qna",
+        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'.",
+    )
+    group.add_argument(
+        "--omniinteract-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local MP4/WAV as data URLs instead of file://. Useful when server lacks "
+        "--allowed-local-media-path; increases request body size.",
+    )
+    group.add_argument(
+        "--omniinteract-model-special-config",
+        type=str,
+        default=None,
+        help=(
+            "Model-specific OmniInteract request profile. Accepts a built-in preset "
+            "('video', 'minicpmo_4_5', or 'minicpmo_4_5_realtime'), an inline JSON object, "
+            "or a JSON file path."
+        ),
+    )
+    group.add_argument(
+        "--omniinteract-eval",
+        action="store_true",
+        default=False,
+        help="Compute OmniInteract QA metrics (IA-QTF1/IDS/NCCS). Disabled by default.",
+    )
+    group.add_argument(
+        "--omniinteract-save-eval-items",
+        action="store_true",
+        default=False,
+        help="When --omniinteract-eval is set, include per-request OmniInteract eval rows in result JSON.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-chunk-ms",
+        type=int,
+        default=200,
+        help="PCM append chunk size for --backend minicpmo-realtime.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-video-fps",
+        type=float,
+        default=1.0,
+        help="Video frame sampling rate for --backend minicpmo-realtime.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-ref-audio",
+        type=str,
+        default=None,
+        help="Reference WAV path for MiniCPM-o full-duplex voice cloning in realtime mode.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-no-pace",
+        action="store_true",
+        default=False,
+        help="Disable realtime pacing and send PCM/video appends as fast as possible.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-timeout-s",
+        type=float,
+        default=120.0,
+        help="Per-session timeout for --backend minicpmo-realtime.",
+    )
+
+
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "omniinteract",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -186,7 +265,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
                 if extra:
                     action.choices = list(action.choices) + extra
             if action.dest == "backend" and action.choices is not None:
-                extra = [choice for choice in ("openai-image-edits-omni",) if choice not in action.choices]
+                extra = [
+                    choice
+                    for choice in ("openai-image-edits-omni", "minicpmo-realtime")
+                    if choice not in action.choices
+                ]
                 if extra:
                     action.choices = list(action.choices) + extra
 
@@ -230,6 +313,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)
@@ -237,6 +321,10 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "omniinteract_eval", False):
+        os.environ["OMNIINTERACT_EVAL"] = "1"
+    if getattr(args, "omniinteract_save_eval_items", False):
+        os.environ["OMNIINTERACT_SAVE_EVAL_ITEMS"] = "1"
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:

@@ -12,7 +12,7 @@ from vllm_omni.benchmarks.adapters.omniinteract import (
     OmniInteractModelSpecialConfig,
     load_model_special_config,
 )
-from vllm_omni.entrypoints.cli.benchmark.serve import add_omniinteract_cli_args
+from vllm_omni.entrypoints.cli.benchmark.cli_args import add_omniinteract_cli_args
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -22,11 +22,19 @@ def test_minicpm_profile_uses_separate_audio_video_and_tts_template():
 
     assert config.content_order == ("audio", "video")
     assert config.requires_audio
+    assert config.is_realtime is False
     assert config.extra_body == {
         "modalities": ["text", "audio"],
         "mm_processor_kwargs": {"use_audio_in_video": False},
         "chat_template_kwargs": {"use_tts_template": True},
     }
+
+
+def test_realtime_profile_is_marked_as_realtime():
+    config = load_model_special_config("minicpmo_4_5_realtime")
+
+    assert config.is_realtime is True
+    assert config.content_order == ("audio", "video")
 
 
 def test_cli_accepts_unified_model_special_config():
@@ -36,29 +44,6 @@ def test_cli_accepts_unified_model_special_config():
     args = parser.parse_args(["--omniinteract-model-special-config", "minicpmo_4_5"])
 
     assert args.omniinteract_model_special_config == "minicpmo_4_5"
-
-
-def test_aura_profile_preserves_multistage_request_fields():
-    config = load_model_special_config(
-        json.dumps(
-            {
-                "preset": "aura",
-                "extra_body": {
-                    "additional_information": {
-                        "tts_task_type": "CustomVoice",
-                        "tts_language": "English",
-                        "tts_speaker": "Ethan",
-                    }
-                },
-            }
-        )
-    )
-
-    assert config.content_order == ("audio", "video")
-    assert len(config.extra_body["sampling_params_list"]) == 4
-    assert config.extra_body["additional_information"]["aura_system_prompt"]
-    assert config.extra_body["additional_information"]["tts_task_type"] == "CustomVoice"
-    assert config.extra_body["additional_information"]["tts_speaker"] == "Ethan"
 
 
 def test_custom_profile_loads_from_json_file_and_deep_merges(tmp_path: Path):

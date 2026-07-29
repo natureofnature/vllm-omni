@@ -215,39 +215,19 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     """Apply per-request OpenAI fields for OmniInteract."""
     if not isinstance(sample, OmniInteractSampleRequest):
         return
+    if getattr(sample, "omniinteract_realtime_turns", None):
+        setattr(rfi, "omniinteract_session_key", sample.omniinteract_session_key)
+        setattr(rfi, "omniinteract_video_path", sample.omniinteract_video_path)
+        setattr(rfi, "omniinteract_realtime_turns", sample.omniinteract_realtime_turns)
+        setattr(rfi, "omniinteract_realtime_chunk_ms", sample.omniinteract_realtime_chunk_ms)
+        setattr(rfi, "omniinteract_realtime_video_fps", sample.omniinteract_realtime_video_fps)
+        setattr(rfi, "omniinteract_realtime_ref_audio", sample.omniinteract_realtime_ref_audio)
+        setattr(rfi, "omniinteract_realtime_pace", sample.omniinteract_realtime_pace)
+        setattr(rfi, "omniinteract_realtime_timeout_s", sample.omniinteract_realtime_timeout_s)
+        return
     rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
     if sample.omni_chat_messages is not None:
         setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
-
-
-#         audio_urls, video_urls = _omniinteract_media_urls(sample.omni_chat_messages)
-#         logger.info(
-#             "OmniInteract request media: request_id=%s video=%s audio=%s",
-#             getattr(rfi, "request_id", None) or getattr(sample, "request_id", None),
-#             ",".join(video_urls) if video_urls else "None",
-#             ",".join(audio_urls) if audio_urls else "None",
-#         )
-
-
-# def _omniinteract_media_urls(messages: list[dict[str, Any]]) -> tuple[list[str], list[str]]:
-#     audio_urls: list[str] = []
-#     video_urls: list[str] = []
-#     for message in messages:
-#         content = message.get("content") if isinstance(message, dict) else None
-#         if not isinstance(content, list):
-#             continue
-#         for part in content:
-#             if not isinstance(part, dict):
-#                 continue
-#             if part.get("type") == "audio_url":
-#                 audio = part.get("audio_url")
-#                 if isinstance(audio, dict) and audio.get("url"):
-#                     audio_urls.append(str(audio["url"]))
-#             elif part.get("type") == "video_url":
-#                 video = part.get("video_url")
-#                 if isinstance(video, dict) and video.get("url"):
-#                     video_urls.append(str(video["url"]))
-#     return audio_urls, video_urls
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -307,7 +287,7 @@ def get_samples(args, tokenizer):
     )
 
     # Check if we need to handle omni-related backends/datasets
-    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni"]
+    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni", "minicpmo-realtime"]
     is_omni_dataset = is_daily_omni or is_omniinteract or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
@@ -448,10 +428,10 @@ def get_samples(args, tokenizer):
         )
 
     if is_omniinteract:
-        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+        if args.backend not in ["openai-chat-omni", "daily-omni", "minicpmo-realtime"]:
             raise ValueError(
                 "OmniInteract requires a multimodal backend that supports video/audio. "
-                f"Got backend={args.backend!r}; use --backend openai-chat-omni."
+                f"Got backend={args.backend!r}; use --backend openai-chat-omni or minicpmo-realtime."
             )
 
         dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -469,13 +449,16 @@ def get_samples(args, tokenizer):
         if not subsets:
             subsets = ["1q1a", "1q1a_math", "1qna"]
 
+        model_special_config = getattr(args, "omniinteract_model_special_config", None)
+        if model_special_config is None and args.backend == "minicpmo-realtime":
+            model_special_config = "minicpmo_4_5_realtime"
+
         logger.info(
             "Loading OmniInteract dataset: dataset_path=%s, omniinteract_root=%s, subsets=%s, model_special_config=%s",
             dataset_path,
             omniinteract_root,
             subsets,
-            getattr(args, "omniinteract_model_special_config", None)
-            or getattr(args, "omniinteract_input_mode", "video"),
+            model_special_config,
         )
 
         dataset = OmniInteractDataset(
@@ -484,13 +467,7 @@ def get_samples(args, tokenizer):
             random_seed=args.seed,
             subsets=subsets,
             inline_local_video=getattr(args, "omniinteract_inline_local_video", False),
-            model_special_config=getattr(args, "omniinteract_model_special_config", None),
-            input_mode=getattr(args, "omniinteract_input_mode", "video"),
-            aura_tts_task_type=getattr(args, "omniinteract_aura_tts_task_type", "Base"),
-            aura_tts_language=getattr(args, "omniinteract_aura_tts_language", "Chinese"),
-            aura_tts_speaker=getattr(args, "omniinteract_aura_tts_speaker", None),
-            aura_tts_ref_audio=getattr(args, "omniinteract_aura_tts_ref_audio", None),
-            aura_tts_ref_text=getattr(args, "omniinteract_aura_tts_ref_text", None),
+            model_special_config=model_special_config,
             disable_shuffle=getattr(args, "disable_shuffle", False),
         )
         out_len = getattr(args, "output_len", None)
@@ -498,15 +475,27 @@ def get_samples(args, tokenizer):
             out_len = getattr(args, "hf_output_len", None)
         if out_len is None:
             out_len = OmniInteractDataset.DEFAULT_OUTPUT_LEN
-        return dataset.sample(
+        samples = dataset.sample(
             tokenizer=tokenizer,
             num_requests=args.num_prompts,
             output_len=out_len,
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
         )
-
-    # Handle random-mm dataset (Omni's synthetic multimodal dataset)
+        if args.backend == "minicpmo-realtime":
+            for sample in samples:
+                if not isinstance(sample, OmniInteractSampleRequest):
+                    continue
+                sample.omniinteract_realtime_chunk_ms = int(getattr(args, "omniinteract_realtime_chunk_ms", 200) or 200)
+                sample.omniinteract_realtime_video_fps = float(
+                    getattr(args, "omniinteract_realtime_video_fps", 1.0) or 1.0
+                )
+                sample.omniinteract_realtime_ref_audio = getattr(args, "omniinteract_realtime_ref_audio", None)
+                sample.omniinteract_realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
+                sample.omniinteract_realtime_timeout_s = float(
+                    getattr(args, "omniinteract_realtime_timeout_s", 120.0) or 120.0
+                )
+        return samples
     if args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
         input_requests = dataset.sample(
@@ -563,6 +552,8 @@ class MixRequestFuncOutput(RequestFuncOutput):
     stage_metrics: dict[str, dict] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
+    omniinteract_session_turn_metrics: list[dict[str, Any]] | None = None
+    omniinteract_turn_outputs: list[dict[str, Any]] | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -1469,6 +1460,117 @@ async def async_request_openai_audio_speech(
     return output
 
 
+def _flatten_omniinteract_realtime_for_eval(
+    input_requests: list[SampleRequest],
+    outputs: list[MixRequestFuncOutput],
+) -> tuple[list[SampleRequest], list[MixRequestFuncOutput]]:
+    flat_requests: list[SampleRequest] = []
+    flat_outputs: list[MixRequestFuncOutput] = []
+    for request, output in zip(input_requests, outputs, strict=True):
+        turns = getattr(request, "omniinteract_realtime_turns", None)
+        turn_outputs = getattr(output, "omniinteract_turn_outputs", None)
+        if not isinstance(request, OmniInteractSampleRequest) or not turns or not turn_outputs:
+            flat_requests.append(request)
+            flat_outputs.append(output)
+            continue
+        for turn, turn_output in zip(turns, turn_outputs, strict=True):
+            flat_requests.append(
+                OmniInteractSampleRequest(
+                    prompt=turn.question_text,
+                    prompt_len=0,
+                    expected_output_len=0,
+                    request_id=f"{request.request_id}:{turn.turn_index}",
+                    omniinteract_gold_answer=turn.gold_answer,
+                    omniinteract_subset=turn.subset,
+                    omniinteract_question_type=turn.question_type,
+                    omniinteract_video=turn.video_rel,
+                    omniinteract_question_time=turn.question_time,
+                    omniinteract_answer_time=turn.answer_time,
+                    omniinteract_is_interrupted=turn.is_interrupted,
+                    omniinteract_scene_type=turn.scene_type,
+                    omniinteract_nested_group_id=turn.nested_group_id,
+                    omniinteract_nested_role=turn.nested_role,
+                    omniinteract_profile="realtime",
+                    omniinteract_official_compatible=False,
+                )
+            )
+            turn_result = MixRequestFuncOutput()
+            turn_result.success = bool(turn_output.get("success"))
+            turn_result.generated_text = str(turn_output.get("generated_text") or "")
+            turn_result.error = str(turn_output.get("error") or "")
+            flat_outputs.append(turn_result)
+    return flat_requests, flat_outputs
+
+
+async def async_request_minicpmo_realtime(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    from pathlib import Path
+
+    from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
+        run_omniinteract_realtime_session,
+        summarize_turn_metrics,
+    )
+
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    turns = getattr(request_func_input, "omniinteract_realtime_turns", None)
+    video_path = getattr(request_func_input, "omniinteract_video_path", None)
+    session_key = getattr(request_func_input, "omniinteract_session_key", None) or request_func_input.request_id
+    if not turns or not video_path:
+        output.success = False
+        output.error = "OmniInteract realtime request is missing session media paths."
+        if pbar:
+            pbar.update(1)
+        return output
+
+    chunk_ms = int(getattr(request_func_input, "omniinteract_realtime_chunk_ms", 200) or 200)
+    video_fps = float(getattr(request_func_input, "omniinteract_realtime_video_fps", 1.0) or 1.0)
+    ref_audio = getattr(request_func_input, "omniinteract_realtime_ref_audio", None)
+    realtime_pacing = bool(getattr(request_func_input, "omniinteract_realtime_pace", True))
+    timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 120.0) or 120.0)
+
+    try:
+        session_result = await run_omniinteract_realtime_session(
+            api_url=request_func_input.api_url,
+            model=request_func_input.model_name or request_func_input.model,
+            video_path=Path(video_path),
+            turns=turns,
+            session_key=str(session_key),
+            ref_audio=ref_audio,
+            chunk_ms=chunk_ms,
+            video_fps=video_fps,
+            realtime_pacing=realtime_pacing,
+            timeout_s=timeout_s,
+        )
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        if pbar:
+            pbar.update(1)
+        return output
+
+    output.success = session_result.success
+    output.error = session_result.error
+    output.latency = session_result.latency_s
+    output.ttft = session_result.ttft_s
+    output.text_latency = session_result.ttft_s
+    output.audio_rtf = session_result.audio_rtf
+    output.generated_text = (
+        session_result.turn_outputs[-1].get("generated_text", "") if session_result.turn_outputs else ""
+    )
+    output.omniinteract_session_turn_metrics = summarize_turn_metrics(session_result.turn_metrics)[
+        "omniinteract_realtime_turn_metrics"
+    ]
+    output.omniinteract_turn_outputs = session_result.turn_outputs
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
@@ -1484,6 +1586,8 @@ if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 # Daily-Omni backend for audio-visual reasoning benchmark
 # Reuses openai-chat-omni completions for video+text understanding
 ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
+
+ASYNC_REQUEST_FUNCS["minicpmo-realtime"] = async_request_minicpmo_realtime
 if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
@@ -1861,14 +1965,40 @@ async def benchmark(
             "true",
             "yes",
         )
+        eval_requests, eval_outputs = _flatten_omniinteract_realtime_for_eval(input_requests, outputs)
         _omniinteract_metrics = compute_omniinteract_metrics(
-            input_requests,
-            outputs,
+            eval_requests,
+            eval_outputs,
             include_per_item=_save_omniinteract_items,
         )
         if _omniinteract_metrics is not None:
             result.update(_omniinteract_metrics)
             print_omniinteract_summary(_omniinteract_metrics)
+
+    from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
+        OmniInteractRealtimeTurnMetrics,
+        summarize_turn_metrics,
+    )
+
+    session_turn_metrics: list[OmniInteractRealtimeTurnMetrics] = []
+    for output in outputs:
+        for row in getattr(output, "omniinteract_session_turn_metrics", None) or []:
+            session_turn_metrics.append(
+                OmniInteractRealtimeTurnMetrics(
+                    turn_index=int(row.get("turn_index", 0) or 0),
+                    response_id=row.get("response_id"),
+                    ttft_s=float(row.get("ttft_s", 0.0) or 0.0),
+                    tpot_s=float(row.get("tpot_s", 0.0) or 0.0),
+                    rtf=float(row.get("rtf", 0.0) or 0.0),
+                    audio_duration_s=float(row.get("audio_duration_s", 0.0) or 0.0),
+                    response_generation_s=float(row.get("response_generation_s", 0.0) or 0.0),
+                    generated_text=str(row.get("generated_text") or ""),
+                    success=bool(row.get("success")),
+                    error=str(row.get("error") or ""),
+                )
+            )
+    if session_turn_metrics:
+        result.update(summarize_turn_metrics(session_turn_metrics))
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (

@@ -219,41 +219,7 @@ def test_omniinteract_dataset_minicpm_profile_sends_question_audio_once(omniinte
     assert request_input.omni_chat_messages == req.omni_chat_messages
 
 
-def test_omniinteract_dataset_aura_mode_sends_audio_and_video(omniinteract_root: Path, mock_tokenizer):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    ref_audio = omniinteract_root / "ref.wav"
-    ref_audio.write_bytes(b"fake-ref-wav")
-    ds = OmniInteractDataset(
-        dataset_path=str(omniinteract_root),
-        random_seed=0,
-        disable_shuffle=True,
-        input_mode="aura",
-        aura_tts_language="English",
-        aura_tts_ref_audio=str(ref_audio),
-        aura_tts_ref_text="reference transcript",
-    )
-    reqs = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
-    assert len(reqs) == 1
-    req = reqs[0]
-    assert req.omni_chat_messages is not None
-    user_msg = req.omni_chat_messages[1]["content"]
-    assert user_msg[0]["type"] == "audio_url"
-    assert user_msg[1]["type"] == "video_url"
-    assert len(user_msg) == 2
-    assert req.omniinteract_video == "subvideos/0001_0.mp4"
-    assert req.omni_extra_body is not None
-    assert req.omni_extra_body["modalities"] == ["text", "audio"]
-    assert req.omni_extra_body["mm_processor_kwargs"] == {"use_audio_in_video": False}
-    assert len(req.omni_extra_body["sampling_params_list"]) == 4
-    assert req.omni_extra_body["additional_information"]["tts_task_type"] == "Base"
-    assert req.omni_extra_body["additional_information"]["tts_language"] == "English"
-    assert req.omni_extra_body["additional_information"]["tts_ref_audio"] == str(ref_audio.resolve())
-    assert req.omni_extra_body["additional_information"]["tts_ref_text"] == "reference transcript"
-
-
-def test_omniinteract_dataset_aura_mode_passes_custom_voice_speaker(omniinteract_root: Path, mock_tokenizer):
+def test_omniinteract_dataset_realtime_profile_builds_session_with_turns(omniinteract_root: Path, mock_tokenizer):
     audio_dir = omniinteract_root / "1q1a" / "audios"
     audio_dir.mkdir()
     (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
@@ -261,34 +227,20 @@ def test_omniinteract_dataset_aura_mode_passes_custom_voice_speaker(omniinteract
         dataset_path=str(omniinteract_root),
         random_seed=0,
         disable_shuffle=True,
-        input_mode="aura",
-        aura_tts_task_type="CustomVoice",
-        aura_tts_language="English",
-        aura_tts_speaker="Ethan",
+        model_special_config="minicpmo_4_5_realtime",
     )
 
     [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
 
-    assert req.omni_extra_body is not None
-    additional_info = req.omni_extra_body["additional_information"]
-    assert additional_info["tts_task_type"] == "CustomVoice"
-    assert additional_info["tts_language"] == "English"
-    assert additional_info["tts_speaker"] == "Ethan"
-    assert "tts_ref_audio" not in additional_info
-    assert "tts_ref_text" not in additional_info
-
-
-def test_omniinteract_dataset_aura_mode_requires_base_tts_refs(omniinteract_root: Path):
-    audio_dir = omniinteract_root / "1q1a" / "audios"
-    audio_dir.mkdir()
-    (audio_dir / "0001_0.wav").write_bytes(b"fake-wav")
-    with pytest.raises(ValueError, match="requires both"):
-        OmniInteractDataset(
-            dataset_path=str(omniinteract_root),
-            random_seed=0,
-            disable_shuffle=True,
-            input_mode="aura",
-        )
+    assert req.omniinteract_profile == "realtime"
+    assert req.omniinteract_realtime_turns is not None
+    assert len(req.omniinteract_realtime_turns) == 1
+    assert req.omniinteract_video_path.endswith("0001_0.mp4")
+    assert req.omniinteract_realtime_turns[0].gold_answer == "red"
+    request_input = SimpleNamespace(extra_body=None)
+    _attach_omniinteract_to_request_func_input(req, request_input)
+    assert request_input.omniinteract_realtime_turns == req.omniinteract_realtime_turns
+    assert request_input.omniinteract_video_path == req.omniinteract_video_path
 
 
 def test_omniinteract_eval_counts_exact_and_soft_match():

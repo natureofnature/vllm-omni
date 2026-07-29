@@ -2929,18 +2929,6 @@ class MiniCPMO45OmniLLMProcessingInfo(BaseProcessingInfo):
             chunk_input=chunk_input,
             chunk_length=chunk_length,
         )
-        logger.info(
-            "MiniCPM-o audio placeholder: audio_lens=%s chunk_input=%s "
-            "chunk_length=%s processor.pool_step=%s config.audio_pool_step=%s "
-            "placeholder_chars=%s",
-            audio_lens,
-            chunk_input,
-            chunk_length,
-            getattr(hf_processor, "pool_step", None),
-            self.get_default_audio_pool_step(),
-            len(placeholder),
-        )
-        return placeholder
 
     def get_default_audio_pool_step(self) -> int:
         return int(getattr(self.get_hf_config(), "audio_pool_step", 5))
