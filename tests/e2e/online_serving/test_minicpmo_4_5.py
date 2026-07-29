@@ -1,8 +1,8 @@
 """E2E online tests for MiniCPM-o 4.5 multimodal input and audio/text output.
 
-The batching deployment uses async chunk transfer across separate Thinker,
-Talker, and Code2Wav stages. Dedicated streaming cases below use the single-GPU
-deployment and validate incremental SSE text and audio output.
+The existing batching cases explicitly disable async chunk to cover sequential
+stage execution. Dedicated streaming cases below use the single-GPU deployment
+with async chunk enabled and validate incremental SSE text and audio output.
 """
 
 import os
@@ -27,7 +27,10 @@ test_params = [
             model=_MODEL,
             stage_config_path=_CI_DEPLOY,
             use_stage_cli=True,
-            server_args=["--trust-remote-code"],
+            server_args=[
+                "--trust-remote-code",
+                "--no-async-chunk",
+            ],
         ),
         id="default",
     )
