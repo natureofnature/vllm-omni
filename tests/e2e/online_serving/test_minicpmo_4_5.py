@@ -11,6 +11,7 @@ import pytest
 
 from tests.helpers.mark import hardware_test
 from tests.helpers.media import generate_synthetic_audio, generate_synthetic_image, generate_synthetic_video
+from tests.helpers.minicpmo import assert_audio_stream, assert_text_stream
 from tests.helpers.runtime import OmniServerParams, dummy_messages_from_mix_data
 from tests.helpers.stage_config import get_deploy_config_path
 
@@ -18,7 +19,7 @@ os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
 
 _MODEL = "openbmb/MiniCPM-o-4_5"
 _CI_DEPLOY = get_deploy_config_path("minicpmo_4_5_batching.yaml")
-_ASYNC_CHUNK_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
+_SINGLE_GPU_DEPLOY = get_deploy_config_path("minicpmo_4_5.yaml")
 
 test_params = [
     pytest.param(
@@ -36,7 +37,7 @@ async_chunk_test_params = [
     pytest.param(
         OmniServerParams(
             model=_MODEL,
-            stage_config_path=_ASYNC_CHUNK_DEPLOY,
+            stage_config_path=_SINGLE_GPU_DEPLOY,
             use_stage_cli=True,
             server_args=[
                 "--trust-remote-code",
@@ -75,26 +76,6 @@ def get_prompt(prompt_type: str = "text_only") -> str:
 def get_max_batch_size(size_type="few"):
     batch_sizes = {"few": 5, "medium": 100, "large": 256}
     return batch_sizes.get(size_type, 5)
-
-
-def _assert_stream_finished(response) -> None:
-    finish_reasons = response.finish_reasons or []
-    assert finish_reasons, "Stream ended without a finish reason"
-    assert finish_reasons[-1] == "stop", f"Unexpected terminal finish reason: {finish_reasons[-1]}"
-
-
-def _assert_text_stream(response, *, min_chunks: int = 2) -> None:
-    chunks = response.text_chunks or []
-    assert len(chunks) >= min_chunks, f"Expected at least {min_chunks} text chunks, got {len(chunks)}"
-    assert response.text_content == "".join(chunks)
-    _assert_stream_finished(response)
-
-
-def _assert_audio_stream(response) -> None:
-    chunks = response.audio_data or []
-    assert len(chunks) >= 2, f"Expected at least two audio chunks, got {len(chunks)}"
-    assert response.audio_bytes is not None and len(response.audio_bytes) > 44
-    _assert_stream_finished(response)
 
 
 @pytest.mark.skip(reason="https://github.com/vllm-project/vllm-omni/issues/5437")
@@ -285,7 +266,7 @@ def test_text_to_text_async_chunk_streaming_001(omni_server, openai_client) -> N
     }
 
     response = openai_client.send_omni_request(request_config)[0]
-    _assert_text_stream(response)
+    assert_text_stream(response)
 
 
 @pytest.mark.core_model
@@ -305,7 +286,7 @@ def test_text_to_audio_async_chunk_streaming_001(omni_server, openai_client) -> 
     }
 
     response = openai_client.send_omni_request(request_config)[0]
-    _assert_audio_stream(response)
+    assert_audio_stream(response)
 
 
 @pytest.mark.core_model
@@ -332,5 +313,5 @@ def test_mix_to_text_audio_async_chunk_streaming_001(omni_server, openai_client)
     }
 
     response = openai_client.send_omni_request(request_config)[0]
-    _assert_text_stream(response, min_chunks=1)
-    _assert_audio_stream(response)
+    assert_text_stream(response, min_chunks=1)
+    assert_audio_stream(response)
