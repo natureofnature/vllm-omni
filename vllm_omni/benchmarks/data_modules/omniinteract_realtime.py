@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
+import logging
 import math
 import shutil
 import subprocess
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import OmniInteractQASlot
 from vllm_omni.experimental.fullduplex.client import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
@@ -23,23 +25,7 @@ from vllm_omni.experimental.fullduplex.client import (
     wait_for,
 )
 
-
-@dataclass(frozen=True)
-class OmniInteractQASlotView:
-    slot_index: int
-    question_text: str
-    answer_text: str
-    question_time: str = ""
-    answer_time: str = ""
-    question_type: str = ""
-    is_interrupted: bool | None = None
-    nested_group_id: int | None = None
-    nested_role: str = ""
-    question_time_s: float | None = None
-    answer_time_s: float | None = None
-    subset: str = ""
-    video_rel: str = ""
-    scene_type: str = ""
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -266,12 +252,12 @@ def compute_turn_metrics(
 
 
 def _match_slot(
-    slots: list[OmniInteractQASlotView],
+    slots: list[OmniInteractQASlot],
     *,
     video_time_s: float,
     used: set[int],
-) -> OmniInteractQASlotView | None:
-    candidates: list[tuple[float, OmniInteractQASlotView]] = []
+) -> OmniInteractQASlot | None:
+    candidates: list[tuple[float, OmniInteractQASlot]] = []
     for slot in slots:
         if slot.slot_index in used:
             continue
@@ -330,14 +316,48 @@ async def _drain_active_responses(
     *,
     timeout_s: float,
 ) -> None:
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        created = collector.count("response.created")
-        done = collector.count("response.done")
-        if created <= done:
-            return
-        await asyncio.sleep(0.05)
-    raise TimeoutError("Timed out waiting for active duplex responses to finish")
+    await wait_for(
+        lambda: collector.count("response.created") <= collector.count("response.done"),
+        timeout_s=timeout_s,
+        label="active duplex responses to finish",
+    )
+
+
+def _event_index(events: list[dict[str, object]], event_type: str, after: int) -> int | None:
+    return next(
+        (index for index, event in enumerate(events[after:], start=after) if event.get("type") == event_type),
+        None,
+    )
+
+
+def _post_commit_decision(events: list[dict[str, object]], committed_index: int) -> bool:
+    for event in events[committed_index + 1 :]:
+        if event.get("type") == "response.listen":
+            return True
+        if event.get("type") == "response.done":
+            response = event.get("response")
+            if not isinstance(response, dict) or response.get("status") != "cancelled":
+                return True
+    return False
+
+
+def _response_in_progress(events: list[dict[str, object]]) -> bool:
+    return sum(event.get("type") == "response.created" for event in events) > sum(
+        event.get("type") == "response.done" for event in events
+    )
+
+
+def _has_residual_model_unit(pcm16: bytes, events: list[dict[str, object]]) -> bool:
+    chunk_period_ms = 1000
+    for event in reversed(events):
+        session = event.get("session")
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        period = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
+        if isinstance(period, int) and period > 0:
+            chunk_period_ms = period
+            break
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    return bool(unit_bytes and len(pcm16) % unit_bytes)
 
 
 async def run_omniinteract_realtime_session(
@@ -346,7 +366,7 @@ async def run_omniinteract_realtime_session(
     model: str,
     video_path: Path,
     session_key: str,
-    slots: list[OmniInteractQASlotView],
+    slots: list[OmniInteractQASlot],
     ref_audio: str | None = None,
     chunk_ms: int = 200,
     video_fps: float = 1.0,
@@ -355,13 +375,25 @@ async def run_omniinteract_realtime_session(
 ) -> OmniInteractRealtimeSessionResult:
     result = OmniInteractRealtimeSessionResult(session_key=session_key)
     session_start = time.monotonic()
-    pcm16 = extract_pcm16_from_video(video_path)
+    commit_completed = False
+    wait_error = ""
+    pcm16, video_frames = await asyncio.gather(
+        asyncio.to_thread(extract_pcm16_from_video, video_path),
+        asyncio.to_thread(sample_video_jpeg_frames, video_path, video_fps),
+    )
     if not pcm16:
         result.error = f"No audio extracted from video: {video_path}"
         result.latency_s = time.monotonic() - session_start
         return result
-    video_frames = sample_video_jpeg_frames(video_path, video_fps)
-    ws_url = build_realtime_url(http_url_to_ws_url(api_url), model, session_id=session_key)
+    # When ref_audio is supplied via session.update, disable server-side
+    # autostart so the duplex session does not reject the socket for missing
+    # ref_audio before configure() can send it.
+    ws_url = build_realtime_url(
+        http_url_to_ws_url(api_url),
+        model,
+        autostart=False if ref_audio else None,
+        session_id=session_key,
+    )
 
     try:
         async with RealtimeDuplexClient(ws_url) as client:
@@ -380,16 +412,36 @@ async def run_omniinteract_realtime_session(
                 realtime=realtime_pacing,
                 video_frames=video_frames,
             )
+            commit_cursor = len(client.events.events)
             await client.commit()
             try:
                 await wait_for(
-                    lambda: any(event.get("type") == "input_audio_buffer.committed" for event in client.events.events),
+                    lambda: _event_index(
+                        client.events.events,
+                        "input_audio_buffer.committed",
+                        commit_cursor,
+                    )
+                    is not None,
                     timeout_s=timeout_s,
                     label="input_audio_buffer.committed",
                 )
+                committed_index = _event_index(
+                    client.events.events,
+                    "input_audio_buffer.committed",
+                    commit_cursor,
+                )
+                assert committed_index is not None
+                events_at_commit = client.events.events[: committed_index + 1]
+                if _has_residual_model_unit(pcm16, events_at_commit) or _response_in_progress(events_at_commit):
+                    await wait_for(
+                        lambda: _post_commit_decision(client.events.events, committed_index),
+                        timeout_s=timeout_s,
+                        label="post-commit model decision or response drain",
+                    )
                 await _drain_active_responses(client.events, timeout_s=timeout_s)
+                commit_completed = True
             except TimeoutError as exc:
-                result.error = str(exc)
+                wait_error = str(exc)
 
             used_slots: set[int] = set()
             response_ids = client.events.response_ids[before_created:]
@@ -455,7 +507,10 @@ async def run_omniinteract_realtime_session(
                 )
 
             await client.acknowledge_playback()
-            await client.close_session(timeout_s=timeout_s)
+            try:
+                await client.close_session(timeout_s=min(timeout_s, 20.0))
+            except TimeoutError as exc:
+                logger.warning("OmniInteract session close acknowledgement timed out: %s", exc)
     except Exception as exc:
         result.error = str(exc)
         result.success = False
@@ -463,7 +518,13 @@ async def run_omniinteract_realtime_session(
         return result
 
     result.latency_s = time.monotonic() - session_start
-    result.success = (not result.error) and any(metric.success for metric in result.turn_metrics)
+    protocol_errors = client.events.errors()
+    result.success = commit_completed and not protocol_errors
+    if not result.success and wait_error:
+        result.error = wait_error
+    elif not result.success and protocol_errors:
+        last_error = protocol_errors[-1]
+        result.error = str(last_error.get("error") or last_error.get("message") or last_error)
     if result.turn_metrics:
         result.ttft_s = result.turn_metrics[0].ttft_s
         tpots = [metric.tpot_s for metric in result.turn_metrics if metric.tpot_s > 0]

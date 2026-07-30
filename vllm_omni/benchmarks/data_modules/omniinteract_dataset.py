@@ -29,14 +29,10 @@ from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
 from vllm.tokenizers.hf import get_cached_tokenizer
 
-from vllm_omni.benchmarks.adapters.omniinteract import (
-    OmniInteractModelSpecialConfig,
-    load_model_special_config,
-)
-
 logger = logging.getLogger(__name__)
 
 OmniInteractSubset = Literal["1q1a", "1q1a_math", "1qna"]
+_SUPPORTED_SUBSETS = {"1q1a", "1q1a_math", "1qna"}
 
 
 @dataclass(frozen=True)
@@ -54,6 +50,9 @@ class OmniInteractQASlot:
     nested_role: str = ""
     question_time_s: float | None = None
     answer_time_s: float | None = None
+    subset: str = ""
+    video_rel: str = ""
+    scene_type: str = ""
 
 
 @dataclass
@@ -80,7 +79,6 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_realtime_ref_audio: str | None = None
     omniinteract_realtime_pace: bool = True
     omniinteract_realtime_timeout_s: float = 120.0
-    omni_extra_body: dict[str, Any] | None = None
 
 
 @dataclass
@@ -153,6 +151,8 @@ def _infer_nested_roles(ann: list[dict[str, Any]]) -> dict[int, tuple[int, str]]
 def _slots_from_annotation(
     ann: list[dict[str, Any]],
     *,
+    subset: str,
+    video_rel: str,
     scene_type: str,
 ) -> list[OmniInteractQASlot]:
     nested_meta = _infer_nested_roles(ann) if scene_type == "nested" else {}
@@ -178,6 +178,9 @@ def _slots_from_annotation(
                 nested_role=nested_role,
                 question_time_s=_parse_time_seconds(question_time),
                 answer_time_s=_parse_time_seconds(answer_time),
+                subset=subset,
+                video_rel=video_rel,
+                scene_type=scene_type,
             )
         )
     return slots
@@ -300,22 +303,16 @@ class OmniInteractDataset(BenchmarkDataset):
         random_seed: int = 0,
         data_root: str | None = None,
         subsets: list[OmniInteractSubset] | None = None,
-        model_special_config: str | dict[str, Any] | OmniInteractModelSpecialConfig | None = None,
         **kwargs: Any,
     ) -> None:
         self.dataset_path = dataset_path or self.DEFAULT_HF_DATASET_ID
         self.data_root_input = Path(data_root).expanduser().resolve() if data_root else None
         self.subsets = list(subsets or ["1q1a", "1q1a_math", "1qna"])
-        self.model_special_config = load_model_special_config(model_special_config)
+        unsupported = sorted(set(self.subsets) - _SUPPORTED_SUBSETS)
+        if unsupported:
+            raise ValueError(f"Unsupported OmniInteract subsets: {unsupported}. Expected: {sorted(_SUPPORTED_SUBSETS)}")
         self._data_root: Path | None = None
         self._sessions: list[_OmniInteractSession] = []
-
-        # Drop unused clip-only kwargs from older callers.
-        kwargs.pop("inline_local_video", None)
-        kwargs.pop("input_mode", None)
-        for key in list(kwargs):
-            if key.startswith("aura_"):
-                kwargs.pop(key)
 
         super().__init__(
             dataset_path=self.dataset_path,
@@ -323,12 +320,6 @@ class OmniInteractDataset(BenchmarkDataset):
             **kwargs,
         )
         self.load_data()
-        logger.info(
-            "OmniInteract duplex config: name=%s sessions=%d subsets=%s",
-            self.model_special_config.name,
-            len(self._sessions),
-            self.subsets,
-        )
 
     def _resolve_data_root(self) -> Path:
         if self._data_root is not None:
@@ -368,7 +359,12 @@ class OmniInteractDataset(BenchmarkDataset):
                 ann = self._read_json(ann_path)
                 if not isinstance(ann, list):
                     continue
-                slots = _slots_from_annotation(ann, scene_type=scene_type)
+                slots = _slots_from_annotation(
+                    ann,
+                    subset=subset,
+                    video_rel=video_rel,
+                    scene_type=scene_type,
+                )
                 if not slots:
                     continue
                 sessions.append(
@@ -395,13 +391,19 @@ class OmniInteractDataset(BenchmarkDataset):
             ann = self._read_json(ann_path)
             if not isinstance(ann, list):
                 continue
-            slots = _slots_from_annotation(ann, scene_type="1qna")
+            video_rel = str(video_path.relative_to(subset_root))
+            slots = _slots_from_annotation(
+                ann,
+                subset=subset,
+                video_rel=video_rel,
+                scene_type="1qna",
+            )
             if not slots:
                 continue
             sessions.append(
                 _OmniInteractSession(
                     subset=subset,
-                    video_rel=str(video_path.relative_to(subset_root)),
+                    video_rel=video_rel,
                     video_path=video_path,
                     scene_type="1qna",
                     slots=slots,
@@ -473,7 +475,6 @@ class OmniInteractDataset(BenchmarkDataset):
                     omniinteract_session_key=f"{session.subset}:{session.video_rel}",
                     omniinteract_video_path=str(session.video_path.resolve()),
                     omniinteract_slots=list(session.slots),
-                    omni_extra_body=dict(self.model_special_config.extra_body),
                 )
             )
         self.maybe_oversample_requests(out, num_requests, request_id_prefix, no_oversample)

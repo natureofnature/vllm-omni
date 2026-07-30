@@ -181,15 +181,6 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "Each request is one continuous full-video duplex session.",
     )
     group.add_argument(
-        "--omniinteract-model-special-config",
-        type=str,
-        default=None,
-        help=(
-            "Model-specific OmniInteract duplex request profile. Accepts a built-in preset "
-            "('minicpmo_4_5_realtime' / aliases), an inline JSON object, or a JSON file path."
-        ),
-    )
-    group.add_argument(
         "--omniinteract-eval",
         action="store_true",
         default=False,

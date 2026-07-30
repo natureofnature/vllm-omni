@@ -26,20 +26,6 @@ Install vLLM-Omni and prepare
 
 Server must expose MiniCPM-o full duplex over WebSocket `/v1/realtime`.
 
-## Model special config
-
-```text
---omniinteract-model-special-config <preset | inline-json | json-file>
-```
-
-Built-in preset (aliases map here too):
-
-| Preset | Meaning |
-|---|---|
-| `minicpmo_4_5_realtime` | Native full-duplex WebSocket profile (`modalities` + TTS template) |
-
-Aliases: `realtime`, `minicpm`, `minicpmo`, `minicpm-o-4.5`, `minicpmo_4_5`.
-
 ## Example: MiniCPM-o 4.5 full duplex
 
 ```bash
@@ -54,7 +40,6 @@ vllm bench serve --omni \
   --dataset-name omniinteract \
   --dataset-path "${DATASET_ROOT}" \
   --omniinteract-subsets 1q1a,1q1a_math,1qna \
-  --omniinteract-model-special-config minicpmo_4_5_realtime \
   --omniinteract-realtime-chunk-ms 200 \
   --omniinteract-realtime-video-fps 1 \
   --omniinteract-realtime-ref-audio /path/to/ref.wav \
@@ -86,7 +71,6 @@ each continuous session.
 |---|---|
 | `--omniinteract-root` | Explicit local extracted dataset root |
 | `--omniinteract-subsets` | Comma-separated subset list (`1q1a`, `1q1a_math`, `1qna`) |
-| `--omniinteract-model-special-config` | Preset, inline JSON, or JSON file |
 | `--omniinteract-realtime-chunk-ms` | PCM append chunk size |
 | `--omniinteract-realtime-video-fps` | Frame sampling rate while streaming |
 | `--omniinteract-realtime-ref-audio` | Reference WAV for voice cloning |

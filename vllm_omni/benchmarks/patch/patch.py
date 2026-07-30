@@ -218,50 +218,30 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     setattr(rfi, "omniinteract_session_key", sample.omniinteract_session_key)
     setattr(rfi, "omniinteract_video_path", sample.omniinteract_video_path)
     setattr(rfi, "omniinteract_slots", sample.omniinteract_slots)
-    setattr(rfi, "omniinteract_subset", sample.omniinteract_subset)
-    setattr(rfi, "omniinteract_video", sample.omniinteract_video)
-    setattr(rfi, "omniinteract_scene_type", sample.omniinteract_scene_type)
     setattr(rfi, "omniinteract_realtime_chunk_ms", sample.omniinteract_realtime_chunk_ms)
     setattr(rfi, "omniinteract_realtime_video_fps", sample.omniinteract_realtime_video_fps)
     setattr(rfi, "omniinteract_realtime_ref_audio", sample.omniinteract_realtime_ref_audio)
     setattr(rfi, "omniinteract_realtime_pace", sample.omniinteract_realtime_pace)
     setattr(rfi, "omniinteract_realtime_timeout_s", sample.omniinteract_realtime_timeout_s)
-    if sample.omni_extra_body:
-        rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
 
 
-def _daily_omni_repo_from_args(args) -> str | None:
-    """Resolve HuggingFace repo id for Daily-Omni from CLI args.
-
-    vLLM allows ``--dataset-path`` to be a local path while the real HF id is
-    passed via ``--hf-name``. Upstream ``get_samples`` for ``hf`` only matches
-    a fixed elif-chain and never discovers Omni's loader, so we must detect
-    Daily-Omni here using either field.
-    """
-    dp = getattr(args, "dataset_path", None)
-    hn = getattr(args, "hf_name", None)
-    if dp in DailyOmniDataset.SUPPORTED_DATASET_PATHS:
-        return dp
-    if hn in DailyOmniDataset.SUPPORTED_DATASET_PATHS:
-        return hn
+def _hf_repo_from_args(args, supported_paths: set[str]) -> str | None:
+    for value in (getattr(args, "dataset_path", None), getattr(args, "hf_name", None)):
+        if value in supported_paths:
+            return value
     return None
 
 
-def _omniinteract_repo_from_args(args) -> str | None:
-    dp = getattr(args, "dataset_path", None)
-    hn = getattr(args, "hf_name", None)
-    if dp in OmniInteractDataset.SUPPORTED_DATASET_PATHS:
-        return dp
-    if hn in OmniInteractDataset.SUPPORTED_DATASET_PATHS:
-        return hn
-    return None
-
-
-def _is_local_omniinteract_path(path: str | None) -> bool:
+def _is_local_omniinteract_root(path: str | None) -> bool:
     if not path:
         return False
     p = Path(path).expanduser()
-    return p.exists() and p.is_dir()
+    return p.is_dir() and (
+        (p / "1q1a").is_dir()
+        or (p / "data" / "1q1a").is_dir()
+        or (p / "data.tar.gz").is_file()
+        or (p / "data.tar").is_file()
+    )
 
 
 def get_samples(args, tokenizer):
@@ -270,13 +250,18 @@ def get_samples(args, tokenizer):
 
     # Daily-Omni: explicit dataset name, or hf + matching path/hf-name
     is_daily_omni = args.dataset_name == "daily-omni" or (
-        args.dataset_name == "hf" and _daily_omni_repo_from_args(args) is not None
+        args.dataset_name == "hf" and _hf_repo_from_args(args, DailyOmniDataset.SUPPORTED_DATASET_PATHS) is not None
     )
     is_omniinteract = (
         args.dataset_name == "omniinteract"
-        or _is_local_omniinteract_path(getattr(args, "dataset_path", None))
-        or _is_local_omniinteract_path(getattr(args, "omniinteract_root", None))
-        or (args.dataset_name == "hf" and _omniinteract_repo_from_args(args) is not None)
+        or getattr(args, "omniinteract_root", None) is not None
+        or (
+            args.dataset_name == "hf"
+            and (
+                _is_local_omniinteract_root(getattr(args, "dataset_path", None))
+                or _hf_repo_from_args(args, OmniInteractDataset.SUPPORTED_DATASET_PATHS) is not None
+            )
+        )
     )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
@@ -337,7 +322,7 @@ def get_samples(args, tokenizer):
                 disable_shuffle=getattr(args, "disable_shuffle", False),
             )
         else:
-            repo_id = _daily_omni_repo_from_args(args)
+            repo_id = _hf_repo_from_args(args, DailyOmniDataset.SUPPORTED_DATASET_PATHS)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
                     repo_id = _DEFAULT_DAILY_OMNI_REPO
@@ -449,15 +434,11 @@ def get_samples(args, tokenizer):
         if not subsets:
             subsets = ["1q1a", "1q1a_math", "1qna"]
 
-        model_special_config = getattr(args, "omniinteract_model_special_config", None) or "minicpmo_4_5_realtime"
-
         logger.info(
-            "Loading OmniInteract duplex sessions: dataset_path=%s, "
-            "omniinteract_root=%s, subsets=%s, model_special_config=%s",
+            "Loading OmniInteract duplex sessions: dataset_path=%s, omniinteract_root=%s, subsets=%s",
             dataset_path,
             omniinteract_root,
             subsets,
-            model_special_config,
         )
 
         dataset = OmniInteractDataset(
@@ -465,7 +446,6 @@ def get_samples(args, tokenizer):
             data_root=omniinteract_root,
             random_seed=args.seed,
             subsets=subsets,
-            model_special_config=model_special_config,
             disable_shuffle=getattr(args, "disable_shuffle", False),
         )
         out_len = getattr(args, "output_len", None)
@@ -547,7 +527,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     stage_metrics: dict[str, dict] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
-    omniinteract_session_turn_metrics: list[dict[str, Any]] | None = None
+    omniinteract_session_turn_metrics: list[Any] | None = None
     omniinteract_turn_outputs: list[dict[str, Any]] | None = None
 
 
@@ -1502,12 +1482,8 @@ async def async_request_minicpmo_realtime(
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    from pathlib import Path
-
     from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
-        OmniInteractQASlotView,
         run_omniinteract_realtime_session,
-        summarize_turn_metrics,
     )
 
     output = MixRequestFuncOutput()
@@ -1528,35 +1504,13 @@ async def async_request_minicpmo_realtime(
     ref_audio = getattr(request_func_input, "omniinteract_realtime_ref_audio", None)
     realtime_pacing = bool(getattr(request_func_input, "omniinteract_realtime_pace", True))
     timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 120.0) or 120.0)
-    subset = getattr(request_func_input, "omniinteract_subset", "") or ""
-    video_rel = getattr(request_func_input, "omniinteract_video", "") or ""
-    scene_type = getattr(request_func_input, "omniinteract_scene_type", "") or ""
-    slot_views = [
-        OmniInteractQASlotView(
-            slot_index=int(getattr(slot, "slot_index", idx)),
-            question_text=str(getattr(slot, "question_text", "") or ""),
-            answer_text=str(getattr(slot, "answer_text", "") or ""),
-            question_time=str(getattr(slot, "question_time", "") or ""),
-            answer_time=str(getattr(slot, "answer_time", "") or ""),
-            question_type=str(getattr(slot, "question_type", "") or ""),
-            is_interrupted=getattr(slot, "is_interrupted", None),
-            nested_group_id=getattr(slot, "nested_group_id", None),
-            nested_role=str(getattr(slot, "nested_role", "") or ""),
-            question_time_s=getattr(slot, "question_time_s", None),
-            answer_time_s=getattr(slot, "answer_time_s", None),
-            subset=subset,
-            video_rel=video_rel,
-            scene_type=scene_type,
-        )
-        for idx, slot in enumerate(slots)
-    ]
 
     try:
         session_result = await run_omniinteract_realtime_session(
             api_url=request_func_input.api_url,
             model=request_func_input.model_name or request_func_input.model,
             video_path=Path(video_path),
-            slots=slot_views,
+            slots=slots,
             session_key=str(session_key),
             ref_audio=ref_audio,
             chunk_ms=chunk_ms,
@@ -1580,9 +1534,7 @@ async def async_request_minicpmo_realtime(
     output.generated_text = (
         session_result.turn_outputs[-1].get("generated_text", "") if session_result.turn_outputs else ""
     )
-    output.omniinteract_session_turn_metrics = summarize_turn_metrics(session_result.turn_metrics)[
-        "omniinteract_realtime_turn_metrics"
-    ]
+    output.omniinteract_session_turn_metrics = session_result.turn_metrics
     output.omniinteract_turn_outputs = session_result.turn_outputs
     if pbar:
         pbar.update(1)
@@ -1993,28 +1945,11 @@ async def benchmark(
             result.update(_omniinteract_metrics)
             print_omniinteract_summary(_omniinteract_metrics)
 
-    from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
-        OmniInteractRealtimeTurnMetrics,
-        summarize_turn_metrics,
-    )
+    from vllm_omni.benchmarks.data_modules.omniinteract_realtime import summarize_turn_metrics
 
-    session_turn_metrics: list[OmniInteractRealtimeTurnMetrics] = []
+    session_turn_metrics = []
     for output in outputs:
-        for row in getattr(output, "omniinteract_session_turn_metrics", None) or []:
-            session_turn_metrics.append(
-                OmniInteractRealtimeTurnMetrics(
-                    turn_index=int(row.get("turn_index", 0) or 0),
-                    response_id=row.get("response_id"),
-                    ttft_s=float(row.get("ttft_s", 0.0) or 0.0),
-                    tpot_s=float(row.get("tpot_s", 0.0) or 0.0),
-                    rtf=float(row.get("rtf", 0.0) or 0.0),
-                    audio_duration_s=float(row.get("audio_duration_s", 0.0) or 0.0),
-                    response_generation_s=float(row.get("response_generation_s", 0.0) or 0.0),
-                    generated_text=str(row.get("generated_text") or ""),
-                    success=bool(row.get("success")),
-                    error=str(row.get("error") or ""),
-                )
-            )
+        session_turn_metrics.extend(getattr(output, "omniinteract_session_turn_metrics", None) or [])
     if session_turn_metrics:
         result.update(summarize_turn_metrics(session_turn_metrics))
 

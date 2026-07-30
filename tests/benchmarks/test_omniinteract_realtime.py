@@ -7,17 +7,46 @@ import base64
 import pytest
 
 from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
+    _event_index,
+    _has_residual_model_unit,
+    _post_commit_decision,
     compute_turn_metrics,
     http_url_to_ws_url,
     summarize_turn_metrics,
 )
-from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector as ClientCollector
+from vllm_omni.experimental.fullduplex.client import (
+    PCM16_BYTES_PER_SAMPLE,
+    PCM16_SAMPLE_RATE,
+)
+from vllm_omni.experimental.fullduplex.client import (
+    RealtimeEventCollector as ClientCollector,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def test_http_url_to_ws_url_converts_http_scheme():
     assert http_url_to_ws_url("http://127.0.0.1:8099/v1/realtime") == "ws://127.0.0.1:8099/v1/realtime"
+
+
+def test_post_commit_wait_ignores_precommit_decisions():
+    events = [
+        {"type": "response.listen"},
+        {"type": "input_audio_buffer.committed"},
+    ]
+    committed_index = _event_index(events, "input_audio_buffer.committed", 0)
+    assert committed_index == 1
+    assert not _post_commit_decision(events, committed_index)
+
+    events.append({"type": "response.listen"})
+    assert _post_commit_decision(events, committed_index)
+
+
+def test_residual_model_unit_requires_post_commit_decision():
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    session_events = [{"session": {"capabilities": {"chunk_period_ms": 1000}}}]
+    assert not _has_residual_model_unit(b"\0" * unit_bytes, session_events)
+    assert _has_residual_model_unit(b"\0" * (unit_bytes + 2), session_events)
 
 
 def test_compute_turn_metrics_uses_stage0_engine_metrics():

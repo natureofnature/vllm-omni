@@ -147,11 +147,17 @@ def test_omniinteract_dataset_builds_full_video_duplex_sessions(omniinteract_roo
     assert req.omniinteract_profile == "realtime"
     assert len(req.omniinteract_slots) == 1
     assert req.omniinteract_slots[0].answer_text == "red"
+    assert req.omniinteract_slots[0].subset == "1q1a"
+    assert req.omniinteract_slots[0].video_rel == "videos/0001.mp4"
     assert req.omniinteract_video_path.endswith("videos/0001.mp4")
-    assert req.omni_extra_body == {
-        "modalities": ["text", "audio"],
-        "chat_template_kwargs": {"use_tts_template": True},
-    }
+
+
+def test_omniinteract_dataset_rejects_unknown_subset(omniinteract_root: Path):
+    with pytest.raises(ValueError, match="Unsupported OmniInteract subsets"):
+        OmniInteractDataset(
+            dataset_path=str(omniinteract_root),
+            subsets=["unknown"],  # type: ignore[list-item]
+        )
 
 
 def test_omniinteract_dataset_attaches_realtime_session_fields(omniinteract_root: Path, mock_tokenizer):
@@ -159,15 +165,12 @@ def test_omniinteract_dataset_attaches_realtime_session_fields(omniinteract_root
         dataset_path=str(omniinteract_root),
         random_seed=0,
         disable_shuffle=True,
-        model_special_config="minicpmo_4_5_realtime",
     )
     [req] = ds.sample(mock_tokenizer, num_requests=1, no_oversample=True)
     request_input = SimpleNamespace(extra_body=None)
     _attach_omniinteract_to_request_func_input(req, request_input)
     assert request_input.omniinteract_slots == req.omniinteract_slots
     assert request_input.omniinteract_video_path == req.omniinteract_video_path
-    assert request_input.omniinteract_subset == "1q1a"
-    assert request_input.omniinteract_video == "videos/0001.mp4"
 
 
 def test_omniinteract_1qna_loads_continuous_videos_bench_sessions(tmp_path: Path, mock_tokenizer):
