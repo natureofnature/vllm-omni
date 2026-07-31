@@ -163,6 +163,9 @@ def test_text_to_audio_long_output_001(omni_server, openai_client) -> None:
         "model": omni_server.model,
         "messages": messages,
         "stream": True,
+        "extra_body": {
+            "chat_template_kwargs": {"enable_thinking": False},
+        },
         "key_words": {"audio": ["Beijing"]},
     }
 
