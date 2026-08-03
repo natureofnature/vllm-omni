@@ -78,7 +78,7 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_realtime_video_fps: float = 1.0
     omniinteract_realtime_ref_audio: str | None = None
     omniinteract_realtime_pace: bool = True
-    omniinteract_realtime_timeout_s: float = 120.0
+    omniinteract_realtime_timeout_s: float = 900.0
 
 
 @dataclass
@@ -148,6 +148,11 @@ def _infer_nested_roles(ann: list[dict[str, Any]]) -> dict[int, tuple[int, str]]
     return nested_meta
 
 
+def _format_mmss(seconds: float) -> str:
+    total = max(0, int(round(float(seconds))))
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 def _slots_from_annotation(
     ann: list[dict[str, Any]],
     *,
@@ -183,6 +188,70 @@ def _slots_from_annotation(
                 scene_type=scene_type,
             )
         )
+    return slots
+
+
+def _slots_from_1qna_annotation(
+    ann: dict[str, Any],
+    *,
+    subset: str,
+    video_rel: str,
+) -> list[OmniInteractQASlot]:
+    """Convert official 1qna conversation JSON into interaction slots.
+
+    Official OmniInteract 1qna annotations are dicts with a ``conversations``
+    list (one user instruction + many timed assistant responses), not the flat
+    1q1a QA list schema.
+    """
+    conversations = ann.get("conversations")
+    if not isinstance(conversations, list):
+        return []
+    user_text = "1qna monitoring"
+    prev_ts: float | None = None
+    slots: list[OmniInteractQASlot] = []
+    for item in conversations:
+        if not isinstance(item, dict):
+            continue
+        role = str(item.get("from") or "").strip().lower()
+        if role == "user":
+            text = str(item.get("value") or "").strip()
+            if text:
+                user_text = text
+            prev_ts = _parse_time_seconds(item.get("timestamp"))
+            if prev_ts is None:
+                prev_ts = 0.0
+            continue
+        if role != "assistant":
+            continue
+        answer = str(item.get("value") or "").strip()
+        if not answer:
+            continue
+        answer_s = _parse_time_seconds(item.get("timestamp"))
+        if answer_s is None:
+            continue
+        start_s = float(prev_ts) if prev_ts is not None else float(answer_s)
+        interrupted = item.get("interrupted")
+        if interrupted is None:
+            interrupted = item.get("is_interrupted")
+        slots.append(
+            OmniInteractQASlot(
+                slot_index=len(slots),
+                question_text=user_text,
+                answer_text=answer,
+                question_time=_format_mmss(start_s),
+                answer_time=_format_mmss(answer_s),
+                question_type="1qna",
+                is_interrupted=bool(interrupted) if interrupted is not None else None,
+                nested_group_id=None,
+                nested_role="",
+                question_time_s=start_s,
+                answer_time_s=answer_s,
+                subset=subset,
+                video_rel=video_rel,
+                scene_type="1qna",
+            )
+        )
+        prev_ts = answer_s
     return slots
 
 
@@ -389,15 +458,22 @@ class OmniInteractDataset(BenchmarkDataset):
             if not ann_path.is_file():
                 continue
             ann = self._read_json(ann_path)
-            if not isinstance(ann, list):
-                continue
             video_rel = str(video_path.relative_to(subset_root))
-            slots = _slots_from_annotation(
-                ann,
-                subset=subset,
-                video_rel=video_rel,
-                scene_type="1qna",
-            )
+            if isinstance(ann, dict):
+                slots = _slots_from_1qna_annotation(
+                    ann,
+                    subset=subset,
+                    video_rel=video_rel,
+                )
+            elif isinstance(ann, list):
+                slots = _slots_from_annotation(
+                    ann,
+                    subset=subset,
+                    video_rel=video_rel,
+                    scene_type="1qna",
+                )
+            else:
+                continue
             if not slots:
                 continue
             sessions.append(

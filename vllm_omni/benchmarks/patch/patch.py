@@ -468,7 +468,7 @@ def get_samples(args, tokenizer):
             sample.omniinteract_realtime_ref_audio = getattr(args, "omniinteract_realtime_ref_audio", None)
             sample.omniinteract_realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
             sample.omniinteract_realtime_timeout_s = float(
-                getattr(args, "omniinteract_realtime_timeout_s", 120.0) or 120.0
+                getattr(args, "omniinteract_realtime_timeout_s", 900.0) or 900.0
             )
         return samples
     if args.dataset_name == "random-mm":
@@ -1503,7 +1503,7 @@ async def async_request_minicpmo_realtime(
     video_fps = float(getattr(request_func_input, "omniinteract_realtime_video_fps", 1.0) or 1.0)
     ref_audio = getattr(request_func_input, "omniinteract_realtime_ref_audio", None)
     realtime_pacing = bool(getattr(request_func_input, "omniinteract_realtime_pace", True))
-    timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 120.0) or 120.0)
+    timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 900.0) or 900.0)
 
     try:
         session_result = await run_omniinteract_realtime_session(

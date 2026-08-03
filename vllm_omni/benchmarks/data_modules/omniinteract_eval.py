@@ -24,6 +24,31 @@ def _normalize_text(text: str | None) -> str:
     return t
 
 
+def _is_soft_match(pred: str, gold: str) -> bool:
+    """Proxy soft match approximating OmniInteract answer usefulness.
+
+    Official scoring uses a GPT-4o judge. This heuristic:
+    - accepts exact containment when the shorter side is non-trivial (>=4 chars)
+    - otherwise accepts a substantial gold fragment appearing in the prediction
+      (covers cases like ``秘书长是吴玉章`` vs a longer gold sentence)
+    """
+    if not pred or not gold:
+        return False
+    shorter, longer = (pred, gold) if len(pred) <= len(gold) else (gold, pred)
+    if shorter in longer and (len(shorter) >= 4 or pred == gold):
+        return True
+    min_hit = 3
+    best = 0
+    for length in range(len(gold), min_hit - 1, -1):
+        for start in range(0, len(gold) - length + 1):
+            if gold[start : start + length] in pred:
+                best = length
+                break
+        if best:
+            break
+    return best >= min_hit and (best / max(len(gold), 1)) >= 0.25
+
+
 def _safe_ratio(num: int, den: int) -> float | None:
     return (num / den) if den else None
 
@@ -155,7 +180,7 @@ def compute_omniinteract_metrics(
         per_subset[subset]["total"] += 1
         per_qtype[qtype]["total"] += 1
         is_exact = pred == gold
-        is_soft = bool(pred and gold and (pred in gold or gold in pred))
+        is_soft = _is_soft_match(pred, gold)
         quality_score = 1.0 if is_soft else 0.0
         has_output = bool(pred_raw.strip())
         if is_exact:

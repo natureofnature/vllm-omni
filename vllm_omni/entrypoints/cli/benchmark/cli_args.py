@@ -219,8 +219,12 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
     group.add_argument(
         "--omniinteract-realtime-timeout-s",
         type=float,
-        default=120.0,
-        help="Per-session timeout for --backend minicpmo-realtime.",
+        default=900.0,
+        help=(
+            "Per-session timeout for --backend minicpmo-realtime waiters "
+            "(session.created / commit / drain). OmniInteract videos are "
+            "typically 150–300s; keep this above post-stream response drain."
+        ),
     )
 
 

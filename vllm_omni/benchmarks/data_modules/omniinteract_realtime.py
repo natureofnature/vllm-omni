@@ -251,28 +251,50 @@ def compute_turn_metrics(
     return metrics
 
 
+def _slot_windows(
+    slots: list[OmniInteractQASlot],
+) -> list[tuple[OmniInteractQASlot, float, float, float]]:
+    """Build OmniInteract interaction windows ``[t_start, t_a, t_end)``.
+
+    Matches paper Sec. 3.3.1: ``t_start`` is the query/observation onset,
+    ``t_a`` is the earliest valid core-answer time, and ``t_end`` is the next
+    slot's ``t_start`` (or +inf for the last slot). Nested overlap prefers the
+    latest ``t_start``.
+    """
+    ordered = sorted(
+        (slot for slot in slots if slot.question_time_s is not None),
+        key=lambda slot: (float(slot.question_time_s), slot.slot_index),
+    )
+    windows: list[tuple[OmniInteractQASlot, float, float, float]] = []
+    for index, slot in enumerate(ordered):
+        t_start = float(slot.question_time_s)
+        t_a = float(slot.answer_time_s) if slot.answer_time_s is not None else t_start
+        t_end = float(ordered[index + 1].question_time_s) if index + 1 < len(ordered) else float("inf")
+        windows.append((slot, t_start, t_a, t_end))
+    return windows
+
+
 def _match_slot(
     slots: list[OmniInteractQASlot],
     *,
     video_time_s: float,
-    used: set[int],
+    used: set[int] | None = None,
 ) -> OmniInteractQASlot | None:
+    """Assign a response chunk to the open slot whose window contains its time.
+
+    Official rule: map a chunk to the slot with the latest ``t_start`` among
+    windows where ``t_start <= t < t_end``. Multiple chunks may share one slot;
+    ``used`` is retained only for backward-compatible call sites and is ignored.
+    """
+    del used  # multi-chunk-per-slot aggregation owns exclusivity downstream
     candidates: list[tuple[float, OmniInteractQASlot]] = []
-    for slot in slots:
-        if slot.slot_index in used:
-            continue
-        q_s = slot.question_time_s
-        a_s = slot.answer_time_s
-        if q_s is None:
-            continue
-        if a_s is not None and q_s <= video_time_s <= a_s:
-            candidates.append((0.0, slot))
-        elif video_time_s >= q_s:
-            candidates.append((video_time_s - q_s, slot))
+    for slot, t_start, _t_a, t_end in _slot_windows(slots):
+        if t_start <= video_time_s < t_end:
+            candidates.append((t_start, slot))
     if not candidates:
         return None
     candidates.sort(key=lambda item: (item[0], item[1].slot_index))
-    return candidates[0][1]
+    return candidates[-1][1]
 
 
 async def _stream_pcm16_with_video(
@@ -444,6 +466,8 @@ async def run_omniinteract_realtime_session(
                 wait_error = str(exc)
 
             used_slots: set[int] = set()
+            slot_text_parts: dict[int, list[str]] = {}
+            slot_primary_turn: dict[int, int] = {}
             response_ids = client.events.response_ids[before_created:]
             for turn_index, response_id in enumerate(response_ids):
                 turn_metrics = compute_turn_metrics(
@@ -454,9 +478,26 @@ async def run_omniinteract_realtime_session(
                 )
                 turn_metrics.turn_index = turn_index
                 result.turn_metrics.append(turn_metrics)
-                matched = _match_slot(slots, video_time_s=turn_metrics.video_time_s, used=used_slots)
+                matched = _match_slot(slots, video_time_s=turn_metrics.video_time_s)
+                matched_index = matched.slot_index if matched is not None else None
                 if matched is not None:
                     used_slots.add(matched.slot_index)
+                    text = (turn_metrics.generated_text or "").strip()
+                    if text:
+                        slot_text_parts.setdefault(matched.slot_index, []).append(text)
+                        # Prefer the chunk nearest answer_time for primary metrics.
+                        answer_s = matched.answer_time_s
+                        if answer_s is None:
+                            slot_primary_turn.setdefault(matched.slot_index, turn_index)
+                        else:
+                            prev = slot_primary_turn.get(matched.slot_index)
+                            if prev is None:
+                                slot_primary_turn[matched.slot_index] = turn_index
+                            else:
+                                prev_t = result.turn_metrics[prev].video_time_s
+                                cur_t = turn_metrics.video_time_s
+                                if abs(cur_t - answer_s) < abs(prev_t - answer_s):
+                                    slot_primary_turn[matched.slot_index] = turn_index
                 result.turn_outputs.append(
                     {
                         "turn_index": turn_index,
@@ -473,18 +514,42 @@ async def run_omniinteract_realtime_session(
                         "question_time": matched.question_time if matched else "",
                         "answer_time": matched.answer_time if matched else "",
                         "is_interrupted": matched.is_interrupted if matched else None,
-                        "matched_slot_index": matched.slot_index if matched else None,
+                        "matched_slot_index": matched_index,
                         **turn_metrics.as_dict(),
                     }
                 )
 
-            # Unmatched GT slots become FN rows for soft QA metrics.
-            for slot in slots:
-                if slot.slot_index in used_slots:
+            # Collapse multi-chunk slot hits into one eval row per slot (paper:
+            # chunks share a slot; proxy QA uses the concatenated transcript).
+            collapsed: list[dict[str, Any]] = []
+            emitted_slots: set[int] = set()
+            for row in result.turn_outputs:
+                slot_idx = row.get("matched_slot_index")
+                if not isinstance(slot_idx, int):
+                    # Unmatched model chunks become FP rows (empty gold skipped
+                    # by exact/soft; marked failed so FN/FP accounting can use
+                    # question_type when present). Keep for turn metrics only.
                     continue
-                result.turn_outputs.append(
+                if slot_idx in emitted_slots:
+                    continue
+                emitted_slots.add(slot_idx)
+                primary_idx = slot_primary_turn.get(slot_idx, int(row["turn_index"]))
+                primary = result.turn_outputs[primary_idx]
+                merged_text = " ".join(slot_text_parts.get(slot_idx, [])).strip()
+                collapsed.append(
                     {
-                        "turn_index": len(result.turn_outputs),
+                        **primary,
+                        "turn_index": len(collapsed),
+                        "generated_text": merged_text or str(primary.get("generated_text") or ""),
+                        "success": bool(merged_text) or bool(primary.get("success")),
+                    }
+                )
+            for slot in slots:
+                if slot.slot_index in emitted_slots:
+                    continue
+                collapsed.append(
+                    {
+                        "turn_index": len(collapsed),
                         "question_text": slot.question_text,
                         "gold_answer": slot.answer_text,
                         "generated_text": "",
@@ -505,6 +570,8 @@ async def run_omniinteract_realtime_session(
                         "rtf": 0.0,
                     }
                 )
+            # Keep per-response rows for performance; replace eval rows.
+            result.turn_outputs = collapsed
 
             await client.acknowledge_playback()
             try:

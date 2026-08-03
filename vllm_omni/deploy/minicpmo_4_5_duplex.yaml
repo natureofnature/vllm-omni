@@ -8,8 +8,10 @@ pipeline: minicpmo_4_5
 session_mode: duplex
 active_stream_window: 1
 duplex_session:
-  idle_ttl_s: 300
-  disconnect_grace_s: 30
+  # OmniInteract videos are ~150–300s; keep sessions alive through paced
+  # streaming plus post-commit response drain.
+  idle_ttl_s: 900
+  disconnect_grace_s: 60
   reaper_interval_s: 5
   resume_replay_ttl_s: 60
   resume_replay_max_bytes_per_session: 8388608
