@@ -85,14 +85,24 @@ def _validate_semantic_isolation(
         return True
     if len(expected_tokens) != len(results):
         return False
-    for result, expected_token in zip(results, expected_tokens, strict=True):
+    normalized_expected_tokens = [token.strip().casefold() for token in expected_tokens]
+    if any(not token for token in normalized_expected_tokens):
+        return False
+    for result_index, (result, expected_token) in enumerate(zip(results, normalized_expected_tokens, strict=True)):
         details = result.get("transcript_integrity")
         transcripts = (
             [str(item.get("transcript", "")) for item in details if isinstance(item, dict)]
             if isinstance(details, list)
             else []
         )
-        if expected_token not in "".join(transcripts):
+        joined_transcripts = "".join(transcripts).casefold()
+        if expected_token not in joined_transcripts:
+            return False
+        if any(
+            other_token in joined_transcripts
+            for other_index, other_token in enumerate(normalized_expected_tokens)
+            if other_index != result_index
+        ):
             return False
     return True
 
@@ -461,10 +471,11 @@ def _demo_args(args: argparse.Namespace, index: int) -> SimpleNamespace:
         omit_transcript_hints=True,
         validation_mode=validation_mode,
         temperature=args.temperature,
-        scenario="sequential",
+        scenario=getattr(args, "scenario", "sequential"),
+        silence_ms=getattr(args, "silence_ms", 500),
         require_audio=args.response_required,
         require_distinct_inputs=False,
-        expect_empty_turn=[],
+        expect_empty_turn=list(getattr(args, "expect_empty_turn", []) or []),
         short_ack_ms=350,
         turns=args.turns,
         timeout_s=args.timeout_s,
@@ -580,7 +591,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--turns", type=int, default=1)
     parser.add_argument("--first-turn-ms", type=int, default=1400)
     parser.add_argument("--turn-duration-ms", type=int, action="append", default=[])
+    parser.add_argument("--expect-empty-turn", type=int, action="append", default=[])
     parser.add_argument("--response-required", action="store_true")
+    parser.add_argument(
+        "--scenario",
+        choices=["sequential", "listen-only-overlap"],
+        default="sequential",
+    )
+    parser.add_argument("--silence-ms", type=int, default=500)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--disconnect-session-index", type=int)
     parser.add_argument("--takeover-session-index", type=int)

@@ -14,6 +14,9 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      # Bound transient diffusion-cache memory while keeping four-way GPU
+      # batching. Larger duplex capacities are decoded in exact-shape tiles.
+      code2wav_max_batch_size: 4
 
 stages:
   - stage_id: 0

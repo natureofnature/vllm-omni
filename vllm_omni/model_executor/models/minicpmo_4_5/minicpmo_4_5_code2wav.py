@@ -153,6 +153,9 @@ class MiniCPMO45Code2Wav(nn.Module):
         self._min_batch_size = int(extra.get("code2wav_min_batch_size", 1))
         if self._min_batch_size < 1:
             raise ValueError("MiniCPM-o Code2Wav code2wav_min_batch_size must be >= 1")
+        self._max_batch_size = int(extra.get("code2wav_max_batch_size", 0))
+        if self._max_batch_size < 0:
+            raise ValueError("MiniCPM-o Code2Wav code2wav_max_batch_size must be >= 0")
         self._default_prompt_id = str(extra.get("prompt_cache_id", "HT_ref_audio"))
         self._prompt_wav_override = extra.get("prompt_wav")
 
@@ -625,7 +628,16 @@ class MiniCPMO45Code2Wav(nn.Module):
                     prompt_wav=item.prompt_wav,
                     token2wav=state,
                 )
-        for bucket in buckets.values():
+        decode_buckets = (
+            [
+                bucket[start : start + self._max_batch_size]
+                for bucket in buckets.values()
+                for start in range(0, len(bucket), self._max_batch_size)
+            ]
+            if self._max_batch_size
+            else list(buckets.values())
+        )
+        for bucket in decode_buckets:
             batch_size = len(bucket)
             try:
                 features = self.backend.prepare_prompt(

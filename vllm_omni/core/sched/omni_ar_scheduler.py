@@ -433,7 +433,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     request.resumable = False
                     stopped = True
 
+            confirmed_num_computed_tokens = None
             if stopped:
+                if self.chunk_transfer_adapter is not None:
+                    confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
                 if model_runner_output.routed_experts is not None:
                     routed_experts = omni_routed_experts_for_request(model_runner_output.routed_experts, request)
 
@@ -507,6 +510,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     inter_stage_output,
                     request,
                     is_segment_finished,
+                    confirmed_num_computed_tokens=confirmed_num_computed_tokens,
                 )
 
         self._remove_stopped_requests_from_queues(

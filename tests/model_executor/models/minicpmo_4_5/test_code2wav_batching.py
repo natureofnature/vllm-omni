@@ -135,13 +135,14 @@ class _FakeToken2Wav:
         raise AssertionError("sequential __call__ fallback must never be called")
 
 
-def _config(minimum: int = 1):
+def _config(minimum: int = 1, maximum: int = 0):
     return SimpleNamespace(
         model_config=SimpleNamespace(
             model="/fake/model",
             stage_connector_config={
                 "extra": {
                     "code2wav_min_batch_size": minimum,
+                    "code2wav_max_batch_size": maximum,
                     "prompt_cache_id": "shared",
                     "prompt_wav": "/fake/prompt.wav",
                 }
@@ -150,10 +151,10 @@ def _config(minimum: int = 1):
     )
 
 
-def _model():
+def _model(maximum: int = 0):
     token2wav = _FakeToken2Wav()
     backend = BatchedToken2Wav(token2wav)
-    model = MiniCPMO45Code2Wav(vllm_config=_config())
+    model = MiniCPMO45Code2Wav(vllm_config=_config(maximum=maximum))
     model.backend = backend
     return model, token2wav
 
@@ -594,6 +595,23 @@ def test_singleton_and_mixed_shape_buckets_use_same_batched_backend_without_fall
     # Exact-shape buckets execute independently but both use the same vectorized
     # adapter; there is no Token2wav.stream/__call__ fallback.
     assert token2wav.hift.calls[-2:] == [1, 1]
+
+
+def test_large_exact_shape_bucket_respects_decode_batch_limit():
+    model, token2wav = _model(maximum=2)
+    names = ["a", "b", "c", "d", "e"]
+
+    output = _forward(
+        model,
+        [_info(name, 0, [index + 1, index + 2]) for index, name in enumerate(names)],
+    )
+
+    assert token2wav.hift.calls == [2, 2, 1]
+    assert len(output.multimodal_outputs["model_outputs"]) == len(names)
+    assert set(model._states) == set(names)
+    assert [
+        model._states[name].token2wav.flow_cache["estimator_cnn_cache"][0, 0, 0, 0, 0].item() for name in names
+    ] == [1, 2, 3, 4, 5]
 
 
 def test_backend_failure_does_not_commit_any_request_state(monkeypatch):

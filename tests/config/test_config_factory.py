@@ -1155,9 +1155,11 @@ class TestDeployConfigLoading:
 
         assert deploy.session_mode == "duplex"
         assert deploy.async_chunk is True
-        assert deploy.active_stream_window == 1
+        assert deploy.active_stream_window == 8
+        assert [stage.max_num_seqs for stage in deploy.stages] == [8, 8, 8]
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
+        assert deploy.connectors["connector_of_shared_memory"]["extra"]["code2wav_max_batch_size"] == 4
         assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
         assert all("Async" not in (stage.scheduler_cls or "") for stage in stages)
         assert [stage.devices for stage in deploy.stages] == ["0", "0", "0"]

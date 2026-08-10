@@ -161,6 +161,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
+        confirmed_num_computed_tokens: int | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -178,10 +179,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             multimodal_output: Per-request multimodal output dictionary
             request: Request object
             is_segment_finished: whether the segment of request is finished
+            confirmed_num_computed_tokens: committed token count captured
+                before a streaming transition can mutate ``request``
         """
         is_finished = request.is_finished() and not request.resumable
 
-        confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
+        if confirmed_num_computed_tokens is None:
+            confirmed_num_computed_tokens = self._confirmed_num_computed_tokens(request)
 
         # If the request is preempted, skip the already saved chunks.
         if confirmed_num_computed_tokens < self.requests_num_chunks_sent.get(request.external_req_id, 0):
@@ -201,6 +205,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_segment_finished": is_segment_finished,
         }
         self._pending_save_reqs.append(task)
+        if is_segment_finished:
+            # The queued FIFO item now owns the old segment. Start the next
+            # segment's deduplication watermark before the worker sends it.
+            self.requests_num_chunks_sent.pop(request.external_req_id, None)
         with self._save_cond:
             self._save_cond.notify()
 
@@ -386,7 +394,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if is_segment_finished:
             self.code_prompt_token_ids.pop(external_req_id, None)
-            self.requests_num_chunks_sent.pop(external_req_id, None)
             self.ramp_chunk_count.pop(external_req_id, None)
             cached_ic = getattr(self, "_cached_ic", None)
             if cached_ic is not None:

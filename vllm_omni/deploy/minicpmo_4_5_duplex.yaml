@@ -2,11 +2,11 @@
 #
 # The registered minicpmo_4_5 pipeline owns the fixed
 # Thinker -> Talker -> Code2Wav topology. This overlay changes session
-# lifetime and bounds all three stages to two live duplex sessions.
+# lifetime and bounds all three stages to eight live duplex sessions.
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 session_mode: duplex
-active_stream_window: 1
+active_stream_window: 8
 duplex_session:
   idle_ttl_s: 300
   disconnect_grace_s: 30
@@ -16,16 +16,16 @@ duplex_session:
   max_pending_input_bytes_per_session: 16777216
   max_pending_turns_per_session: 4
   # Matches the configured Stage0/Stage1 sequence capacity below.
-  max_sessions: 2
+  max_sessions: 8
   completed_append_cache_size: 256
 
 stages:
   - stage_id: 0
-    max_num_seqs: 2
+    max_num_seqs: 8
     async_scheduling: false
 
   - stage_id: 1
-    max_num_seqs: 2
+    max_num_seqs: 8
     async_scheduling: false
     # The split Talker exposes a binary continue/stop vocabulary; native
     # segment and turn boundaries travel as explicit output metadata.
@@ -35,5 +35,5 @@ stages:
       stop_token_ids: [1]
 
   - stage_id: 2
-    max_num_seqs: 2
+    max_num_seqs: 8
     async_scheduling: false
