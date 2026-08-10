@@ -281,6 +281,14 @@ class PipelineConfig:
     # Optional model-owned Serving adapter loaded only when the Realtime duplex
     # endpoint is enabled. Generic OpenAI modules must not select a model.
     duplex_serving_adapter: str | None = None
+    # Optional API-server Session adapter for models whose multi-turn state is
+    # maintained above the ordinary request path (for example JoyAI). Unlike
+    # ``duplex_serving_adapter``, this does not enable the resident-request
+    # duplex control plane.
+    session_serving_adapter: str | None = None
+    # Optional Serving adapter for the shared streaming-video WebSocket path.
+    # The default handler remains active when this is unset.
+    streaming_video_serving_adapter: str | None = None
     # Explicitly enable the stable duplex control mechanism. This is separate
     # from the optional model extension because turn-commit-only deployments
     # do not require a model planner.

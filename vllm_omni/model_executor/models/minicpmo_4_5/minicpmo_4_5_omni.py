@@ -884,6 +884,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         payload = self._minicpmo45_duplex_payload_for_row(row_idx)
         force_listen = isinstance(payload, dict) and payload.get("force_listen") is True
+        turn_eos_id = token_ids.get("turn_eos_token_id", -1)
+        max_turn_tokens = int(
+            getattr(
+                self,
+                "max_new_speak_tokens_per_turn",
+                MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_TURN,
+            )
+            or MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_TURN
+        )
+        if (
+            state is not None
+            and not getattr(state, "current_turn_ended", True)
+            and 0 <= turn_eos_id
+            and int(getattr(state, "turn_generated_token_count", 0)) >= max(1, max_turn_tokens)
+        ):
+            return int(turn_eos_id)
         if (
             sampled == listen_id
             and 0 <= tts_bos_id
@@ -913,6 +929,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             generated_tokens = []
             state.generated_tokens = generated_tokens
         generated_tokens.append(int(sampled))
+        state.turn_generated_token_count = int(getattr(state, "turn_generated_token_count", 0)) + 1
         history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         del generated_tokens[:-history_size]
 
@@ -938,6 +955,8 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         if sampled in terminators:
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
+            if sampled in {listen_id, turn_eos_id}:
+                state.turn_generated_token_count = 0
             if sampled == turn_eos_id or (sampled == listen_id and force_listen):
                 state.current_turn_ended = True
                 with suppress(Exception):

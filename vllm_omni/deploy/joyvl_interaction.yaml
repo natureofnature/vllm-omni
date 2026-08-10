@@ -1,0 +1,21 @@
+# JoyAI interaction runs Session policy in the vLLM-Omni API Server and
+# submits every tick as an ordinary single-stage VLM request through AsyncOmni.
+#
+# External JoyAI orchestration remains available through
+# examples/online_serving/joyvl_interaction/scripts/start_all.sh.
+
+pipeline: joyvl_interaction
+async_chunk: false
+
+stages:
+  - stage_id: 0
+    max_model_len: 131072
+    max_num_batched_tokens: 32768
+    max_num_seqs: 8
+    trust_remote_code: true
+    enable_prefix_caching: true
+    enable_chunked_prefill: true
+    limit_mm_per_prompt:
+      image: 256
+      video: 1
+    devices: "0"

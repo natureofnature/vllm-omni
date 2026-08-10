@@ -13,8 +13,18 @@ import torch
 import torch.nn as nn
 import torchaudio
 import torchaudio.compliance.kaldi as kaldi
-from flashcosyvoice.modules.hifigan import HiFTGenerator
-from flashcosyvoice.utils.audio import mel_spectrogram
+
+try:
+    from flashcosyvoice.modules.hifigan import HiFTGenerator
+    from flashcosyvoice.utils.audio import mel_spectrogram
+except ModuleNotFoundError as exc:
+    if exc.name != "flashcosyvoice":
+        raise
+    from stepaudio2.flashcosyvoice.modules.hifigan import HiFTGenerator
+    from stepaudio2.flashcosyvoice.utils.audio import mel_spectrogram
+    from stepaudio2.token2wav import _setup_cosyvoice2_alias
+
+    _setup_cosyvoice2_alias()
 from hyperpyyaml import load_hyperpyyaml
 from vllm.config import VllmConfig
 from vllm.logger import init_logger

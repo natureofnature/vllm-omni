@@ -105,6 +105,7 @@ class StagePool:
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
+        self._session_bindings: dict[str, int] = {}
         self._unavailable_replicas: set[int] = set()
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
         self._output_timestamps_by_request: dict[str, list[float]] = {}
@@ -127,6 +128,7 @@ class StagePool:
         # Kept separate from the legacy ``_request_bindings`` so the two
         # binding shapes do not collide.
         self._affinity: dict[str, str] = {}
+        self._session_affinity: dict[str, str] = {}
 
     # ---- Stage-level properties ----
 
@@ -283,6 +285,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_routing_key: str | None = None,
     ) -> int:
         """Return a replica id for ``request_id``.
 
@@ -295,7 +298,11 @@ class StagePool:
         :meth:`select_replica_id`.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_routing_key=session_routing_key,
+            )
 
         # 1. Sticky: previously bound and still serviceable?
         bound_addr = self._affinity.get(request_id)
@@ -306,7 +313,17 @@ class StagePool:
             # Bound replica is gone or DOWN — fall through to re-select.
             self._affinity.pop(request_id, None)
 
-        # 2. Inherited affinity (CFG companion sharing a parent request_id).
+        # 2. Session affinity for stateful models whose request id changes.
+        if session_routing_key is not None:
+            session_addr = self._session_affinity.get(session_routing_key)
+            if session_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(session_addr)
+                if replica_id is not None:
+                    self._affinity[request_id] = session_addr
+                    return replica_id
+                self._session_affinity.pop(session_routing_key, None)
+
+        # 3. Inherited affinity (CFG companion sharing a parent request_id).
         if affinity_request_id is not None:
             parent_addr = self._affinity.get(affinity_request_id)
             if parent_addr is not None:
@@ -325,6 +342,8 @@ class StagePool:
                 lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
                 replica_info, replica_id = candidates[lb_idx]
                 self._affinity[request_id] = replica_info.input_addr
+                if session_routing_key is not None:
+                    self._session_affinity[session_routing_key] = replica_info.input_addr
                 return replica_id
 
             now = _time.monotonic()
@@ -338,6 +357,7 @@ class StagePool:
         task: Task | None = None,
         *,
         affinity_request_id: str | None = None,
+        session_routing_key: str | None = None,
     ) -> int | None:
         """Synchronously pick and bind a replica before request preprocessing.
 
@@ -350,7 +370,11 @@ class StagePool:
         submit-time router wait without blocking the caller.
         """
         if self._hub is None or self._lb is None:
-            return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return self.select_replica_id(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_routing_key=session_routing_key,
+            )
 
         bound_addr = self._affinity.get(request_id)
         if bound_addr is not None:
@@ -358,6 +382,15 @@ class StagePool:
             if replica_id is not None:
                 return replica_id
             self._affinity.pop(request_id, None)
+
+        if session_routing_key is not None:
+            session_addr = self._session_affinity.get(session_routing_key)
+            if session_addr is not None:
+                replica_id = self._serviceable_replica_id_for_addr(session_addr)
+                if replica_id is not None:
+                    self._affinity[request_id] = session_addr
+                    return replica_id
+                self._session_affinity.pop(session_routing_key, None)
 
         if affinity_request_id is not None:
             parent_addr = self._affinity.get(affinity_request_id)
@@ -375,6 +408,8 @@ class StagePool:
         lb_idx = self._lb.select(task, [rep for rep, _ in candidates])
         replica_info, replica_id = candidates[lb_idx]
         self._affinity[request_id] = replica_info.input_addr
+        if session_routing_key is not None:
+            self._session_affinity[session_routing_key] = replica_info.input_addr
         return replica_id
 
     def _collect_serviceable_replicas(self) -> list[tuple[ReplicaInfo, int]]:
@@ -421,6 +456,9 @@ class StagePool:
         affected: list[str] = [rid for rid, addr in self._affinity.items() if addr == input_addr]
         for rid in affected:
             self._affinity.pop(rid, None)
+        for session_key, addr in list(self._session_affinity.items()):
+            if addr == input_addr:
+                self._session_affinity.pop(session_key, None)
         return affected
 
     # ---- Legacy (non-distributed) route binding ----
@@ -435,6 +473,16 @@ class StagePool:
         if legacy is not None:
             return legacy
         addr = self._affinity.get(request_id)
+        if addr is None:
+            return None
+        return self._addr_to_replica_id.get(addr)
+
+    def get_session_bound_replica_id(self, session_routing_key: str) -> int | None:
+        """Return the replica that owns model state for a logical session."""
+        legacy = self._session_bindings.get(session_routing_key)
+        if legacy is not None:
+            return legacy
+        addr = self._session_affinity.get(session_routing_key)
         if addr is None:
             return None
         return self._addr_to_replica_id.get(addr)
@@ -498,6 +546,11 @@ class StagePool:
         for request_id in request_ids:
             self.release_binding(request_id)
 
+    def release_session_binding(self, session_routing_key: str) -> None:
+        """Drop the persistent route for a stateful logical session."""
+        self._session_bindings.pop(session_routing_key, None)
+        self._session_affinity.pop(session_routing_key, None)
+
     def release_replica_bindings(self, replica_id: int) -> list[str]:
         """Drop all route/session bindings owned by one physical replica."""
         released_request_ids = [
@@ -513,6 +566,12 @@ class StagePool:
         released_request_ids = list(dict.fromkeys(released_request_ids))
         for request_id in released_request_ids:
             self.release_binding(request_id)
+        for session_key, bound_replica_id in list(self._session_bindings.items()):
+            if bound_replica_id == replica_id:
+                self.release_session_binding(session_key)
+        for session_key, input_addr in list(self._session_affinity.items()):
+            if self._addr_to_replica_id.get(input_addr) == replica_id:
+                self.release_session_binding(session_key)
         return released_request_ids
 
     def mark_replica_unavailable(self, replica_id: int) -> list[str]:
@@ -536,6 +595,7 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_routing_key: str | None = None,
     ) -> int:
         """Pick a replica id for *request_id* and cache the choice (legacy path)."""
         cached = self.get_bound_replica_id(request_id)
@@ -546,7 +606,13 @@ class StagePool:
             self.release_binding(request_id)
 
         chosen: int | None = None
-        if affinity_request_id is not None:
+        if session_routing_key is not None:
+            session_replica = self._session_bindings.get(session_routing_key)
+            if session_replica is not None and self.is_replica_available(session_replica):
+                chosen = session_replica
+            elif session_replica is not None:
+                self.release_session_binding(session_routing_key)
+        if chosen is None and affinity_request_id is not None:
             parent = self.get_bound_replica_id(affinity_request_id)
             if parent is not None and self.clients[parent] is not None and self.is_replica_available(parent):
                 chosen = parent
@@ -565,6 +631,8 @@ class StagePool:
                 self._next_replica_id = (self._next_replica_id + 1) % len(live)
 
         self._request_bindings[request_id] = chosen
+        if session_routing_key is not None:
+            self._session_bindings[session_routing_key] = chosen
         return chosen
 
     def _llm_client(self, replica_id: int) -> StagePoolLLMClient:
@@ -932,6 +1000,7 @@ class StagePool:
         *,
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
+        session_routing_key: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
         params_override: Any = None,
     ) -> int:
@@ -950,6 +1019,7 @@ class StagePool:
             replica_id = await self._pick_or_select(
                 request_id,
                 affinity_request_id=affinity_request_id,
+                session_routing_key=session_routing_key,
             )
             client = self._diffusion_client(replica_id)
             await client.add_request_async(request_id, request, params, **submit_kwargs)
@@ -958,6 +1028,7 @@ class StagePool:
         replica_id = await self._pick_or_select(
             request_id,
             affinity_request_id=affinity_request_id,
+            session_routing_key=session_routing_key,
         )
         client = self.clients[replica_id]
         if client is None:
@@ -1070,11 +1141,20 @@ class StagePool:
         request_id: str,
         *,
         affinity_request_id: str | None = None,
+        session_routing_key: str | None = None,
     ) -> int:
         """Bridge to ``pick`` in distributed mode or ``select_replica_id`` legacy."""
         if self.is_distributed:
-            return await self.pick(request_id, affinity_request_id=affinity_request_id)
-        return self.select_replica_id(request_id, affinity_request_id=affinity_request_id)
+            return await self.pick(
+                request_id,
+                affinity_request_id=affinity_request_id,
+                session_routing_key=session_routing_key,
+            )
+        return self.select_replica_id(
+            request_id,
+            affinity_request_id=affinity_request_id,
+            session_routing_key=session_routing_key,
+        )
 
     # ---- Stage-local polling ----
 

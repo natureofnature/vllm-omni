@@ -53,8 +53,36 @@ def stream(
     ``query`` is attached to the first tick to arm the session; inject later
     queries by posting another frame turn with a new text part.
     """
-    url = server.rstrip("/") + "/v1/chat/completions"
-    requests.post(server.rstrip("/") + "/reset", json={"session_id": session_id}, timeout=10)
+    server = server.rstrip("/")
+    url = server + "/v1/chat/completions"
+    reset_url = server + "/reset"
+
+    def post_reset(expected_epoch: int):
+        nonlocal reset_url
+        response = requests.post(
+            reset_url, json={"session_id": session_id, "session_epoch": expected_epoch}, timeout=10
+        )
+        if response.status_code == 404 and reset_url == server + "/reset":
+            reset_url = server + "/v1/session/reset"
+            response = requests.post(
+                reset_url, json={"session_id": session_id, "session_epoch": expected_epoch}, timeout=10
+            )
+        return response
+
+    reset_response = post_reset(0)
+    if reset_response.status_code == 409:
+        current_epoch = reset_response.json()["current_epoch"]
+        reset_response = post_reset(current_epoch)
+    reset_response.raise_for_status()
+    reset_payload = reset_response.json()
+    epoch = reset_payload["epoch"]
+    if reset_payload.get("advanced") is False:
+        reset_response = post_reset(epoch)
+        reset_response.raise_for_status()
+        reset_payload = reset_response.json()
+        if reset_payload.get("advanced") is False:
+            raise RuntimeError("session reset did not advance the epoch")
+        epoch = reset_payload["epoch"]
     for i, (t, jpeg) in enumerate(iter_frames(video_path, fps)):
         data_url = "data:image/jpeg;base64," + base64.b64encode(jpeg).decode()
         content = [{"type": "image_url", "image_url": {"url": data_url}}]
@@ -62,7 +90,12 @@ def stream(
             content.insert(0, {"type": "text", "text": query})
         resp = requests.post(
             url,
-            json={"session_id": session_id, "messages": [{"role": "user", "content": content}]},
+            json={
+                "session_id": session_id,
+                "session_epoch": epoch,
+                "operation_id": str(i),
+                "messages": [{"role": "user", "content": content}],
+            },
             timeout=120,
         ).json()
         info = resp.get("interaction", {})

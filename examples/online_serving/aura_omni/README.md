@@ -60,6 +60,11 @@ Recommended baseline on one GPU for H200
 - Stage 2 (Qwen3-TTS Talker): `0.20`
 - Stage 3 (Qwen3-TTS Code2Wav): `0.20`
 
+The default single-H200 profile caps the AURA stage at 32,768 tokens so all
+four stages can start within those memory shares. For longer model context,
+assign Stage 1 more GPU memory or place it on a dedicated GPU before raising
+`max_model_len`.
+
 ## Python Client
 
 ```bash
@@ -108,6 +113,23 @@ By default, AURA responses are passed to Qwen3-TTS as text. Set
 `tts_pass_token_ids=true` to pass AURA-generated assistant token ids directly
 to Qwen3-TTS instead. The processor still uses AURA token ids, when available,
 to estimate the Talker prompt length in the default text path.
+
+## Streaming Video Client
+
+Start the same server, then run the WebSocket client against a video and
+optional raw PCM16 16 kHz mono audio input:
+
+```bash
+python examples/online_serving/aura_omni/streaming_video_client.py \
+  --host localhost \
+  --port 8091 \
+  --video /path/to/video.mp4 \
+  --audio /path/to/audio.pcm \
+  --query "请在看到目标时提醒我" \
+  --output-wav outputs/aura_stream.wav
+```
+
+The client uses `/v1/video/chat/stream` and saves streamed audio deltas as WAV.
 
 ## Curl
 

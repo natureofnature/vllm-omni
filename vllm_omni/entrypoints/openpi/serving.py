@@ -116,8 +116,22 @@ class ServingRealtimeRobotOpenPI:
             model_config = getattr(engine_client, "model_config", None)
         return PolicyServerConfig.from_model_config(model_config)
 
-    def reset(self, obs: dict) -> None:
-        """Compatibility hook; per-connection state lives in RobotRealtimeConnection."""
+    async def reset_session(self, session_id: str) -> list[Any]:
+        """Clear model-runner state and release the Session's replica route."""
+        return await self._control_session("reset", session_id)
+
+    async def close_session(self, session_id: str) -> list[Any]:
+        """Close model-runner state and release the Session's replica route."""
+        return await self._control_session("close", session_id)
+
+    async def _control_session(self, action: str, session_id: str) -> list[Any]:
+        return await self.engine_client.collective_rpc(
+            method="handle_session_control",
+            args=(action, session_id),
+            stage_ids=[0],
+            session_routing_key=self._session_routing_key(session_id),
+            release_session_binding=True,
+        )
 
     async def infer(self, obs: dict, *, session_id: str, reset: bool) -> ActionOutput:
         """raw obs → engine → actions."""
@@ -131,6 +145,7 @@ class ServingRealtimeRobotOpenPI:
             prompt=request.prompt,
             request_id=request.request_id,
             sampling_params_list=[request.sampling_params],
+            stage_session_keys={0: self._session_routing_key(session_id)},
         ):
             result = output
         if result is None:
@@ -140,6 +155,10 @@ class ServingRealtimeRobotOpenPI:
 
     def _next_request_id(self, session_id: str) -> str:
         return f"robot-{session_id}-{next(self._request_counter)}"
+
+    @staticmethod
+    def _session_routing_key(session_id: str) -> str:
+        return f"dreamzero:{session_id}"
 
     def _build_request(self, obs: dict, *, session_id: str, reset: bool) -> Any:
         """Build engine request from raw robot obs.

@@ -37,6 +37,7 @@ class _MiniCPMO45Stage0SessionState:
     pending_speech_append_identity: tuple[int | None, int] | None = None
     pending_speech_response_open: bool = False
     generated_tokens: list[int] = field(default_factory=list)
+    turn_generated_token_count: int = 0
 
 
 class MiniCPMO45Stage0DuplexRuntime:

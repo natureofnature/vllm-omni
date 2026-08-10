@@ -65,7 +65,8 @@ spawn() { local log="$1"; shift; setsid "$@" > "$log" 2>&1 < /dev/null & }
 
 echo "[1/3] model on GPU ${GPU}…"
 spawn "$LOG/model.log" env HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 CUDA_VISIBLE_DEVICES="$GPU" \
-  vllm serve "$MODEL" --served-model-name "$SERVED_NAME" --port "$MODEL_PORT" \
+  vllm serve "$MODEL" \
+  --served-model-name "$SERVED_NAME" --port "$MODEL_PORT" \
   --gpu-memory-utilization 0.85 --max-model-len 131072 --enable-prefix-caching \
   --limit-mm-per-prompt '{"image":256,"video":1}'
 wait_http "http://127.0.0.1:${MODEL_PORT}/health" && echo "  up :${MODEL_PORT}"

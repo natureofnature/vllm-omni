@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import copy
 import logging
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,7 +17,7 @@ from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import Delegatio
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction
 from vllm_omni.experimental.fullduplex.joyvl.decision.policy import JoyVLPolicy
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SYSTEM_PROMPTS, USER_QUERY_HEADER
-from vllm_omni.experimental.fullduplex.joyvl.memory.memory import Summarizer, WorkingChunk
+from vllm_omni.experimental.fullduplex.joyvl.memory.memory import QAEntry, Summarizer, WorkingChunk
 from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
 
 logger = logging.getLogger("vllm_omni.experimental.fullduplex.joyvl")
@@ -30,6 +33,21 @@ class StepResult:
     long_term_memory: str
     mid_term_summaries: list[dict[str, Any]] = field(default_factory=list)
     delegation: dict[str, Any] | None = None
+
+
+@dataclass
+class _SessionStateSnapshot:
+    qa_history: list[QAEntry]
+    current_query: str | None
+    query_time: str | None
+    query_in_current_chunk: bool
+    frame_index: int
+    chunk_index: int
+    chunk_frame_count: int
+    working_frames: list[tuple[str, str]]
+    last_response_text: str
+    response_records: list[tuple[str, str]]
+    chunk: WorkingChunk
 
 
 class InteractionSession:
@@ -68,7 +86,14 @@ class InteractionSession:
         self._system_prompt = prompt
         return True
 
-    async def step(self, frames: list[str], query: str | None = None, t: float | None = None) -> StepResult:
+    async def step(
+        self,
+        frames: list[str],
+        query: str | None = None,
+        t: float | None = None,
+        *,
+        commit_scope: Callable[[], contextlib.AbstractAsyncContextManager[None]] | None = None,
+    ) -> StepResult:
         self.last_access = time.monotonic()
         started = time.perf_counter()
         policy = self._policy
@@ -79,27 +104,47 @@ class InteractionSession:
 
         delegation_info = await policy.fold_delegations()
 
-        if policy.needs_flush():
-            self._spawn_consolidation(policy.close_chunk(), policy.take_working_frames())
-            self.chunk = WorkingChunk()
+        snapshot = self._snapshot_state()
+        consolidation: tuple[int, list[tuple[str, str]]] | None = None
+        try:
+            if policy.needs_flush():
+                consolidation = (policy.close_chunk(), policy.take_working_frames())
+                self.chunk = WorkingChunk()
 
-        query_is_fresh = policy.set_query(query)
+            query_is_fresh = policy.set_query(query)
 
-        for tr, url in zip(time_ranges, frames):
-            policy.observe(tr, url)
-        self.chunk.messages.append(self._frame_message(time_ranges, frames, include_query=query_is_fresh))
+            for tr, url in zip(time_ranges, frames):
+                policy.observe(tr, url)
+            self.chunk.messages.append(self._frame_message(time_ranges, frames, include_query=query_is_fresh))
 
-        if self.config.force_silence_before_query and not brain.current_query:
-            action = ParsedAction(Action.SILENCE, raw="</silence>")
-            skipped = True
-        else:
-            action = policy.commit(await self._infer())
-            skipped = False
-        self.chunk.messages.append({"role": "assistant", "content": action.raw or "</silence>"})
+            if self.config.force_silence_before_query and not brain.current_query:
+                action = ParsedAction(Action.SILENCE, raw="</silence>")
+                skipped = True
+            else:
+                raw = await self._infer()
+                action = policy.commit(raw)
+                skipped = False
+            self.chunk.messages.append({"role": "assistant", "content": action.raw or "</silence>"})
+        except BaseException:
+            self._restore_state(snapshot)
+            raise
 
-        submitted = await policy.submit_if_delegate(action, list(policy.working_frames))
-        if submitted:
-            delegation_info = submitted
+        try:
+            scope = commit_scope() if commit_scope is not None else contextlib.nullcontext()
+            async with scope:
+                if consolidation is not None:
+                    self._spawn_consolidation(*consolidation)
+
+                try:
+                    submitted = await policy.submit_if_delegate(action, list(policy.working_frames))
+                except Exception:
+                    logger.exception("delegation submission failed for session %s", self.session_id)
+                    submitted = None
+                if submitted:
+                    delegation_info = submitted
+        except BaseException:
+            self._restore_state(snapshot)
+            raise
 
         return StepResult(
             action=action,
@@ -114,6 +159,36 @@ class InteractionSession:
             ],
             delegation=delegation_info,
         )
+
+    def _snapshot_state(self) -> _SessionStateSnapshot:
+        brain = self._policy.brain
+        return _SessionStateSnapshot(
+            qa_history=copy.deepcopy(brain.memory.qa_history),
+            current_query=brain.current_query,
+            query_time=brain.query_time,
+            query_in_current_chunk=brain.query_in_current_chunk,
+            frame_index=brain.frame_index,
+            chunk_index=brain.chunk_index,
+            chunk_frame_count=brain._chunk_frame_count,
+            working_frames=list(brain.working_frames),
+            last_response_text=brain.last_response_text,
+            response_records=list(brain.response_records),
+            chunk=copy.deepcopy(self.chunk),
+        )
+
+    def _restore_state(self, snapshot: _SessionStateSnapshot) -> None:
+        brain = self._policy.brain
+        brain.memory.qa_history = snapshot.qa_history
+        brain.current_query = snapshot.current_query
+        brain.query_time = snapshot.query_time
+        brain.query_in_current_chunk = snapshot.query_in_current_chunk
+        brain.frame_index = snapshot.frame_index
+        brain.chunk_index = snapshot.chunk_index
+        brain._chunk_frame_count = snapshot.chunk_frame_count
+        brain.working_frames = snapshot.working_frames
+        brain.last_response_text = snapshot.last_response_text
+        brain.response_records = snapshot.response_records
+        self.chunk = snapshot.chunk
 
     async def reset(self) -> None:
         await self._cancel_consolidation()

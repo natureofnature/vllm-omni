@@ -26,6 +26,7 @@ class StageSubmissionMessage(EngineQueueMessage, kw_only=True):
     preprocess_ms: float
     request_timestamp: float
     enqueue_ts: float
+    stage_session_keys: dict[int, str] | None = None
     final_output_stage_ids: list[int] | None = None
 
 
@@ -58,6 +59,8 @@ class CollectiveRPCRequestMessage(EngineQueueMessage, kw_only=True):
     args: tuple[object, ...]
     kwargs: dict[str, object]
     stage_ids: list[int] | None
+    session_routing_key: str | None = None
+    release_session_binding: bool = False
 
 
 class ShutdownRequestMessage(EngineQueueMessage, kw_only=True):

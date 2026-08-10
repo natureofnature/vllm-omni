@@ -22,6 +22,7 @@ vLLM-native markers:
 from __future__ import annotations
 
 import asyncio
+import uuid
 from typing import Any
 
 import msgspec
@@ -158,12 +159,17 @@ class RobotRealtimeConnection:
         self.websocket = websocket
         self.serving = serving
         self._idle_timeout = idle_timeout
+        self._implicit_session_id = f"connection-{uuid.uuid4().hex}"
         self._current_session_id: str | None = None
         self._call_count = 0
 
     def reset(self) -> None:
         self._current_session_id = None
         self._call_count = 0
+
+    def _resolve_session_id(self, requested_session_id: Any = None) -> str:
+        """Resolve a stable Session ID without sharing the legacy ``default`` key."""
+        return str(requested_session_id or self._current_session_id or self._implicit_session_id)
 
     async def _send_error(self, message: str) -> None:
         await self.websocket.send_bytes(_pack({"type": "error", "message": message}))
@@ -220,11 +226,14 @@ class RobotRealtimeConnection:
                     endpoint = obs.pop("endpoint", "infer")
 
                     if endpoint == "reset":
+                        session_id = self._resolve_session_id(obs.get("session_id"))
+                        if self._current_session_id is not None and session_id != self._current_session_id:
+                            await self.serving.close_session(self._current_session_id)
+                        await self.serving.reset_session(session_id)
                         self.reset()
-                        self.serving.reset(obs)
                         await self.websocket.send_bytes(_pack({"status": "reset successful"}))
                     else:
-                        session_id = str(obs.get("session_id") or self._current_session_id or "default")
+                        session_id = self._resolve_session_id(obs.get("session_id"))
                         if session_id != self._current_session_id:
                             if self._current_session_id is not None:
                                 logger.info(
@@ -232,6 +241,7 @@ class RobotRealtimeConnection:
                                     self._current_session_id,
                                     session_id,
                                 )
+                                await self.serving.close_session(self._current_session_id)
                             self._current_session_id = session_id
                             self._call_count = 0
 
@@ -253,3 +263,11 @@ class RobotRealtimeConnection:
             pass
         except Exception:
             logger.exception("Connection error")
+        finally:
+            session_id = self._current_session_id
+            self.reset()
+            if session_id is not None:
+                try:
+                    await self.serving.close_session(session_id)
+                except Exception:
+                    logger.exception("Failed to close robot OpenPI session %s", session_id)

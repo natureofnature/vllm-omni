@@ -601,6 +601,9 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
             await shutdown_task
         finally:
             state = getattr(app, "state", None)
+            session_adapter = getattr(state, "openai_session_adapter", None) if state is not None else None
+            if session_adapter is not None:
+                await session_adapter.aclose()
             serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
             if serving_speech is not None:
                 serving_speech.shutdown()
@@ -983,6 +986,16 @@ async def omni_init_app_state(
     state.openai_serving_chat_batch = (
         OmniOpenAIServingChatBatch(**_chat_kwargs) if "generate" in supported_tasks else None
     )
+    state.openai_session_adapter = None
+    session_adapter_path = getattr(engine_client, "session_serving_adapter_path", None)
+    if state.openai_serving_chat is not None and session_adapter_path:
+        from vllm_omni.entrypoints.openai.session_adapter import load_session_serving_adapter
+
+        state.openai_session_adapter = load_session_serving_adapter(
+            session_adapter_path,
+            state.openai_serving_chat,
+            model_name,
+        )
 
     # Warm up chat template processing to avoid first-request latency
     if state.openai_serving_chat is not None:
@@ -1199,6 +1212,16 @@ def OmniAudioGenerate(request: Request) -> OmniOpenAIServingAudioGenerate | None
 async def create_chat_completion(request: ChatCompletionRequest, raw_request: Request):
     metrics_header_format = raw_request.headers.get(ENDPOINT_LOAD_METRICS_FORMAT_HEADER_LABEL, "")
     handler = Omnichat(raw_request)
+    session_adapter = getattr(raw_request.app.state, "openai_session_adapter", None)
+    if session_adapter is not None:
+        try:
+            return await session_adapter.create_chat_completion(request, raw_request)
+        except (EngineGenerateError, EngineDeadError) as exc:
+            return _create_engine_error_json_response(raw_request, exc)
+        except Exception as e:
+            logger.exception("Session chat completion failed: %s", e)
+            raise HTTPException(status_code=HTTPStatus.INTERNAL_SERVER_ERROR.value, detail=str(e)) from e
+
     if handler is None:
         base_server = getattr(raw_request.app.state, "serving_tokenization", None)
         if base_server is None:
@@ -1257,6 +1280,26 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
                         )
 
     return StreamingResponse(content=generator, media_type="text/event-stream")
+
+
+@router.post("/v1/session/reset")
+async def reset_session(raw_request: Request):
+    adapter = getattr(raw_request.app.state, "openai_session_adapter", None)
+    if adapter is None:
+        raise HTTPException(status_code=HTTPStatus.NOT_FOUND.value, detail="The model does not support Session reset")
+    body = await raw_request.body()
+    if not body:
+        payload = {}
+    else:
+        try:
+            payload = json.loads(body)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HTTPException(status_code=HTTPStatus.BAD_REQUEST.value, detail="Invalid JSON request body") from exc
+        if not isinstance(payload, dict):
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value, detail="Session reset body must be a JSON object"
+            )
+    return await adapter.reset_session(raw_request, payload)
 
 
 @router.post(

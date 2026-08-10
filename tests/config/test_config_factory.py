@@ -2357,6 +2357,7 @@ class TestAuraOmniDeploy:
         deploy = load_deploy_config(deploy_path)
 
         assert deploy.pipeline == "aura_omni"
+        assert deploy.async_chunk is True
 
     def test_aura_omni_deploy_resolves_four_native_stages(self):
         pipeline_cfg = resolve_pipeline_config("aura_omni")
@@ -2375,8 +2376,11 @@ class TestAuraOmniDeploy:
         ]
         assert [stage.final_output for stage in stages] == [False, True, False, True]
         assert [stage.final_output_type for stage in stages] == [None, "text", None, "audio"]
+        assert pipeline_cfg.stages[0].async_chunk_process_next_stage_input_func.endswith("asr2aura_async_chunk")
+        assert pipeline_cfg.stages[1].async_chunk_process_next_stage_input_func.endswith("aura2tts_async_chunk")
         assert stages[0].yaml_engine_args["model_arch"] == "Qwen3ASRForConditionalGeneration"
         assert stages[1].yaml_engine_args["model_arch"] == "AuraQwen3VLForConditionalGeneration"
+        assert stages[1].yaml_engine_args["max_model_len"] == 32768
         assert stages[2].yaml_engine_args["model_arch"] == "Qwen3TTSTalkerForConditionalGeneration"
         assert stages[3].yaml_engine_args["model_arch"] == "Qwen3TTSCode2Wav"
 

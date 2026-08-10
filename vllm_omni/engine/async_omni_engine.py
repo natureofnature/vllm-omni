@@ -231,6 +231,12 @@ class AsyncOmniEngine:
         self.duplex_serving_adapter_path = (
             pipeline_config.duplex_serving_adapter if pipeline_config is not None else None
         )
+        self.session_serving_adapter_path = (
+            pipeline_config.session_serving_adapter if pipeline_config is not None else None
+        )
+        self.streaming_video_serving_adapter_path = (
+            pipeline_config.streaming_video_serving_adapter if pipeline_config is not None else None
+        )
         self._duplex_control_enabled = bool(pipeline_config and pipeline_config.duplex_control_enabled)
         self.duplex_session_config = DuplexSessionRuntimeConfig()
         if deploy_config_path is not None:
@@ -618,6 +624,7 @@ class AsyncOmniEngine:
         self,
         request_id: str,
         prompt: Any,
+        session_routing_key: str | None = None,
     ) -> int | None:
         stage_pools = getattr(self, "stage_pools", None)
         if isinstance(prompt, EngineCoreRequest) or not stage_pools:
@@ -642,7 +649,7 @@ class AsyncOmniEngine:
                     request_id,
                 )
                 return None
-            replica_id = preselect_replica_id(request_id)
+            replica_id = preselect_replica_id(request_id, session_routing_key=session_routing_key)
             if replica_id is None:
                 logger.debug(
                     "[AsyncOmniEngine] Skipping stage-0 multimodal cache scoping for distributed routing "
@@ -651,7 +658,7 @@ class AsyncOmniEngine:
                 )
                 return None
         else:
-            replica_id = stage0_pool.select_replica_id(request_id)
+            replica_id = stage0_pool.select_replica_id(request_id, session_routing_key=session_routing_key)
 
         for p in prompts:
             self._ensure_stage_replica_mm_uuids(
@@ -684,6 +691,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        stage_session_keys: Mapping[int, str] | None = None,
         message_type: Literal["add_request", "streaming_update"] = "add_request",
     ) -> StageSubmissionMessage:
         """Build an add_request message after stage-0 preprocessing."""
@@ -718,6 +726,7 @@ class AsyncOmniEngine:
             preselected_stage0_replica = self._scope_stage0_multimodal_cache_to_replica(
                 request_id,
                 prompt,
+                (stage_session_keys or {}).get(0),
             )
 
             # Full input processing (tokenization, multimodal, etc.)
@@ -777,6 +786,7 @@ class AsyncOmniEngine:
             preprocess_ms=_preprocess_ms,
             request_timestamp=request_timestamp,
             enqueue_ts=time.perf_counter(),
+            stage_session_keys=dict(stage_session_keys or {}),
         )
 
     def _enqueue_cfg_companions(
@@ -1325,6 +1335,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        stage_session_keys: Mapping[int, str] | None = None,
     ) -> None:
         """Process stage-0 input locally, then send to the Orchestrator.
 
@@ -1348,6 +1359,7 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            stage_session_keys=stage_session_keys,
         )
         self.request_queue.sync_q.put(msg)
 
@@ -1377,6 +1389,7 @@ class AsyncOmniEngine:
         reasoning_ended: bool | None = None,
         *,
         resumable: bool = False,
+        stage_session_keys: Mapping[int, str] | None = None,
     ) -> None:
         """Async add_request API."""
         self.add_request(
@@ -1394,6 +1407,7 @@ class AsyncOmniEngine:
             data_parallel_rank=data_parallel_rank,
             reasoning_ended=reasoning_ended,
             resumable=resumable,
+            stage_session_keys=stage_session_keys,
         )
 
     def add_streaming_update(
@@ -1771,6 +1785,8 @@ class AsyncOmniEngine:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        session_routing_key: str | None = None,
+        release_session_binding: bool = False,
     ) -> list[Any]:
         """Send a control RPC to the Orchestrator and wait for aggregated results.
 
@@ -1785,6 +1801,8 @@ class AsyncOmniEngine:
             args=tuple(args),
             kwargs=kwargs or {},
             stage_ids=stage_ids,
+            session_routing_key=session_routing_key,
+            release_session_binding=release_session_binding,
         )
 
         transport = self._correlated_rpc_client
@@ -1808,6 +1826,8 @@ class AsyncOmniEngine:
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        session_routing_key: str | None = None,
+        release_session_binding: bool = False,
     ) -> list[Any]:
         """Async wrapper around collective_rpc()."""
         loop = asyncio.get_running_loop()
@@ -1819,6 +1839,8 @@ class AsyncOmniEngine:
                 args=args,
                 kwargs=kwargs,
                 stage_ids=stage_ids,
+                session_routing_key=session_routing_key,
+                release_session_binding=release_session_binding,
             ),
         )
 

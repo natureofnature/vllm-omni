@@ -13,6 +13,7 @@ import torch
 # examples/offline_inference/step_audio2/README.md.
 try:
     from vllm_omni.model_executor.models.step_audio2.step_audio2_token2wav import (
+        HiFTGenerator,
         StepAudio2Token2WavForConditionalGeneration,
     )
 except ModuleNotFoundError as exc:
@@ -22,6 +23,18 @@ except ModuleNotFoundError as exc:
     )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+def test_minicpmo_packaged_flashcosyvoice_is_supported():
+    assert HiFTGenerator.__module__ in {
+        "flashcosyvoice.modules.hifigan",
+        "stepaudio2.flashcosyvoice.modules.hifigan",
+    }
+
+    if HiFTGenerator.__module__.startswith("stepaudio2."):
+        from cosyvoice2.flow.flow import CausalMaskedDiffWithXvec
+
+        assert CausalMaskedDiffWithXvec.__module__.startswith("stepaudio2.")
 
 
 class _DummyModelConfig:

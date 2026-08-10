@@ -290,6 +290,34 @@ async def test_build_add_request_message_scopes_mm_uuids_to_distributed_stage0_r
     assert await stage_pool.pick("req-2") == 1
 
 
+@pytest.mark.asyncio
+async def test_distributed_stage_session_affinity_survives_request_cleanup():
+    addr0 = "tcp://host-a:1000/input"
+    addr1 = "tcp://host-b:1000/input"
+    stage_pool = StagePool(0, [_FakeStageClient(addr0), _FakeStageClient(addr1)])
+    stage_pool.attach_hub(_FakeHub([_replica(addr0), _replica(addr1)]))
+    stage_pool.attach_load_balancer(_RoundRobinLB())
+    session_key = "dreamzero:session-1"
+
+    first_replica = stage_pool.preselect_replica_id(
+        "request-1",
+        session_routing_key=session_key,
+    )
+    stage_pool.release_binding("request-1")
+    second_replica = await stage_pool.pick(
+        "request-2",
+        session_routing_key=session_key,
+    )
+    other_session_replica = await stage_pool.pick(
+        "request-3",
+        session_routing_key="dreamzero:session-2",
+    )
+
+    assert first_replica == 0
+    assert second_replica == 0
+    assert other_session_replica == 1
+
+
 def test_build_add_request_message_skips_distributed_mm_scope_when_no_replica(mocker: MockerFixture):
     engine = object.__new__(AsyncOmniEngine)
     params = SamplingParams(max_tokens=8)

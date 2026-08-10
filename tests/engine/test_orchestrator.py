@@ -1759,6 +1759,140 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
 
 
 @pytest.mark.asyncio
+async def test_stage_pool_session_affinity_survives_request_cleanup() -> None:
+    """New requests in one stateful session must return to the same replica."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    session_key = "dreamzero:robot-7"
+
+    req0_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    await pool.submit_initial(
+        "req-0",
+        req0_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[1]),
+        session_routing_key=session_key,
+    )
+    pool.release_binding("req-0")
+
+    req1_state = OrchestratorRequestState(
+        request_id="req-1",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    await pool.submit_initial(
+        "req-1",
+        req1_state,
+        SimpleNamespace(request_id="req-1", prompt_token_ids=[2]),
+        session_routing_key=session_key,
+    )
+
+    req2_state = OrchestratorRequestState(
+        request_id="req-2",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    await pool.submit_initial(
+        "req-2",
+        req2_state,
+        SimpleNamespace(request_id="req-2", prompt_token_ids=[3]),
+        session_routing_key="dreamzero:robot-8",
+    )
+
+    assert pool.get_bound_replica_id("req-0") is None
+    assert pool.get_session_bound_replica_id(session_key) == 0
+    assert pool.get_bound_replica_id("req-1") == 0
+    assert pool.get_bound_replica_id("req-2") == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_routes_downstream_stage_by_session_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage1_r0 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7]}],
+    )
+    stage1_r1 = FakeStageClient(
+        stage_type="llm",
+        final_output=True,
+        next_inputs=[{"prompt_token_ids": [7]}],
+    )
+    pools = [
+        StagePool(0, [stage0], output_processor=FakeOutputProcessor()),
+        StagePool(1, [stage1_r0, stage1_r1], output_processor=FakeOutputProcessor()),
+    ]
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=pools,
+    )
+    monkeypatch.setattr(
+        orchestrator,
+        "_build_next_stage_request",
+        lambda request_id, *_args, **_kwargs: SimpleNamespace(
+            request_id=request_id,
+            prompt_token_ids=[7],
+        ),
+    )
+    session_key = "aura:session-9"
+
+    async def submit(request_id: str) -> None:
+        state = OrchestratorRequestState(
+            request_id=request_id,
+            prompt={"prompt_token_ids": [1]},
+            sampling_params_list=[_sampling_params(), _sampling_params()],
+            final_stage_id=1,
+            stage_session_keys={1: session_key},
+        )
+        await orchestrator._forward_to_next_stage(
+            request_id,
+            0,
+            SimpleNamespace(request_id=request_id),
+            state,
+        )
+        pools[1].release_binding(request_id)
+
+    await submit("turn-0")
+    await submit("turn-1")
+
+    assert pools[1].get_session_bound_replica_id(session_key) == 0
+    assert len(stage1_r0.add_request_calls) == 2
+    assert len(stage1_r1.add_request_calls) == 0
+
+
+def test_stage_pool_releases_session_affinity_explicitly() -> None:
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    session_key = "dreamzero:robot-7"
+    assert pool.select_replica_id("req-0", session_routing_key=session_key) == 0
+    pool.release_binding("req-0")
+    assert pool.select_replica_id("req-1", session_routing_key=session_key) == 0
+
+    pool.release_session_binding(session_key)
+
+    assert pool.get_session_bound_replica_id(session_key) is None
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_failed_replica_releases_distributed_affinity_and_stops_polling() -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(
@@ -2437,3 +2571,87 @@ async def test_request_cleanup_failure_is_deferred_to_control_plane():
 
     assert orchestrator.duplex_control_plane.deferred == ["sid-cleanup"]
     assert orchestrator.duplex_control_plane.finalized == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("worker_wrapped_result", [False, True])
+async def test_collective_rpc_targets_session_owner_and_releases_binding(
+    orchestrator_factory,
+    worker_wrapped_result: bool,
+) -> None:
+    replicas = []
+    for replica_id in range(2):
+        rpc_result: Any = {"supported": True, "replica": replica_id}
+        if worker_wrapped_result:
+            rpc_result = [rpc_result]
+        replicas.append(
+            FakeCollectiveRpcStageClient(
+                stage_type="llm",
+                final_output=True,
+                rpc_result=rpc_result,
+            )
+        )
+    stage_pools = _build_stage_pools([replicas])
+    session_key = "dreamzero:session-1"
+    bound_replica_id = stage_pools[0].select_replica_id(
+        "request-1",
+        session_routing_key=session_key,
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CollectiveRPCRequestMessage(
+                rpc_id="rpc-session-reset",
+                method="handle_session_control",
+                args=("reset", "session-1"),
+                kwargs={},
+                stage_ids=[0],
+                session_routing_key=session_key,
+                release_session_binding=True,
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert msg.results == [replicas[bound_replica_id].rpc_result]
+        for replica_id, replica in enumerate(replicas):
+            expected_calls = 1 if replica_id == bound_replica_id else 0
+            assert len(replica.collective_rpc_calls) == expected_calls
+        assert stage_pools[0].get_session_bound_replica_id(session_key) is None
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_for_unknown_session_does_not_broadcast(orchestrator_factory) -> None:
+    replicas = [
+        FakeCollectiveRpcStageClient(
+            stage_type="llm",
+            final_output=True,
+            rpc_result={"supported": True, "replica": replica_id},
+        )
+        for replica_id in range(2)
+    ]
+    stage_pools = _build_stage_pools([replicas])
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CollectiveRPCRequestMessage(
+                rpc_id="rpc-unknown-session",
+                method="handle_session_control",
+                args=("close", "missing"),
+                kwargs={},
+                stage_ids=[0],
+                session_routing_key="dreamzero:missing",
+                release_session_binding=True,
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert msg.results == [{"supported": True, "found": False}]
+        assert all(not replica.collective_rpc_calls for replica in replicas)
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)

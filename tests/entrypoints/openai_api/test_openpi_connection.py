@@ -47,6 +47,8 @@ def _serving_mock():
         }
     )
     serving.infer = AsyncMock(return_value=[0.0])
+    serving.reset_session = AsyncMock(return_value=[])
+    serving.close_session = AsyncMock(return_value=[])
     return serving
 
 
@@ -209,6 +211,7 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
     )
     serving = MagicMock()
     serving.infer = AsyncMock(side_effect=RuntimeError("secret traceback text"))
+    serving.close_session = AsyncMock(return_value=[])
     connection = openpi_connection.RobotRealtimeConnection(websocket, serving)
 
     asyncio.run(connection.handle_connection())
@@ -218,7 +221,7 @@ def test_handle_connection_returns_structured_error_for_infer_exception(monkeypa
     assert websocket.sent_texts == []
     serving.infer.assert_awaited_once_with(
         {"prompt": "pick up the object"},
-        session_id="default",
+        session_id=connection._implicit_session_id,
         reset=True,
     )
 
@@ -291,6 +294,28 @@ def test_handle_connection_keeps_session_state_per_websocket(monkeypatch):
     assert calls[2].kwargs == {"session_id": "session-b", "reset": True}
 
 
+def test_reset_for_different_session_closes_current_session(monkeypatch):
+    monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
+    requests = {
+        b"a1": {"prompt": "first", "session_id": "session-a"},
+        b"reset-b": {"endpoint": "reset", "session_id": "session-b"},
+    }
+    monkeypatch.setattr(openpi_connection, "_unpack", lambda data: dict(requests[data]))
+    serving = _serving_mock()
+    websocket = FakeWebSocket(
+        [
+            {"type": "websocket.receive", "bytes": b"a1"},
+            {"type": "websocket.receive", "bytes": b"reset-b"},
+            {"type": "websocket.disconnect"},
+        ]
+    )
+
+    asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
+
+    serving.close_session.assert_awaited_once_with("session-a")
+    serving.reset_session.assert_awaited_once_with("session-b")
+
+
 def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     monkeypatch.setattr(openpi_connection, "_pack", lambda obj: obj)
     requests = {
@@ -312,6 +337,7 @@ def test_handle_connection_reset_endpoint_resets_next_infer(monkeypatch):
     asyncio.run(openpi_connection.RobotRealtimeConnection(websocket, serving).handle_connection())
 
     assert [call.kwargs["reset"] for call in serving.infer.await_args_list] == [True, True]
-    serving.reset.assert_called_once_with({})
+    serving.reset_session.assert_awaited_once_with("session-a")
+    serving.close_session.assert_awaited_once_with("session-a")
     assert websocket.sent_bytes[2] == {"status": "reset successful"}
     assert websocket.sent_texts == []

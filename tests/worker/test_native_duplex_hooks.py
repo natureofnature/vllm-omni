@@ -2466,3 +2466,42 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
+
+
+def test_minicpmo_stage0_native_sampler_caps_model_turn_length():
+    from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
+        _MiniCPMO45Stage0SessionState,
+    )
+    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
+        MiniCPMO45OmniForConditionalGeneration,
+    )
+
+    session_key = ("sid-turn-cap", 0)
+    state = _MiniCPMO45Stage0SessionState(
+        session_id=session_key[0],
+        current_turn_ended=False,
+        turn_generated_token_count=3,
+    )
+    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
+    model._minicpmo45_duplex_data_plane_helper = SimpleNamespace(sessions={session_key: state})
+    model._minicpmo45_duplex_row_sessions = {0: session_key}
+    model.max_new_speak_tokens_per_turn = 3
+    token_ids = {
+        "unit_token_id": 1,
+        "unit_end_token_id": 2,
+        "listen_token_id": 3,
+        "speak_token_id": 4,
+        "tts_bos_token_id": 5,
+        "tts_eos_token_id": 6,
+        "tts_pad_token_id": 7,
+        "chunk_eos_token_id": 8,
+        "chunk_tts_eos_token_id": 9,
+        "turn_eos_token_id": 10,
+    }
+
+    sampled = model._finalize_minicpmo45_native_duplex_sample(0, 1234, token_ids)
+
+    assert sampled == token_ids["turn_eos_token_id"]
+    model._record_minicpmo45_duplex_terminator(0, sampled, token_ids)
+    assert state.current_turn_ended is True
+    assert state.turn_generated_token_count == 0

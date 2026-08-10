@@ -558,6 +558,32 @@ class DiffusionWorker:
         assert self.model_runner is not None, "Model runner not initialized"
         self.model_runner.submit_interaction(request_id, interaction)
 
+    def handle_session_control(self, action: str, session_id: str) -> dict[str, Any]:
+        """Run an optional model-runner Session lifecycle operation."""
+        if action not in {"reset", "close"}:
+            return {
+                "supported": False,
+                "action": action,
+                "session_id": session_id,
+                "error": f"unsupported session action: {action}",
+            }
+
+        runner = self.model_runner
+        method = getattr(runner, f"{action}_session", None) if runner is not None else None
+        if not callable(method):
+            return {
+                "supported": False,
+                "action": action,
+                "session_id": session_id,
+            }
+
+        method(session_id)
+        return {
+            "supported": True,
+            "action": action,
+            "session_id": session_id,
+        }
+
     def list_loras(self) -> list[int]:
         return self.lora_manager.list_adapters()
 

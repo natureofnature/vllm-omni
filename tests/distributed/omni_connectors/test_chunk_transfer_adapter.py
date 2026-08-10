@@ -200,6 +200,38 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
+def test_ar_receiver_replaces_computed_streaming_prompt(build_adapter, mocker: MockerFixture) -> None:
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-replace", RequestStatus.WAITING, external_req_id="external-replace")
+    request.resumable = True
+    request.prompt_token_ids = [0, 0]
+    request.num_prompt_tokens = 2
+    request.num_computed_tokens = 4
+    request._all_token_ids = [0, 0, 7, 8]
+    request._output_token_ids = [7, 8]
+    request.update_block_hashes = mocker.Mock()
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [41, 42]},
+            "meta": {
+                "replace_streaming_prompt": True,
+                "next_stage_prompt_len": 3,
+                "finished": torch.tensor(False),
+            },
+        },
+        16,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request._all_token_ids == [0, 0, 0]
+    assert request._output_token_ids == []
+    assert request.num_prompt_tokens == 3
+    assert request.num_computed_tokens == 0
+    request.update_block_hashes.assert_called_once_with()
+
+
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-tensor", RequestStatus.WAITING, external_req_id="external-tensor")
@@ -1722,3 +1754,94 @@ def test_purge_is_noop_on_empty_deques(build_adapter):
     adapter.restore_queues(waiting_queue, running_queue, scheduler_requests={})
     assert running_queue == []
     assert waiting_queue == []
+
+
+def test_send_single_request_accepts_mapping_payload(build_adapter, monkeypatch):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-aura-send", RequestStatus.WAITING, external_req_id="ext-aura-send")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: {
+        "prompt_token_ids": [1, 2, 3],
+        "meta": {"next_stage_prompt_len": 3},
+    }
+    monkeypatch.setattr(adapter, "cleanup", lambda *args: None)
+
+    adapter._send_single_request(
+        {
+            "multimodal_output": None,
+            "request": request,
+            "is_finished": False,
+            "is_segment_finished": True,
+        }
+    )
+
+    sent = connector.put.call_args.kwargs["data"]
+    assert sent["prompt_token_ids"] == [1, 2, 3]
+    assert sent["meta"]["next_stage_prompt_len"] == 3
+    assert sent["meta"]["finished"].item() is False
+    assert sent["meta"]["is_segment_finished"].item() is True
+
+
+def test_ar_receiver_applies_mapping_prompt_and_token_budget(build_adapter, mocker):
+    adapter, connector = build_adapter(stage_id=2)
+    request = _req("req-aura-tts", RequestStatus.WAITING, external_req_id="ext-aura-tts")
+    request.resumable = True
+    request._all_token_ids = []
+    request._output_token_ids = []
+    request.block_hashes = []
+    request.update_block_hashes = mocker.Mock()
+    request.max_tokens = 20
+    request.sampling_params = SimpleNamespace(max_tokens=20)
+    connector.get.return_value = (
+        {
+            "prompt_token_ids": [0, 0, 0],
+            "max_new_tokens": [7],
+            "meta": {"finished": torch.tensor(True)},
+        },
+        16,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [0, 0, 0]
+    assert request.max_tokens == 7
+    assert request.sampling_params.max_tokens == 7
+    request.update_block_hashes.assert_called_once_with()
+
+
+def test_ar_receiver_resolves_aura_asr_payload_on_stage_worker(
+    build_adapter,
+    monkeypatch,
+    mocker,
+):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-aura-asr", RequestStatus.WAITING, external_req_id="ext-aura-asr")
+    request.resumable = True
+    request._all_token_ids = []
+    request._output_token_ids = []
+    request.block_hashes = []
+    request.update_block_hashes = mocker.Mock()
+    payload = {
+        "aura_asr_transcript": "hello",
+        "additional_information": {"aura_session_id": "session-1"},
+        "meta": {"finished": torch.tensor(True)},
+    }
+    connector.get.return_value = (payload, 16)
+
+    def fake_resolve(payload_data, target_request, model_config, vllm_config):
+        assert model_config is adapter.model_config
+        assert vllm_config is adapter.vllm_config
+        payload_data["prompt_token_ids"] = [4, 5]
+        target_request.mm_features = ["feature"]
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.stage_input_processors.aura_omni.resolve_aura_async_chunk_stage_payload",
+        fake_resolve,
+    )
+    adapter.mm_receiver_cache = mocker.Mock()
+    adapter.mm_receiver_cache.get_and_update_features.return_value = ["cached-feature"]
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [4, 5]
+    assert request.mm_features == ["cached-feature"]
+    assert request.additional_information == {"aura_session_id": "session-1"}

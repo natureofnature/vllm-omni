@@ -54,13 +54,17 @@ class RecordingEngine:
     def get_diffusion_od_config(self):
         return self.od_config
 
-    def generate(self, *, prompt, request_id, sampling_params_list):
+    async def collective_rpc(self, **_kwargs):
+        return [{"supported": True}]
+
+    def generate(self, *, prompt, request_id, sampling_params_list, stage_session_keys=None):
         async def _generate():
             self.generate_calls.append(
                 {
                     "prompt": prompt,
                     "request_id": request_id,
                     "sampling_params_list": sampling_params_list,
+                    "stage_session_keys": stage_session_keys,
                 }
             )
             yield SimpleNamespace(multimodal_output={"actions": [0.0]})
@@ -83,7 +87,7 @@ class ConcurrentRecordingEngine(RecordingEngine):
             )
             self.saw_overlap = self.saw_overlap or completed
 
-    def generate(self, *, prompt, request_id, sampling_params_list):
+    def generate(self, *, prompt, request_id, sampling_params_list, stage_session_keys=None):
         async def _generate():
             with self.condition:
                 self.generate_calls.append(
@@ -91,6 +95,7 @@ class ConcurrentRecordingEngine(RecordingEngine):
                         "prompt": prompt,
                         "request_id": request_id,
                         "sampling_params_list": sampling_params_list,
+                        "stage_session_keys": stage_session_keys,
                     }
                 )
                 if len(self.generate_calls) >= self.expected_calls:
@@ -279,11 +284,16 @@ def test_two_websocket_clients_without_session_id_do_not_conflict(monkeypatch):
     request_ids = [call["request_id"] for call in engine.generate_calls]
     assert len(request_ids) == 2
     assert len(set(request_ids)) == 2
-    assert all(request_id.startswith("robot-default-") for request_id in request_ids)
+    assert all(request_id.startswith("robot-connection-") for request_id in request_ids)
     assert engine.saw_overlap is True
 
     sampling_params = [call["sampling_params_list"][0] for call in engine.generate_calls]
-    assert [params.extra_args["session_id"] for params in sampling_params] == ["default", "default"]
+    session_ids = [params.extra_args["session_id"] for params in sampling_params]
+    assert len(set(session_ids)) == 2
+    assert all(session_id.startswith("connection-") for session_id in session_ids)
+    assert [call["stage_session_keys"] for call in engine.generate_calls] == [
+        {0: f"dreamzero:{session_id}"} for session_id in session_ids
+    ]
     assert [params.extra_args["reset"] for params in sampling_params] == [True, True]
 
 
@@ -347,3 +357,42 @@ def test_extract_actions_does_not_iterate_result_object():
     actions = serving._extract_actions(IterableResult())
 
     np.testing.assert_allclose(actions, np.array([[1.0, 2.0, 3.0]], dtype=np.float32))
+
+
+def test_session_lifecycle_targets_bound_stage_and_releases_route():
+    class FakeEngineClient:
+        def __init__(self):
+            self.calls = []
+
+        def get_diffusion_od_config(self):
+            return SimpleNamespace(model_config={"policy_server_config": TEST_POLICY_SERVER_CONFIG})
+
+        async def collective_rpc(self, **kwargs):
+            self.calls.append(kwargs)
+            return [{"supported": True}]
+
+    engine = FakeEngineClient()
+    serving = openpi_serving.ServingRealtimeRobotOpenPI(engine_client=engine)
+
+    async def run_controls():
+        await serving.reset_session("session-a")
+        await serving.close_session("session-b")
+
+    asyncio.run(run_controls())
+
+    assert engine.calls == [
+        {
+            "method": "handle_session_control",
+            "args": ("reset", "session-a"),
+            "stage_ids": [0],
+            "session_routing_key": "dreamzero:session-a",
+            "release_session_binding": True,
+        },
+        {
+            "method": "handle_session_control",
+            "args": ("close", "session-b"),
+            "stage_ids": [0],
+            "session_routing_key": "dreamzero:session-b",
+            "release_session_binding": True,
+        },
+    ]

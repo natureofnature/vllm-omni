@@ -114,7 +114,7 @@ class FakePrewarmPool:
         )
         self.submitted: list[Any] = []
 
-    async def submit_initial(self, _request_id, _req_state, request, prompt_text=None):
+    async def submit_initial(self, _request_id, _req_state, request, prompt_text=None, **_kwargs):
         self.submitted.append(request)
         return 0
 

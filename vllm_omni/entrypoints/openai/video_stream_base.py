@@ -12,6 +12,7 @@ Protocol:
         {"type": "session.config", ...}         # Session config (sent once)
         {"type": "video.frame", "data": "...", "frame_id": "...", "pts_ms": 0}
         {"type": "audio.chunk", "data": "..."}  # base64 PCM16 16kHz mono
+        {"type": "audio.done"}                  # End of utterance (alias: audio.commit)
         {"type": "video.query", "text": "..."}  # Submit query about buffered frames
         {"type": "video.done"}                  # End of session
 
@@ -25,6 +26,12 @@ Protocol:
         {"type": "response.audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
+
+    Input audio: clients must send the full utterance as ``audio.chunk`` messages,
+    then ``audio.done`` / ``audio.commit``. Pipelines that enable voice auto-trigger
+    open a turn only after ``audio.done`` (not per chunk), when the turn lock is free.
+    If ``audio.done`` arrives while locked, the buffered utterance is retained and the
+    voice turn starts automatically once the lock clears.
 """
 
 import asyncio
@@ -35,7 +42,7 @@ import json
 import time as _time
 import uuid
 import wave
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
@@ -55,6 +62,9 @@ from vllm_omni.outputs import OmniRequestOutput
 logger = init_logger(__name__)
 
 _DEFAULT_IDLE_TIMEOUT = 60.0
+# While a turn is still running (TTS can take many minutes), do not drop the
+# session for lack of client messages.
+_GENERATION_IDLE_TIMEOUT = 1800.0
 _DEFAULT_CONFIG_TIMEOUT = 10.0
 _MAX_FRAME_SIZE = 10 * 1024 * 1024  # 10MB per frame
 _MAX_BUFFER_FRAMES = 64
@@ -63,9 +73,45 @@ _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
 _BAD_FRAME = object()
 
+ReleaseTurnLockFn = Callable[..., Awaitable[None]]
+
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+
+def _downscale_frame_max_edge(frame: Any, max_frame_edge: int) -> Any:
+    """Downscale a decoded RGB frame so ``max(H, W) <= max_frame_edge``.
+
+    Matches native AURA client's ``max_frame_edge`` (default 640): shrink pixels
+    kept for VL / deferred video transport. ``max_frame_edge <= 0`` disables.
+    """
+    if max_frame_edge is None or int(max_frame_edge) <= 0:
+        return frame
+    limit = int(max_frame_edge)
+
+    if isinstance(frame, Image.Image):
+        width, height = frame.size
+        long_edge = max(width, height)
+        if long_edge <= limit:
+            return frame
+        scale = limit / float(long_edge)
+        new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return frame.resize(new_size, Image.Resampling.LANCZOS)
+
+    import numpy as np
+
+    array = np.asarray(frame)
+    if array.ndim < 2:
+        return frame
+    height, width = int(array.shape[0]), int(array.shape[1])
+    long_edge = max(height, width)
+    if long_edge <= limit:
+        return array
+    scale = limit / float(long_edge)
+    new_size = (max(1, int(width * scale)), max(1, int(height * scale)))
+    image = Image.fromarray(array.astype("uint8", copy=False)).resize(new_size, Image.Resampling.LANCZOS)
+    return np.asarray(image)
 
 
 @runtime_checkable
@@ -74,6 +120,14 @@ class VideoStreamPipelineHooks(Protocol):
 
     def should_trigger_turn(self, trigger: "VideoStreamTurnTrigger") -> bool:
         """Return True to auto-start a turn after a new frame (no ``video.query``)."""
+        ...
+
+    def auto_trigger_frame_count(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+    ) -> int:
+        """Frames to compare against ``auto_trigger_min_frames`` (default: session buffer)."""
         ...
 
     def build_engine_prompt(
@@ -93,6 +147,7 @@ class VideoStreamPipelineHooks(Protocol):
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
         """Update session state after a successful turn."""
         ...
@@ -104,6 +159,7 @@ class VideoStreamTurnTrigger:
 
     frame_count: int
     is_generating: bool
+    is_turn_locked: bool
     config: "StreamingVideoSessionConfig"
 
 
@@ -143,6 +199,10 @@ class StreamingVideoSessionConfig(BaseModel):
         default=True,
         description="EVS pixel-similarity pre-filter to drop near-duplicate frames.",
     )
+    return_stage_metrics: bool = Field(
+        default=False,
+        description="Include per-stage engine metrics in WebSocket response events.",
+    )
     frame_filter_threshold: float = Field(
         default=0.95,
         ge=0.0,
@@ -162,6 +222,33 @@ class OmniStreamingVideoHandler:
         """Auto-trigger after ``video.frame`` when True (default: never)."""
         return False
 
+    def should_trigger_on_audio_done(self, *, has_audio: bool, is_turn_locked: bool) -> bool:
+        """Open a turn after a complete utterance (``audio.done``). Default: never."""
+        del has_audio, is_turn_locked
+        return False
+
+    def ensure_frames_for_audio_turn(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+        config: "StreamingVideoSessionConfig",
+    ) -> bool:
+        """Ensure at least one vision frame exists before an audio-triggered turn.
+
+        Default: require a non-empty session ``frame_buffer``.
+        """
+        del message_history, config
+        return bool(frame_buffer)
+
+    def auto_trigger_frame_count(
+        self,
+        frame_buffer: list[str],
+        message_history: Any,
+    ) -> int:
+        """Frames counted for auto-trigger (default: cumulative session ``frame_buffer``)."""
+        del message_history
+        return len(frame_buffer)
+
     def build_engine_prompt(
         self,
         config: StreamingVideoSessionConfig,
@@ -178,8 +265,13 @@ class OmniStreamingVideoHandler:
         message_history: list[dict[str, Any]],
         user_message: dict[str, Any],
         response_text: str,
+        request_id: str | None = None,
     ) -> None:
         raise NotImplementedError
+
+    def on_session_end(self, message_history: Any) -> None:
+        """Hook when a WebSocket session ends (default: no-op)."""
+        del message_history
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> Any:
         """Per-session conversation state (default: empty OpenAI-style list)."""
@@ -194,6 +286,18 @@ class OmniStreamingVideoHandler:
     ) -> None:
         """Hook after a frame is accepted into the session buffer."""
         del raw_bytes, frame_b64, message_history, config
+
+    def supports_manual_query_turn(self) -> bool:
+        """Whether ``video.query`` may start an inference turn."""
+        return True
+
+    def supports_query_interrupt(self) -> bool:
+        """Whether a new turn may interrupt in-flight generation."""
+        return True
+
+    def releases_turn_after_text_done(self) -> bool:
+        """Release turn lock and update history after assistant text (TTS may continue)."""
+        return False
 
     def __init__(
         self,
@@ -228,9 +332,72 @@ class OmniStreamingVideoHandler:
             active_request_id: str | None = None
             prev_request_id: str | None = None  # abort target iff prev was interrupted
             prev_was_interrupted: bool = False
+            is_turn_locked: bool = False
+            pending_audio_done: bool = False
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
+            background_query_tasks: set[asyncio.Task[Any]] = set()
+
+            def _register_query_task(task: asyncio.Task[Any]) -> None:
+                background_query_tasks.add(task)
+                task.add_done_callback(background_query_tasks.discard)
+
+            async def _gather_pending_query_tasks() -> None:
+                pending = [t for t in background_query_tasks if not t.done()]
+                if query_task is not None and not query_task.done() and query_task not in pending:
+                    pending.append(query_task)
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+
+            async def _release_turn_lock(
+                *,
+                message_history: Any,
+                user_message: dict[str, Any],
+                response_text: str,
+                request_id: str,
+            ) -> None:
+                """Commit SessionHistory and allow the next frame trigger while TTS may continue."""
+                nonlocal is_turn_locked, active_request_id, prev_request_id
+                if not is_turn_locked:
+                    return
+                is_turn_locked = False
+                self.on_turn_complete(message_history, user_message, response_text, request_id)
+                if active_request_id == request_id:
+                    prev_request_id = request_id
+                    active_request_id = None
+                await _flush_pending_audio_done()
+
+            async def _flush_pending_audio_done() -> None:
+                """Start a voice turn that arrived while the previous turn was locked."""
+                nonlocal pending_audio_done
+                if not pending_audio_done or len(audio_buffer) == 0:
+                    if len(audio_buffer) == 0:
+                        pending_audio_done = False
+                    return
+                if self.releases_turn_after_text_done():
+                    if is_turn_locked:
+                        return
+                elif active_request_id is not None or (query_task is not None and not query_task.done()):
+                    return
+                if not self.should_trigger_on_audio_done(
+                    has_audio=True,
+                    is_turn_locked=False,
+                ):
+                    pending_audio_done = False
+                    return
+                if not self.ensure_frames_for_audio_turn(
+                    frame_buffer,
+                    message_history,
+                    config,
+                ):
+                    await self._send_error(
+                        websocket,
+                        "No frames available for audio-triggered turn",
+                    )
+                    return
+                pending_audio_done = False
+                await _start_query_turn(query_text="")
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -239,9 +406,16 @@ class OmniStreamingVideoHandler:
                 try:
                     while True:
                         try:
+                            pending_queries = (
+                                active_request_id is not None
+                                or (query_task is not None and not query_task.done())
+                                or any(not t.done() for t in background_query_tasks)
+                                or not msg_queue.empty()
+                            )
+                            recv_timeout = _GENERATION_IDLE_TIMEOUT if pending_queries else self._idle_timeout
                             raw = await asyncio.wait_for(
                                 websocket.receive_text(),
-                                timeout=self._idle_timeout,
+                                timeout=recv_timeout,
                             )
                         except asyncio.TimeoutError:
                             await self._send_error(websocket, "Idle timeout")
@@ -276,7 +450,7 @@ class OmniStreamingVideoHandler:
 
             async def _cancel_active_query(*, abort_now: bool = False) -> None:
                 """Signal soft interrupt for the active query."""
-                nonlocal active_request_id, prev_was_interrupted, query_task
+                nonlocal active_request_id, prev_was_interrupted, query_task, is_turn_locked
                 if active_request_id is not None:
                     interrupt_event.set()
                     prev_was_interrupted = True
@@ -290,12 +464,21 @@ class OmniStreamingVideoHandler:
                         query_task.cancel()
                         await asyncio.gather(query_task, return_exceptions=True)
                     query_task = None
+                    is_turn_locked = False
 
             async def _start_query_turn(*, query_text: str) -> None:
                 """Schedule a new inference turn from the current buffers."""
-                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task, is_turn_locked
 
-                await _cancel_active_query()
+                if self.releases_turn_after_text_done():
+                    turn_busy = is_turn_locked
+                else:
+                    turn_busy = active_request_id is not None or (query_task is not None and not query_task.done())
+                if turn_busy:
+                    if self.supports_query_interrupt():
+                        await _cancel_active_query()
+                    else:
+                        return
 
                 if not frame_buffer:
                     await self._send_error(websocket, "No frames buffered")
@@ -311,6 +494,8 @@ class OmniStreamingVideoHandler:
 
                 request_id = f"video-{uuid.uuid4().hex[:12]}"
                 active_request_id = request_id
+                if self.releases_turn_after_text_done():
+                    is_turn_locked = True
                 interrupt_event.clear()
                 query_frames = list(frame_buffer)
                 query_frame_metadata = list(frame_metadata)
@@ -319,11 +504,14 @@ class OmniStreamingVideoHandler:
                 query_prewarmed_frames = dict(frame_pil_cache)
 
                 async def _run_query() -> None:
-                    nonlocal active_request_id, prev_request_id
+                    nonlocal active_request_id, prev_request_id, is_turn_locked
+                    release_cb = _release_turn_lock if self.releases_turn_after_text_done() else None
                     try:
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
                             process_kwargs["frame_metadata"] = query_frame_metadata
+                        if release_cb is not None:
+                            process_kwargs["release_turn_lock"] = release_cb
                         await self._process_query(
                             websocket,
                             config,
@@ -338,14 +526,18 @@ class OmniStreamingVideoHandler:
                         )
                     finally:
                         if active_request_id == request_id:
+                            is_turn_locked = False
                             prev_request_id = request_id
                             active_request_id = None
+                        await _flush_pending_audio_done()
 
                 query_task = asyncio.create_task(_run_query())
+                _register_query_task(query_task)
 
             async def _processor() -> None:
                 """Process enqueued messages."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal pending_audio_done
 
                 while True:
                     msg = await msg_queue.get()
@@ -447,10 +639,18 @@ class OmniStreamingVideoHandler:
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
                         )
+                        trigger_turn_locked = is_turn_locked if self.releases_turn_after_text_done() else is_generating
+                        # Frame auto-trigger stays independent of buffered audio: silent vision
+                        # turns keep running while chunks accumulate; audio.done still opens a
+                        # voice turn when the utterance is complete and unlocked.
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
-                                frame_count=len(frame_buffer),
+                                frame_count=self.auto_trigger_frame_count(
+                                    frame_buffer,
+                                    message_history,
+                                ),
                                 is_generating=is_generating,
+                                is_turn_locked=trigger_turn_locked,
                                 config=config,
                             )
                         ):
@@ -468,7 +668,47 @@ class OmniStreamingVideoHandler:
                             continue
                         audio_buffer.extend(pcm_bytes)
 
+                    elif msg_type in ("audio.done", "audio.commit"):
+                        # End of utterance: open a turn only when unlocked and audio present.
+                        # Do not trigger on each audio.chunk.
+                        if self.releases_turn_after_text_done():
+                            audio_locked = is_turn_locked
+                        else:
+                            audio_locked = active_request_id is not None or (
+                                query_task is not None and not query_task.done()
+                            )
+                        has_audio = len(audio_buffer) > 0
+                        if not has_audio:
+                            pending_audio_done = False
+                            continue
+                        if audio_locked:
+                            # Keep the utterance and open a voice turn after unlock.
+                            # Dropping here would lose push-to-talk while silent/vision
+                            # turns hold the lock under continuous video.frame streaming.
+                            pending_audio_done = True
+                            continue
+                        if not self.should_trigger_on_audio_done(
+                            has_audio=True,
+                            is_turn_locked=False,
+                        ):
+                            continue
+                        if not self.ensure_frames_for_audio_turn(
+                            frame_buffer,
+                            message_history,
+                            config,
+                        ):
+                            await self._send_error(
+                                websocket,
+                                "No frames available for audio-triggered turn",
+                            )
+                            continue
+                        pending_audio_done = False
+                        await _start_query_turn(query_text="")
+
                     elif msg_type == "video.query":
+                        if not self.supports_manual_query_turn():
+                            continue
+
                         query_text = msg.get("text", "")
                         audio_data_b64 = msg.get("audio_data")
                         if audio_data_b64:
@@ -482,12 +722,17 @@ class OmniStreamingVideoHandler:
                             except Exception:
                                 pass
 
+                        is_generating = active_request_id is not None or (
+                            query_task is not None and not query_task.done()
+                        )
+                        if is_generating and not self.supports_query_interrupt():
+                            continue
+
                         await _start_query_turn(query_text=query_text)
 
                     elif msg_type == "video.done":
-                        if query_task is not None and not query_task.done():
-                            await asyncio.gather(query_task, return_exceptions=True)
-                            query_task = None
+                        await _gather_pending_query_tasks()
+                        query_task = None
                         await websocket.send_json({"type": "session.done"})
                         return
 
@@ -513,8 +758,10 @@ class OmniStreamingVideoHandler:
                     t.cancel()
                 if prewarm_tasks:
                     await asyncio.gather(*prewarm_tasks, return_exceptions=True)
+                await _gather_pending_query_tasks()
                 if query_task is not None and not query_task.done():
                     await _cancel_active_query(abort_now=True)
+                self.on_session_end(message_history)
 
         except WebSocketDisconnect:
             logger.info("Streaming video: client disconnected")
@@ -579,6 +826,7 @@ class OmniStreamingVideoHandler:
         interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
         frame_metadata: list[dict[str, Any]] | None = None,
+        release_turn_lock: ReleaseTurnLockFn | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
 
@@ -589,6 +837,8 @@ class OmniStreamingVideoHandler:
         engine_kwargs: dict[str, Any] = {}
         if frame_metadata:
             engine_kwargs["frame_metadata"] = frame_metadata
+        if release_turn_lock is not None:
+            engine_kwargs["release_turn_lock"] = release_turn_lock
         await self._process_query_engine(
             websocket,
             config,
@@ -606,24 +856,17 @@ class OmniStreamingVideoHandler:
     # Engine-client path (async_chunk audio streaming)
     # ------------------------------------------------------------------
 
-    async def _process_query_engine(
+    async def prepare_chat_request_kwargs(
         self,
-        websocket: WebSocket,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        request_id: str,
-        interrupt_event: asyncio.Event,
         prewarmed_frames: dict[str, tuple[Any, str]],
         frame_metadata: list[dict[str, Any]] | None = None,
-    ) -> None:
+    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
         """Direct engine_client.generate() path for async_chunk audio."""
-        from vllm.entrypoints.openai.chat_completion.protocol import (
-            ChatCompletionRequest,
-        )
-
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -648,12 +891,44 @@ class OmniStreamingVideoHandler:
             }
         if config.sampling_params_list:
             request_kwargs["sampling_params_list"] = config.sampling_params_list
+        return request_kwargs, user_message, {}
+
+    async def _process_query_engine(
+        self,
+        websocket: WebSocket,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        audio_buffer: bytearray,
+        message_history: list[dict[str, Any]],
+        query_text: str,
+        request_id: str,
+        interrupt_event: asyncio.Event,
+        prewarmed_frames: dict[str, tuple[Any, str]],
+        frame_metadata: list[dict[str, Any]] | None = None,
+        release_turn_lock: ReleaseTurnLockFn | None = None,
+    ) -> None:
+        """Direct engine_client.generate() path for async_chunk audio."""
+        from vllm.entrypoints.openai.chat_completion.protocol import (
+            ChatCompletionRequest,
+        )
+
+        request_kwargs, user_message, extra_attrs = await self.prepare_chat_request_kwargs(
+            config,
+            frame_buffer,
+            audio_buffer,
+            message_history,
+            query_text,
+            prewarmed_frames,
+            frame_metadata,
+        )
 
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
         except Exception as e:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
+        for attr_name, attr_value in extra_attrs.items():
+            setattr(chat_request, attr_name, attr_value)
 
         try:
             engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
@@ -664,6 +939,38 @@ class OmniStreamingVideoHandler:
         selected_metadata = self._sample_frame_metadata(frame_metadata or [], config.num_frames)
         model_selected_ts_ms = _time.monotonic() * 1000
 
+        await self._run_engine_generation(
+            websocket,
+            config,
+            message_history,
+            user_message,
+            request_id,
+            interrupt_event,
+            engine_prompt,
+            frame_metadata=frame_metadata,
+            selected_metadata=selected_metadata,
+            decoded_ready_ts_ms=decoded_ready_ts_ms,
+            model_selected_ts_ms=model_selected_ts_ms,
+            release_turn_lock=release_turn_lock,
+        )
+
+    async def _run_engine_generation(
+        self,
+        websocket: WebSocket,
+        config: StreamingVideoSessionConfig,
+        message_history: Any,
+        user_message: dict[str, Any],
+        request_id: str,
+        interrupt_event: asyncio.Event,
+        engine_prompt: Any,
+        frame_metadata: list[dict[str, Any]] | None = None,
+        selected_metadata: list[dict[str, Any]] | None = None,
+        decoded_ready_ts_ms: float | None = None,
+        model_selected_ts_ms: float | None = None,
+        release_turn_lock: ReleaseTurnLockFn | None = None,
+    ) -> None:
+        """Stream engine outputs and update session history when complete."""
+        del release_turn_lock
         await websocket.send_json({"type": "response.start"})
         text_parts: list[str] = []
         text_done_sent = False
@@ -805,7 +1112,7 @@ class OmniStreamingVideoHandler:
                 await websocket.send_json({"type": "response.audio.done"})
 
             response_text = "".join(text_parts)
-            self.on_turn_complete(message_history, user_message, response_text)
+            self.on_turn_complete(message_history, user_message, response_text, request_id)
 
             t_end = _time.monotonic()
             logger.info(
@@ -889,12 +1196,24 @@ class OmniStreamingVideoHandler:
     ) -> tuple[str | None, int]:
         """Emit only tensors appended since the last call."""
         # Single tensor: output_processor hands us one tensor before it becomes a
-        # list (see output_processor.py:89). Treat it as chunk #0.
+        # list (see output_processor.py:89).  Some streaming pipelines (AURA
+        # Code2Wav) also yield each audio delta as a fresh single tensor, not a
+        # cumulative list, so every non-list tensor is emitted as a new chunk.
+        # The cumulative-list path below still uses chunks_drained to avoid
+        # replaying already-sent tensors.
         if not isinstance(audio_data, list):
-            if chunks_drained >= 1:
-                return None, chunks_drained
             tail_np = cls._tensor_to_1d_np(audio_data)
-            return cls._encode_tail(tail_np, chunks_drained, new_drained=1, is_first=True)
+            logger.info(
+                "[video_stream audio.delta] single_tensor old_drained=%d samples=%s",
+                chunks_drained,
+                None if tail_np is None else len(tail_np),
+            )
+            return cls._encode_tail(
+                tail_np,
+                chunks_drained,
+                new_drained=chunks_drained + 1,
+                is_first=(chunks_drained == 0),
+            )
 
         n = len(audio_data)
         if n <= chunks_drained:
@@ -903,6 +1222,13 @@ class OmniStreamingVideoHandler:
         new_chunks = audio_data[chunks_drained:]
         tail = new_chunks[0] if len(new_chunks) == 1 else torch.cat(new_chunks, dim=-1)
         tail_np = cls._tensor_to_1d_np(tail)
+        logger.info(
+            "[video_stream audio.delta] list_chunks old_drained=%d new_drained=%d new_chunks=%d samples=%s",
+            chunks_drained,
+            n,
+            len(new_chunks),
+            None if tail_np is None else len(tail_np),
+        )
         return cls._encode_tail(tail_np, chunks_drained, new_drained=n, is_first=(chunks_drained == 0))
 
     @classmethod
@@ -959,6 +1285,15 @@ class OmniStreamingVideoHandler:
         if len(tail_np) == 0:
             return None, new_drained
         try:
+            logger.info(
+                "[video_stream audio.delta] encoding old_drained=%d new_drained=%d is_first=%s "
+                "samples=%d duration_s=%.3f",
+                old_drained,
+                new_drained,
+                is_first,
+                len(tail_np),
+                len(tail_np) / 24000.0,
+            )
             return cls._encode_audio_wav_b64(tail_np), new_drained
         except Exception:
             logger.exception("Failed to encode audio delta WAV")

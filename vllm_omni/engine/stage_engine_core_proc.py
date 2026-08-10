@@ -144,6 +144,11 @@ class StageEngineCoreProc(EngineCoreProc):
                 **kwargs,
             )
 
+            scheduler = getattr(engine_core, "scheduler", None)
+            transfer_adapter = getattr(scheduler, "chunk_transfer_adapter", None) if scheduler is not None else None
+            if transfer_adapter is not None:
+                transfer_adapter.mm_receiver_cache = getattr(engine_core, "mm_receiver_cache", None)
+
             # Each subprocess corresponds to exactly one omni replica with
             # its own OmniMasterServer allocation, so the heartbeat client
             # runs unconditionally — there is no dp_rank-based gating.

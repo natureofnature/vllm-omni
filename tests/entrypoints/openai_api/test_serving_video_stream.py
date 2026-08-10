@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -16,8 +17,10 @@ from PIL import Image
 
 from vllm_omni.entrypoints.openai import video_stream_base, video_stream_envs
 from vllm_omni.entrypoints.openai.serving_video_stream import (
+    AuraStreamingVideoHandler,
     QwenOmniStreamingVideoHandler,
     StreamingVideoSessionConfig,
+    create_streaming_video_handler,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import OmniStreamingVideoHandler
 from vllm_omni.outputs import OmniRequestOutput
@@ -105,6 +108,29 @@ class TimedWebSocket:
 
     def sent_types(self) -> list[str]:
         return [m.get("type", "") for m in self.sent]
+
+
+def test_aura_pipeline_selects_streaming_video_serving_adapter():
+    from vllm_omni.model_executor.models.aura_omni.pipeline import AURA_OMNI_PIPELINE
+
+    adapter_path = AURA_OMNI_PIPELINE.streaming_video_serving_adapter
+    engine_client = SimpleNamespace(streaming_video_serving_adapter_path=adapter_path)
+
+    handler = create_streaming_video_handler(
+        chat_service=object(),
+        engine_client=engine_client,
+    )
+
+    assert isinstance(handler, AuraStreamingVideoHandler)
+
+
+def test_streaming_video_handler_uses_default_without_adapter():
+    handler = create_streaming_video_handler(
+        chat_service=object(),
+        engine_client=SimpleNamespace(),
+    )
+
+    assert type(handler) is QwenOmniStreamingVideoHandler
 
 
 def test_api_server_registers_video_stream_route():

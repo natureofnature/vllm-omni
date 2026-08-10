@@ -159,6 +159,8 @@ class AsyncOmni(EngineClient, OmniBase):
         self.endpoint_restrictions = self.engine.endpoint_restrictions
         self.duplex_session_config = self.engine.duplex_session_config
         self.duplex_serving_adapter_path = self.engine.duplex_serving_adapter_path
+        self.session_serving_adapter_path = self.engine.session_serving_adapter_path
+        self.streaming_video_serving_adapter_path = self.engine.streaming_video_serving_adapter_path
 
         stage_index = self._get_comprehension_stage_index()
         if stage_index is None:
@@ -468,6 +470,7 @@ class AsyncOmni(EngineClient, OmniBase):
         reasoning_ended: bool | None = None,
         reasoning_parser_kwargs: dict[str, Any] | None = None,
         arrival_time: float | None = None,
+        stage_session_keys: Mapping[int, str] | None = None,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
         """Generate outputs for the given prompt(s) asynchronously.
 
@@ -599,6 +602,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    stage_session_keys=stage_session_keys,
                 )
             else:
                 await self.engine.add_request_async(
@@ -608,6 +612,7 @@ class AsyncOmni(EngineClient, OmniBase):
                     final_stage_id=final_stage_id_for_e2e,
                     final_output_stage_ids=final_output_stage_ids,
                     arrival_time=wall_start_ts,
+                    stage_session_keys=stage_session_keys,
                 )
             submit_ts = time.time()
             req_state.metrics.stage_first_ts[0] = submit_ts
@@ -659,6 +664,7 @@ class AsyncOmni(EngineClient, OmniBase):
         final_stage_id: int,
         final_output_stage_ids: Sequence[int],
         arrival_time: float,
+        stage_session_keys: Mapping[int, str] | None = None,
     ) -> asyncio.Task:
         """Submit a streaming input generator as incremental stage-0 updates."""
         if not sampling_params_list:
@@ -697,6 +703,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
                             resumable=True,
+                            stage_session_keys=stage_session_keys,
                         )
                         has_submitted_first_chunk = True
                     else:
@@ -740,6 +747,7 @@ class AsyncOmni(EngineClient, OmniBase):
                             final_output_stage_ids=final_output_stage_ids,
                             arrival_time=arrival_time,
                             resumable=False,
+                            stage_session_keys=stage_session_keys,
                         )
                     else:
                         await self.engine.add_request_async(
@@ -963,6 +971,8 @@ class AsyncOmni(EngineClient, OmniBase):
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
         stage_ids: list[int] | None = None,
+        session_routing_key: str | None = None,
+        release_session_binding: bool = False,
     ) -> list[Any]:
         """Execute a best-effort control RPC on selected stages.
 
@@ -976,6 +986,8 @@ class AsyncOmni(EngineClient, OmniBase):
             args=args,
             kwargs=kwargs,
             stage_ids=stage_ids,
+            session_routing_key=session_routing_key,
+            release_session_binding=release_session_binding,
         )
 
         unsupported_stage_ids: list[int] = []

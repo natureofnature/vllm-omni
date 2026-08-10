@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -49,10 +50,19 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import (
+    deserialize_additional_information,
+    serialize_additional_information,
+)
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
+from vllm_omni.model_executor.stage_input_processors.stage_bypass import (
+    build_empty_asr_aura_chunk_payload,
+    make_mock_text_stage_output,
+    should_skip_stage,
+    should_skip_stage_from_info,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -73,6 +83,41 @@ if TYPE_CHECKING:
         DuplexSessionRuntimeState,
     )
     from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
+
+
+def _resolve_prompt_additional_information(prompt: Any) -> dict[str, Any] | None:
+    """Return a plain dict from ``additional_information`` on a prompt or request."""
+    if isinstance(prompt, dict):
+        info = prompt.get("additional_information")
+        if isinstance(info, dict):
+            return info
+        if info is not None:
+            return deserialize_additional_information(info)
+    info_payload = getattr(prompt, "additional_information", None)
+    if info_payload is not None:
+        return deserialize_additional_information(info_payload)
+    return None
+
+
+def _should_skip_stage_submission(prompt: Any, original_prompt: Any, stage_id: int) -> bool:
+    """Return True when ``omni_skip_stages`` requests bypassing ``stage_id``."""
+    for candidate in (prompt, original_prompt):
+        if should_skip_stage(candidate, stage_id):
+            return True
+        info = _resolve_prompt_additional_information(candidate)
+        if should_skip_stage_from_info(info, stage_id):
+            return True
+    return False
+
+
+def _stage0_hard_bypass_enabled() -> bool:
+    """Hard Stage0 skip (SHM inject). Default on; ``VLLM_AURA_STAGE0_BYPASS=0`` runs Stage0 GPU.
+
+    When disabled we must still *submit* Stage0 — returning early from ``_bypass_stage0``
+    without inject leaves async_chunk Stage1 waiting forever on SharedMemory chunks.
+    """
+    raw = (os.environ.get("VLLM_AURA_STAGE0_BYPASS") or "1").strip().lower()
+    return raw not in {"0", "false", "off", "no"}
 
 
 def _build_terminal_empty_output(
@@ -177,6 +222,7 @@ class OrchestratorRequestState:
     mm_processor_kwargs: dict | None = None
     mm_features: list | None = None
     pd_prefill_multimodal_output: dict[str, Any] | None = None
+    stage_session_keys: dict[int, str] = field(default_factory=dict)
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
@@ -186,6 +232,8 @@ class OrchestratorRequestState:
     duplex_stage_fences: dict[int, DuplexFence] = field(default_factory=dict)
     duplex_config_generation: int = -1
     running_counter_registered: bool = False
+    # Stage 0 may be replaced by a synthetic finished ASR payload.
+    stage0_bypassed: bool = False
 
 
 @dataclass
@@ -422,6 +470,7 @@ class Orchestrator:
 
         # Distributed membership (optional, injected by DistStageRuntime)
         self._membership = membership_controller
+        self._stage0_bypass_connector: Any | None = None
 
     def _init_metrics_state(
         self,
@@ -671,6 +720,7 @@ class Orchestrator:
             final_output_stage_ids=final_output_stage_ids,
             request_timestamp=float(msg.request_timestamp or _time.time()),
             mm_features=getattr(prompt, "mm_features", None),
+            stage_session_keys=dict(msg.stage_session_keys or {}),
         )
         self.request_states[request_id] = req_state
         self._register_running_request(req_state)
@@ -682,11 +732,20 @@ class Orchestrator:
         preprocess_ms = msg.preprocess_ms
         if preprocess_ms > 0:
             req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
+        if _should_skip_stage_submission(prompt, original_prompt, stage_id):
+            if _stage0_hard_bypass_enabled():
+                await self._bypass_stage0(request_id, prompt, req_state, original_prompt=original_prompt)
+                return
+            logger.info(
+                "[Orchestrator] Stage0 bypass disabled; submitting Stage0 for req=%s",
+                request_id,
+            )
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
             prompt,
             prompt_text=msg.output_prompt_text,
+            session_routing_key=req_state.stage_session_keys.get(stage_id),
         )
 
         if self.async_chunk and stage_id == 0 and final_stage_id > 0:
@@ -717,6 +776,14 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
+        if _should_skip_stage_submission(request, msg.original_prompt, stage_id):
+            if _stage0_hard_bypass_enabled():
+                await self._bypass_stage0(request_id, request, req_state, original_prompt=msg.original_prompt)
+                return
+            logger.info(
+                "[Orchestrator] Stage0 bypass disabled; updating Stage0 for req=%s",
+                request_id,
+            )
         await self.stage_pools[stage_id].submit_update(
             request_id,
             req_state,
@@ -855,7 +922,17 @@ class Orchestrator:
         results: list[Any] = []
         stage_ids: list[int] = []
         for pool in target_pools:
-            for replica_id in pool.live_replica_ids():
+            if msg.session_routing_key is not None:
+                bound_replica_id = pool.get_session_bound_replica_id(msg.session_routing_key)
+                if bound_replica_id is None:
+                    stage_ids.append(pool.stage_id)
+                    results.append({"supported": True, "found": False})
+                    continue
+                replica_ids = [bound_replica_id]
+            else:
+                replica_ids = pool.live_replica_ids()
+
+            for replica_id in replica_ids:
                 stage_result = await pool.collective_rpc(
                     replica_id=replica_id,
                     method=method,
@@ -865,6 +942,12 @@ class Orchestrator:
                 )
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
+                if (
+                    msg.session_routing_key is not None
+                    and msg.release_session_binding
+                    and self._session_control_succeeded(stage_result)
+                ):
+                    pool.release_session_binding(msg.session_routing_key)
 
         await self.rpc_async_queue.put(
             CollectiveRPCResultMessage(
@@ -874,6 +957,15 @@ class Orchestrator:
                 results=results,
             )
         )
+
+    @staticmethod
+    def _session_control_succeeded(stage_result: Any) -> bool:
+        """Return whether every worker accepted a routed Session operation."""
+        if isinstance(stage_result, dict):
+            return stage_result.get("supported") is True
+        if isinstance(stage_result, list) and stage_result:
+            return all(Orchestrator._session_control_succeeded(result) for result in stage_result)
+        return False
 
     # ---- Orchestration loop ----
 
@@ -1743,6 +1835,7 @@ class Orchestrator:
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
         next_stage_resumable = is_streaming_session and not is_final_update
+        session_routing_key = req_state.stage_session_keys.get(next_logical)
         already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
         _t_submit_start = _time.perf_counter()
@@ -1881,6 +1974,7 @@ class Orchestrator:
                     req_id,
                     req_state,
                     diffusion_prompt,
+                    session_routing_key=session_routing_key,
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
@@ -1941,7 +2035,13 @@ class Orchestrator:
                 if already_submitted:
                     replica_id = await next_pool.submit_update(req_id, req_state, request)
                 else:
-                    replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                    replica_id = await next_pool.submit_initial(
+                        req_id,
+                        req_state,
+                        request,
+                        prompt_text=None,
+                        session_routing_key=session_routing_key,
+                    )
                 self._record_duplex_stage_submission(
                     next_logical,
                     req_id,
@@ -2051,7 +2151,13 @@ class Orchestrator:
             if already_submitted:
                 replica_id = await next_pool.submit_update(req_id, req_state, request)
             else:
-                replica_id = await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+                replica_id = await next_pool.submit_initial(
+                    req_id,
+                    req_state,
+                    request,
+                    prompt_text=None,
+                    session_routing_key=session_routing_key,
+                )
             self._record_duplex_stage_submission(
                 next_logical,
                 req_id,
@@ -2068,6 +2174,141 @@ class Orchestrator:
             to_pool=next_pool,
             request_id=req_id,
             tx_ms=_tx_ms,
+        )
+
+    async def _bypass_stage0(
+        self,
+        request_id: str,
+        stage0_request: Any,
+        req_state: OrchestratorRequestState,
+        *,
+        original_prompt: Any = None,
+    ) -> None:
+        """Skip Stage0 GPU work when ``omni_skip_stages`` includes 0.
+
+        Under ``async_chunk``, Stage1+ wait on SharedMemoryConnector chunks, so
+        the order must be: prewarm downstream → inject finished empty ASR
+        payload. Sync (non-async_chunk) uses mock text forward instead.
+
+        Disable with ``VLLM_AURA_STAGE0_BYPASS=0`` (caller must submit Stage0 GPU instead).
+        """
+        if not _stage0_hard_bypass_enabled():
+            logger.info(
+                "[Orchestrator] Stage0 bypass disabled via VLLM_AURA_STAGE0_BYPASS for req=%s",
+                request_id,
+            )
+            return
+
+        if req_state.stage0_bypassed:
+            logger.debug(
+                "[Orchestrator] Stage0 already bypassed for req=%s; skipping re-inject",
+                request_id,
+            )
+            return
+
+        req_state.stage0_bypassed = True
+        logger.info(
+            "[Orchestrator] Bypassing stage-0 GPU for req=%s (omni_skip_stages, async_chunk=%s)",
+            request_id,
+            self.async_chunk,
+        )
+
+        if self.async_chunk:
+            # Keep final_stage_id as requested (typically 3). Stage0 bypass only skips
+            # ASR GPU — vision-only turns may still speak. Stage1→TTS emits an empty
+            # finish on <|silent|> so Talker does not synthesize; do not clamp to
+            # Stage1 here based on "no mic".
+            if req_state.final_stage_id > 0:
+                await self._prewarm_async_chunk_stages(request_id, stage0_request, req_state)
+            additional_info = (
+                _resolve_prompt_additional_information(stage0_request)
+                or _resolve_prompt_additional_information(original_prompt)
+                or _resolve_prompt_additional_information(req_state.prompt)
+                or {}
+            )
+            await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            return
+
+        await self._forward_bypassed_stage_zero(request_id, req_state)
+
+    async def _forward_bypassed_stage_zero(
+        self,
+        request_id: str,
+        req_state: OrchestratorRequestState,
+    ) -> None:
+        """Sync-path Stage0 bypass via mock text output (non-async_chunk only)."""
+        mock_output = make_mock_text_stage_output(request_id, text="")
+        is_streaming = req_state.streaming.enabled
+        if is_streaming:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=True,
+                is_final_update=False,
+            )
+            if getattr(mock_output, "finished", True):
+                await self._forward_to_next_stage(
+                    request_id,
+                    0,
+                    mock_output,
+                    req_state,
+                    src_replica_id=0,
+                    is_streaming_session=True,
+                    is_final_update=True,
+                )
+        else:
+            await self._forward_to_next_stage(
+                request_id,
+                0,
+                mock_output,
+                req_state,
+                src_replica_id=0,
+                is_streaming_session=False,
+                is_final_update=True,
+            )
+
+    def _get_stage0_bypass_connector(self) -> Any:
+        """Lazy SharedMemoryConnector matching Stage0's connector config."""
+        if self._stage0_bypass_connector is not None:
+            return self._stage0_bypass_connector
+        from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+            OmniChunkTransferAdapter,
+        )
+
+        model_config = getattr(self.stage_pools[0].stage_vllm_config, "model_config", None)
+        self._stage0_bypass_connector = OmniChunkTransferAdapter.create_connector(model_config)
+        return self._stage0_bypass_connector
+
+    async def _inject_bypassed_stage0_chunk(
+        self,
+        request_id: str,
+        additional_info: dict[str, Any],
+    ) -> None:
+        """Put a finished empty ASR→AURA chunk so prewarmed Stage1 can proceed."""
+        payload = build_empty_asr_aura_chunk_payload(additional_info)
+        put_key = f"{request_id}_0_0"
+        connector = self._get_stage0_bypass_connector()
+        success, size, _metadata = connector.put(
+            from_stage="0",
+            to_stage="1",
+            put_key=put_key,
+            data=payload,
+        )
+        if not success:
+            logger.error(
+                "[Orchestrator] Failed to inject bypassed Stage0 chunk for req=%s key=%s",
+                request_id,
+                put_key,
+            )
+            return
+        logger.debug(
+            "[Orchestrator] Injected bypassed Stage0 chunk req=%s key=%s size=%s",
+            request_id,
+            put_key,
+            size,
         )
 
     async def _prewarm_async_chunk_stages(
@@ -2091,6 +2332,9 @@ class Orchestrator:
         for next_stage_id in range(1, req_state.final_stage_id + 1):
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
+            model_config = getattr(next_pool.stage_vllm_config, "model_config", None)
+            model_stage = getattr(model_config, "model_stage", None)
+            worker_type = getattr(model_config, "worker_type", None)
             if not self._stage_receives_async_chunks(next_stage_id):
                 # Outgoing-only stages receive their first real input from the
                 # orchestrator. Pre-submitting a placeholder lets it race and
@@ -2105,6 +2349,7 @@ class Orchestrator:
                     request_id,
                     req_state,
                     req_state.prompt,
+                    session_routing_key=req_state.stage_session_keys.get(next_stage_id),
                     submit_kwargs={
                         "kv_sender_info": self._build_kv_sender_info(
                             list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
@@ -2117,18 +2362,20 @@ class Orchestrator:
 
                 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
-                try:
-                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
-                except Exception:
-                    next_prompt_len = max(1, len(prompt_token_ids))
-
                 original_prompt = req_state.prompt
                 if isinstance(original_prompt, dict):
                     base_input = copy.deepcopy(original_prompt)
                 else:
                     base_input = {}
 
-                base_input["prompt_token_ids"] = [0] * next_prompt_len
+                if worker_type == "generation" or model_stage in {"qwen3_tts", "aura", "code2wav"}:
+                    base_input["prompt_token_ids"] = []
+                else:
+                    try:
+                        next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                    except Exception:
+                        next_prompt_len = max(1, len(prompt_token_ids))
+                    base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
                 downstream_resumable = bool(getattr(stage0_request, "resumable", req_state.streaming.enabled))
@@ -2145,6 +2392,7 @@ class Orchestrator:
                     req_state,
                     request,
                     prompt_text=None,
+                    session_routing_key=req_state.stage_session_keys.get(next_stage_id),
                 )
             self._record_duplex_stage_submission(
                 next_stage_id,

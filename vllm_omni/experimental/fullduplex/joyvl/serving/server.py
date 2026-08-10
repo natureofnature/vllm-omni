@@ -6,16 +6,19 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import time
 import uuid
+from collections import OrderedDict
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from typing import Any
 
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from vllm_omni.experimental.fullduplex.joyvl.bridges.backend import OpenAIBackend
+from vllm_omni.experimental.fullduplex.joyvl.bridges.backend import ModelBackend, OpenAIBackend
 from vllm_omni.experimental.fullduplex.joyvl.bridges.delegation import (
     DelegationBridge,
     ImageEditDelegationBridge,
@@ -30,30 +33,67 @@ from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionCo
 from vllm_omni.experimental.fullduplex.joyvl.serving.session import InteractionSession, StepResult
 
 
+class SessionOperationConflictError(ValueError):
+    pass
+
+
+class StaleSessionEpochError(RuntimeError):
+    pass
+
+
+@dataclass
+class _CompletedOperation:
+    digest: str
+    result: StepResult
+
+
+@dataclass
+class _InFlightOperation:
+    digest: str
+    task: asyncio.Task[StepResult]
+
+
+@dataclass
+class _SessionSlot:
+    session: InteractionSession
+    epoch: int
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    commit_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    completed: OrderedDict[str, _CompletedOperation] = field(default_factory=OrderedDict)
+    in_flight: dict[str, _InFlightOperation] = field(default_factory=dict)
+
+
 class SessionManager:
-    def __init__(self, config: InteractionConfig) -> None:
+    def __init__(
+        self,
+        config: InteractionConfig,
+        *,
+        backend: ModelBackend | None = None,
+        summarizer_backend: ModelBackend | None = None,
+    ) -> None:
         self.config = config
-        self._backend = OpenAIBackend(
+        self._backend = backend or OpenAIBackend(
             config.main_backend_url, config.main_model, config.api_key, config.request_timeout_seconds
         )
         self._summarizer: Summarizer | None = None
         if config.enable_memory:
-            summarizer_backend = OpenAIBackend(
+            memory_backend = summarizer_backend or OpenAIBackend(
                 config.resolved_summarizer_url,
                 config.resolved_summarizer_model,
                 config.api_key,
                 config.request_timeout_seconds,
             )
             self._summarizer = Summarizer(
-                summarizer_backend,
+                memory_backend,
                 key_frames_per_chunk=config.mid_term_key_frames,
                 mid_term_max_tokens=config.mid_term_max_tokens,
                 long_term_max_tokens=config.long_term_max_tokens,
                 max_pixels=config.max_pixels,
             )
         self._delegation = self._build_delegation(config) if config.enable_delegation else None
-        self._sessions: dict[str, InteractionSession] = {}
-        self._locks: dict[str, asyncio.Lock] = {}
+        self._slots: dict[str, _SessionSlot] = {}
+        self._epochs: dict[str, int] = {}
+        self._retired_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
     def _build_delegation(config: InteractionConfig) -> DelegationBridge | None:
@@ -100,9 +140,9 @@ class SessionManager:
             return chat_bridge(url)
         return None
 
-    def _get(self, session_id: str) -> InteractionSession:
-        session = self._sessions.get(session_id)
-        if session is None:
+    def _get(self, session_id: str) -> _SessionSlot:
+        slot = self._slots.get(session_id)
+        if slot is None:
             session = InteractionSession(
                 session_id,
                 self.config,
@@ -110,36 +150,173 @@ class SessionManager:
                 summarizer=self._summarizer,
                 delegation=self._delegation,
             )
-            self._sessions[session_id] = session
-            self._locks[session_id] = asyncio.Lock()
-        return session
+            slot = _SessionSlot(session=session, epoch=self._epochs.setdefault(session_id, 0))
+            self._slots[session_id] = slot
+        return slot
 
-    async def step(self, session_id: str, frames: list[str], query: str | None) -> StepResult:
+    async def step(
+        self,
+        session_id: str,
+        frames: list[str],
+        query: str | None,
+        *,
+        operation_id: str | None = None,
+        epoch: int | None = None,
+    ) -> StepResult:
         await self._evict_expired()
-        # capture session + lock together (no await between) so a concurrent reset cannot
-        # swap them out from under us; the lock then serializes step against reset.
-        session = self._get(session_id)
-        lock = self._locks[session_id]
-        async with lock:
-            return await session.step(frames, query)
+        slot = self._get(session_id)
+        if epoch is not None and epoch != slot.epoch:
+            raise StaleSessionEpochError(f"Session {session_id!r} is at epoch {slot.epoch}, received {epoch}")
 
-    async def reset(self, session_id: str) -> None:
-        # Acquire the per-session lock so reset waits for any in-flight step() to finish
-        # instead of mutating/dropping a session mid-request.
-        lock = self._locks.get(session_id)
-        if lock is None:
-            return
-        async with lock:
-            session = self._sessions.pop(session_id, None)
-            self._locks.pop(session_id, None)
-            if session is not None:
-                await session.reset()
+        def require_current() -> None:
+            if self._slots.get(session_id) is not slot or self._epochs.get(session_id, 0) != slot.epoch:
+                raise StaleSessionEpochError(f"Session {session_id!r} epoch {slot.epoch} completed after reset")
 
-    async def set_persona(self, session_id: str, persona: str) -> bool:
-        session = self._get(session_id)
-        lock = self._locks[session_id]
-        async with lock:
-            return session.set_persona(persona)
+        digest = self._operation_digest(frames, query)
+        if operation_id is not None:
+            completed = slot.completed.get(operation_id)
+            if completed is not None:
+                if completed.digest != digest:
+                    raise SessionOperationConflictError(
+                        f"operation_id {operation_id!r} was reused with different input"
+                    )
+                return completed.result
+
+            in_flight = slot.in_flight.get(operation_id)
+            if in_flight is not None:
+                if in_flight.digest != digest:
+                    raise SessionOperationConflictError(
+                        f"operation_id {operation_id!r} was reused with different input"
+                    )
+                result = await asyncio.shield(in_flight.task)
+                require_current()
+                return result
+
+            task = asyncio.create_task(
+                self._run_step(session_id, slot, frames, query, operation_id, digest),
+                name=f"joyvl-step-{session_id}-{slot.epoch}-{operation_id}",
+            )
+            slot.in_flight[operation_id] = _InFlightOperation(digest, task)
+            task.add_done_callback(
+                lambda done, current_slot=slot, current_operation=operation_id: self._discard_in_flight(
+                    current_slot, current_operation, done
+                )
+            )
+            result = await asyncio.shield(task)
+            require_current()
+            return result
+
+        return await self._run_step(session_id, slot, frames, query, None, digest)
+
+    async def reset(self, session_id: str, *, expected_epoch: int) -> int:
+        epoch, _ = await self.reset_with_status(session_id, expected_epoch=expected_epoch)
+        return epoch
+
+    async def reset_with_status(self, session_id: str, *, expected_epoch: int) -> tuple[int, bool]:
+        if expected_epoch < 0:
+            raise ValueError("expected_epoch must be non-negative")
+
+        while True:
+            current_epoch = self._epochs.get(session_id, 0)
+            if expected_epoch + 1 == current_epoch:
+                return current_epoch, False
+            if expected_epoch != current_epoch:
+                raise StaleSessionEpochError(
+                    f"Session {session_id!r} is at epoch {current_epoch}, cannot reset epoch {expected_epoch}"
+                )
+
+            old_slot = self._slots.get(session_id)
+            if old_slot is None:
+                new_epoch = current_epoch + 1
+                self._epochs[session_id] = new_epoch
+                return new_epoch, True
+
+            async with old_slot.commit_lock:
+                if self._slots.get(session_id) is not old_slot:
+                    continue
+                current_epoch = self._epochs.get(session_id, 0)
+                if expected_epoch + 1 == current_epoch:
+                    return current_epoch, False
+                if expected_epoch != current_epoch:
+                    raise StaleSessionEpochError(
+                        f"Session {session_id!r} is at epoch {current_epoch}, cannot reset epoch {expected_epoch}"
+                    )
+
+                new_epoch = current_epoch + 1
+                self._epochs[session_id] = new_epoch
+                self._slots.pop(session_id, None)
+                task = asyncio.create_task(
+                    self._retire_slot(old_slot),
+                    name=f"joyvl-retire-{session_id}-{old_slot.epoch}",
+                )
+                self._retired_tasks.add(task)
+                task.add_done_callback(self._retired_tasks.discard)
+                return new_epoch, True
+
+    async def set_persona(self, session_id: str, persona: str, *, epoch: int | None = None) -> bool:
+        slot = self._get(session_id)
+        if epoch is not None and epoch != slot.epoch:
+            raise StaleSessionEpochError(f"Session {session_id!r} is at epoch {slot.epoch}, received {epoch}")
+        async with slot.lock:
+            if self._slots.get(session_id) is not slot:
+                raise StaleSessionEpochError(f"Session {session_id!r} was reset while persona was queued")
+            return slot.session.set_persona(persona)
+
+    def current_epoch(self, session_id: str) -> int:
+        return self._epochs.get(session_id, 0)
+
+    @staticmethod
+    def _operation_digest(frames: list[str], query: str | None) -> str:
+        digest = hashlib.sha256()
+        query_bytes = (query or "").encode()
+        digest.update(len(query_bytes).to_bytes(8, "big"))
+        digest.update(query_bytes)
+        for frame in frames:
+            frame_bytes = frame.encode()
+            digest.update(len(frame_bytes).to_bytes(8, "big"))
+            digest.update(frame_bytes)
+        return digest.hexdigest()
+
+    async def _run_step(
+        self,
+        session_id: str,
+        slot: _SessionSlot,
+        frames: list[str],
+        query: str | None,
+        operation_id: str | None,
+        digest: str,
+    ) -> StepResult:
+        def require_current() -> None:
+            if self._slots.get(session_id) is not slot or self._epochs.get(session_id, 0) != slot.epoch:
+                raise StaleSessionEpochError(f"Session {session_id!r} epoch {slot.epoch} was reset while queued")
+
+        @contextlib.asynccontextmanager
+        async def commit_scope() -> AsyncIterator[None]:
+            async with slot.commit_lock:
+                require_current()
+                yield
+
+        async with slot.lock:
+            require_current()
+            result = await slot.session.step(frames, query, commit_scope=commit_scope)
+            require_current()
+            if operation_id is not None:
+                slot.completed[operation_id] = _CompletedOperation(digest, result)
+                slot.completed.move_to_end(operation_id)
+                while len(slot.completed) > 256:
+                    slot.completed.popitem(last=False)
+            return result
+
+    @staticmethod
+    def _discard_in_flight(slot: _SessionSlot, operation_id: str, task: asyncio.Task[StepResult]) -> None:
+        current = slot.in_flight.get(operation_id)
+        if current is not None and current.task is task:
+            slot.in_flight.pop(operation_id, None)
+
+    @staticmethod
+    async def _retire_slot(slot: _SessionSlot) -> None:
+        async with slot.lock:
+            await slot.session.reset()
 
     async def _evict_expired(self) -> None:
         ttl = self.config.session_timeout_seconds
@@ -148,26 +325,37 @@ class SessionManager:
         now = time.monotonic()
         expired = [
             sid
-            for sid, sess in self._sessions.items()
-            if now - sess.last_access > ttl and not self._locks[sid].locked()
+            for sid, slot in self._slots.items()
+            if now - slot.session.last_access > ttl and not slot.lock.locked() and not slot.in_flight
         ]
         for sid in expired:
-            await self.reset(sid)
+            slot = self._slots.get(sid)
+            if slot is not None:
+                await self.reset(sid, expected_epoch=slot.epoch)
 
     async def aclose(self) -> None:
-        for sid in list(self._sessions):
-            lock = self._locks.get(sid)
-            if lock is not None:
-                async with lock:
-                    session = self._sessions.pop(sid, None)
-                    self._locks.pop(sid, None)
-                    if session is not None:
-                        await session.aclose()
+        for sid in list(self._slots):
+            slot = self._slots.get(sid)
+            if slot is not None:
+                await self.reset(sid, expected_epoch=slot.epoch)
+        if self._retired_tasks:
+            await asyncio.gather(*self._retired_tasks, return_exceptions=True)
+            self._retired_tasks.clear()
         await self._backend.aclose()
         if self._summarizer is not None:
             await self._summarizer.aclose()
         if self._delegation is not None:
             await self._delegation.aclose()
+
+
+async def _request_payload(request: Request, *, allow_empty: bool = False) -> dict[str, Any]:
+    body = await request.body()
+    if not body and allow_empty:
+        return {}
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise ValueError("request body must be a JSON object")
+    return payload
 
 
 def _extract_frames_and_query(payload: dict[str, Any]) -> tuple[list[str], str | None]:
@@ -193,17 +381,64 @@ def _extract_frames_and_query(payload: dict[str, Any]) -> tuple[list[str], str |
     return frames, query
 
 
+def _explicit_session_id(request: Request, payload: dict[str, Any]) -> str | None:
+    value = request.headers.get("x-streaming-session")
+    if value is None:
+        value = request.headers.get("x-session-id")
+    if value is None:
+        value = payload.get("session_id")
+    if value is None:
+        value = payload.get("user")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("session_id must be a non-empty string or integer")
+    normalized = str(value).strip()
+    return normalized or None
+
+
 def _session_id(request: Request, payload: dict[str, Any]) -> str:
-    return (
-        request.headers.get("x-streaming-session")
-        or request.headers.get("x-session-id")
-        or payload.get("session_id")
-        or payload.get("user")
-        or "default"
-    )
+    return _explicit_session_id(request, payload) or "default"
 
 
-def _completion_response(model: str, result: StepResult) -> dict[str, Any]:
+def _operation_id(request: Request, payload: dict[str, Any]) -> str | None:
+    value = request.headers.get("x-operation-id")
+    if value is None:
+        value = payload.get("operation_id")
+    if value is None:
+        value = payload.get("input_seq")
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("operation_id must be a non-empty string or integer")
+    normalized = str(value).strip()
+    if not normalized:
+        raise ValueError("operation_id must be a non-empty string or integer")
+    return normalized
+
+
+def _session_epoch(request: Request, payload: dict[str, Any]) -> int | None:
+    value = request.headers.get("x-session-epoch")
+    if value is None:
+        value = payload.get("session_epoch", payload.get("epoch"))
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        raise ValueError("session_epoch must be a non-negative integer")
+    epoch = int(value)
+    if epoch < 0:
+        raise ValueError("session_epoch must be a non-negative integer")
+    return epoch
+
+
+def _completion_response(
+    model: str,
+    result: StepResult,
+    *,
+    session_id: str | None = None,
+    epoch: int | None = None,
+    operation_id: str | None = None,
+) -> dict[str, Any]:
     action = result.action
     memory = {"long_term_memory": result.long_term_memory, "mid_term_summaries": result.mid_term_summaries}
     return {
@@ -220,6 +455,9 @@ def _completion_response(model: str, result: StepResult) -> dict[str, Any]:
         ],
         "usage": None,
         "interaction": {
+            "session_id": session_id,
+            "epoch": epoch,
+            "operation_id": operation_id,
             "action": action.action.value,
             "spoke": action.spoke,
             "text": action.text,
@@ -257,25 +495,135 @@ def create_app(config: InteractionConfig) -> FastAPI:
 
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request) -> JSONResponse:
-        payload = await request.json()
-        frames, query = _extract_frames_and_query(payload)
-        if not frames:
-            return JSONResponse({"error": "interaction server requires at least one image_url frame"}, status_code=400)
-        result = await manager.step(_session_id(request, payload), frames, query)
-        return JSONResponse(_completion_response(config.main_model, result))
+        try:
+            payload = await _request_payload(request)
+            frames, query = _extract_frames_and_query(payload)
+            if not frames:
+                return JSONResponse(
+                    {"error": "interaction server requires at least one image_url frame"}, status_code=400
+                )
+            session_id = _session_id(request, payload)
+            operation_id = _operation_id(request, payload)
+            epoch = _session_epoch(request, payload)
+            current_epoch = manager.current_epoch(session_id)
+            if epoch is None:
+                if current_epoch != 0:
+                    return JSONResponse(
+                        {
+                            "error": "session_epoch is required after a session reset",
+                            "type": "missing_session_epoch",
+                            "current_epoch": current_epoch,
+                        },
+                        status_code=409,
+                    )
+                epoch = 0
+            result = await manager.step(
+                session_id,
+                frames,
+                query,
+                operation_id=operation_id,
+                epoch=epoch,
+            )
+        except SessionOperationConflictError as exc:
+            return JSONResponse(
+                {"error": str(exc), "type": "operation_conflict"},
+                status_code=409,
+            )
+        except StaleSessionEpochError as exc:
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "type": "stale_session_epoch",
+                    "current_epoch": manager.current_epoch(session_id),
+                },
+                status_code=409,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc), "type": "invalid_request"}, status_code=400)
+        return JSONResponse(
+            _completion_response(
+                config.main_model,
+                result,
+                session_id=session_id,
+                epoch=manager.current_epoch(session_id),
+                operation_id=operation_id,
+            )
+        )
 
     @app.post("/reset")
     @app.post("/v1/streaming/reset")
-    async def reset(request: Request) -> dict[str, str]:
-        payload = await request.json() if await request.body() else {}
-        await manager.reset(_session_id(request, payload))
-        return {"status": "reset"}
+    async def reset(request: Request) -> JSONResponse:
+        try:
+            payload = await _request_payload(request, allow_empty=True)
+            session_id = _session_id(request, payload)
+            expected_epoch = _session_epoch(request, payload)
+            if expected_epoch is None:
+                return JSONResponse(
+                    {
+                        "error": "session_epoch is required to reset a session",
+                        "type": "missing_session_epoch",
+                        "current_epoch": manager.current_epoch(session_id),
+                    },
+                    status_code=400,
+                )
+            epoch, advanced = await manager.reset_with_status(session_id, expected_epoch=expected_epoch)
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc), "type": "invalid_request"}, status_code=400)
+        except StaleSessionEpochError as exc:
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "type": "stale_session_epoch",
+                    "current_epoch": manager.current_epoch(session_id),
+                },
+                status_code=409,
+            )
+        return JSONResponse(
+            {
+                "status": "reset",
+                "session_id": session_id,
+                "epoch": epoch,
+                "advanced": advanced,
+            }
+        )
 
     @app.post("/v1/streaming/persona")
-    async def persona(request: Request) -> dict[str, Any]:
-        payload = await request.json() if await request.body() else {}
-        ok = await manager.set_persona(_session_id(request, payload), payload.get("persona", "default"))
-        return {"status": "ok" if ok else "unknown_persona"}
+    async def persona(request: Request) -> JSONResponse:
+        try:
+            payload = await _request_payload(request, allow_empty=True)
+            session_id = _session_id(request, payload)
+            epoch = _session_epoch(request, payload)
+            current_epoch = manager.current_epoch(session_id)
+            if epoch is None and current_epoch != 0:
+                return JSONResponse(
+                    {
+                        "error": "session_epoch is required after a session reset",
+                        "type": "missing_session_epoch",
+                        "current_epoch": current_epoch,
+                    },
+                    status_code=409,
+                )
+            if epoch is None:
+                epoch = 0
+            ok = await manager.set_persona(session_id, payload.get("persona", "default"), epoch=epoch)
+        except StaleSessionEpochError as exc:
+            return JSONResponse(
+                {
+                    "error": str(exc),
+                    "type": "stale_session_epoch",
+                    "current_epoch": manager.current_epoch(session_id),
+                },
+                status_code=409,
+            )
+        except ValueError as exc:
+            return JSONResponse({"error": str(exc), "type": "invalid_request"}, status_code=400)
+        return JSONResponse(
+            {
+                "status": "ok" if ok else "unknown_persona",
+                "session_id": session_id,
+                "epoch": manager.current_epoch(session_id),
+            }
+        )
 
     return app
 
