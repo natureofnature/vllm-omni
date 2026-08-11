@@ -446,6 +446,53 @@ def test_native_realtime_protocol_speak_does_not_expose_internal_event():
     ]
 
 
+def test_native_realtime_protocol_projects_input_watermarks():
+    protocol = NativeRealtimeSessionProtocol({})
+
+    committed_events = protocol.encode_outbound_event(
+        {
+            "type": "input.committed",
+            "session_id": "sid-watermark",
+            "epoch": 2,
+            "accepted_input_seq": 7,
+            "native_audio": True,
+            "message": {
+                "role": "user",
+                "content": [{"type": "input_audio", "audio": ""}],
+            },
+        }
+    )
+    committed = next(event for event in committed_events if event["type"] == "input_audio_buffer.committed")
+
+    assert committed["session_id"] == "sid-watermark"
+    assert committed["epoch"] == 2
+    assert committed["accepted_input_seq"] == 7
+
+    processed = protocol.encode_outbound_event(
+        {
+            "type": "input.processed",
+            "session_id": "sid-watermark",
+            "epoch": 2,
+            "processed_input_seq": 7,
+            "outcome": "speak",
+            "response_id": "resp-watermark",
+        }
+    )
+
+    assert len(processed) == 1
+    processed[0].pop("event_id")
+    assert processed == [
+        {
+            "type": "input_audio_buffer.processed",
+            "session_id": "sid-watermark",
+            "epoch": 2,
+            "processed_input_seq": 7,
+            "outcome": "speak",
+            "response_id": "resp-watermark",
+        }
+    ]
+
+
 @pytest.mark.asyncio
 async def test_native_realtime_protocol_drains_internal_conversation_item_control_event():
     ws = TimedWebSocket()
@@ -1458,6 +1505,26 @@ def test_minicpmo_merge_drops_serving_new_user_turn_marker():
     assert "force_speak" not in merged
 
 
+def test_minicpmo_serving_input_watermark_tracks_only_accepted_user_appends():
+    native = MiniCPMO45ServingSessionState()
+
+    native.record_accepted_input(epoch=1, seq=3)
+    native.record_accepted_input(epoch=1, seq=5)
+
+    assert native.accepted_input_watermark(epoch=1) == 5
+    assert native.accepted_input_watermark(epoch=0) is None
+    assert native.mark_input_processed(epoch=1, seq=4) is False
+    assert native.mark_input_processed(epoch=1, seq=3) is True
+    assert native.mark_input_processed(epoch=1, seq=3) is False
+    assert native.accepted_input_seqs == {5}
+
+    native.record_accepted_input(epoch=2, seq=1)
+
+    assert native.accepted_input_watermark(epoch=1) is None
+    assert native.accepted_input_watermark(epoch=2) == 1
+    assert native.mark_input_processed(epoch=2, seq=1) is True
+
+
 @pytest.mark.asyncio
 async def test_minicpmo_clear_continuation_does_not_cancel_pending_silence_task():
     async def _pending() -> bool:
@@ -2376,6 +2443,7 @@ def test_duplex_data_plane_listen_preserves_model_turn_identity():
             "duplex_native_decision": "listen",
             "meta.duplex_turn_id": np.array([2], dtype=np.int32),
             "meta.duplex_epoch": np.array([0], dtype=np.int32),
+            "meta.duplex_input_seq": np.array([9], dtype=np.int32),
         },
     )
 
@@ -2384,6 +2452,7 @@ def test_duplex_data_plane_listen_preserves_model_turn_identity():
     assert len(results) == 1
     assert results[0]["is_listen"] is True
     assert results[0]["model_turn_id"] == 2
+    assert results[0]["input_seq"] == 9
 
 
 def test_duplex_data_plane_does_not_drop_future_model_turn_while_response_active():
@@ -3016,6 +3085,78 @@ async def test_minicpmo_auto_response_listen_before_response_keeps_resumable_req
 
 
 @pytest.mark.asyncio
+async def test_minicpmo_emits_processed_watermark_once_for_exact_user_append():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-processed-watermark",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    handler._minicpmo_session_state(session).record_accepted_input(epoch=0, seq=7)
+    ws = TimedWebSocket()
+    result = {
+        "supported": True,
+        "stage_role": "llm",
+        "is_listen": True,
+        "model_listen": True,
+        "input_seq": 7,
+        "end_of_turn": False,
+    }
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        result,
+        session=session,
+        expected_epoch=0,
+    )
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        result,
+        session=session,
+        expected_epoch=0,
+    )
+
+    processed = [event for event in ws.sent if event.get("type") == "input.processed"]
+    assert processed == [
+        {
+            "type": "input.processed",
+            "session_id": session.session_id,
+            "epoch": 0,
+            "processed_input_seq": 7,
+            "outcome": "listen",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_does_not_emit_processed_watermark_for_internal_append():
+    handler = OmniDuplexSessionHandler(chat_service=FakeChatService(FakeEngineClient()))
+    session = DuplexSession(
+        session_id="sid-internal-watermark",
+        config=DuplexSessionConfig(extra_body={"auto_response": True}),
+    )
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    handler._minicpmo_session_state(session).record_accepted_input(epoch=0, seq=1)
+    ws = TimedWebSocket()
+
+    await handler._send_one_native_duplex_event(
+        ws.send_json,
+        {
+            "supported": True,
+            "stage_role": "llm",
+            "is_listen": True,
+            "model_listen": True,
+            "input_seq": 2,
+            "end_of_turn": False,
+        },
+        session=session,
+        expected_epoch=0,
+    )
+
+    assert "input.processed" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
 async def test_minicpmo_auto_response_listen_without_response_does_not_defer_commit():
     session_id = "sid-listen-before-response-commit"
     request_id = duplex_resource_request_id(DuplexFence(session_id), "stage0")
@@ -3061,6 +3202,7 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
                     "data_plane_append": True,
                     "request_id": request_id,
                     "response_stage_id": 1,
+                    "seq": 1,
                 },
             }
         ],
@@ -3116,6 +3258,7 @@ async def test_minicpmo_auto_response_listen_without_response_does_not_defer_com
     assert len(committed) == 1
     assert committed[0].get("event", {}).get("overlap_deferred") is not True
     assert committed[0].get("event", {}).get("response_create_deferred") is not True
+    assert "accepted_input_seq" not in committed[0]
     assert "response.created" not in ws.sent_types()
 
 
@@ -6044,7 +6187,17 @@ async def test_minicpmo_native_auto_response_commit_finalizes_after_streamed_ful
         "ok": True,
         "unsupported_count": 0,
         "error_count": 0,
-        "stage_results": [],
+        "stage_results": [
+            {
+                "stage_id": 0,
+                "replica_id": 0,
+                "result": {
+                    "supported": True,
+                    "data_plane_append": True,
+                    "seq": 1,
+                },
+            }
+        ],
     }
     engine = FakeEngineClient(control_result=control_result)
     handler = OmniDuplexSessionHandler(
@@ -6072,6 +6225,10 @@ async def test_minicpmo_native_auto_response_commit_finalizes_after_streamed_ful
     assert len(engine.appended) == 1
     assert engine.appended[0][3] is False
     assert "response.created" not in ws.sent_types()
+    committed = next(message for message in ws.sent if message.get("type") == "input.committed")
+    assert committed["session_id"] == "sid-native-auto-finalize"
+    assert committed["epoch"] == 0
+    assert committed["accepted_input_seq"] == 1
 
 
 @pytest.mark.asyncio

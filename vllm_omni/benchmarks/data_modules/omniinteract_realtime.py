@@ -65,10 +65,120 @@ class OmniInteractRealtimeSessionResult:
     turn_outputs: list[dict[str, Any]] = field(default_factory=list)
     success: bool = False
     error: str = ""
+    preprocess_s: float = 0.0
     latency_s: float = 0.0
     ttft_s: float = 0.0
     tpot_s: float = 0.0
     audio_rtf: float = 0.0
+    pacing_mean_lag_s: float = 0.0
+    pacing_max_lag_s: float = 0.0
+    official_summary: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _PlaybackSegment:
+    response_id: str
+    start_s: float
+    sample_count: int
+    sample_rate: int
+
+    @property
+    def duration_s(self) -> float:
+        return self.sample_count / self.sample_rate
+
+    @property
+    def duration_ms(self) -> int:
+        return self.sample_count * 1000 // self.sample_rate
+
+
+class RealtimePlaybackAcknowledger:
+    """Acknowledge only audio that a realtime client could have played.
+
+    The generic demo acknowledges all generated audio after a one-shot input.
+    OmniInteract keeps sending input for several minutes, so doing that only at
+    session close leaves every earlier response marked as unplayed.  This
+    tracker models one serial audio device from client receive timestamps and
+    advances each response's playback cursor while the video is streaming.
+    """
+
+    def __init__(self) -> None:
+        self._event_cursor = 0
+        self._playback_cursor_s = 0.0
+        self._segments: list[_PlaybackSegment] = []
+        self._acked_ms: dict[str, int] = {}
+        self._completed_responses: set[str] = set()
+        self._completion_acked: set[str] = set()
+
+    def _ingest(self, collector: RealtimeEventCollector) -> None:
+        events = collector.events
+        received_times = collector.event_received_at_s
+        while self._event_cursor < len(events):
+            index = self._event_cursor
+            self._event_cursor += 1
+            event = events[index]
+            if event.get("type") == "response.done":
+                response_id = collector.response_id(event)
+                if response_id:
+                    self._completed_responses.add(response_id)
+                continue
+            if event.get("type") != "response.audio.delta":
+                continue
+            response_id = collector.response_id(event)
+            encoded = event.get("delta") or event.get("audio")
+            if not response_id or not isinstance(encoded, str):
+                continue
+            try:
+                pcm16 = base64.b64decode(encoded, validate=True)
+            except ValueError:
+                continue
+            sample_rate = event.get("sample_rate_hz")
+            if not isinstance(sample_rate, int) or sample_rate <= 0:
+                sample_rate = collector.output_sample_rate_hz or 24_000
+            samples = len(pcm16) // PCM16_BYTES_PER_SAMPLE
+            if samples <= 0:
+                continue
+            received_s = received_times[index]
+            start_s = max(received_s, self._playback_cursor_s)
+            segment = _PlaybackSegment(response_id, start_s, samples, sample_rate)
+            self._segments.append(segment)
+            self._playback_cursor_s = start_s + segment.duration_s
+
+    def played_ms(self, collector: RealtimeEventCollector, *, now_s: float) -> dict[str, int]:
+        self._ingest(collector)
+        played: dict[str, int] = {}
+        for segment in self._segments:
+            elapsed_samples = max(0, int(round((now_s - segment.start_s) * segment.sample_rate)))
+            if elapsed_samples >= segment.sample_count:
+                elapsed_ms = segment.duration_ms
+            else:
+                elapsed_ms = elapsed_samples * 1000 // segment.sample_rate
+            played[segment.response_id] = played.get(segment.response_id, 0) + elapsed_ms
+        return played
+
+    async def acknowledge(
+        self,
+        client: RealtimeDuplexClient,
+        collector: RealtimeEventCollector,
+        *,
+        now_s: float | None = None,
+    ) -> None:
+        cursors = self.played_ms(collector, now_s=time.monotonic() if now_s is None else now_s)
+        for response_id, played_ms in cursors.items():
+            completion_ack_due = response_id in self._completed_responses and response_id not in self._completion_acked
+            if played_ms <= self._acked_ms.get(response_id, 0) and not completion_ack_due:
+                continue
+            await client.send(
+                {
+                    "type": "playback.ack",
+                    "response_id": response_id,
+                    "item_id": f"item_{response_id}",
+                    "played_ms": played_ms,
+                    "committed_ms": played_ms,
+                }
+            )
+            self._acked_ms[response_id] = played_ms
+            if response_id in self._completed_responses:
+                self._completion_acked.add(response_id)
 
 
 def http_url_to_ws_url(url: str) -> str:
@@ -94,7 +204,75 @@ def _ref_audio_data_url(path: str | None) -> str | None:
     return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
-def extract_pcm16_from_video(video_path: Path) -> bytes:
+def probe_video_duration_s(video_path: Path) -> float:
+    """Return source-video duration without decoding the full file."""
+    if shutil.which("ffprobe") is not None:
+        proc = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                str(video_path),
+            ],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if proc.returncode == 0:
+            try:
+                duration = float(proc.stdout.strip())
+            except ValueError:
+                duration = 0.0
+            if math.isfinite(duration) and duration > 0:
+                return duration
+
+    try:
+        import imageio.v3 as iio
+
+        metadata = iio.immeta(str(video_path))
+        duration = float(metadata.get("duration") or 0.0)
+        if duration > 0 and math.isfinite(duration):
+            return duration
+        fps = float(metadata.get("fps") or 0.0)
+        frame_count = float(metadata.get("nframes") or metadata.get("n_frames") or 0.0)
+        if fps > 0 and frame_count > 0:
+            return frame_count / fps
+    except Exception:
+        pass
+    raise RuntimeError(f"Could not determine video duration: {video_path}")
+
+
+def validate_realtime_video_fps(fps: float) -> float:
+    """Validate the cadence supported by the MiniCPM duplex adapter.
+
+    Stage0 consumes at most one queued image for each roughly one-second model
+    unit.  Accepting a higher rate would silently delay frames into later units
+    and make accuracy numbers meaningless.
+    """
+    value = float(fps)
+    if not math.isfinite(value) or value <= 0:
+        raise ValueError("OmniInteract realtime video fps must be finite and positive")
+    if value > 1.0:
+        raise ValueError(
+            "OmniInteract MiniCPM duplex supports at most 1 video frame per second; "
+            f"got {value:g}. Higher rates queue stale frames in later model units."
+        )
+    return value
+
+
+def validate_realtime_chunk_ms(chunk_ms: int) -> int:
+    """Validate one append cannot span multiple one-second model units."""
+    value = int(chunk_ms)
+    if value <= 0 or value > 1000:
+        raise ValueError("OmniInteract realtime chunk size must be in the range [1, 1000] ms")
+    return value
+
+
+def extract_pcm16_from_video(video_path: Path, *, duration_s: float | None = None) -> bytes:
     """Extract mono 16 kHz PCM16 from a video, matching OmniInteract MiniCPM-o."""
     if shutil.which("ffmpeg") is None:
         raise RuntimeError("ffmpeg is required to extract OmniInteract duplex audio from video")
@@ -118,13 +296,25 @@ def extract_pcm16_from_video(video_path: Path) -> bytes:
     proc = subprocess.run(cmd, capture_output=True, check=False)
     if proc.returncode != 0:
         raise RuntimeError(f"ffmpeg failed to extract audio from {video_path}: {proc.stderr.decode('utf-8', 'ignore')}")
-    return proc.stdout
+    pcm16 = proc.stdout
+    if duration_s is None:
+        return pcm16
+    # The official runner steps the model for ceil(video_duration) one-second
+    # units.  Keep video-only tails by padding a shorter audio track with silence.
+    target_bytes = int(math.ceil(duration_s) * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+    if len(pcm16) < target_bytes:
+        return pcm16 + bytes(target_bytes - len(pcm16))
+    return pcm16[:target_bytes]
 
 
-def sample_video_jpeg_frames(video_path: Path, fps: float) -> list[str]:
-    """Sample one JPEG frame per ``1/fps`` seconds in presentation order."""
-    if fps <= 0:
-        raise ValueError("video fps must be positive")
+def sample_video_jpeg_frames(
+    video_path: Path,
+    fps: float,
+    *,
+    duration_s: float | None = None,
+) -> list[str | None]:
+    """Sample midpoint frames, matching the official pseudo-online runner."""
+    fps = validate_realtime_video_fps(fps)
     try:
         import imageio.v3 as iio
         from PIL import Image
@@ -139,17 +329,24 @@ def sample_video_jpeg_frames(video_path: Path, fps: float) -> list[str]:
         video_fps = float(meta.get("fps") or 30.0)
     except Exception:
         pass
-    step = max(1, int(round(video_fps / fps)))
-    frames_b64: list[str] = []
+    if duration_s is None:
+        duration_s = probe_video_duration_s(video_path)
+    sample_count = max(1, int(math.ceil(duration_s * fps)))
+    target_indices = [int((sample_index + 0.5) * video_fps / fps) for sample_index in range(sample_count)]
+    frames_b64: list[str | None] = [None] * sample_count
+    target_cursor = 0
     for idx, frame in enumerate(iio.imiter(str(video_path))):
-        if idx % step != 0:
+        if target_cursor >= len(target_indices):
+            break
+        if idx < target_indices[target_cursor]:
             continue
-        image = Image.fromarray(frame)
-        # Keep frames small enough for realtime append validation.
-        image.thumbnail((640, 640))
-        buffer = io.BytesIO()
-        image.save(buffer, format="JPEG", quality=85)
-        frames_b64.append(base64.b64encode(buffer.getvalue()).decode("ascii"))
+        while target_cursor < len(target_indices) and idx >= target_indices[target_cursor]:
+            image = Image.fromarray(frame)
+            image.thumbnail((640, 640))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=85)
+            frames_b64[target_cursor] = base64.b64encode(buffer.getvalue()).decode("ascii")
+            target_cursor += 1
     return frames_b64
 
 
@@ -303,18 +500,26 @@ async def _stream_pcm16_with_video(
     *,
     chunk_ms: int,
     realtime: bool,
-    video_frames: list[str],
-) -> None:
-    chunk_bytes = max(
-        PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
-        PCM16_BYTES_PER_SAMPLE,
-    )
+    video_frames: list[str | None],
+    video_fps: float,
+    playback_acknowledger: RealtimePlaybackAcknowledger | None = None,
+) -> tuple[int, int, float, float]:
+    chunk_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000
+    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     audio_end_ms = 0
-    frames_sent = 0
+    frame_cursor = 0
+    audio_chunks_sent = 0
+    video_frames_sent = 0
+    pacing_start_s = time.monotonic()
+    pacing_lags_s: list[float] = []
     for offset in range(0, len(pcm16), chunk_bytes):
+        if realtime:
+            expected_send_s = pacing_start_s + offset / bytes_per_second
+            pacing_lags_s.append(max(0.0, time.monotonic() - expected_send_s))
         chunk = pcm16[offset : offset + chunk_bytes]
-        duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
-        audio_end_ms += duration_ms
+        next_audio_end_ms = (offset + len(chunk)) * 1000 // bytes_per_second
+        duration_ms = next_audio_end_ms - audio_end_ms
+        audio_end_ms = next_audio_end_ms
         payload: dict[str, object] = {
             "type": "input_audio_buffer.append",
             "audio": base64.b64encode(chunk).decode("ascii"),
@@ -323,14 +528,34 @@ async def _stream_pcm16_with_video(
             "duration_ms": duration_ms,
             "audio_end_ms": audio_end_ms,
         }
-        # Official MiniCPM-o cadence: one camera frame per ~1 s of audio.
-        if video_frames and audio_end_ms > frames_sent * 1000:
-            frame_index = min(frames_sent, len(video_frames) - 1)
-            payload["video_frames"] = [video_frames[frame_index]]
-            frames_sent += 1
+        # Each sampled frame represents the midpoint of its source-video
+        # interval. Attach it before the corresponding one-second model unit is
+        # formed, rather than front-loading the first frame at t=0.
+        ready_frames: list[str] = []
+        while frame_cursor < len(video_frames):
+            frame_time_ms = (frame_cursor + 0.5) * 1000.0 / video_fps
+            if audio_end_ms < frame_time_ms:
+                break
+            frame = video_frames[frame_cursor]
+            if frame:
+                ready_frames.append(frame)
+            frame_cursor += 1
+        if ready_frames:
+            payload["video_frames"] = ready_frames
         await client.send(payload)
+        audio_chunks_sent += 1
+        video_frames_sent += len(ready_frames)
         if realtime:
-            await asyncio.sleep(duration_ms / 1000)
+            if playback_acknowledger is not None:
+                await playback_acknowledger.acknowledge(client, client.events)
+            deadline_s = pacing_start_s + audio_end_ms / 1000
+            await asyncio.sleep(max(0.0, deadline_s - time.monotonic()))
+    if realtime:
+        final_deadline_s = pacing_start_s + audio_end_ms / 1000
+        pacing_lags_s.append(max(0.0, time.monotonic() - final_deadline_s))
+    pacing_mean_lag_s = sum(pacing_lags_s) / len(pacing_lags_s) if pacing_lags_s else 0.0
+    pacing_max_lag_s = max(pacing_lags_s, default=0.0)
+    return audio_chunks_sent, video_frames_sent, pacing_mean_lag_s, pacing_max_lag_s
 
 
 async def _drain_active_responses(
@@ -350,6 +575,80 @@ def _event_index(events: list[dict[str, object]], event_type: str, after: int) -
         (index for index, event in enumerate(events[after:], start=after) if event.get("type") == event_type),
         None,
     )
+
+
+def _committed_input_watermark(event: dict[str, object]) -> tuple[str, int, int]:
+    session_id = event.get("session_id")
+    epoch = event.get("epoch")
+    accepted_input_seq = event.get("accepted_input_seq")
+    if (
+        not isinstance(session_id, str)
+        or not session_id
+        or not isinstance(epoch, int)
+        or isinstance(epoch, bool)
+        or not isinstance(accepted_input_seq, int)
+        or isinstance(accepted_input_seq, bool)
+    ):
+        raise RuntimeError(
+            "Official OmniInteract accuracy requires input_audio_buffer.committed "
+            "to include session_id, epoch, and accepted_input_seq"
+        )
+    return session_id, epoch, accepted_input_seq
+
+
+def _processed_input_event(
+    events: list[dict[str, object]],
+    *,
+    after: int,
+    session_id: str,
+    epoch: int,
+    accepted_input_seq: int,
+) -> dict[str, object] | None:
+    for event in events[after + 1 :]:
+        if event.get("type") != "input_audio_buffer.processed":
+            continue
+        processed_input_seq = event.get("processed_input_seq")
+        if (
+            event.get("session_id") == session_id
+            and event.get("epoch") == epoch
+            and isinstance(processed_input_seq, int)
+            and not isinstance(processed_input_seq, bool)
+            and processed_input_seq == accepted_input_seq
+        ):
+            return event
+    return None
+
+
+def _response_done_event_for_id(
+    events: list[dict[str, object]], *, after: int, response_id: str
+) -> dict[str, object] | None:
+    for event in events[after + 1 :]:
+        if event.get("type") != "response.done":
+            continue
+        response = event.get("response")
+        event_response_id = response.get("id") if isinstance(response, dict) else event.get("response_id")
+        if event_response_id == response_id:
+            return event
+    return None
+
+
+def _validate_final_response_done(event: dict[str, object]) -> None:
+    response = event.get("response")
+    status = response.get("status") if isinstance(response, dict) else event.get("status")
+    if status != "completed":
+        raise RuntimeError(f"The final response ended with status {status!r}")
+
+
+def _final_processing_outcome(event: dict[str, object]) -> tuple[str, str | None]:
+    outcome = event.get("outcome")
+    if outcome == "failed":
+        raise RuntimeError("The runtime reported that the final accepted input failed")
+    if outcome not in {"listen", "speak"}:
+        raise RuntimeError(f"Invalid final input processing outcome: {outcome!r}")
+    response_id = event.get("response_id")
+    if outcome == "speak" and (not isinstance(response_id, str) or not response_id):
+        raise RuntimeError("A processed speak outcome has no response_id")
+    return outcome, response_id if isinstance(response_id, str) else None
 
 
 def _post_commit_decision(events: list[dict[str, object]], committed_index: int) -> bool:
@@ -389,6 +688,11 @@ async def run_omniinteract_realtime_session(
     video_path: Path,
     session_key: str,
     slots: list[OmniInteractQASlot],
+    subset: str = "",
+    video_rel: str = "",
+    annotation_path: Path | None = None,
+    scene_type: str = "multi_turn",
+    official_output_root: Path | None = None,
     ref_audio: str | None = None,
     chunk_ms: int = 200,
     video_fps: float = 1.0,
@@ -396,16 +700,31 @@ async def run_omniinteract_realtime_session(
     timeout_s: float = 120.0,
 ) -> OmniInteractRealtimeSessionResult:
     result = OmniInteractRealtimeSessionResult(session_key=session_key)
-    session_start = time.monotonic()
     commit_completed = False
     wait_error = ""
-    pcm16, video_frames = await asyncio.gather(
-        asyncio.to_thread(extract_pcm16_from_video, video_path),
-        asyncio.to_thread(sample_video_jpeg_frames, video_path, video_fps),
-    )
+    close_error = ""
+    pacing_error = ""
+    output_validation_error = ""
+    preprocess_start_s = time.monotonic()
+    try:
+        validate_realtime_video_fps(video_fps)
+        validate_realtime_chunk_ms(chunk_ms)
+        if official_output_root is not None and not realtime_pacing:
+            raise ValueError("Official OmniInteract accuracy output requires realtime pacing")
+        if official_output_root is not None and (chunk_ms != 200 or video_fps != 1.0):
+            raise ValueError("Official OmniInteract accuracy output requires 200 ms PCM chunks and 1 FPS video")
+        video_duration_s = await asyncio.to_thread(probe_video_duration_s, video_path)
+        pcm16, video_frames = await asyncio.gather(
+            asyncio.to_thread(extract_pcm16_from_video, video_path, duration_s=video_duration_s),
+            asyncio.to_thread(sample_video_jpeg_frames, video_path, video_fps, duration_s=video_duration_s),
+        )
+    except Exception as exc:
+        result.preprocess_s = time.monotonic() - preprocess_start_s
+        result.error = str(exc)
+        return result
+    result.preprocess_s = time.monotonic() - preprocess_start_s
     if not pcm16:
         result.error = f"No audio extracted from video: {video_path}"
-        result.latency_s = time.monotonic() - session_start
         return result
     # When ref_audio is supplied via session.update, disable server-side
     # autostart so the duplex session does not reject the socket for missing
@@ -417,6 +736,8 @@ async def run_omniinteract_realtime_session(
         session_id=session_key,
     )
 
+    session_start_s = time.monotonic()
+    request_done_s: float | None = None
     try:
         async with RealtimeDuplexClient(ws_url) as client:
             await client.configure(
@@ -427,12 +748,20 @@ async def run_omniinteract_realtime_session(
             )
             stream_start_s = time.monotonic()
             before_created = client.events.count("response.created")
-            await _stream_pcm16_with_video(
+            playback_acknowledger = RealtimePlaybackAcknowledger() if realtime_pacing else None
+            (
+                input_audio_chunks,
+                input_video_frames,
+                result.pacing_mean_lag_s,
+                result.pacing_max_lag_s,
+            ) = await _stream_pcm16_with_video(
                 client,
                 pcm16,
                 chunk_ms=chunk_ms,
                 realtime=realtime_pacing,
                 video_frames=video_frames,
+                video_fps=video_fps,
+                playback_acknowledger=playback_acknowledger,
             )
             commit_cursor = len(client.events.events)
             await client.commit()
@@ -453,16 +782,61 @@ async def run_omniinteract_realtime_session(
                     commit_cursor,
                 )
                 assert committed_index is not None
-                events_at_commit = client.events.events[: committed_index + 1]
-                if _has_residual_model_unit(pcm16, events_at_commit) or _response_in_progress(events_at_commit):
-                    await wait_for(
-                        lambda: _post_commit_decision(client.events.events, committed_index),
-                        timeout_s=timeout_s,
-                        label="post-commit model decision or response drain",
+                if official_output_root is not None:
+                    session_id, epoch, accepted_input_seq = _committed_input_watermark(
+                        client.events.events[committed_index]
                     )
+                    await wait_for(
+                        lambda: _processed_input_event(
+                            client.events.events,
+                            after=-1,
+                            session_id=session_id,
+                            epoch=epoch,
+                            accepted_input_seq=accepted_input_seq,
+                        )
+                        is not None,
+                        timeout_s=timeout_s,
+                        label="final accepted input to be processed",
+                    )
+                    processed_event = _processed_input_event(
+                        client.events.events,
+                        after=-1,
+                        session_id=session_id,
+                        epoch=epoch,
+                        accepted_input_seq=accepted_input_seq,
+                    )
+                    assert processed_event is not None
+                    outcome, response_id = _final_processing_outcome(processed_event)
+                    if outcome == "speak":
+                        assert response_id is not None
+                        await wait_for(
+                            lambda: _response_done_event_for_id(
+                                client.events.events,
+                                after=-1,
+                                response_id=response_id,
+                            )
+                            is not None,
+                            timeout_s=timeout_s,
+                            label=f"final response {response_id} to finish",
+                        )
+                        response_done = _response_done_event_for_id(
+                            client.events.events,
+                            after=-1,
+                            response_id=response_id,
+                        )
+                        assert response_done is not None
+                        _validate_final_response_done(response_done)
+                else:
+                    events_at_commit = client.events.events[: committed_index + 1]
+                    if _has_residual_model_unit(pcm16, events_at_commit) or _response_in_progress(events_at_commit):
+                        await wait_for(
+                            lambda: _post_commit_decision(client.events.events, committed_index),
+                            timeout_s=timeout_s,
+                            label="post-commit model decision or response drain",
+                        )
                 await _drain_active_responses(client.events, timeout_s=timeout_s)
                 commit_completed = True
-            except TimeoutError as exc:
+            except (RuntimeError, TimeoutError) as exc:
                 wait_error = str(exc)
 
             used_slots: set[int] = set()
@@ -573,22 +947,97 @@ async def run_omniinteract_realtime_session(
             # Keep per-response rows for performance; replace eval rows.
             result.turn_outputs = collapsed
 
-            await client.acknowledge_playback()
+            request_done_s = time.monotonic()
+            result.latency_s = request_done_s - session_start_s
+            if playback_acknowledger is not None:
+                await playback_acknowledger.acknowledge(client, client.events, now_s=request_done_s)
+            else:
+                # Non-realtime mode is for load debugging only. It has no
+                # meaningful playback clock, so acknowledge the completed audio.
+                await client.acknowledge_playback()
             try:
                 await client.close_session(timeout_s=min(timeout_s, 20.0))
             except TimeoutError as exc:
-                logger.warning("OmniInteract session close acknowledgement timed out: %s", exc)
+                close_error = f"Session close acknowledgement timed out: {exc}"
+                logger.warning("OmniInteract %s", close_error)
+
+            if official_output_root is not None:
+                from vllm_omni.benchmarks.data_modules.omniinteract_official import (
+                    build_official_failure_summary,
+                    write_official_session_artifacts,
+                )
+
+                protocol_errors = client.events.errors()
+                if result.pacing_max_lag_s > chunk_ms / 1000:
+                    pacing_error = (
+                        f"Realtime pacing lag {result.pacing_max_lag_s:.3f}s exceeded one {chunk_ms}ms input chunk"
+                    )
+                status = (
+                    "ok"
+                    if commit_completed and not protocol_errors and not close_error and not pacing_error
+                    else "error"
+                )
+                try:
+                    result.official_summary = await asyncio.to_thread(
+                        write_official_session_artifacts,
+                        output_root=official_output_root,
+                        subset=subset,
+                        video_rel=video_rel or video_path.name,
+                        video_path=video_path,
+                        annotation_path=annotation_path,
+                        scene_type=scene_type,
+                        duration_s=video_duration_s,
+                        inference_s=request_done_s - stream_start_s,
+                        collector=client.events,
+                        stream_start_s=stream_start_s,
+                        status=status,
+                        preprocess_s=result.preprocess_s,
+                        error=wait_error
+                        or close_error
+                        or pacing_error
+                        or (str(protocol_errors[-1]) if protocol_errors else ""),
+                        input_audio_chunks=input_audio_chunks,
+                        input_video_frames=input_video_frames,
+                        pacing_mean_lag_s=result.pacing_mean_lag_s,
+                        pacing_max_lag_s=result.pacing_max_lag_s,
+                    )
+                except ValueError as exc:
+                    output_validation_error = str(exc)
+                    result.official_summary = await asyncio.to_thread(
+                        build_official_failure_summary,
+                        output_root=official_output_root,
+                        subset=subset,
+                        video_rel=video_rel or video_path.name,
+                        video_path=video_path,
+                        annotation_path=annotation_path,
+                        scene_type=scene_type,
+                        error=output_validation_error,
+                    )
     except Exception as exc:
         result.error = str(exc)
         result.success = False
-        result.latency_s = time.monotonic() - session_start
+        result.latency_s = (request_done_s or time.monotonic()) - session_start_s
         return result
 
-    result.latency_s = time.monotonic() - session_start
+    if request_done_s is None:
+        request_done_s = time.monotonic()
+        result.latency_s = request_done_s - session_start_s
     protocol_errors = client.events.errors()
-    result.success = commit_completed and not protocol_errors
+    result.success = (
+        commit_completed
+        and not protocol_errors
+        and not close_error
+        and not pacing_error
+        and not output_validation_error
+    )
     if not result.success and wait_error:
         result.error = wait_error
+    elif not result.success and close_error:
+        result.error = close_error
+    elif not result.success and pacing_error:
+        result.error = pacing_error
+    elif not result.success and output_validation_error:
+        result.error = output_validation_error
     elif not result.success and protocol_errors:
         last_error = protocol_errors[-1]
         result.error = str(last_error.get("error") or last_error.get("message") or last_error)

@@ -28,6 +28,32 @@ class MiniCPMO45ServingSessionState:
     pending_silence_task: asyncio.Task[bool] | None = None
     pending_silence_owner_id: str | None = None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None = None
+    accepted_input_epoch: int = -1
+    accepted_input_seq: int = 0
+    accepted_input_seqs: set[int] = field(default_factory=set)
+
+    def record_accepted_input(self, *, epoch: int, seq: int) -> None:
+        if epoch != self.accepted_input_epoch:
+            self.accepted_input_epoch = epoch
+            self.accepted_input_seq = 0
+            self.accepted_input_seqs.clear()
+        self.accepted_input_seqs.add(seq)
+        if seq > self.accepted_input_seq:
+            self.accepted_input_seq = seq
+
+    def accepted_input_watermark(self, *, epoch: int) -> int | None:
+        if epoch != self.accepted_input_epoch or self.accepted_input_seq <= 0:
+            return None
+        return self.accepted_input_seq
+
+    def mark_input_processed(self, *, epoch: int, seq: int) -> bool:
+        if seq <= 0 or epoch != self.accepted_input_epoch or seq not in self.accepted_input_seqs:
+            return False
+        # The set represents accepted inputs still waiting for their model
+        # decision. Removing the sequence both deduplicates late output and
+        # bounds memory by the processing backlog rather than Session length.
+        self.accepted_input_seqs.remove(seq)
+        return True
 
     def retain_committed_audio(
         self,

@@ -97,6 +97,7 @@ class NativeRuntimeBridgeMixin:
         send_json,
         mode: str = "append_tokens",
         expected_epoch: int | None = None,
+        track_input_watermark: bool = True,
     ) -> tuple[bool, bool]:
         if not session.capabilities.supports_input_append:
             return True, False
@@ -150,6 +151,13 @@ class NativeRuntimeBridgeMixin:
             return False, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        if track_input_watermark and isinstance(result, dict):
+            accepted_input_seq = self._accepted_input_seq(result)
+            if accepted_input_seq is not None:
+                self._runtime_session_state(session).record_accepted_input(
+                    epoch=session.epoch,
+                    seq=accepted_input_seq,
+                )
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         request_id, _ = self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
         if request_id is not None:
@@ -185,6 +193,28 @@ class NativeRuntimeBridgeMixin:
             )
             return False, emitted_response
         return True, emitted_response
+
+    @classmethod
+    def _accepted_input_seq(cls, value: object) -> int | None:
+        if isinstance(value, dict):
+            seq = value.get("accepted_input_seq")
+            if not isinstance(seq, bool) and isinstance(seq, int) and seq > 0:
+                return seq
+            result = value.get("result")
+            if isinstance(result, dict) and result.get("supported") is True:
+                seq = result.get("seq")
+                if not isinstance(seq, bool) and isinstance(seq, int) and seq > 0:
+                    return seq
+            for child in value.values():
+                found = cls._accepted_input_seq(child)
+                if found is not None:
+                    return found
+        elif isinstance(value, list | tuple):
+            for child in value:
+                found = cls._accepted_input_seq(child)
+                if found is not None:
+                    return found
+        return None
 
     @staticmethod
     def _callable_accepts_keyword(fn, name: str) -> bool:
@@ -786,6 +816,13 @@ class NativeRuntimeBridgeMixin:
             return close_reason, emitted_response
         if isinstance(native_result.get("error_code"), str):
             response_id = session.active_response_id
+            await self._emit_input_processed(
+                send_json,
+                session=session,
+                native_result=native_result,
+                outcome="failed",
+                response_id=response_id,
+            )
             await send_json(
                 {
                     "type": "error",
@@ -878,6 +915,12 @@ class NativeRuntimeBridgeMixin:
                 "reason": native_result.get("reason") or "model_listen",
                 "model_listen": model_listen,
             }
+            await self._emit_input_processed(
+                send_json,
+                session=session,
+                native_result=native_result,
+                outcome="listen",
+            )
             self._attach_native_runtime_metadata(payload, native_result)
             await send_json(payload)
             if native_result.get("abort_data_plane_request") is True and isinstance(data_plane_request_id, str):
@@ -952,6 +995,12 @@ class NativeRuntimeBridgeMixin:
                     "reason": "model_turn_completed_without_output",
                     "model_listen": True,
                 }
+                await self._emit_input_processed(
+                    send_json,
+                    session=session,
+                    native_result=native_result,
+                    outcome="listen",
+                )
                 self._attach_native_runtime_metadata(payload, native_result)
                 await send_json(payload)
             return close_reason, emitted_response
@@ -985,6 +1034,13 @@ class NativeRuntimeBridgeMixin:
                     epoch=session.epoch,
                 )
             )
+        await self._emit_input_processed(
+            send_json,
+            session=session,
+            native_result=native_result,
+            outcome="speak",
+            response_id=response_id,
+        )
         response_stage_metrics = session.accumulate_response_stage_metrics(
             native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
         )
@@ -1113,6 +1169,32 @@ class NativeRuntimeBridgeMixin:
                 }
             )
         return close_reason, emitted_response
+
+    async def _emit_input_processed(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        native_result: dict[str, object],
+        outcome: str,
+        response_id: str | None = None,
+    ) -> None:
+        input_seq = coerce_int(native_result.get("input_seq"))
+        if input_seq is None or input_seq <= 0:
+            return
+        native = self._runtime_session_state(session)
+        if not native.mark_input_processed(epoch=session.epoch, seq=input_seq):
+            return
+        payload: dict[str, object] = {
+            "type": "input.processed",
+            "session_id": session.session_id,
+            "epoch": session.epoch,
+            "processed_input_seq": input_seq,
+            "outcome": outcome,
+        }
+        if isinstance(response_id, str) and response_id:
+            payload["response_id"] = response_id
+        await send_json(payload)
 
     async def _end_active_response_before_future_model_turn(
         self,

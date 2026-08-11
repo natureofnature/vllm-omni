@@ -73,12 +73,14 @@ class OmniInteractSampleRequest(SampleRequest):
     omniinteract_official_compatible: bool = False
     omniinteract_session_key: str = ""
     omniinteract_video_path: str = ""
+    omniinteract_annotation_path: str = ""
     omniinteract_slots: list[OmniInteractQASlot] = field(default_factory=list)
     omniinteract_realtime_chunk_ms: int = 200
     omniinteract_realtime_video_fps: float = 1.0
     omniinteract_realtime_ref_audio: str | None = None
     omniinteract_realtime_pace: bool = True
     omniinteract_realtime_timeout_s: float = 900.0
+    omniinteract_official_output_root: str | None = None
 
 
 @dataclass
@@ -86,6 +88,7 @@ class _OmniInteractSession:
     subset: str
     video_rel: str
     video_path: Path
+    annotation_path: Path
     scene_type: str
     slots: list[OmniInteractQASlot]
 
@@ -441,6 +444,7 @@ class OmniInteractDataset(BenchmarkDataset):
                         subset=subset,
                         video_rel=video_rel,
                         video_path=video_path,
+                        annotation_path=ann_path,
                         scene_type=scene_type,
                         slots=slots,
                     )
@@ -481,6 +485,7 @@ class OmniInteractDataset(BenchmarkDataset):
                     subset=subset,
                     video_rel=video_rel,
                     video_path=video_path,
+                    annotation_path=ann_path,
                     scene_type="1qna",
                     slots=slots,
                 )
@@ -550,6 +555,7 @@ class OmniInteractDataset(BenchmarkDataset):
                     omniinteract_official_compatible=False,
                     omniinteract_session_key=f"{session.subset}:{session.video_rel}",
                     omniinteract_video_path=str(session.video_path.resolve()),
+                    omniinteract_annotation_path=str(session.annotation_path.resolve()),
                     omniinteract_slots=list(session.slots),
                 )
             )

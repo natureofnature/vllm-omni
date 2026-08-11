@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import copy
 import io
 import json
 import mimetypes
@@ -62,6 +63,46 @@ RETURN_STAGE_METRICS_FIELD = "return_stage_metrics"
 _IMAGE_STAGE_METRICS_BACKENDS = frozenset({"openai-image-edits-omni"})
 _PRINT_STAGE = False
 _BENCH_NO_STREAM = False
+
+_CONTINUOUS_SESSION_UNDEFINED_RESULT_FIELDS = (
+    "total_input_tokens",
+    "total_output_tokens",
+    "output_throughput",
+    "total_token_throughput",
+    defs.TOTAL_AUDIO_DURATION_S,
+    defs.TOTAL_AUDIO_FRAMES,
+    defs.AUDIO_THROUGHPUT,
+    defs.TOTAL_IMAGES,
+    defs.IMAGE_THROUGHPUT,
+    defs.AVERAGE_PIXELS_PER_IMAGE,
+    defs.MEAN_DENOISE_STEP_LATENCY_MS,
+    "input_lens",
+    "output_lens",
+    "ttfts",
+    "itls",
+    "max_output_tokens_per_s",
+    "rtfx",
+)
+
+
+def _project_continuous_session_result(result: dict[str, Any]) -> dict[str, Any]:
+    for field_name in _CONTINUOUS_SESSION_UNDEFINED_RESULT_FIELDS:
+        result.pop(field_name, None)
+    for field_name in list(result):
+        if field_name.startswith(("mean_", "median_")):
+            metric_name = field_name.split("_", 1)[1]
+        elif field_name.startswith("p") and "_" in field_name:
+            percentile, metric_name = field_name.split("_", 1)
+            if not percentile[1:].replace(".", "", 1).isdigit():
+                continue
+        else:
+            continue
+        if metric_name.startswith(("ttft_", "tpot_", "itl_", "audio_")):
+            result.pop(field_name, None)
+    result["omniinteract_realtime_metric_scope"] = (
+        "continuous_session; generic token, TPOT, ITL, and output-modality throughput metrics are undefined"
+    )
+    return result
 
 
 def maybe_enable_stage_metrics(extra_body: dict[str, Any] | None, *, enabled: bool) -> dict[str, Any] | None:
@@ -217,12 +258,38 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
         return
     setattr(rfi, "omniinteract_session_key", sample.omniinteract_session_key)
     setattr(rfi, "omniinteract_video_path", sample.omniinteract_video_path)
+    setattr(rfi, "omniinteract_annotation_path", sample.omniinteract_annotation_path)
+    setattr(rfi, "omniinteract_subset", sample.omniinteract_subset)
+    setattr(rfi, "omniinteract_video_rel", sample.omniinteract_video)
+    setattr(rfi, "omniinteract_scene_type", sample.omniinteract_scene_type)
     setattr(rfi, "omniinteract_slots", sample.omniinteract_slots)
     setattr(rfi, "omniinteract_realtime_chunk_ms", sample.omniinteract_realtime_chunk_ms)
     setattr(rfi, "omniinteract_realtime_video_fps", sample.omniinteract_realtime_video_fps)
     setattr(rfi, "omniinteract_realtime_ref_audio", sample.omniinteract_realtime_ref_audio)
     setattr(rfi, "omniinteract_realtime_pace", sample.omniinteract_realtime_pace)
     setattr(rfi, "omniinteract_realtime_timeout_s", sample.omniinteract_realtime_timeout_s)
+    setattr(rfi, "omniinteract_official_output_root", sample.omniinteract_official_output_root)
+
+
+def _omniinteract_failure_summary(request: RequestFuncInput, error: str) -> dict[str, Any] | None:
+    output_root = getattr(request, "omniinteract_official_output_root", None)
+    if not output_root:
+        return None
+    from vllm_omni.benchmarks.data_modules.omniinteract_official import (
+        build_official_failure_summary,
+    )
+
+    video_path = getattr(request, "omniinteract_video_path", None)
+    annotation_path = getattr(request, "omniinteract_annotation_path", None)
+    return build_official_failure_summary(
+        output_root=Path(output_root).expanduser(),
+        subset=str(getattr(request, "omniinteract_subset", "") or "unknown"),
+        video_rel=str(getattr(request, "omniinteract_video_rel", "") or request.request_id),
+        video_path=Path(video_path) if video_path else None,
+        annotation_path=Path(annotation_path) if annotation_path else None,
+        scene_type=str(getattr(request, "omniinteract_scene_type", "multi_turn") or "multi_turn"),
+        error=error,
+    )
 
 
 def _hf_repo_from_args(args, supported_paths: set[str]) -> str | None:
@@ -419,6 +486,30 @@ def get_samples(args, tokenizer):
                 f"(got backend={args.backend!r})."
             )
 
+        from vllm_omni.benchmarks.data_modules.omniinteract_realtime import (
+            validate_realtime_chunk_ms,
+            validate_realtime_video_fps,
+        )
+
+        chunk_ms = validate_realtime_chunk_ms(int(getattr(args, "omniinteract_realtime_chunk_ms", 200)))
+        video_fps = validate_realtime_video_fps(float(getattr(args, "omniinteract_realtime_video_fps", 1.0)))
+        official_output = getattr(args, "omniinteract_official_output_dir", None)
+        if getattr(args, "omniinteract_eval", False):
+            raise ValueError(
+                "--omniinteract-eval does not implement the official continuous-session slot/judge rules. "
+                "Use --omniinteract-official-output-dir and run_official_eval.py for accuracy."
+            )
+        accuracy_mode = bool(official_output)
+        realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
+        if accuracy_mode and not getattr(args, "no_oversample", False):
+            raise ValueError("OmniInteract accuracy runs require --no-oversample to avoid duplicate samples.")
+        if accuracy_mode and not realtime_pace:
+            raise ValueError(
+                "OmniInteract accuracy runs require realtime pacing; remove --omniinteract-realtime-no-pace."
+            )
+        if official_output and (chunk_ms != 200 or video_fps != 1.0):
+            raise ValueError("Official OmniInteract accuracy output requires 200 ms PCM chunks and 1 FPS video.")
+
         dataset_path = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
         omniinteract_root = getattr(args, "omniinteract_root", None)
         if args.dataset_name == "omniinteract" and not dataset_path and not omniinteract_root:
@@ -463,13 +554,17 @@ def get_samples(args, tokenizer):
         for sample in samples:
             if not isinstance(sample, OmniInteractSampleRequest):
                 continue
-            sample.omniinteract_realtime_chunk_ms = int(getattr(args, "omniinteract_realtime_chunk_ms", 200) or 200)
-            sample.omniinteract_realtime_video_fps = float(getattr(args, "omniinteract_realtime_video_fps", 1.0) or 1.0)
+            sample.omniinteract_realtime_chunk_ms = chunk_ms
+            sample.omniinteract_realtime_video_fps = video_fps
             sample.omniinteract_realtime_ref_audio = getattr(args, "omniinteract_realtime_ref_audio", None)
-            sample.omniinteract_realtime_pace = not getattr(args, "omniinteract_realtime_no_pace", False)
+            sample.omniinteract_realtime_pace = realtime_pace
             sample.omniinteract_realtime_timeout_s = float(
                 getattr(args, "omniinteract_realtime_timeout_s", 900.0) or 900.0
             )
+            sample.omniinteract_official_output_root = official_output
+            # A benchmark request owns one server Session. Source-media identity
+            # alone is unsafe when load-mode oversampling repeats a video.
+            sample.omniinteract_session_key = f"{sample.omniinteract_session_key}:{sample.request_id}"
         return samples
     if args.dataset_name == "random-mm":
         dataset = OmniRandomMultiModalDataset(random_seed=args.seed, dataset_path=args.dataset_path)
@@ -529,6 +624,10 @@ class MixRequestFuncOutput(RequestFuncOutput):
     final_output_type: str | None = None
     omniinteract_session_turn_metrics: list[Any] | None = None
     omniinteract_turn_outputs: list[dict[str, Any]] | None = None
+    omniinteract_official_summary: dict[str, Any] | None = None
+    omniinteract_official_output_root: str | None = None
+    omniinteract_pacing_mean_lag_s: float = 0.0
+    omniinteract_pacing_max_lag_s: float = 0.0
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -1487,23 +1586,29 @@ async def async_request_minicpmo_realtime(
     )
 
     output = MixRequestFuncOutput()
-    output.prompt_len = request_func_input.prompt_len
+    # A continuous audio/video Session has no single text prompt token count.
+    # Report zero here and expose per-turn/full-session metrics separately.
+    output.prompt_len = 0
     output.start_time = time.perf_counter()
+    official_output_root = getattr(request_func_input, "omniinteract_official_output_root", None)
+    output.omniinteract_official_output_root = str(official_output_root) if official_output_root else None
     slots = getattr(request_func_input, "omniinteract_slots", None) or []
     video_path = getattr(request_func_input, "omniinteract_video_path", None)
     session_key = getattr(request_func_input, "omniinteract_session_key", None) or request_func_input.request_id
     if not video_path:
         output.success = False
         output.error = "OmniInteract realtime request is missing session video path."
+        output.omniinteract_official_summary = _omniinteract_failure_summary(request_func_input, output.error)
         if pbar:
             pbar.update(1)
         return output
 
-    chunk_ms = int(getattr(request_func_input, "omniinteract_realtime_chunk_ms", 200) or 200)
+    chunk_ms = int(getattr(request_func_input, "omniinteract_realtime_chunk_ms", 200))
     video_fps = float(getattr(request_func_input, "omniinteract_realtime_video_fps", 1.0) or 1.0)
     ref_audio = getattr(request_func_input, "omniinteract_realtime_ref_audio", None)
     realtime_pacing = bool(getattr(request_func_input, "omniinteract_realtime_pace", True))
     timeout_s = float(getattr(request_func_input, "omniinteract_realtime_timeout_s", 900.0) or 900.0)
+    annotation_path = getattr(request_func_input, "omniinteract_annotation_path", None)
 
     try:
         session_result = await run_omniinteract_realtime_session(
@@ -1512,6 +1617,11 @@ async def async_request_minicpmo_realtime(
             video_path=Path(video_path),
             slots=slots,
             session_key=str(session_key),
+            subset=str(getattr(request_func_input, "omniinteract_subset", "") or ""),
+            video_rel=str(getattr(request_func_input, "omniinteract_video_rel", "") or ""),
+            annotation_path=Path(annotation_path) if annotation_path else None,
+            scene_type=str(getattr(request_func_input, "omniinteract_scene_type", "multi_turn") or "multi_turn"),
+            official_output_root=Path(official_output_root).expanduser() if official_output_root else None,
             ref_audio=ref_audio,
             chunk_ms=chunk_ms,
             video_fps=video_fps,
@@ -1521,6 +1631,7 @@ async def async_request_minicpmo_realtime(
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
+        output.omniinteract_official_summary = _omniinteract_failure_summary(request_func_input, output.error)
         if pbar:
             pbar.update(1)
         return output
@@ -1531,11 +1642,19 @@ async def async_request_minicpmo_realtime(
     output.ttft = session_result.ttft_s
     output.text_latency = session_result.ttft_s
     output.audio_rtf = session_result.audio_rtf
-    output.generated_text = (
-        session_result.turn_outputs[-1].get("generated_text", "") if session_result.turn_outputs else ""
+    output.generated_text = "\n".join(
+        text for row in session_result.turn_outputs if (text := str(row.get("generated_text") or "").strip())
     )
     output.omniinteract_session_turn_metrics = session_result.turn_metrics
     output.omniinteract_turn_outputs = session_result.turn_outputs
+    output.omniinteract_pacing_mean_lag_s = session_result.pacing_mean_lag_s
+    output.omniinteract_pacing_max_lag_s = session_result.pacing_max_lag_s
+    output.omniinteract_official_summary = session_result.official_summary
+    if output.omniinteract_official_summary is None and official_output_root:
+        output.omniinteract_official_summary = _omniinteract_failure_summary(
+            request_func_input,
+            session_result.error or "OmniInteract session failed before official artifacts were written.",
+        )
     if pbar:
         pbar.update(1)
     return output
@@ -1621,6 +1740,12 @@ async def benchmark(
     ssl_context: ssl.SSLContext | bool | None = None,
     self_timed: bool = False,
 ):
+    continuous_omniinteract = endpoint_type == "minicpmo-realtime"
+    if continuous_omniinteract and any(metric in goodput_config_dict for metric in ("ttft", "tpot", "audio_ttft")):
+        raise ValueError(
+            "Generic TTFT/TPOT/audio TTFT goodput is undefined for a continuous Duplex Session; "
+            "use the OmniInteract per-response metrics instead."
+        )
     try:
         request_func = ASYNC_REQUEST_FUNCS[endpoint_type]
     except KeyError:
@@ -1677,8 +1802,17 @@ async def benchmark(
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract_to_request_func_input(input_requests[0], test_input)
+    if endpoint_type == "minicpmo-realtime":
+        # Warmups, when explicitly requested, must not overwrite measured
+        # official artifacts for the first video.
+        setattr(test_input, "omniinteract_official_output_root", None)
 
-    if ready_check_timeout_sec > 0:
+    if endpoint_type == "minicpmo-realtime":
+        # A realtime request is a complete 150-300 second source video, not a
+        # cheap endpoint probe. Replaying the first sample here would duplicate
+        # its model state, artifacts, and accuracy contribution.
+        print("Skipping initial prompt test for continuous OmniInteract sessions.")
+    elif ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
             request_func,
             test_input,
@@ -1702,12 +1836,17 @@ async def benchmark(
         warmup_semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else contextlib.nullcontext()
         warmup_tasks = []
 
-        async def warmup_limited_request_func():
+        async def warmup_limited_request_func(warmup_index: int):
             async with warmup_semaphore:
-                return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
+                warmup_input = copy.deepcopy(test_input)
+                session_key = getattr(warmup_input, "omniinteract_session_key", None)
+                if session_key:
+                    warmup_input.omniinteract_session_key = f"{session_key}:warmup:{warmup_index}"
+                    warmup_input.omniinteract_official_output_root = None
+                return await request_func(request_func_input=warmup_input, session=session, pbar=warmup_pbar)
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
+        for warmup_index in range(num_warmups):
+            request_task = asyncio.create_task(warmup_limited_request_func(warmup_index))
             warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)
 
@@ -1836,6 +1975,26 @@ async def benchmark(
         )
     outputs: list[MixRequestFuncOutput] = await asyncio.gather(*tasks)
 
+    official_summaries = [
+        output.omniinteract_official_summary
+        for output in outputs
+        if isinstance(output.omniinteract_official_summary, dict)
+    ]
+    official_roots = {
+        output.omniinteract_official_output_root for output in outputs if output.omniinteract_official_output_root
+    }
+    if official_summaries:
+        if len(official_roots) != 1:
+            raise ValueError("OmniInteract official artifacts must use one output root per benchmark run.")
+        from vllm_omni.benchmarks.data_modules.omniinteract_official import (
+            write_official_batch_files,
+        )
+
+        output_root = Path(next(iter(official_roots))).expanduser()
+        batch_path, manifest_path = write_official_batch_files(output_root, official_summaries)
+        print(f"OmniInteract official batch summary: {batch_path}")
+        print(f"OmniInteract official evaluation manifest: {manifest_path}")
+
     if pbar is not None:
         pbar.close()
 
@@ -1855,6 +2014,7 @@ async def benchmark(
             request_rate=request_rate,
             benchmark_duration=benchmark_duration,
             print_stage=_PRINT_STAGE,
+            continuous_session=continuous_omniinteract,
         )
     else:
         metrics = calculate_metrics_for_embeddings(
@@ -1951,7 +2111,40 @@ async def benchmark(
     for output in outputs:
         session_turn_metrics.extend(getattr(output, "omniinteract_session_turn_metrics", None) or [])
     if session_turn_metrics:
-        result.update(summarize_turn_metrics(session_turn_metrics))
+        turn_summary = summarize_turn_metrics(session_turn_metrics)
+        result.update(turn_summary)
+        session_outputs = [
+            output for output in outputs if output.success and output.omniinteract_session_turn_metrics is not None
+        ]
+        first_response_ttfts = [output.ttft for output in session_outputs if output.ttft > 0]
+        result["omniinteract_realtime_session_count"] = len(session_outputs)
+        result["omniinteract_realtime_session_first_response_ttft_mean_s"] = (
+            sum(first_response_ttfts) / len(first_response_ttfts) if first_response_ttfts else None
+        )
+        print("\n{s:{c}^{n}}".format(s=" OmniInteract Duplex Result ", n=50, c="="))
+        print("{:<40} {:<10}".format("Completed Sessions:", len(session_outputs)))
+        print("{:<40} {:<10}".format("Model responses:", turn_summary["omniinteract_realtime_turn_count"]))
+        session_ttft = result["omniinteract_realtime_session_first_response_ttft_mean_s"]
+        response_ttft = turn_summary["omniinteract_realtime_turn_ttft_mean_s"]
+        response_tpot = turn_summary["omniinteract_realtime_turn_tpot_mean_s"]
+        response_rtf = turn_summary["omniinteract_realtime_turn_rtf_mean"]
+        if session_ttft is not None:
+            print("{:<40} {:<10.2f}".format("Mean first-response TTFT / Session (ms):", session_ttft * 1000))
+        if response_ttft is not None:
+            print("{:<40} {:<10.2f}".format("Mean TTFT / response (ms):", response_ttft * 1000))
+        if response_tpot is not None:
+            print("{:<40} {:<10.2f}".format("Mean TPOT / response (ms):", response_tpot * 1000))
+        if response_rtf is not None:
+            print("{:<40} {:<10.3f}".format("Mean audio RTF / response:", response_rtf))
+        print("=" * 50)
+    pacing_outputs = [output for output in outputs if output.omniinteract_session_turn_metrics is not None]
+    if pacing_outputs:
+        pacing_mean_lags = [output.omniinteract_pacing_mean_lag_s for output in pacing_outputs]
+        pacing_max_lags = [output.omniinteract_pacing_max_lag_s for output in pacing_outputs]
+        result["omniinteract_pacing_mean_lag_s"] = (
+            sum(pacing_mean_lags) / len(pacing_mean_lags) if pacing_mean_lags else 0.0
+        )
+        result["omniinteract_pacing_max_lag_s"] = max(pacing_max_lags, default=0.0)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
@@ -2023,6 +2216,9 @@ async def benchmark(
     else:
         result_percentile_metrics.append("e2el")
         process_one_metric("e2el")
+
+    if continuous_omniinteract:
+        _project_continuous_session_result(result)
 
     if profile:
         print("Stopping profiler...")
