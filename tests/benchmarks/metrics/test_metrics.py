@@ -217,5 +217,33 @@ def test_text_benchmark_still_reports_ttft(capsys):
     assert "Time to First Token" in out, "text benchmarks must keep TTFT"
 
 
+def test_continuous_session_prints_generic_token_metrics_as_na(capsys):
+    output = _make_output(0, output_tokens=10)
+    output.ttft = 0.7
+    output.itl = [0.02, 0.03]
+
+    calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=10.0,
+        tokenizer=_EmptyAwareTokenizer(),
+        selected_percentiles=[99.0],
+        goodput_config_dict={},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=["ttft", "tpot", "itl", "e2el"],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=10.0,
+        continuous_session=True,
+    )
+
+    rendered = capsys.readouterr().out
+    assert "Token / TPOT / ITL metrics:" in rendered
+    assert "N/A" in rendered
+    assert "Mean TTFT" not in rendered
+    assert "Mean TPOT" not in rendered
+    assert "Mean ITL" not in rendered
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "-s"])

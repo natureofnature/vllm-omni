@@ -355,6 +355,7 @@ class DuplexSessionRunnerMixin:
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
+                        track_input_watermark=not silence_continuation,
                     )
                     if append_ok:
                         if pcm_reservation is not None:
@@ -1638,6 +1639,7 @@ class DuplexSessionRunnerMixin:
                                     committed=committed,
                                     realtime_item_id=event.get("realtime_item_id"),
                                     transcript=event.get("transcript"),
+                                    include_accepted_input_watermark=final_payload is None,
                                 )
                             )
                             if final_payload is not None:
