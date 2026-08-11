@@ -1,4 +1,0 @@
-interface:
-  display_name: "Disaggregate an Omni Model"
-  short_description: "Design non-async vLLM-Omni stage boundaries"
-  default_prompt: "Use $disaggregate-omni-model to design and validate an async_chunk=false multi-stage boundary for this vLLM-Omni model."

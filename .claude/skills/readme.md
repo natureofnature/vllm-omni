@@ -32,8 +32,8 @@ self-check.
   performance optimization, including profiling traces, parallel strategies,
   stage timing analysis, and benchmark-driven tuning
 - [`disaggregate-deploy-model`](disaggregate-deploy-model/SKILL.md): guides
-  multi-stage disaggregation deployment for stage-boundary analysis, transfer
-  ownership, implementation mapping, and verification
+  multi-stage disaggregation deployment, including stage-boundary analysis,
+  transfer ownership, implementation mapping, and verification
 - [`precheck-pr`](precheck-pr/SKILL.md): self-checks a branch before creating a
   PR by validating title format, dead code, accuracy and performance claims,
   and merge readiness

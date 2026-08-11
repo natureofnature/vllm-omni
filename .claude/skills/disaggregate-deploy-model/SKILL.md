@@ -1,9 +1,9 @@
 ---
-name: disaggregate-omni-model
+name: disaggregate-deploy-model
 description: Design, implement, review, and validate an async_chunk=false multi-stage boundary for a vLLM-Omni model. Use when adding or changing non-async stage topology, completed-stage-output handoff, full-payload transport, KV transfer, scheduler readiness coordination, or cross-stage request and output semantics.
 ---
 
-# Disaggregate an Omni Model
+# Disaggregate Model Deployment
 
 Define each stage boundary as a semantic contract, prove that the downstream
 stage can reconstruct its inputs, and then map the contract to vLLM-Omni.

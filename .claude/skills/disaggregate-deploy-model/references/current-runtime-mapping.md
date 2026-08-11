@@ -112,6 +112,13 @@ list, and submits one prompt. `StagePool.submit_initial()` rejects a remaining
 list prompt. Put request expansion and CFG companion collection in their
 declared hooks, then return one assembled diffusion prompt.
 
+## Additional Model Examples
+
+| Model | Example boundary | Contract focus |
+|---|---|---|
+| HunyuanImage3 | Existing AR to DiT edge | `HUNYUAN_IMAGE3_PIPELINE` and `ar2diffusion` convert completed AR text and token-derived resolution, together with original multimodal input, into one diffusion request |
+| MiniMax-H3 | Candidate DiT to video/audio VAE decode edge | Transfer terminal `video_latent`, `audio_latent`, `height`, and `width`; prove independent VAE construction and acceptable transfer cost before implementation |
+
 ## Verification Entry Points
 
 Resolve these paths and test names from the current checkout. Use the
