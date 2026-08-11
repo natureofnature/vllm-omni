@@ -42,6 +42,7 @@ from vllm_omni.benchmarks.data_modules.omniinteract_eval import (  # noqa: E402
 )
 from vllm_omni.benchmarks.patch.patch import (  # noqa: E402
     _attach_omniinteract_to_request_func_input,
+    get_samples,
 )
 
 
@@ -150,6 +151,7 @@ def test_omniinteract_dataset_builds_full_video_duplex_sessions(omniinteract_roo
     assert req.omniinteract_slots[0].subset == "1q1a"
     assert req.omniinteract_slots[0].video_rel == "videos/0001.mp4"
     assert req.omniinteract_video_path.endswith("videos/0001.mp4")
+    assert req.omniinteract_annotation_path.endswith("annotations/0001.json")
 
 
 def test_omniinteract_dataset_rejects_unknown_subset(omniinteract_root: Path):
@@ -171,6 +173,75 @@ def test_omniinteract_dataset_attaches_realtime_session_fields(omniinteract_root
     _attach_omniinteract_to_request_func_input(req, request_input)
     assert request_input.omniinteract_slots == req.omniinteract_slots
     assert request_input.omniinteract_video_path == req.omniinteract_video_path
+    assert request_input.omniinteract_annotation_path == req.omniinteract_annotation_path
+
+
+def _omniinteract_benchmark_args(root: Path, **overrides):
+    values = {
+        "dataset_name": "omniinteract",
+        "backend": "minicpmo-realtime",
+        "dataset_path": str(root),
+        "hf_name": None,
+        "omniinteract_root": None,
+        "omniinteract_subsets": "1q1a",
+        "omniinteract_eval": False,
+        "omniinteract_official_output_dir": None,
+        "omniinteract_realtime_video_fps": 1.0,
+        "omniinteract_realtime_no_pace": False,
+        "omniinteract_realtime_chunk_ms": 200,
+        "omniinteract_realtime_ref_audio": None,
+        "omniinteract_realtime_timeout_s": 30.0,
+        "no_oversample": True,
+        "num_prompts": 1,
+        "seed": 0,
+        "request_id_prefix": "req-",
+        "disable_shuffle": True,
+        "output_len": 16,
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
+def test_omniinteract_benchmark_uses_unique_server_session_key(omniinteract_root: Path, mock_tokenizer):
+    [request] = get_samples(_omniinteract_benchmark_args(omniinteract_root), mock_tokenizer)
+    assert request.omniinteract_session_key == "1q1a:videos/0001.mp4:req-0"
+
+
+def test_omniinteract_oversampling_keeps_server_sessions_isolated(omniinteract_root: Path, mock_tokenizer):
+    requests = get_samples(
+        _omniinteract_benchmark_args(omniinteract_root, num_prompts=3, no_oversample=False),
+        mock_tokenizer,
+    )
+
+    assert len(requests) == 3
+    assert len({request.request_id for request in requests}) == 3
+    assert len({request.omniinteract_session_key for request in requests}) == 3
+
+
+def test_omniinteract_accuracy_rejects_oversampling(omniinteract_root: Path, mock_tokenizer):
+    args = _omniinteract_benchmark_args(
+        omniinteract_root,
+        omniinteract_official_output_dir="/tmp/official-output",
+        no_oversample=False,
+    )
+    with pytest.raises(ValueError, match="require --no-oversample"):
+        get_samples(args, mock_tokenizer)
+
+
+def test_omniinteract_accuracy_rejects_unpaced_mode(omniinteract_root: Path, mock_tokenizer):
+    args = _omniinteract_benchmark_args(
+        omniinteract_root,
+        omniinteract_official_output_dir="/tmp/official-output",
+        omniinteract_realtime_no_pace=True,
+    )
+    with pytest.raises(ValueError, match="require realtime pacing"):
+        get_samples(args, mock_tokenizer)
+
+
+def test_omniinteract_realtime_rejects_nonofficial_proxy_eval(omniinteract_root: Path, mock_tokenizer):
+    args = _omniinteract_benchmark_args(omniinteract_root, omniinteract_eval=True)
+    with pytest.raises(ValueError, match="does not implement the official continuous-session"):
+        get_samples(args, mock_tokenizer)
 
 
 def test_omniinteract_1qna_loads_continuous_videos_bench_sessions(tmp_path: Path, mock_tokenizer):

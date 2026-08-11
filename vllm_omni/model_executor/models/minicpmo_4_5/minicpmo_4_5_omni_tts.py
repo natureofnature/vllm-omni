@@ -432,6 +432,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         native_duplex_flags: list[torch.Tensor] = []
         duplex_epochs: list[torch.Tensor] = []
         duplex_turn_ids: list[torch.Tensor] = []
+        duplex_input_seqs: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
         empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
@@ -444,6 +445,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     duplex_info = {}
                 epoch = duplex_info.get("epoch", -1)
                 turn_id = duplex_info.get("turn_id", -1)
+                input_seq = duplex_info.get("input_seq", -1)
                 if native_duplex and not all(
                     isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in (epoch, turn_id)
                 ):
@@ -471,6 +473,9 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 native_duplex_flags.append(torch.tensor(native_duplex, dtype=torch.bool))
                 duplex_epochs.append(torch.tensor(epoch if isinstance(epoch, int) else -1, dtype=torch.long))
                 duplex_turn_ids.append(torch.tensor(turn_id if isinstance(turn_id, int) else -1, dtype=torch.long))
+                duplex_input_seqs.append(
+                    torch.tensor(input_seq if isinstance(input_seq, int) else -1, dtype=torch.long)
+                )
                 segment_texts_utf8.append(
                     torch.tensor(
                         list(segment_text.encode("utf-8")),
@@ -555,6 +560,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     "native_duplex": native_duplex_flags,
                     "duplex_epoch": duplex_epochs,
                     "duplex_turn_id": duplex_turn_ids,
+                    "duplex_input_seq": duplex_input_seqs,
                     "llm_output_text_utf8": segment_texts_utf8,
                     "turn_end": turn_end_flags,
                 }

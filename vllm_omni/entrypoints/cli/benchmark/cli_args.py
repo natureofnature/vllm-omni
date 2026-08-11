@@ -184,13 +184,25 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "--omniinteract-eval",
         action="store_true",
         default=False,
-        help="Compute OmniInteract QA metrics (IA-QTF1/IDS/NCCS). Disabled by default.",
+        help=(
+            "Legacy per-request proxy metrics. Unsupported by the continuous-session realtime backend; "
+            "use --omniinteract-official-output-dir and the upstream evaluator for accuracy."
+        ),
     )
     group.add_argument(
         "--omniinteract-save-eval-items",
         action="store_true",
         default=False,
         help="When --omniinteract-eval is set, include per-request OmniInteract eval rows in result JSON.",
+    )
+    group.add_argument(
+        "--omniinteract-official-output-dir",
+        type=str,
+        default=None,
+        help=(
+            "Write output.wav, response/event JSONL, native transcripts, batch_summary.json, "
+            "and an official-evaluator manifest below this directory."
+        ),
     )
     group.add_argument(
         "--omniinteract-realtime-chunk-ms",
@@ -202,7 +214,10 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "--omniinteract-realtime-video-fps",
         type=float,
         default=1.0,
-        help="Video frame sampling rate for --backend minicpmo-realtime.",
+        help=(
+            "Video frame sampling rate for --backend minicpmo-realtime. "
+            "Current MiniCPM duplex accuracy runs support at most 1 FPS."
+        ),
     )
     group.add_argument(
         "--omniinteract-realtime-ref-audio",
@@ -214,7 +229,10 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "--omniinteract-realtime-no-pace",
         action="store_true",
         default=False,
-        help="Disable realtime pacing and send PCM/video appends as fast as possible.",
+        help=(
+            "Disable realtime pacing for load/debug runs. This mode is incompatible "
+            "with OmniInteract accuracy evaluation and official output."
+        ),
     )
     group.add_argument(
         "--omniinteract-realtime-timeout-s",
