@@ -65,14 +65,6 @@ class BatchedToken2Wav(nn.Module):
         self._token2wav = token2wav
         self.flow = token2wav.flow
         self.hift = token2wav.hift
-        # The upstream streaming path preallocates fixed-size CFM and DiT
-        # caches. This adapter never calls that path and supplies dynamically
-        # sized request-owned buffers to ``blocks_forward_chunk`` instead.
-        decoder = self.flow.decoder
-        for module in (decoder, decoder.estimator):
-            for buffer_name in ("att_cache_buffer", "cnn_cache_buffer"):
-                if buffer_name in module._buffers:
-                    setattr(module, buffer_name, None)
         hift_parameter = next(self.hift.parameters(), None)
         if hift_parameter is not None and hift_parameter.device.type == "cuda":
             # Prime the CUDA state used by HiFT during backend construction.
