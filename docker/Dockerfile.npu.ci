@@ -32,6 +32,7 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "pytest-cov>=4.0.0" \
       "pytest-mock>=3.10.0" \
       "openpyxl>=3.0.0" \
+      "opencc==1.4.1" \
       "psutil>=7.2.0" \
       "soundfile>=0.13.1" \
       "pyttsx3>=2.99" \
@@ -40,6 +41,10 @@ RUN source /usr/local/Ascend/ascend-toolkit/set_env.sh && \
       "hyperpyyaml>=1.2.0" \
       "onnx>=1.16.0" \
       "librosa>=0.10.0" \
+      "jiwer>=4.0.0" \
+      "zhon>=2.1.1" \
+      "zhconv>=1.4.3" \
+      "datasets>=3.0.0" \
       --index-url http://cache-service.nginx-pypi-cache.svc.cluster.local/pypi/simple \
       --trusted-host cache-service.nginx-pypi-cache.svc.cluster.local \
       --default-timeout=60 && \

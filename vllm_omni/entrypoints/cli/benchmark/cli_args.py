@@ -16,7 +16,6 @@ by ``add_omni_args``.
 """
 
 import argparse
-import os
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -97,12 +96,96 @@ def add_daily_omni_cli_args(parser: argparse.ArgumentParser) -> None:
         "and matches official separate video/audio streams.",
     )
     group.add_argument(
+        "--daily-omni-pack-mode",
+        type=str,
+        choices=["qwen", "minicpm-interleave"],
+        default="qwen",
+        help="How to pack multimodal parts into OpenAI chat messages. "
+        "'qwen' (default): one video_url + one audio_url (Daily-Omni/Qwen protocol). "
+        "'minicpm-interleave': MiniCPM-o official recipe — 1fps frames interleaved with "
+        "matching 1s audio segments as image_url/audio_url pairs (needed to approach "
+        "OpenBMB ~80%% Daily-Omni; requires local Videos extract). For MiniCPM-o 4.5 "
+        "string chat templates also start the server with --interleave-mm-strings.",
+    )
+    group.add_argument(
         "--daily-omni-save-eval-items",
         action="store_true",
         default=False,
         help="Include per-request Daily-Omni accuracy rows (gold/predicted/correct) "
         "in the saved JSON under key daily_omni_eval_items. "
         "Alternatively set env DAILY_OMNI_SAVE_EVAL_ITEMS=1.",
+    )
+
+
+def add_videomme_cli_args(parser: argparse.ArgumentParser) -> None:
+    """Add CLI arguments specific to the Video-MME dataset."""
+    group = parser.add_argument_group("Video-MME Dataset Options")
+    group.add_argument(
+        "--videomme-parquet",
+        type=str,
+        default=None,
+        help="Path to local Video-MME parquet "
+        "(e.g. videomme/test-00000-of-00001.parquet). When set, Hub QA loading is skipped.",
+    )
+    group.add_argument(
+        "--videomme-video-dir",
+        type=str,
+        default=None,
+        help="Directory containing extracted Video-MME videos (videoID.mp4). "
+        "Typical layout after unzipping videos_chunked_*.zip: <root>/video/. "
+        "When using file:// URLs, start the server with --allowed-local-media-path "
+        "covering this directory.",
+    )
+    group.add_argument(
+        "--videomme-subtitle-dir",
+        type=str,
+        default=None,
+        help="Directory containing Video-MME .srt subtitles (videoID.srt). Used only with --videomme-use-subtitle.",
+    )
+    group.add_argument(
+        "--videomme-pack-mode",
+        type=str,
+        choices=["minicpm-frames", "minicpm-interleave", "video_url"],
+        default="minicpm-frames",
+        help="Multimodal packing. "
+        "'minicpm-frames' (default): OmniEvalKit MiniCPM videomme recipe — sampled frames "
+        "as image_url only (max_frames=96). "
+        "'minicpm-interleave': OmniEvalKit videomme_short recipe — 1fps frame/audio pairs "
+        "(max_frames=64). "
+        "'video_url': single video_url part (models with native video input).",
+    )
+    group.add_argument(
+        "--videomme-max-frames",
+        type=int,
+        default=None,
+        help="Override max sampled frames (OmniEvalKit defaults: 96 for minicpm-frames, 64 for minicpm-interleave).",
+    )
+    group.add_argument(
+        "--videomme-duration",
+        type=str,
+        choices=["all", "short", "medium", "long"],
+        default="all",
+        help="Filter by Video-MME duration bucket (default: all).",
+    )
+    group.add_argument(
+        "--videomme-use-subtitle",
+        action="store_true",
+        default=False,
+        help="Prepend subtitle text to the user prompt (Video-MME w/ subs setting).",
+    )
+    group.add_argument(
+        "--videomme-inline-local-video",
+        action="store_true",
+        default=False,
+        help="Embed local frames/audio as base64 data URLs so the server does not need "
+        "--allowed-local-media-path. Increases request size; use for small --num-prompts.",
+    )
+    group.add_argument(
+        "--videomme-save-eval-items",
+        action="store_true",
+        default=False,
+        help="Include per-request Video-MME accuracy rows in the saved JSON under "
+        "videomme_eval_items. Or set env VIDEOMME_SAVE_EVAL_ITEMS=1.",
     )
 
 
@@ -115,6 +198,13 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
         choices=["en", "zh"],
         default="en",
         help="Which Seed-TTS split to load: en/meta.lst or zh/meta.lst under the dataset root.",
+    )
+    group.add_argument(
+        "--seed-tts-turns-per-session",
+        type=int,
+        default=1,
+        help="Group this many Seed-TTS target texts into one Realtime session. "
+        "The first row's reference audio and transcript are reused for every turn.",
     )
     group.add_argument(
         "--seed-tts-root",
@@ -164,90 +254,20 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for the OmniInteract benchmark dataset."""
-    group = parser.add_argument_group("OmniInteract Dataset Options")
-    group.add_argument(
-        "--omniinteract-root",
-        type=str,
-        default=None,
-        help="Local OmniInteract extracted data root (contains 1q1a/1q1a_math/1qna, or a parent with data/). "
-        "If omitted, benchmark downloads data.tar.gz from --dataset-path/--hf-name (default lucky-lance/OmniInteract).",
-    )
-    group.add_argument(
-        "--omniinteract-subsets",
-        type=str,
-        default="1q1a,1q1a_math,1qna",
-        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'. "
-        "Each request is one continuous full-video duplex session.",
-    )
-    group.add_argument(
-        "--omniinteract-eval",
-        action="store_true",
-        default=False,
-        help=(
-            "Legacy per-request proxy metrics. Unsupported by the continuous-session realtime backend; "
-            "use --omniinteract-official-output-dir and the upstream evaluator for accuracy."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-save-eval-items",
-        action="store_true",
-        default=False,
-        help="When --omniinteract-eval is set, include per-request OmniInteract eval rows in result JSON.",
-    )
-    group.add_argument(
-        "--omniinteract-official-output-dir",
-        type=str,
-        default=None,
-        help=(
-            "Write output.wav, response/event JSONL, native transcripts, batch_summary.json, "
-            "and an official-evaluator manifest below this directory."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-realtime-chunk-ms",
-        type=int,
-        default=200,
-        help="PCM append chunk size for --backend minicpmo-realtime.",
-    )
-    group.add_argument(
-        "--omniinteract-realtime-video-fps",
-        type=float,
-        default=1.0,
-        help=(
-            "Video frame sampling rate for --backend minicpmo-realtime. "
-            "Current MiniCPM duplex accuracy runs support at most 1 FPS."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-realtime-ref-audio",
-        type=str,
-        default=None,
-        help="Reference WAV path for MiniCPM-o full-duplex voice cloning in realtime mode.",
-    )
-    group.add_argument(
-        "--omniinteract-realtime-no-pace",
-        action="store_true",
-        default=False,
-        help=(
-            "Disable realtime pacing for load/debug runs. This mode is incompatible "
-            "with OmniInteract accuracy evaluation and official output."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-realtime-timeout-s",
-        type=float,
-        default=900.0,
-        help=(
-            "Per-session timeout for --backend minicpmo-realtime waiters "
-            "(session.created / commit / drain). OmniInteract videos are "
-            "typically 150–300s; keep this above post-stream response drain."
-        ),
-    )
+    group = parser.add_argument_group("OmniInteract")
+    group.add_argument("--omniinteract-root", default=None, help="Extracted dataset directory")
+    group.add_argument("--omniinteract-subsets", default="1q1a,1q1a_math,1qna")
+    group.add_argument("--omniinteract-official-output-dir", default=None)
+    group.add_argument("--omniinteract-realtime-ref-audio", default=None)
+    group.add_argument("--omniinteract-realtime-chunk-ms", type=int, default=200)
+    group.add_argument("--omniinteract-realtime-video-fps", type=float, default=1.0)
+    group.add_argument("--omniinteract-realtime-timeout-s", type=float, default=900.0)
+    group.add_argument("--omniinteract-realtime-no-pace", action="store_true")
 
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "videomme",
     "omniinteract",
     "seed-tts",
     "seed-tts-text",
@@ -319,6 +339,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_videomme_cli_args(parser)
     add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
@@ -327,10 +348,6 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
-    if getattr(args, "omniinteract_eval", False):
-        os.environ["OMNIINTERACT_EVAL"] = "1"
-    if getattr(args, "omniinteract_save_eval_items", False):
-        os.environ["OMNIINTERACT_SAVE_EVAL_ITEMS"] = "1"
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:

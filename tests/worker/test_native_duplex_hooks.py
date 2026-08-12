@@ -2475,3 +2475,165 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
     assert len(state.context_embeds) == 6
+
+
+# ---------------------------------------------------------------------------
+# Cross-platform wiring: every AR model runner must reach the duplex hook.
+#
+# ``GPUARModelRunner`` and ``NPUARModelRunner`` are siblings -- neither inherits
+# the other's ``_sample`` -- so the NPU runner once carried a copy of the GPU
+# ``_sample`` with the ``prepare_duplex_sampling`` call dropped.  That left the
+# MiniCPM-o 4.5 thinker without a row -> session map on Ascend, so every mid-turn
+# ``<|listen|>`` was emitted verbatim and the model stopped speaking after turn 1.
+#
+# These checks parse the source instead of importing it: the NPU runner needs
+# ``vllm_ascend``, which is absent on the CPU test images that run this file.
+# ---------------------------------------------------------------------------
+
+# method that must call it -> mixin method it must call
+_REQUIRED_DUPLEX_CALLS = {
+    "__init__": "_init_duplex_sampling_state",
+    "load_model": "_resolve_duplex_sampling_hook",
+    "_update_states": "_update_duplex_sampling_states",
+    "_sample": "_apply_duplex_sampling",
+}
+
+# The sampler ``_sample`` hands the prepared logits to.  ``_apply_duplex_sampling``
+# both masks those logits (force_listen) and publishes the row -> session map the
+# model's own sampler reads, so calling it *after* this is the same silent no-op as
+# not calling it at all.
+_MODEL_SAMPLER_CALL = "model_sample"
+
+
+def _repo_root():
+    from pathlib import Path
+
+    return Path(__file__).parents[2]
+
+
+def _ar_runner_sources():
+    """Every AR model runner in the repo, discovered rather than hand-listed.
+
+    A new platform runner is picked up automatically instead of silently escaping
+    the checks below.  ``vllm_omni/worker/gpu_ar_model_runner.py`` is named
+    separately because it does not live under ``platforms/``.
+    """
+    root = _repo_root()
+    paths = [root / "vllm_omni/worker/gpu_ar_model_runner.py"]
+    paths.extend(sorted(root.glob("vllm_omni/platforms/*/worker/*_ar_model_runner.py")))
+    return paths
+
+
+def _ar_runner_classdefs():
+    """``{class_name: (ClassDef, relative_path)}`` for every ``*ARModelRunner``."""
+    import ast
+
+    root = _repo_root()
+    found = {}
+    for path in _ar_runner_sources():
+        module = ast.parse(path.read_text())
+        for node in module.body:
+            if isinstance(node, ast.ClassDef) and node.name.endswith("ARModelRunner"):
+                found[node.name] = (node, str(path.relative_to(root)))
+    assert found, "no AR model runners discovered; the glob in _ar_runner_sources() is stale"
+    return found
+
+
+def _method_calls(method):
+    """``{attribute_name: first lineno}`` for every ``x.y(...)`` call in ``method``."""
+    import ast
+
+    calls = {}
+    for node in ast.walk(method):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            calls.setdefault(node.func.attr, node.lineno)
+    return calls
+
+
+def _wires_duplex_sampling_directly(classdef) -> bool:
+    import ast
+
+    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+    if "DuplexSamplingRunnerMixin" not in bases:
+        return False
+    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
+    return all(
+        method_name in methods and required_call in _method_calls(methods[method_name])
+        for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items()
+    )
+
+
+def test_every_ar_runner_reaches_the_duplex_sampling_hook():
+    """Each AR runner must wire the hook itself or inherit from one that does.
+
+    ``XPUARModelRunner`` derives from ``GPUARModelRunner`` and so is wired for free;
+    ``NPUARModelRunner`` derives from ``OmniNPUModelRunner``, which is not an AR
+    runner, so it has to do the wiring itself.  Asserting every discovered class
+    wires directly would wrongly fail the XPU runner.
+    """
+    import ast
+
+    classdefs = _ar_runner_classdefs()
+    wired = {name for name, (classdef, _path) in classdefs.items() if _wires_duplex_sampling_directly(classdef)}
+
+    for class_name, (classdef, path) in sorted(classdefs.items()):
+        if class_name in wired:
+            continue
+        base_names = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+        assert base_names & wired, (
+            f"{path}::{class_name} neither wires the duplex sampling hook nor derives from a "
+            f"runner that does (wired runners: {sorted(wired)}).  Inherit DuplexSamplingRunnerMixin "
+            f"and call {sorted(_REQUIRED_DUPLEX_CALLS.values())} from "
+            f"{sorted(_REQUIRED_DUPLEX_CALLS)} respectively."
+        )
+
+
+@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
+def test_ar_runner_calls_every_duplex_sampling_hook_site(class_name: str):
+    import ast
+
+    classdefs = _ar_runner_classdefs()
+    assert class_name in classdefs, f"{class_name} not found by _ar_runner_sources()"
+    classdef, path = classdefs[class_name]
+
+    bases = {base.id for base in classdef.bases if isinstance(base, ast.Name)}
+    assert "DuplexSamplingRunnerMixin" in bases, (
+        f"{path}::{class_name} must inherit DuplexSamplingRunnerMixin so the duplex "
+        f"sampling hook is wired the same way on every platform"
+    )
+
+    methods = {node.name: node for node in classdef.body if isinstance(node, ast.FunctionDef)}
+    for method_name, required_call in _REQUIRED_DUPLEX_CALLS.items():
+        method = methods.get(method_name)
+        assert method is not None, f"{path}::{class_name}.{method_name} is missing; it must call {required_call}"
+        calls = _method_calls(method)
+        assert required_call in calls, f"{path}::{class_name}.{method_name} must call self.{required_call}"
+
+
+@pytest.mark.parametrize("class_name", ["GPUARModelRunner", "NPUARModelRunner"])
+def test_ar_runner_applies_duplex_sampling_before_the_model_sampler(class_name: str):
+    """Ordering is load-bearing: the hook must run before the sampler reads the logits."""
+    import ast
+
+    classdef, path = _ar_runner_classdefs()[class_name]
+    sample = next(node for node in classdef.body if isinstance(node, ast.FunctionDef) and node.name == "_sample")
+
+    apply_lineno = _method_calls(sample).get("_apply_duplex_sampling")
+    sampler_lineno = next(
+        (
+            node.lineno
+            for node in ast.walk(sample)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == _MODEL_SAMPLER_CALL
+        ),
+        None,
+    )
+    assert apply_lineno is not None, f"{path}::{class_name}._sample must call self._apply_duplex_sampling"
+    assert sampler_lineno is not None, (
+        f"{path}::{class_name}._sample no longer calls {_MODEL_SAMPLER_CALL}(); update _MODEL_SAMPLER_CALL "
+        f"so the ordering check keeps testing something"
+    )
+    assert apply_lineno < sampler_lineno, (
+        f"{path}::{class_name}._sample calls self._apply_duplex_sampling at line {apply_lineno}, after "
+        f"{_MODEL_SAMPLER_CALL}() at line {sampler_lineno}.  The hook masks the logits and publishes the "
+        f"row -> session map the sampler reads, so running it afterwards is a silent no-op."
+    )
