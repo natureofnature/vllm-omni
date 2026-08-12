@@ -50,6 +50,8 @@ class _FakeEstimator(nn.Module):
         self.blocks = [_FakeBlock()]
         self.cfg_batches: list[int] = []
         self.speaker_order: list[list[float]] = []
+        self.register_buffer("att_cache_buffer", torch.ones(1), persistent=False)
+        self.register_buffer("cnn_cache_buffer", torch.ones(1), persistent=False)
 
     def t_embedder(self, time):
         return time[:, None]
@@ -79,6 +81,8 @@ class _FakeDecoder(nn.Module):
         self.estimator = _FakeEstimator()
         self.inference_cfg_rate = 0.7
         self.register_buffer("rand_noise", torch.zeros(1, 1, 100), persistent=False)
+        self.register_buffer("att_cache_buffer", torch.ones(1), persistent=False)
+        self.register_buffer("cnn_cache_buffer", torch.ones(1), persistent=False)
 
 
 class _FakeFlow(nn.Module):
@@ -156,6 +160,24 @@ def _model():
     model = MiniCPMO45Code2Wav(vllm_config=_config())
     model.backend = backend
     return model, token2wav
+
+
+def test_adapter_releases_unused_upstream_streaming_buffers():
+    token2wav = _FakeToken2Wav()
+    decoder = token2wav.flow.decoder
+    modules = (decoder, decoder.estimator)
+
+    assert all(
+        getattr(module, name) is not None for module in modules for name in ("att_cache_buffer", "cnn_cache_buffer")
+    )
+
+    BatchedToken2Wav(token2wav)
+
+    assert all(
+        name in module._buffers and getattr(module, name) is None
+        for module in modules
+        for name in ("att_cache_buffer", "cnn_cache_buffer")
+    )
 
 
 def test_code2wav_resolves_hf_model_id_for_assets(mocker, tmp_path):
