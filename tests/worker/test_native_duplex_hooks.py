@@ -519,6 +519,7 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
                     "special_token_ids": {"listen_token_id": 702},
                     "epoch": 4,
                     "seq": 12,
+                    "input_seq": 9,
                     "turn_id": 8,
                 },
             },
@@ -533,7 +534,7 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     assert int(to_payload_element(listen_rows, 0, 0, 2).reshape(-1)[0]) == 701
     assert int(to_payload_element(listen_rows, 1, 2, 4).reshape(-1)[0]) == 702
     assert int(to_payload_element(input_seq_rows, 0, 0, 2).reshape(-1)[0]) == 11
-    assert int(to_payload_element(input_seq_rows, 1, 2, 4).reshape(-1)[0]) == 12
+    assert int(to_payload_element(input_seq_rows, 1, 2, 4).reshape(-1)[0]) == 9
 
 
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
