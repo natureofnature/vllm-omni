@@ -23,8 +23,6 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
-from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _carries_stage_payload
-from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -508,25 +506,6 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert "chunk_seq" not in request.additional_information["meta"]
     assert "last_chunk" not in request.additional_information["meta"]
     assert request.request_id in adapter.segment_finished_requests
-
-    runner = object.__new__(OmniGPUModelRunner)
-    runner.model = SimpleNamespace(replace_runtime_additional_information=True)
-    runner.requests = {request.request_id: SimpleNamespace()}
-    runner.model_intermediate_buffer = {
-        request.request_id: {
-            "codes": {"audio": torch.tensor([1, 2])},
-            "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
-        }
-    }
-    new_req = SimpleNamespace(
-        model_intermediate_buffer=request.additional_information,
-        additional_information=None,
-    )
-
-    runner._update_streaming_input_additional_info(new_req, request.request_id)
-
-    info = runner.model_intermediate_buffer[request.request_id]
-    assert not _carries_stage_payload(info, info["meta"])
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):

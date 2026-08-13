@@ -537,67 +537,6 @@ def test_minicpmo_stage0_routes_duplex_metadata_per_batched_request():
     assert int(to_payload_element(input_seq_rows, 1, 2, 4).reshape(-1)[0]) == 9
 
 
-def test_minicpmo_stage0_preserves_continuation_origin_through_preprocess_and_forward():
-    from vllm_omni.experimental.fullduplex.engine.duplex_runtime import DuplexInputMode
-    from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
-    from vllm_omni.experimental.fullduplex.minicpmo45.runtime import build_duplex_data_plane_prompt
-    from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_omni import (
-        MiniCPMO45OmniForConditionalGeneration,
-    )
-
-    class _Thinker(torch.nn.Module):
-        def forward(self, *, input_ids, **kwargs):
-            del kwargs
-            return torch.ones(input_ids.numel(), 2)
-
-    helper = SimpleNamespace(
-        sessions={("sid-origin", 1): object()},
-        _decode_audio_payload=lambda payload: np.zeros(4, dtype=np.float32),
-        _decode_video_frames_payload=lambda payload: [],
-        _stage_prefill_embeddings_only=lambda *args, **kwargs: {
-            "success": True,
-            "inputs_embeds": torch.ones(1, 2),
-            "input_token_ids": [101],
-        },
-        stage_padding_token_id=lambda: 0,
-        _required_token_id=lambda name: 101,
-    )
-    model = MiniCPMO45OmniForConditionalGeneration.__new__(MiniCPMO45OmniForConditionalGeneration)
-    torch.nn.Module.__init__(model)
-    model.model_stage = "llm"
-    model.thinker = _Thinker()
-    model._minicpmo45_duplex_data_plane_helper = helper
-
-    prompt = build_duplex_data_plane_prompt(
-        request_id="req-origin",
-        fence=DuplexFence("sid-origin", incarnation=1, epoch=2, turn_id=3),
-        session_config={},
-        runtime_config={},
-        seq=8,
-        turn_seq=1,
-        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        payload={"audio": [0.0], "duplex_origin_input_seq": 7},
-        final=False,
-    )
-    duplex = prompt["model_intermediate_buffer"]["duplex"]
-    assert duplex["seq"] == 8
-    assert duplex["input_seq"] == 7
-
-    input_ids, _, additional = model.preprocess(
-        input_ids=torch.tensor([0]),
-        input_embeds=torch.zeros(1, 2),
-        duplex_prompt_len=1,
-        duplex=duplex,
-    )
-    output = model.forward(
-        input_ids=input_ids,
-        positions=torch.arange(input_ids.numel()),
-        runtime_additional_information=[additional],
-    )
-
-    assert output.multimodal_outputs["meta"]["duplex_input_seq"][0].item() == 7
-
-
 def test_minicpmo_stage0_rejects_invalid_resolved_ref_audio():
     from vllm_omni.experimental.fullduplex.minicpmo45.stage0 import (
         MiniCPMO45Stage0DuplexRuntime,

@@ -504,22 +504,21 @@ class DuplexSessionRunnerMixin:
             clear_completed_pending_silence()
             pending_silence = native.pending_silence_task
             if pending_silence is not None and not pending_silence.done():
-                if pending_silence is asyncio.current_task():
-                    return False
-                try:
-                    if not await pending_silence:
+                if pending_silence is not asyncio.current_task():
+                    try:
+                        if not await pending_silence:
+                            return False
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
                         return False
-                except asyncio.CancelledError:
-                    current = asyncio.current_task()
-                    if current is not None and current.cancelling():
-                        raise
-                    return False
-                except Exception:
-                    return False
-                clear_completed_pending_silence()
-                pending_silence = native.pending_silence_task
-                if pending_silence is not None and not pending_silence.done():
-                    return False
+                    except Exception:
+                        return False
+                    clear_completed_pending_silence()
+                    pending_silence = native.pending_silence_task
+                    if pending_silence is not None and not pending_silence.done():
+                        return False
             append_tail = actor.native_append_tail
             if (append_tail is None or append_tail.done()) and real_native_input_waiting():
                 return False
@@ -1655,6 +1654,13 @@ class DuplexSessionRunnerMixin:
                                     include_accepted_input_watermark=True,
                                 )
                             )
+                            if final_payload is None:
+                                await self._continue_pending_native_input(
+                                    emit_event,
+                                    session=session,
+                                    expected_epoch=session.epoch,
+                                    final_commit=True,
+                                )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
                         if (

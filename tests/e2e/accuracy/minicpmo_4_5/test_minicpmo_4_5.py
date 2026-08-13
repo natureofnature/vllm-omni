@@ -356,17 +356,17 @@ def test_minicpmo_4_5_omniinteract_e2e(omni_server, model_prefix: str, tmp_path:
             f"--omniinteract-subsets={subset}",
             f"--omniinteract-realtime-ref-audio={resolve_ref_audio(model_prefix)}",
             f"--omniinteract-official-output-dir={output}",
-            "--num-prompts=1",
-            "--max-concurrency=1",
+            "--num-prompts=4",
+            "--max-concurrency=2",
             "--no-oversample",
             "--disable-shuffle",
         ],
     )
     summary = json.loads((output / "batch_summary.json").read_text())
-    assert (summary["total"], summary["success"], summary["failed"]) == (1, 1, 0)
-    result = summary["results"][0]
-    assert result["input_audio_chunks"] > 0 and result["input_video_frames"] > 0
-    sample = Path(result["output_dir"])
-    assert all((sample / name).is_file() for name in (".done", "output.wav", "wav_transcript.json"))
-    assert json.loads((sample / "wav_transcript.json").read_text())["chunks"]
-    assert len((output / "official_eval_manifest.jsonl").read_text().splitlines()) == 1
+    assert (summary["total"], summary["success"], summary["failed"]) == (4, 4, 0)
+    for result in summary["results"]:
+        assert result["input_audio_chunks"] > 0 and result["input_video_frames"] > 0
+        sample = Path(result["output_dir"])
+        assert all((sample / name).is_file() for name in (".done", "output.wav", "wav_transcript.json"))
+        assert json.loads((sample / "wav_transcript.json").read_text())["chunks"]
+    assert len((output / "official_eval_manifest.jsonl").read_text().splitlines()) == 4

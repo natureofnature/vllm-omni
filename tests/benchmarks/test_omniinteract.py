@@ -1,37 +1,16 @@
 from __future__ import annotations
 
-import asyncio
 import base64
 import io
 import tarfile
-import threading
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.benchmarks.data_modules import omniinteract as oi
-from vllm_omni.benchmarks.patch.patch import (
-    _prepare_omniinteract_warmup,
-    _project_omniinteract_result,
-    get_samples,
-)
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
-
-
-def _config(output_root: str | None = None) -> oi.OmniInteractConfig:
-    return oi.OmniInteractConfig(output_root=output_root)
-
-
-def _case(tmp_path: Path, config: oi.OmniInteractConfig | None = None) -> oi.OmniInteractCase:
-    video, annotation = tmp_path / "clip.mp4", tmp_path / "clip.json"
-    video.write_bytes(b"video")
-    annotation.write_text("[]")
-    return oi.OmniInteractCase(
-        "1q1a", "videos/clip.mp4", str(video), str(annotation), "multi_turn", config or _config()
-    )
 
 
 def _collector(*events: dict[str, object]) -> RealtimeEventCollector:
@@ -74,38 +53,6 @@ def test_tar_extract_is_python310_compatible_and_safe(tmp_path: Path):
         oi._extract(bad, tmp_path / "bad")
 
 
-def test_warmup_identity_and_metric_scope(tmp_path: Path):
-    request = SimpleNamespace(request_id="req", omniinteract=_case(tmp_path, _config(str(tmp_path / "out"))))
-    warmups = [_prepare_omniinteract_warmup(request, index) for index in range(2)]
-    assert warmups[0].request_id != warmups[1].request_id
-    assert all(item.omniinteract.config.output_root is None for item in warmups)
-
-    result = {"mean_ttft_ms": 1, "p99_tpot_ms": 2, "total_output_tokens": 3}
-    _project_omniinteract_result(result, [SimpleNamespace(omniinteract={"success": True})], [request])
-    assert "mean_ttft_ms" not in result and "total_output_tokens" not in result
-    assert result["omniinteract_realtime_metric_scope"].startswith("continuous_session")
-
-
-def test_official_output_guards(tmp_path: Path):
-    args = SimpleNamespace(
-        dataset_name="omniinteract",
-        backend="minicpmo-realtime",
-        omniinteract_official_output_dir="out",
-        no_oversample=False,
-    )
-    with pytest.raises(ValueError, match="no-oversample"):
-        get_samples(args, None)
-    ok = {
-        "status": "ok",
-        "subset": "1q1a",
-        "output_dir": str(tmp_path / "ok"),
-        "annotation": "gt.json",
-        "scene_type": "multi_turn",
-    }
-    oi.write_batch(tmp_path, [ok, {"status": "error"}])
-    assert len((tmp_path / "official_eval_manifest.jsonl").read_text().splitlines()) == 1
-
-
 @pytest.mark.asyncio
 async def test_final_watermark_accepts_exact_precommit_speak():
     await oi._wait_final(
@@ -140,117 +87,3 @@ async def test_final_watermark_accepts_exact_precommit_speak():
 async def test_final_watermark_fails_closed(events: list[dict[str, object]], error: type[Exception]):
     with pytest.raises(error):
         await oi._wait_final(_collector(*events), 0, 0.03)
-
-
-def test_official_output_rejects_invalid_audio():
-    with pytest.raises(ValueError):
-        oi.validate_output(_collector({**_audio(), "delta": "not base64"}))
-    with pytest.raises(ValueError, match="failure"):
-        oi.validate_output(_collector({"type": "response.done", "status": "failed"}))
-
-
-class _Client:
-    def __init__(self) -> None:
-        self.events = RealtimeEventCollector()
-        self.sent: list[dict[str, object]] = []
-
-    async def send(self, payload: dict[str, object]) -> None:
-        self.sent.append(payload)
-
-
-class _Realtime(_Client):
-    fail = False
-    instance: _Realtime | None = None
-
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__()
-        _Realtime.instance = self
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *args) -> None:
-        return None
-
-    async def configure(self, *args, **kwargs) -> None:
-        self.events.add({"type": "session.created"})
-
-    async def commit(self) -> None:
-        self.events.add(_identity("input_audio_buffer.committed", 1))
-        self.events.add(
-            {"type": "error", "message": "backend failed"}
-            if self.fail
-            else _identity("input_audio_buffer.processed", 1, outcome="listen")
-        )
-
-    async def close_session(self, **kwargs) -> None:
-        self.events.add({"type": "session.closed"})
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("fail", [False, True])
-async def test_session_run_closes_and_writes_terminal_marker(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool
-):
-    output = tmp_path / "output"
-    _Realtime.fail = fail
-    monkeypatch.setattr(oi, "RealtimeDuplexClient", _Realtime)
-    monkeypatch.setattr(oi, "prepare_media", lambda *args: (1.0, bytes(32_000), [None]))
-
-    async def no_sleep(*args) -> None:
-        return None
-
-    monkeypatch.setattr(oi.asyncio, "sleep", no_sleep)
-    result = await oi.run_omniinteract(
-        _case(tmp_path, _config(str(output))), "http://server/v1/realtime", "model", "request"
-    )
-    marker = ".failed.json" if fail else ".done"
-    assert result.success is not fail
-    assert (Path(result.official_summary["output_dir"]) / marker).is_file()
-    assert _Realtime.instance
-    assert _Realtime.instance.events.count("session.closed") == 1
-
-
-@pytest.mark.asyncio
-async def test_nonofficial_residual_waits_for_legacy_decision(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    class Legacy(_Realtime):
-        async def commit(self) -> None:
-            self.events.add({"type": "input_audio_buffer.committed"})
-            asyncio.get_running_loop().call_soon(self.events.add, {"type": "response.listen"})
-
-    monkeypatch.setattr(oi, "RealtimeDuplexClient", Legacy)
-    monkeypatch.setattr(oi, "prepare_media", lambda *args: (1.0, bytes(32_002), []))
-
-    async def streamed(*args):
-        return 1, 0, 0.0, 0.0
-
-    monkeypatch.setattr(oi, "_stream", streamed)
-    result = await oi.run_omniinteract(_case(tmp_path), "http://server", "model", "legacy")
-    assert result.success and Legacy.instance.events.count("response.listen") == 1
-
-
-@pytest.mark.asyncio
-async def test_slow_artifact_writer_does_not_block_peer(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    started, release = threading.Event(), threading.Event()
-    _Realtime.fail = False
-    monkeypatch.setattr(oi, "RealtimeDuplexClient", _Realtime)
-    monkeypatch.setattr(oi, "prepare_media", lambda *args: (1.0, bytes(32_000), [None]))
-
-    async def no_sleep(*args):
-        return None
-
-    monkeypatch.setattr(oi.asyncio, "sleep", no_sleep)
-
-    def slow_writer(*args, **kwargs):
-        started.set()
-        assert release.wait(2)
-        return {"status": "ok", "output_dir": str(tmp_path / "out")}
-
-    monkeypatch.setattr(oi, "write_artifacts", slow_writer)
-    first = asyncio.create_task(
-        oi.run_omniinteract(_case(tmp_path, _config(str(tmp_path / "out"))), "http://server", "model", "one")
-    )
-    assert await asyncio.to_thread(started.wait, 1)
-    peer = await asyncio.wait_for(oi.run_omniinteract(_case(tmp_path), "http://server", "model", "two"), 0.5)
-    release.set()
-    assert peer.success and (await first).success

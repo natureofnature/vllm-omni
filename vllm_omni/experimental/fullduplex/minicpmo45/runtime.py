@@ -142,6 +142,7 @@ def build_duplex_data_plane_prompt(
         "incarnation": fence.incarnation,
         "epoch": fence.epoch,
         "seq": seq,
+        "input_seq": seq,
         "turn_id": fence.turn_id,
         "response_seq": fence.response_seq,
         "turn_seq": turn_seq,
@@ -156,9 +157,8 @@ def build_duplex_data_plane_prompt(
     }
     origin_input_seq = payload.get("duplex_origin_input_seq") if isinstance(payload, dict) else None
     if isinstance(origin_input_seq, int) and not isinstance(origin_input_seq, bool) and origin_input_seq > 0:
-        # Serving adds this field only to internal silence continuations. Keep
-        # the control append sequence separate while attributing its model
-        # decision to the accepted user input that requested continuation.
+        # Serving adds this field only to internal silence continuations. Keep the
+        # control sequence separate while attributing its model decision to the user input.
         duplex_info["input_seq"] = origin_input_seq
     return {
         "prompt_token_ids": [token_id] * token_budget,

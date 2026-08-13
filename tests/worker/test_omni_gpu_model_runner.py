@@ -491,13 +491,9 @@ def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
     new_req = SimpleNamespace(
         req_id="r1",
         model_intermediate_buffer=marker,
-        # A stale legacy payload must not override the direct current snapshot.
         additional_information=serialize_additional_information(terminal),
     )
 
-    # This is the production order for a resumable existing request: first
-    # _update_states handles the streaming input, then _preprocess refreshes
-    # scheduled_new_reqs through _update_additional_information.
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
     OmniGPUModelRunner._update_additional_information(
         runner,
@@ -540,7 +536,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
     runner.model_intermediate_buffer["r1"] = {
         "duplex": {
-            "session_id": "sid",
+            "input_seq": 1,
             "seq": 1,
         }
     }
@@ -548,7 +544,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     new_req_data = SimpleNamespace(
         model_intermediate_buffer={
             "duplex": {
-                "session_id": "sid",
+                "input_seq": 2,
                 "seq": 2,
                 "payload": {"type": "audio"},
             }
@@ -559,7 +555,7 @@ def test_streaming_input_update_merges_model_intermediate_buffer():
     OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req_data, "r1")
 
     info = runner.model_intermediate_buffer["r1"]
-    assert info["duplex"]["session_id"] == "sid"
+    assert info["duplex"]["input_seq"] == 2
     assert info["duplex"]["seq"] == 2
     assert info["duplex"]["payload"] == {"type": "audio"}
     assert runner.requests["r1"].additional_information_cpu is info

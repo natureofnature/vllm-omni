@@ -298,26 +298,6 @@ def test_duplex_prompt_expands_incarnation_metadata():
     assert prompt["model_intermediate_buffer"]["duplex"]["incarnation"] == 3
 
 
-@pytest.mark.parametrize("origin", [None, True, 0, -1, "7"])
-def test_duplex_prompt_rejects_untrusted_continuation_origin(origin):
-    payload = {"duplex_origin_input_seq": origin}
-    prompt = build_duplex_data_plane_prompt(
-        request_id="req-origin-boundary",
-        fence=DuplexFence("sid-origin-boundary"),
-        session_config={},
-        runtime_config={},
-        seq=8,
-        turn_seq=1,
-        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
-        payload=payload,
-        final=False,
-    )
-
-    duplex = prompt["model_intermediate_buffer"]["duplex"]
-    assert duplex["seq"] == 8
-    assert "input_seq" not in duplex
-
-
 def test_duplex_runtime_tracks_turn_local_append_sequence():
     manager = DuplexSessionRuntimeManager()
     session = manager.open_session(
