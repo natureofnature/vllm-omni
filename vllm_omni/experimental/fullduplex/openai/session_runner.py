@@ -373,12 +373,13 @@ class DuplexSessionRunnerMixin:
             session.release_all_input_bytes()
             await actor.cancel_append_tasks()
             await self._cancel_native_data_plane_stream(session)
-            if await self._close_runtime_session(
+            runtime_closed = await self._close_runtime_session(
                 session,
                 reason="runtime_signal_failed",
                 send_json=emit_event,
-            ):
-                runtime_closed = True
+            )
+            if not runtime_closed:
+                return
             session.close()
             await emit_event(
                 {

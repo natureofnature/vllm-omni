@@ -1766,7 +1766,6 @@ async def test_minicpmo_vad_barge_in_cancels_inflight_pcm_and_keeps_preroll():
 
 
 @pytest.mark.asyncio
-@pytest.mark.asyncio
 async def test_minicpmo_vad_barge_in_discards_queued_pcm_reservation():
     class BlockingFirstAppendEngine(FakeEngineClient):
         def __init__(self) -> None:
@@ -1866,6 +1865,7 @@ async def test_minicpmo_vad_barge_in_discards_queued_pcm_reservation():
     assert len([event for event in ws.sent if event.get("type") == "audio.cancelled"]) == 1
 
 
+@pytest.mark.asyncio
 async def test_minicpmo_vad_barge_in_fences_response_bound_append_only():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
@@ -5289,6 +5289,37 @@ async def test_turn_signal_barge_in_closes_session_when_runtime_signal_fails():
     assert len(closed) == 1
     assert closed[0]["reason"] == "runtime_signal_failed"
     assert engine.closed == [("sid-turn-barge-signal-fail", "runtime_signal_failed")]
+
+
+@pytest.mark.asyncio
+async def test_turn_signal_barge_in_does_not_ack_failed_runtime_close():
+    class FailingSignalAndCloseEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__(fail_signal_events={"barge_in"})
+            self.close_attempts = 0
+
+        async def close_duplex_session_async(self, session_id: str, **kwargs):
+            del kwargs
+            self.close_attempts += 1
+            raise RuntimeError(f"close failed for {session_id}")
+
+    engine = FailingSignalAndCloseEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-turn-barge-close-fail"))
+    ws.put({"type": "turn.signal", "event": "barge_in"})
+
+    await handler.handle_session(ws)
+
+    errors = [message.get("code") for message in ws.sent if message.get("type") == "error"]
+    assert errors == ["runtime_signal_failed", "runtime_close_failed"]
+    assert "session.closed" not in ws.sent_types()
+    assert engine.close_attempts == 2
+    assert handler._registry.get("sid-turn-barge-close-fail") is None
 
 
 @pytest.mark.asyncio
