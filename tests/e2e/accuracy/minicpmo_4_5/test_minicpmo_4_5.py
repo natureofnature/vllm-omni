@@ -45,7 +45,10 @@ _RESULT_DIR = Path(
 _MIN_DAILY_OMNI_ACCURACY = 0.78
 # MiniCPM-o 4.5 reports 70.4 on Video-MME (w/o subs); ~2pp margin like Daily-Omni.
 _MIN_VIDEOMME_ACCURACY = float(os.environ.get("ACC_BENCH_MIN_VIDEOMME_ACCURACY", "0.68"))
-_MAX_SEED_TTS_MEAN_WER = 0.05
+_MAX_SEED_TTS_MEAN_WER = 0.02
+# Full Seed-TTS zh split (seed-tts-eval/zh/meta.lst) is 2020 rows.
+_SEED_TTS_LOCALE = "zh"
+_SEED_TTS_NUM_PROMPTS = 2020
 # Match the validated Daily-Omni / Video-MME client body from the MiniCPM run scripts.
 _DAILY_EXTRA_BODY = {
     "modalities": ["text"],
@@ -132,8 +135,8 @@ def _optional_local_videomme_dataset_path() -> str | None:
     """Return an explicit local Video-MME root, or ``None`` to use the Hub default.
 
     Same rule as Daily-Omni / Seed-TTS: only an env-provided existing directory counts as
-    local. Hard-coded workspace paths are intentionally not probed so CI defaults to
-    ``lmms-lab/Video-MME`` via ``--videomme-repo``.
+    local. Hard-coded workspace paths are intentionally not probed so CI defaults to the
+    Hub id in ``VIDEOMME_DEFAULT_HF_REPO`` (``lmms-eval/Video-MME``).
     """
     for key in ("VLLM_VIDEOMME_DATASET_PATH", "VIDEOMME_ROOT"):
         raw = os.environ.get(key, "").strip()
@@ -213,7 +216,7 @@ def test_minicpmo_4_5_daily_omni_accuracy_bench(omni_server) -> None:
     assert _acc_bench.run_acc_benchmark(_acc_bench.parse_acc_benchmark_args(argv)) == 0
 
 
-@hardware_test(res={"cuda": "H100", "npu": "A3"}, num_cards=1)
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.parametrize("omni_server", videomme_test_params, indirect=True)
 def test_minicpmo_4_5_videomme_accuracy_bench(omni_server) -> None:
     """Gate MiniCPM-o 4.5 Video-MME (w/o subs) overall accuracy at the OmniEvalKit recipe."""
@@ -273,6 +276,7 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
         skip_seed=False,
         skip_daily=True,
         skip_videomme=True,
+        num_prompts=_SEED_TTS_NUM_PROMPTS,
         max_concurrency=4,
     )
     argv.extend(
@@ -281,6 +285,8 @@ def test_minicpmo_4_5_seed_tts_wer_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
+            "--seed-tts-locale",
+            _SEED_TTS_LOCALE,
             "--seed-extra-body-json",
             json.dumps(_SEED_EXTRA_BODY, separators=(",", ":")),
             "--trust-remote-code",
@@ -311,6 +317,8 @@ def test_minicpmo_4_5_duplex_seed_tts_wer_bench(omni_server) -> None:
             str(_RESULT_DIR),
             "--max-seed-tts-mean-wer",
             str(_MAX_SEED_TTS_MEAN_WER),
+            "--seed-tts-locale",
+            _SEED_TTS_LOCALE,
             "--seed-extra-body-json",
             json.dumps({"save_duplex_request_metrics": True}, separators=(",", ":")),
             "--seed-backend",
