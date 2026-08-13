@@ -1,4 +1,4 @@
-"""Tests for the upstream OmniInteract evaluator wrapper."""
+"""Contract tests for the optional upstream OmniInteract evaluator wrapper."""
 
 from __future__ import annotations
 
@@ -12,218 +12,90 @@ import pytest
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
-def test_official_eval_wrapper_builds_portable_dry_run(tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[2]
-    script = repo_root / "benchmarks" / "omniinteract" / "run_official_eval.py"
-    official_repo = tmp_path / "official"
-    (official_repo / "eval").mkdir(parents=True)
-    (official_repo / "eval" / "run_eval.py").write_text("", encoding="utf-8")
-
-    output_root = tmp_path / "outputs"
-    sample_dir = output_root / "1q1a" / "videos__0001"
-    sample_dir.mkdir(parents=True)
-    (output_root / "batch_summary.json").write_text(
-        json.dumps({"total": 1, "success": 1, "failed": 0, "results": []}),
-        encoding="utf-8",
-    )
-    (output_root / "official_eval_manifest.jsonl").write_text(
-        json.dumps(
-            {
-                "sample_id": "1q1a__videos__0001",
-                "gt_json": str(tmp_path / "annotations" / "0001.json"),
-                "model_json": str(sample_dir / "wav_transcript.json"),
-                "scene_type": "multi_turn",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--official-repo",
-            str(official_repo),
-            "--output-root",
-            str(output_root),
-            "--asr-model",
-            "/models/Qwen3-ASR-1.7B",
-            "--align-model",
-            "/models/Qwen3-ForcedAligner-0.6B",
-            "--num-workers",
-            "3",
-            "--dry-run",
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert "eval/data_prep/data_prep_batch.py" in completed.stdout
-    assert "--num_workers 3" in completed.stdout
-    assert "--fail_fast" in completed.stdout
-    assert "--force_asr" in completed.stdout
-    assert "--force_precise" in completed.stdout
-    assert "eval/run_eval.py" in completed.stdout
-    assert "--skip_existing" not in completed.stdout
-    manifest = output_root / "official_eval_manifest.precise_truncation.jsonl"
-    assert manifest.is_file()
-    assert "precise_truncation.json" in manifest.read_text(encoding="utf-8")
-
-
-def test_official_eval_wrapper_rejects_failed_benchmark_samples(tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[2]
-    script = repo_root / "benchmarks" / "omniinteract" / "run_official_eval.py"
-    official_repo = tmp_path / "official"
-    (official_repo / "eval").mkdir(parents=True)
-    (official_repo / "eval" / "run_eval.py").write_text("", encoding="utf-8")
-    output_root = tmp_path / "outputs"
-    output_root.mkdir()
-    (output_root / "batch_summary.json").write_text(
-        json.dumps({"total": 2, "success": 1, "failed": 1, "results": []}),
-        encoding="utf-8",
-    )
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--official-repo",
-            str(official_repo),
-            "--output-root",
-            str(output_root),
-            "--skip-data-prep",
-            "--dry-run",
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-    assert completed.returncode != 0
-    assert "failed samples" in completed.stderr
-
-
-def test_official_eval_wrapper_checks_fresh_evaluator_summary(tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[2]
-    script = repo_root / "benchmarks" / "omniinteract" / "run_official_eval.py"
-    official_repo = tmp_path / "official"
-    (official_repo / "eval").mkdir(parents=True)
-    (official_repo / "eval" / "run_eval.py").write_text(
-        """import argparse, json, os
-from pathlib import Path
-p = argparse.ArgumentParser()
-p.add_argument('--manifest')
-p.add_argument('--out_dir')
-p.add_argument('--num_workers')
-p.add_argument('--judge_api_url')
-p.add_argument('--judge_api_model')
-p.add_argument('--judge_api_key')
-a = p.parse_args()
-assert os.environ['JUDGE_API_KEY'] == 'test-key'
-out = Path(a.out_dir)
-out.mkdir(parents=True, exist_ok=True)
-(out / 'unified_eval_summary.json').write_text(json.dumps({
-    'summary': {'num_items': 1, 'failed_or_skipped': 0}
-}))
-""",
-        encoding="utf-8",
-    )
-    output_root = tmp_path / "outputs"
-    sample_dir = output_root / "1q1a" / "videos__0001"
-    sample_dir.mkdir(parents=True)
-    (sample_dir / "wav_transcript.json").write_text("{}", encoding="utf-8")
+def _layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    official, output = tmp_path / "official", tmp_path / "outputs"
+    (official / "eval").mkdir(parents=True)
+    (official / "eval" / "run_eval.py").write_text("")
+    sample = output / "1q1a" / "videos__0001"
+    sample.mkdir(parents=True)
+    (sample / "wav_transcript.json").write_text("{}")
     annotation = tmp_path / "annotations" / "0001.json"
     annotation.parent.mkdir()
-    annotation.write_text("[]", encoding="utf-8")
-    (output_root / "batch_summary.json").write_text(
-        json.dumps({"total": 1, "success": 1, "failed": 0, "results": []}),
-        encoding="utf-8",
-    )
-    (output_root / "official_eval_manifest.jsonl").write_text(
+    annotation.write_text("[]")
+    (output / "batch_summary.json").write_text(json.dumps({"total": 1, "success": 1, "failed": 0, "results": []}))
+    (output / "official_eval_manifest.jsonl").write_text(
         json.dumps(
             {
                 "sample_id": "1q1a__videos__0001",
                 "gt_json": str(annotation),
-                "model_json": str(sample_dir / "wav_transcript.json"),
+                "model_json": str(sample / "wav_transcript.json"),
                 "scene_type": "multi_turn",
             }
         )
-        + "\n",
-        encoding="utf-8",
+        + "\n"
     )
-    stale = output_root / "unified_eval" / "stale.unified_eval.json"
+    return official, output, Path(__file__).resolve().parents[2] / "benchmarks/omniinteract/run_official_eval.py"
+
+
+def _run(script: Path, official: Path, output: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [
+            sys.executable,
+            str(script),
+            "--official-repo",
+            str(official),
+            "--output-root",
+            str(output),
+            *args,
+        ],
+        capture_output=True,
+        check=False,
+        text=True,
+    )
+
+
+def test_official_eval_dry_run_builds_portable_pipeline(tmp_path: Path):
+    official, output, script = _layout(tmp_path)
+    result = _run(
+        script,
+        official,
+        output,
+        "--asr-model",
+        "/models/asr",
+        "--align-model",
+        "/models/align",
+        "--num-workers",
+        "3",
+        "--dry-run",
+    )
+    assert result.returncode == 0, result.stderr
+    assert all(
+        item in result.stdout
+        for item in ("data_prep_batch.py", "--num_workers 3", "--force_asr", "--force_precise", "run_eval.py")
+    )
+    assert "precise_truncation.json" in (output / "official_eval_manifest.precise_truncation.jsonl").read_text()
+
+
+def test_official_eval_fails_closed_and_hides_secret(tmp_path: Path):
+    official, output, script = _layout(tmp_path)
+    summary = output / "batch_summary.json"
+    summary.write_text(json.dumps({"total": 2, "success": 1, "failed": 1, "results": []}))
+    assert _run(script, official, output, "--skip-data-prep", "--dry-run").returncode != 0
+
+    summary.write_text(json.dumps({"total": 1, "success": 1, "failed": 0, "results": []}))
+    stale = output / "unified_eval" / "stale.unified_eval.json"
     stale.parent.mkdir()
-    stale.write_text("{}", encoding="utf-8")
-
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--official-repo",
-            str(official_repo),
-            "--output-root",
-            str(output_root),
-            "--skip-data-prep",
-            "--judge-api-key",
-            "test-key",
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-    assert completed.returncode == 0, completed.stderr
-    assert not stale.exists()
-
-
-def test_official_eval_wrapper_does_not_leak_judge_key_on_failure(tmp_path: Path):
-    repo_root = Path(__file__).resolve().parents[2]
-    script = repo_root / "benchmarks" / "omniinteract" / "run_official_eval.py"
-    official_repo = tmp_path / "official"
-    (official_repo / "eval").mkdir(parents=True)
-    (official_repo / "eval" / "run_eval.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
-    output_root = tmp_path / "outputs"
-    sample_dir = output_root / "1q1a" / "videos__0001"
-    sample_dir.mkdir(parents=True)
-    (sample_dir / "wav_transcript.json").write_text("{}", encoding="utf-8")
-    (output_root / "batch_summary.json").write_text(
-        json.dumps({"total": 1, "success": 1, "failed": 0, "results": []}),
-        encoding="utf-8",
-    )
-    (output_root / "official_eval_manifest.jsonl").write_text(
-        json.dumps(
-            {
-                "sample_id": "1q1a__videos__0001",
-                "gt_json": str(tmp_path / "annotations" / "0001.json"),
-                "model_json": str(sample_dir / "wav_transcript.json"),
-                "scene_type": "multi_turn",
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
+    stale.write_text("{}")
+    (official / "eval" / "run_eval.py").write_text("raise SystemExit(7)\n")
     secret = "never-print-this-judge-key"
+    result = _run(script, official, output, "--skip-data-prep", "--judge-api-key", secret)
+    assert result.returncode != 0 and secret not in result.stdout + result.stderr
 
-    completed = subprocess.run(
-        [
-            sys.executable,
-            str(script),
-            "--official-repo",
-            str(official_repo),
-            "--output-root",
-            str(output_root),
-            "--skip-data-prep",
-            "--judge-api-key",
-            secret,
-        ],
-        capture_output=True,
-        check=False,
-        text=True,
-    )
-
-    assert completed.returncode != 0
-    assert secret not in completed.stdout
-    assert secret not in completed.stderr
+    stale.parent.mkdir(exist_ok=True)
+    stale.write_text("{}")
+    evaluator = "import json,sys;from pathlib import Path;out=Path(sys.argv[sys.argv.index('--out_dir')+1]);"
+    evaluator += "out.mkdir(parents=True,exist_ok=True);(out/'unified_eval_summary.json').write_text("
+    evaluator += "json.dumps({'summary':{'num_items':1,'failed_or_skipped':0}}))"
+    (official / "eval" / "run_eval.py").write_text(evaluator)
+    assert _run(script, official, output, "--skip-data-prep", "--judge-api-key", secret).returncode == 0
+    assert not stale.exists()

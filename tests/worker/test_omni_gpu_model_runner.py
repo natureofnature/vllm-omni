@@ -467,6 +467,57 @@ def test_update_additional_information_deserializes_new_request_payload():
     )
 
 
+def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
+    from vllm_omni.engine.serialization import serialize_additional_information
+
+    runner = _make_runner(req_ids=("r1", "r2"), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    terminal = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    peer = {
+        "codes": {"audio": torch.tensor([9])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 1, "last_chunk": False},
+    }
+    runner.model_intermediate_buffer.update(r1=terminal, r2=peer)
+    marker = {
+        "meta": {
+            "finished": False,
+            "is_segment_finished": True,
+            "request_finished": False,
+        }
+    }
+    new_req = SimpleNamespace(
+        req_id="r1",
+        model_intermediate_buffer=marker,
+        # A stale legacy payload must not override the direct current snapshot.
+        additional_information=serialize_additional_information(terminal),
+    )
+
+    # This is the production order for a resumable existing request: first
+    # _update_states handles the streaming input, then _preprocess refreshes
+    # scheduled_new_reqs through _update_additional_information.
+    OmniGPUModelRunner._update_streaming_input_additional_info(runner, new_req, "r1")
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[new_req],
+            scheduled_cached_reqs=SimpleNamespace(),
+        ),
+    )
+
+    info = runner.model_intermediate_buffer["r1"]
+    assert "codes" not in info
+    assert info["meta"] == {
+        **marker["meta"],
+        "num_processed_tokens": 0,
+        "resumable": True,
+    }
+    assert runner.requests["r1"].additional_information_cpu == info
+    assert runner.model_intermediate_buffer["r2"] == peer
+
+
 def test_update_intermediate_buffer_skips_empty_update():
     """Validate that an empty update dict is a no-op."""
     runner = _make_runner(req_ids=("r1",), hidden_size=4)

@@ -3,7 +3,7 @@
 
 import threading
 from collections import deque
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +12,10 @@ from pytest_mock import MockerFixture
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.request import RequestStatus
 
+from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import (
+    OmniGenerationScheduler,
+)
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 from vllm_omni.distributed.omni_connectors.adapter import construct_next_stage_streaming_input_prompt
 from vllm_omni.distributed.omni_connectors.transfer_adapter.base import OmniTransferAdapterBase
@@ -19,6 +23,8 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
     OmniChunkTransferAdapter,
 )
 from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
+from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import _carries_stage_payload
+from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -30,18 +36,33 @@ class DummyWaitingQueue(list):
     def add_request(self, request):
         self.append(request)
 
+    def remove_requests(self, requests):
+        remove = set(requests)
+        self[:] = [request for request in self if request not in remove]
+
+
+class DummyRequest:
+    def __init__(
+        self,
+        req_id: str,
+        status: RequestStatus,
+        external_req_id: str | None = None,
+    ):
+        self.request_id = req_id
+        self.external_req_id = external_req_id or req_id
+        self.client_index = 0
+        self.status = status
+        self.prompt_token_ids = []
+        self.num_computed_tokens = 0
+        self.num_output_placeholders = 0
+        self.additional_information = None
+
+    def is_finished(self):
+        return RequestStatus.is_finished(self.status)
+
 
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
-    return SimpleNamespace(
-        request_id=req_id,
-        external_req_id=external_req_id or req_id,
-        status=status,
-        prompt_token_ids=[],
-        num_computed_tokens=0,
-        num_output_placeholders=0,
-        additional_information=None,
-        is_finished=lambda: status == RequestStatus.FINISHED_STOPPED,
-    )
+    return DummyRequest(req_id, status, external_req_id)
 
 
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
@@ -462,6 +483,52 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     assert "req-non-ar" in adapter.finished_requests
 
 
+def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-marker", RequestStatus.WAITING, external_req_id="external-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "request_finished": torch.tensor(False, dtype=torch.bool),
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert "codes" not in request.additional_information
+    assert "cache_epoch" not in request.additional_information["meta"]
+    assert "chunk_seq" not in request.additional_information["meta"]
+    assert "last_chunk" not in request.additional_information["meta"]
+    assert request.request_id in adapter.segment_finished_requests
+
+    runner = object.__new__(OmniGPUModelRunner)
+    runner.model = SimpleNamespace(replace_runtime_additional_information=True)
+    runner.requests = {request.request_id: SimpleNamespace()}
+    runner.model_intermediate_buffer = {
+        request.request_id: {
+            "codes": {"audio": torch.tensor([1, 2])},
+            "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+        }
+    }
+    new_req = SimpleNamespace(
+        model_intermediate_buffer=request.additional_information,
+        additional_information=None,
+    )
+
+    runner._update_streaming_input_additional_info(new_req, request.request_id)
+
+    info = runner.model_intermediate_buffer[request.request_id]
+    assert not _carries_stage_payload(info, info["meta"])
+
+
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="ar")
     request = _req("req-merged", RequestStatus.WAITING, external_req_id="ext-merged")
@@ -839,6 +906,78 @@ def test_finish_requests_releases_active_stream_slot(build_adapter):
     assert [request.request_id for request in adapter._held_non_active] == []
     assert list(adapter._active_streams) == [waiting.request_id]
     assert waiting.status == RequestStatus.WAITING_FOR_CHUNK
+
+
+@pytest.mark.parametrize(
+    "scheduler_cls",
+    [
+        pytest.param(OmniGenerationScheduler, id="generation"),
+        pytest.param(OmniARScheduler, id="ar"),
+    ],
+)
+@pytest.mark.parametrize(
+    ("placement", "origin_status"),
+    [
+        pytest.param("hidden", RequestStatus.RUNNING, id="hidden"),
+        pytest.param("running", RequestStatus.WAITING, id="stale-origin"),
+        pytest.param("waiting", RequestStatus.WAITING, id="waiting"),
+    ],
+)
+def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
+    build_adapter,
+    scheduler_cls,
+    placement,
+    origin_status,
+):
+    """Close frees a live segment-stop once and releases its capacity."""
+    adapter, _ = build_adapter(stage_id=1, active_stream_window=2)
+    request = _req(
+        "req-segment-stop",
+        RequestStatus.FINISHED_STOPPED,
+        external_req_id="ext-segment-stop",
+    )
+    request.resumable = True
+    request.is_finished = lambda: RequestStatus.is_finished(request.status)
+    adapter.requests_origin_status[request.request_id] = origin_status
+    if placement == "hidden":
+        adapter.waiting_for_chunk_running_requests.append(request)
+    adapter._active_streams[request.request_id] = request
+
+    scheduler = scheduler_cls.__new__(scheduler_cls)
+    scheduler.chunk_transfer_adapter = adapter
+    scheduler.input_coordinator = None
+    scheduler.requests = {request.request_id: request}
+    scheduler.running = [request] if placement == "running" else []
+    scheduler.waiting = DummyWaitingQueue([request] if placement == "waiting" else [])
+    scheduler.skipped_waiting = DummyWaitingQueue()
+
+    freed: list[str] = []
+
+    def fake_free_request(self, live, delay_free_blocks=False):
+        del delay_free_blocks
+        freed.append(live.request_id)
+        self.requests.pop(live.request_id)
+        return None, None
+
+    scheduler._free_request = MethodType(fake_free_request, scheduler)
+
+    first = scheduler_cls.finish_requests(scheduler, [request.request_id], RequestStatus.FINISHED_ABORTED)
+    second = scheduler_cls.finish_requests(scheduler, [request.request_id], RequestStatus.FINISHED_ABORTED)
+
+    assert len(first) == 1
+    assert second == []
+    assert freed == [request.request_id]
+    assert request.request_id not in scheduler.requests
+    assert request.request_id not in adapter._active_streams
+    assert not adapter.waiting_for_chunk_running_requests
+    assert scheduler.running == []
+    assert list(scheduler.waiting) == []
+
+    fresh_a = _req("req-fresh-a", RequestStatus.WAITING)
+    fresh_b = _req("req-fresh-b", RequestStatus.WAITING)
+    assert adapter._ensure_active_stream(fresh_a)
+    assert adapter._ensure_active_stream(fresh_b)
+    assert set(adapter._active_streams) == {fresh_a.request_id, fresh_b.request_id}
 
 
 def test_restore_queues_skips_requests_missing_from_scheduler_requests(build_adapter):

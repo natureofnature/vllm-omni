@@ -77,11 +77,32 @@ class ServingRuntimeSessionState(Protocol):
     pending_silence_owner_id: str | None
     silence_continuation_scheduler: Callable[..., Awaitable[bool]] | None
 
-    def record_accepted_input(self, *, epoch: int, seq: int) -> None: ...
+    def begin_input_acceptance(self) -> None: ...
+
+    def cancel_input_acceptance(self) -> None: ...
+
+    def record_accepted_input(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        model_turn_id: int | None = None,
+    ) -> tuple[str, str | None] | None: ...
 
     def accepted_input_watermark(self, *, epoch: int) -> int | None: ...
 
     def mark_input_processed(self, *, epoch: int, seq: int) -> bool: ...
+
+    def defer_input_processed(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        outcome: str,
+        response_id: str | None,
+    ) -> bool: ...
+
+    def pending_input_identity(self, *, epoch: int) -> tuple[int, int] | None: ...
 
     def retain_committed_audio(
         self,

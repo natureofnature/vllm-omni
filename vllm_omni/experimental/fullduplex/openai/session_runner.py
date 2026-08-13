@@ -1633,17 +1633,8 @@ class DuplexSessionRunnerMixin:
                                 transcript=event.get("transcript"),
                                 turn_id=data_plane_turn_id,
                             )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                    include_accepted_input_watermark=final_payload is None,
-                                )
-                            )
                             if final_payload is not None:
-                                await start_native_append(
+                                append_task = await start_native_append(
                                     {
                                         **final_payload,
                                         "duplex_turn_id": data_plane_turn_id,
@@ -1653,6 +1644,17 @@ class DuplexSessionRunnerMixin:
                                     operation_id=commit_reservation.operation_id,
                                     retained_committed_payload=final_payload,
                                 )
+                                if append_task is None or not await append_task:
+                                    continue
+                            await emit_event(
+                                self._native_audio_committed_payload(
+                                    session,
+                                    committed=committed,
+                                    realtime_item_id=event.get("realtime_item_id"),
+                                    transcript=event.get("transcript"),
+                                    include_accepted_input_watermark=True,
+                                )
+                            )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
                         if (
