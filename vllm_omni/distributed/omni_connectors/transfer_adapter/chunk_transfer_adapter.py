@@ -258,8 +258,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                     request.prompt_token_ids = new_ids
                 if not use_tensor_codes:
                     request.prompt_token_ids = new_ids
+                # Generation chunks are complete per-step snapshots. Reusing
+                # fields from the previous chunk can replay a terminal model
+                # payload when the next wire item is only a segment marker.
+                # Diffusion payloads remain incremental and keep merge
+                # semantics below.
                 prev_info = getattr(request, "additional_information", None)
-                info = dict(prev_info) if isinstance(prev_info, dict) else {}
+                info = (
+                    {} if self.model_mode == "generation" else (dict(prev_info) if isinstance(prev_info, dict) else {})
+                )
                 for key, value in payload_data.items():
                     if key == "codes":
                         if use_tensor_codes and isinstance(value, dict):
@@ -791,8 +798,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # First pass: collect requests to remove from queues
         for req_id in request_ids:
             request = requests.get(req_id) if requests else None
-            if request is None or request.is_finished():
+            if request is None:
                 # Invalid request ID.
+                continue
+            resumable_segment_stop = bool(
+                getattr(request, "resumable", False) and request.status == RequestStatus.FINISHED_STOPPED
+            )
+            if request.is_finished() and not resumable_segment_stop:
                 continue
             if req_id in self.requests_origin_status:
                 request.status = self.requests_origin_status.pop(req_id)
@@ -810,10 +822,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         )
 
         for req_id in request_ids:
-            self._active_streams.pop(req_id, None)
-            self.requests_with_ready_chunks.discard(req_id)
-            self.finished_requests.discard(req_id)
-            self._finished_load_reqs.discard(req_id)
-            self._cancelled_load_reqs.add(req_id)
+            self.cleanup_receiver(req_id)
 
         return []

@@ -16,7 +16,6 @@ by ``add_omni_args``.
 """
 
 import argparse
-import os
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -164,85 +163,49 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for the OmniInteract benchmark dataset."""
-    group = parser.add_argument_group("OmniInteract Dataset Options")
+    group = parser.add_argument_group("OmniInteract")
     group.add_argument(
         "--omniinteract-root",
-        type=str,
         default=None,
-        help="Local OmniInteract extracted data root (contains 1q1a/1q1a_math/1qna, or a parent with data/). "
-        "If omitted, benchmark downloads data.tar.gz from --dataset-path/--hf-name (default lucky-lance/OmniInteract).",
+        help="Local extracted OmniInteract data root (otherwise download from Hugging Face).",
     )
     group.add_argument(
         "--omniinteract-subsets",
-        type=str,
         default="1q1a,1q1a_math,1qna",
-        help="Comma-separated subsets to evaluate, e.g. '1q1a,1q1a_math' or '1qna'. "
-        "Each request is one continuous full-video duplex session.",
-    )
-    group.add_argument(
-        "--omniinteract-eval",
-        action="store_true",
-        default=False,
-        help=(
-            "Legacy per-request proxy metrics. Unsupported by the continuous-session realtime backend; "
-            "use --omniinteract-official-output-dir and the upstream evaluator for accuracy."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-save-eval-items",
-        action="store_true",
-        default=False,
-        help="When --omniinteract-eval is set, include per-request OmniInteract eval rows in result JSON.",
+        help="Comma-separated dataset subsets.",
     )
     group.add_argument(
         "--omniinteract-official-output-dir",
-        type=str,
         default=None,
-        help=(
-            "Write output.wav, response/event JSONL, native transcripts, batch_summary.json, "
-            "and an official-evaluator manifest below this directory."
-        ),
+        help="Write official evaluator artifacts below this directory.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-ref-audio",
+        default=None,
+        help="Reference WAV for MiniCPM-o voice cloning.",
     )
     group.add_argument(
         "--omniinteract-realtime-chunk-ms",
         type=int,
         default=200,
-        help="PCM append chunk size for --backend minicpmo-realtime.",
+        help="PCM append chunk size.",
     )
     group.add_argument(
         "--omniinteract-realtime-video-fps",
         type=float,
         default=1.0,
-        help=(
-            "Video frame sampling rate for --backend minicpmo-realtime. "
-            "Current MiniCPM duplex accuracy runs support at most 1 FPS."
-        ),
-    )
-    group.add_argument(
-        "--omniinteract-realtime-ref-audio",
-        type=str,
-        default=None,
-        help="Reference WAV path for MiniCPM-o full-duplex voice cloning in realtime mode.",
-    )
-    group.add_argument(
-        "--omniinteract-realtime-no-pace",
-        action="store_true",
-        default=False,
-        help=(
-            "Disable realtime pacing for load/debug runs. This mode is incompatible "
-            "with OmniInteract accuracy evaluation and official output."
-        ),
+        help="Video frame sampling rate.",
     )
     group.add_argument(
         "--omniinteract-realtime-timeout-s",
         type=float,
         default=900.0,
-        help=(
-            "Per-session timeout for --backend minicpmo-realtime waiters "
-            "(session.created / commit / drain). OmniInteract videos are "
-            "typically 150–300s; keep this above post-stream response drain."
-        ),
+        help="Per-session timeout.",
+    )
+    group.add_argument(
+        "--omniinteract-realtime-no-pace",
+        action="store_true",
+        help="Disable realtime pacing for load/debug runs.",
     )
 
 
@@ -327,10 +290,6 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
-    if getattr(args, "omniinteract_eval", False):
-        os.environ["OMNIINTERACT_EVAL"] = "1"
-    if getattr(args, "omniinteract_save_eval_items", False):
-        os.environ["OMNIINTERACT_SAVE_EVAL_ITEMS"] = "1"
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:
