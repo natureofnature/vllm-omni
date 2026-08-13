@@ -488,10 +488,14 @@ class OmniDuplexSessionHandler(
                 "duration_ms": duration_ms,
                 "buffer_audio": True,
             }
-        if self._session_auto_responds(session):
+        policy = session.config.overlap_policy
+        if self._session_auto_responds(session) and not (
+            policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and is_speech
+        ):
             # Full-duplex input remains model-owned while output is active. Feed
             # complete model units into the existing Stage0 stream immediately;
-            # playback only controls history ACKs, not model admission.
+            # playback only controls history ACKs, not model admission. An
+            # explicit speech barge-in policy is handled below.
             if is_speech:
                 session.accumulate_overlap_speech(duration_ms)
             return {
@@ -514,7 +518,6 @@ class OmniDuplexSessionHandler(
                 "defer_runtime_append": True,
             }
 
-        policy = session.config.overlap_policy
         if not is_speech:
             if session.overlap_speech_ms <= 0:
                 session.reset_overlap_speech()

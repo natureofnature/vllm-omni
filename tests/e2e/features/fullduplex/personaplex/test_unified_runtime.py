@@ -258,6 +258,28 @@ def test_pcm_buffer_emits_one_80ms_frame_transactionally() -> None:
     assert buffer.pending_byte_count == 1920 * 4
 
 
+def test_pcm_buffer_discard_drops_reserved_frame_and_keeps_pending_audio() -> None:
+    buffer = PersonaPlexPcmAppendBuffer()
+    old_epoch = buffer.prepare_append(
+        _pcm_payload(np.ones(1920, dtype=np.float32)),
+        operation_id="old-epoch",
+        chunk_period_ms=80,
+        allow_emit=True,
+    )
+    assert old_epoch is not None
+    assert (
+        buffer.prepare_append(
+            _pcm_payload(np.ones(480, dtype=np.float32)),
+            operation_id="new-epoch-preroll",
+            chunk_period_ms=80,
+            allow_emit=True,
+        )
+        is None
+    )
+    assert old_epoch.discard() == 1920 * 4
+    assert buffer.pending_byte_count == 480 * 4
+
+
 def test_pcm_buffer_rejects_changed_sample_rate() -> None:
     buffer = PersonaPlexPcmAppendBuffer()
     assert (

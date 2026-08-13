@@ -18,6 +18,7 @@ from vllm_omni.experimental.fullduplex.openai.commit_policy import (
     decide_commit_action,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
+    DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionState,
@@ -283,6 +284,132 @@ class DuplexSessionRunnerMixin:
                 return True
             return False
 
+        async def cancel_fenced_native_response(
+            *,
+            reason: str,
+            response_bound_only: bool,
+            had_native_unbuffered_append: bool,
+            playback_was_active: bool,
+            force_response_cancel: bool = False,
+        ) -> bool:
+            assert session is not None
+            had_native_append = await actor.cancel_append_tasks(
+                response_bound_only=response_bound_only,
+            )
+            had_native_stream = native.data_plane_task is not None
+            cancelled = await self._cancel_active_response(
+                session,
+                actor.active_response_task,
+                emit_event,
+                reason=reason,
+            )
+            had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
+            if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
+                old_epoch = session.epoch
+                old_response_id = session.active_response_id
+                committed_ms = session.playback.committed_ms
+                self._commit_played_response_history(session, old_response_id, committed_ms)
+                new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                await emit_event(
+                    {
+                        "type": "audio.cancelled",
+                        "session_id": session.session_id,
+                        "response_id": old_response_id,
+                        "reason": reason,
+                        "cancelled_epoch": old_epoch,
+                        "epoch": new_epoch,
+                        "committed_ms": committed_ms,
+                        "playback": old_playback,
+                    }
+                )
+                cancelled = True
+            if not cancelled and playback_was_active:
+                old_epoch = session.epoch
+                committed_ms = session.playback.committed_ms
+                self._commit_played_response_history(session, session.last_response_id, committed_ms)
+                new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                await emit_event(
+                    {
+                        "type": "audio.cancelled",
+                        "session_id": session.session_id,
+                        "response_id": session.last_response_id,
+                        "reason": reason,
+                        "cancelled_epoch": old_epoch,
+                        "epoch": new_epoch,
+                        "committed_ms": committed_ms,
+                        "playback": old_playback,
+                    }
+                )
+                cancelled = True
+            if not cancelled and force_response_cancel:
+                old_epoch = session.epoch
+                old_response_id = session.active_response_id
+                committed_ms = session.playback.committed_ms
+                self._commit_played_response_history(session, old_response_id, committed_ms)
+                new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                await emit_event(
+                    {
+                        "type": "audio.cancelled",
+                        "session_id": session.session_id,
+                        "response_id": old_response_id,
+                        "reason": reason,
+                        "cancelled_epoch": old_epoch,
+                        "epoch": new_epoch,
+                        "committed_ms": committed_ms,
+                        "playback": old_playback,
+                    }
+                )
+                cancelled = True
+            return cancelled
+
+        async def close_after_runtime_signal_failure() -> None:
+            nonlocal runtime_closed
+            assert session is not None
+            begin_close("runtime_signal_failed")
+            native.audio_buffer.clear()
+            native.clear_committed_audio()
+            native.input_since_commit = False
+            native.speech_since_commit = False
+            session.release_all_input_bytes()
+            await actor.cancel_append_tasks()
+            await self._cancel_native_data_plane_stream(session)
+            if await self._close_runtime_session(
+                session,
+                reason="runtime_signal_failed",
+                send_json=emit_event,
+            ):
+                runtime_closed = True
+            session.close()
+            await emit_event(
+                {
+                    "type": "session.closed",
+                    "session_id": session.session_id,
+                    "reason": "runtime_signal_failed",
+                }
+            )
+
+        async def signal_fenced_native_barge_in(cancelled_fence: DuplexFence) -> bool:
+            assert session is not None
+            if await self._signal_runtime_session(
+                session,
+                "barge_in",
+                emit_event,
+                fence=cancelled_fence,
+                next_fence=(
+                    DuplexFence(
+                        session.session_id,
+                        epoch=session.epoch,
+                        turn_id=session.turn_id,
+                        incarnation=session.incarnation,
+                    )
+                    if session.epoch > cancelled_fence.epoch
+                    else None
+                ),
+            ):
+                return True
+            await close_after_runtime_signal_failure()
+            return False
+
         def clear_completed_pending_silence() -> None:
             task = native.pending_silence_task
             if task is not None and task.done():
@@ -357,8 +484,7 @@ class DuplexSessionRunnerMixin:
                         expected_epoch=append_epoch,
                     )
                     if append_ok:
-                        if pcm_reservation is not None:
-                            pcm_reservation.commit()
+                        if pcm_reservation is not None and pcm_reservation.commit():
                             session.release_input_bytes(pcm_reservation.byte_count)
                         if (
                             retained_committed_payload is not None
@@ -399,8 +525,6 @@ class DuplexSessionRunnerMixin:
                                 self._turn_controller.signal(session, DuplexTurnEventType.USER_STARTED.value)
                             )
                     return append_ok
-                except asyncio.CancelledError:
-                    raise
                 except Exception as exc:
                     if pcm_reservation is not None:
                         pcm_reservation.rollback()
@@ -424,7 +548,7 @@ class DuplexSessionRunnerMixin:
                             )
                     return False
 
-            async def _run_in_wire_order(predecessor: asyncio.Task[bool] | None) -> bool:
+            async def _run_in_wire_order_inner(predecessor: asyncio.Task[bool] | None) -> bool:
                 if predecessor is not None:
                     try:
                         predecessor_ok = await predecessor
@@ -450,6 +574,14 @@ class DuplexSessionRunnerMixin:
                 if pcm_reservation is not None and not pcm_reservation.active:
                     return False
                 return await _run()
+
+            async def _run_in_wire_order(predecessor: asyncio.Task[bool] | None) -> bool:
+                try:
+                    return await _run_in_wire_order_inner(predecessor)
+                except asyncio.CancelledError:
+                    if pcm_reservation is not None:
+                        session.release_input_bytes(pcm_reservation.discard())
+                    raise
 
             predecessor = actor.native_append_tail
             if predecessor is not None and predecessor.done():
@@ -924,73 +1056,13 @@ class DuplexSessionRunnerMixin:
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.clear_committed_audio()
-                    had_native_append = await actor.cancel_append_tasks(
-                        response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
-                    )
-                    had_native_stream = native.data_plane_task is not None
-                    cancelled = await self._cancel_active_response(
-                        session,
-                        actor.active_response_task,
-                        emit_event,
+                    cancelled = await cancel_fenced_native_response(
                         reason=cancel_reason,
+                        response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
+                        had_native_unbuffered_append=had_native_unbuffered_append,
+                        playback_was_active=playback_was_active,
+                        force_response_cancel=event_type == "response.cancel",
                     )
-                    had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
-                    if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
-                        old_epoch = session.epoch
-                        old_response_id = session.active_response_id
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
-                    if not cancelled and playback_was_active:
-                        old_epoch = session.epoch
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, session.last_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": session.last_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
-                    if not cancelled and event_type == "response.cancel":
-                        old_epoch = session.epoch
-                        old_response_id = session.active_response_id
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
                     if not cancelled and event_type == "output_audio_buffer.clear":
                         old_playback = session.playback.as_dict()
                         committed_ms = session.playback.committed_ms
@@ -1011,23 +1083,8 @@ class DuplexSessionRunnerMixin:
                         continue
                     if not cancelled:
                         await self._cancel_pending_input(session, emit_event, reason="barge_in")
-                    if not await self._signal_runtime_session(
-                        session,
-                        "barge_in",
-                        emit_event,
-                        fence=cancelled_fence,
-                        next_fence=(
-                            DuplexFence(
-                                session.session_id,
-                                epoch=session.epoch,
-                                turn_id=session.turn_id,
-                                incarnation=session.incarnation,
-                            )
-                            if session.epoch > cancelled_fence.epoch
-                            else None
-                        ),
-                    ):
-                        continue
+                    if not await signal_fenced_native_barge_in(cancelled_fence):
+                        return
                     actor.active_response_task = None
                     continue
 
@@ -1249,7 +1306,16 @@ class DuplexSessionRunnerMixin:
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
                         mark_pending_silence_superseded()
-                        overlap_active = not self._session_auto_responds(session) and native_response_in_progress()
+                        auto_barge_in = self._session_auto_responds(session) and (
+                            (
+                                session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                                and bool(payload["is_speech"])
+                            )
+                            or self._event_requests_barge_in(event)
+                        )
+                        overlap_active = native_response_in_progress() and (
+                            not self._session_auto_responds(session) or auto_barge_in
+                        )
                         if overlap_active:
                             decision = self._overlap_decision(session, event, payload)
                             await self._emit_overlap_decision(emit_event, session, decision)
@@ -1286,72 +1352,21 @@ class DuplexSessionRunnerMixin:
                                 defer_native_append = False
                                 native.audio_buffer.clear_force_listen()
                                 session.reset_overlap_speech()
+                                had_native_unbuffered_append = (
+                                    native.input_since_commit and not native.audio_buffer.has_pending()
+                                )
+                                session.release_input_bytes(native.clear_committed_audio())
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
-                                await actor.cancel_append_tasks()
-                                had_native_stream = native.data_plane_task is not None
-                                cancelled = await self._cancel_active_response(
-                                    session,
-                                    actor.active_response_task,
-                                    emit_event,
+                                cancelled = await cancel_fenced_native_response(
                                     reason="barge_in",
+                                    response_bound_only=False,
+                                    had_native_unbuffered_append=had_native_unbuffered_append,
+                                    playback_was_active=playback_was_active,
                                 )
-                                had_native_stream = (
-                                    await self._cancel_native_data_plane_stream(session) or had_native_stream
-                                )
-                                if not cancelled and had_native_stream:
-                                    old_epoch = session.epoch
-                                    old_response_id = session.active_response_id
-                                    committed_ms = session.playback.committed_ms
-                                    self._commit_played_response_history(session, old_response_id, committed_ms)
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                                    await emit_event(
-                                        {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
-                                            "response_id": old_response_id,
-                                            "reason": "barge_in",
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
-                                        }
-                                    )
-                                    cancelled = True
-                                if not cancelled and playback_was_active:
-                                    old_epoch = session.epoch
-                                    committed_ms = session.playback.committed_ms
-                                    self._commit_played_response_history(
-                                        session, session.last_response_id, committed_ms
-                                    )
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                                    await emit_event(
-                                        {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
-                                            "response_id": session.last_response_id,
-                                            "reason": "barge_in",
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
-                                        }
-                                    )
-                                    cancelled = True
                                 if session.epoch > cancelled_fence.epoch:
-                                    if not await self._signal_runtime_session(
-                                        session,
-                                        "barge_in",
-                                        emit_event,
-                                        fence=cancelled_fence,
-                                        next_fence=DuplexFence(
-                                            session.session_id,
-                                            epoch=session.epoch,
-                                            turn_id=session.turn_id,
-                                            incarnation=session.incarnation,
-                                        ),
-                                    ):
-                                        continue
+                                    if not await signal_fenced_native_barge_in(cancelled_fence):
+                                        return
                                 actor.active_response_task = None
                         elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
                             event, payload, session=session

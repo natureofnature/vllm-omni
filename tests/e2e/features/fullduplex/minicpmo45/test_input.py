@@ -130,6 +130,34 @@ def test_pcm_append_reservation_rollback_restores_emitted_audio():
     assert base64.b64decode(retried["audio"]) == base64.b64decode(original["audio"])
 
 
+def test_pcm_append_reservation_discard_preserves_only_unreserved_preroll():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    old_epoch = buffer.prepare_append(
+        pcm_payload(16_000),
+        operation_id="old-epoch",
+        chunk_period_ms=1_000,
+    )
+    assert old_epoch is not None
+    assert (
+        buffer.prepare_append(
+            pcm_payload(3_200, speech=False),
+            operation_id="new-epoch-preroll",
+            chunk_period_ms=1_000,
+        )
+        is None
+    )
+
+    assert old_epoch.discard() == 16_000 * 4
+    assert not old_epoch.active
+    assert not buffer.has_reserved()
+    assert buffer.pending_byte_count == 3_200 * 4
+
+    emitted = buffer.flush(chunk_period_ms=1_000)
+    assert emitted is not None
+    samples = np.frombuffer(base64.b64decode(emitted["audio"]), dtype=np.float32)
+    assert samples[:3_200].tolist() == [1.0] * 3_200
+
+
 def test_pcm_commit_keeps_prior_append_reservation_active():
     buffer = MiniCPMO45PcmAppendBuffer()
     append_reservation = buffer.prepare_append(

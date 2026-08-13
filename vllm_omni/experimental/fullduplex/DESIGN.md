@@ -49,6 +49,9 @@ The checkpoint keeps these verified contracts:
 - model-owned listen/speak decisions on the normal auto-response path;
 - continuous browser PCM upload during assistant playback, without browser VAD
   or browser-generated input commits;
+- opt-in serving-side speech interruption with epoch fencing and exactly one
+  cancellation terminal; speech is classified from an explicit client hint or
+  a lightweight PCM RMS threshold;
 - segment EOS and turn EOS as different boundaries;
 - transcript/audio cursors scoped to a response and turn;
 - playback acknowledgement and history commit;
@@ -63,8 +66,7 @@ The checkpoint keeps these verified contracts:
 The checkpoint does not claim:
 
 - scheduler-native KV append;
-- deterministic VAD-triggered interruption (the browser intentionally does not
-  run VAD; MiniCPM owns listen/speak decisions at model-unit boundaries);
+- neural-network VAD or browser-side VAD;
 - production multi-session admission, fairness, capacity, or failure recovery;
 - bounded long-session KV;
 - video input or audio/video synchronization.
@@ -644,6 +646,14 @@ item". Silent overlap no longer discards earlier user PCM. This is an input
 ownership correction. It does not add a VAD policy: overlap is admitted to
 Stage0 and the model decides whether to listen or speak.
 
+When an auto-response session explicitly selects the
+`barge_in_on_speech` overlap policy, the serving runner instead treats an
+explicit `is_speech=true` hint or PCM above the configured RMS threshold as a
+barge-in. It cancels in-flight append and response work, advances the epoch,
+signals the runtime with the old and new fences, and retains the triggering
+audio as input for the new epoch. This is a lightweight energy policy, not a
+neural VAD; the default auto-response policy remains model-owned.
+
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
 has already advanced the Session turn; clear, cancel, close, and successful
@@ -1024,6 +1034,6 @@ Passing this checkpoint supports the statement:
 > Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
 > validated H20 configuration.
 
-It does not support claims for deterministic VAD-triggered interruption,
+It does not support claims for neural or browser-side VAD,
 multi-session production concurrency, bounded long-session KV,
 scheduler-native append, or video input.

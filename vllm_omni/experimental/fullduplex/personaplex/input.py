@@ -44,11 +44,14 @@ class PersonaPlexPcmAppendReservation:
     def byte_count(self) -> int:
         return len(self._raw)
 
-    def commit(self) -> None:
-        self._owner._commit_reservation(self)
+    def commit(self) -> bool:
+        return self._owner._commit_reservation(self)
 
     def rollback(self) -> None:
         self._owner._rollback_reservation(self)
+
+    def discard(self) -> int:
+        return self._owner._discard_reservation(self)
 
 
 class PersonaPlexPcmAppendBuffer:
@@ -185,11 +188,27 @@ class PersonaPlexPcmAppendBuffer:
         self._reservations.append(reservation)
         return reservation
 
-    def _commit_reservation(self, reservation: PersonaPlexPcmAppendReservation) -> None:
+    def _commit_reservation(self, reservation: PersonaPlexPcmAppendReservation) -> bool:
         if not reservation.active:
-            return
+            return False
         reservation._active = False
         self._reservations.remove(reservation)
+        return True
+
+    def _discard_reservation(self, reservation: PersonaPlexPcmAppendReservation) -> int:
+        if not reservation.active:
+            return 0
+        try:
+            index = self._reservations.index(reservation)
+        except ValueError:
+            reservation._active = False
+            return 0
+        discarded = self._reservations[index:]
+        byte_count = sum(item.byte_count for item in discarded if item.active)
+        for item in discarded:
+            item._active = False
+        del self._reservations[index:]
+        return byte_count
 
     def _rollback_reservation(self, reservation: PersonaPlexPcmAppendReservation) -> None:
         if not reservation.active:

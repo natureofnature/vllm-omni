@@ -64,11 +64,14 @@ class MiniCPMO45PcmAppendReservation:
     def byte_count(self) -> int:
         return len(self._raw)
 
-    def commit(self) -> None:
-        self._owner._commit_reservation(self)
+    def commit(self) -> bool:
+        return self._owner._commit_reservation(self)
 
     def rollback(self) -> None:
         self._owner._rollback_reservation(self)
+
+    def discard(self) -> int:
+        return self._owner._discard_reservation(self)
 
 
 def validate_native_ref_audio_config(session_config: dict[str, Any]) -> None:
@@ -377,13 +380,35 @@ class MiniCPMO45PcmAppendBuffer:
         assert reservation.payload is not None
         return reservation.payload
 
-    def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
+    def _commit_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> bool:
         if not reservation._active:
-            return
+            return False
         if not self._reservations or self._reservations[0] is not reservation:
             raise RuntimeError("PCM append reservations must commit in wire order")
         self._reservations.pop(0)
         reservation._active = False
+        return True
+
+    def _discard_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> int:
+        """Drop a cancelled reservation and dependent queued appends.
+
+        Cancellation fences the old runtime epoch, so restoring audio that may
+        already have crossed the RPC boundary would replay it in the new epoch.
+        Unreserved PCM remains buffered as barge-in pre-roll.
+        """
+        if not reservation._active:
+            return 0
+        try:
+            index = self._reservations.index(reservation)
+        except ValueError:
+            reservation._active = False
+            return 0
+        discarded = self._reservations[index:]
+        byte_count = sum(item.byte_count for item in discarded if item._active)
+        for item in discarded:
+            item._active = False
+        del self._reservations[index:]
+        return byte_count
 
     def _rollback_reservation(self, reservation: MiniCPMO45PcmAppendReservation) -> None:
         if not reservation._active:

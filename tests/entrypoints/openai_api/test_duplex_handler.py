@@ -36,6 +36,7 @@ from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionConfig,
+    DuplexSessionState,
     ResponseCreateOptions,
 )
 from vllm_omni.experimental.fullduplex.openai.realtime_session import NativeRealtimeSessionProtocol
@@ -1558,6 +1559,421 @@ def test_auto_response_playback_overlap_admits_model_units_and_tracks_speech():
     assert decision["force_listen"] is False
     assert decision["buffer_audio"] is True
     assert session.overlap_speech_ms == 540
+
+
+def test_minicpmo_auto_response_barge_in_on_speech_interrupts_active_response():
+    handler, session = _auto_response_context("sid-native-auto-barge", playback_active=True)
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+
+    decision = handler._overlap_decision(
+        session,
+        {"duration_ms": 200, "is_speech": True},
+        _native_audio_payload(samples=3200),
+    )
+
+    assert session.capabilities.supports_barge_in is True
+    assert decision["action"] == "barge_in"
+    assert decision["reason"] == "policy_barge_in_on_speech"
+    assert decision["buffer_audio"] is True
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_auto_response_vad_barge_in_cancels_and_retains_audio():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    create = _native_session_create("sid-native-auto-vad-barge")
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    try:
+        for _ in range(100):
+            session = handler._registry.get("sid-native-auto-vad-barge")
+            if session is not None and "session.created" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("native duplex session did not open")
+
+        session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+        old_epoch = session.epoch
+        response_id = session.begin_response()
+        session.mark_audio_sent(duration_ms=2000)
+        request_id = handler._native_stage0_request_id(session, old_epoch)
+        session.bind_request(request_id)
+        cancelled_fence = DuplexFence(
+            session.session_id,
+            epoch=old_epoch,
+            turn_id=session.turn_id,
+            incarnation=session.incarnation,
+        )
+
+        chunk = {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(3200, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 200,
+        }
+        for _ in range(5):
+            ws.put(chunk)
+        for _ in range(100):
+            if engine.appended:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("interrupting model unit was not appended")
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    cancelled_events = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+    assert len(cancelled_events) == 1
+    assert cancelled_events[0]["response_id"] == response_id
+    assert cancelled_events[0]["cancelled_epoch"] == old_epoch
+    assert cancelled_events[0]["epoch"] == old_epoch + 1
+    overlap_events = [event for event in ws.sent if event.get("type") == "overlap.decision"]
+    assert len(overlap_events) == 1
+    assert overlap_events[0]["action"] == "barge_in"
+    assert overlap_events[0]["reason"] == "policy_barge_in_on_speech"
+    assert engine.aborted == [request_id]
+    assert engine.signals == [(session.session_id, "barge_in")]
+    assert engine.signal_fences == [cancelled_fence]
+    assert engine.signal_next_fences == [
+        DuplexFence(
+            session.session_id,
+            epoch=old_epoch + 1,
+            turn_id=session.turn_id,
+            incarnation=session.incarnation,
+        )
+    ]
+    assert len(engine.appended) == 1
+    appended_session_id, mode, payload, final = engine.appended[0]
+    assert appended_session_id == session.session_id
+    assert mode == "append_audio_chunk"
+    assert final is False
+    assert isinstance(payload, dict)
+    assert np.frombuffer(base64.b64decode(payload["audio"]), dtype="<f4").shape == (16000,)
+    assert engine.appended_fences[0] is not None
+    assert engine.appended_fences[0].epoch == old_epoch + 1
+    assert "error" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vad_barge_in_cancels_inflight_pcm_and_keeps_preroll():
+    class BlockingFirstAppendEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_append_started = asyncio.Event()
+            self.first_append_cancelled = asyncio.Event()
+            self.release_first_append = asyncio.Event()
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            if len(self.appended) == 1:
+                self.first_append_started.set()
+                try:
+                    await self.release_first_append.wait()
+                except asyncio.CancelledError:
+                    self.first_append_cancelled.set()
+                    raise
+            return result
+
+    engine = BlockingFirstAppendEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-native-vad-inflight-pcm")
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    try:
+        for _ in range(100):
+            session = handler._registry.get("sid-native-vad-inflight-pcm")
+            if session is not None and "session.created" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("native duplex session did not open")
+
+        silent_chunk = {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(3200, value=0.0),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 200,
+        }
+        speech_chunk = {
+            **silent_chunk,
+            "audio": _pcm_f32_b64(3200, value=0.05),
+        }
+        for _ in range(5):
+            ws.put(silent_chunk)
+        await asyncio.wait_for(engine.first_append_started.wait(), timeout=1)
+
+        session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+        old_epoch = session.epoch
+        response_id = session.begin_response()
+        session.mark_audio_sent(duration_ms=2000)
+        request_id = handler._native_stage0_request_id(session, old_epoch)
+        session.bind_request(request_id)
+
+        ws.put(silent_chunk)
+        for _ in range(4):
+            ws.put(speech_chunk)
+        for _ in range(100):
+            if len(engine.appended) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("new-epoch model unit was not appended")
+    finally:
+        engine.release_first_append.set()
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    assert engine.first_append_cancelled.is_set()
+    cancelled_events = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+    assert len(cancelled_events) == 1
+    assert cancelled_events[0]["response_id"] == response_id
+    assert cancelled_events[0]["cancelled_epoch"] == old_epoch
+    assert cancelled_events[0]["epoch"] == old_epoch + 1
+    assert engine.aborted == [request_id]
+    assert engine.signals == [(session.session_id, "barge_in")]
+    assert len(engine.appended) == 2
+    new_payload = engine.appended[1][2]
+    assert isinstance(new_payload, dict)
+    new_pcm = np.frombuffer(base64.b64decode(new_payload["audio"]), dtype="<f4")
+    assert new_pcm.shape == (16000,)
+    np.testing.assert_array_equal(new_pcm[:3200], 0.0)
+    np.testing.assert_array_equal(new_pcm[3200:], np.float32(0.05))
+    assert engine.appended_fences[1] is not None
+    assert engine.appended_fences[1].epoch == old_epoch + 1
+    assert "runtime_append_task_failed" not in {event.get("code") for event in ws.sent if event.get("type") == "error"}
+
+
+@pytest.mark.asyncio
+@pytest.mark.asyncio
+async def test_minicpmo_vad_barge_in_discards_queued_pcm_reservation():
+    class BlockingFirstAppendEngine(FakeEngineClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.first_append_started = asyncio.Event()
+            self.first_append_cancelled = asyncio.Event()
+            self.release_first_append = asyncio.Event()
+
+        async def append_duplex_input_async(self, session_id: str, **kwargs):
+            kwargs.pop("expected_epoch", None)
+            result = await super().append_duplex_input_async(session_id, **kwargs)
+            if len(self.appended) == 1:
+                self.first_append_started.set()
+                try:
+                    await self.release_first_append.wait()
+                except asyncio.CancelledError:
+                    self.first_append_cancelled.set()
+                    raise
+            return result
+
+    async def wait_for(predicate, label: str) -> None:
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"timeout waiting for {label}")
+
+    engine = BlockingFirstAppendEngine()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-native-vad-queued-pcm")
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    try:
+        for _ in range(100):
+            session = handler._registry.get("sid-native-vad-queued-pcm")
+            if session is not None and "session.created" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("native duplex session did not open")
+        native = handler._runtime_session_state(session)
+        speech_chunk = {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(3200, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 200,
+        }
+        silent_chunk = {
+            **speech_chunk,
+            "audio": _pcm_f32_b64(3200, value=0.0),
+        }
+
+        # Final commit creates a blocked predecessor without a reservation.
+        # The following model unit reserves PCM behind it.
+        ws.put(speech_chunk)
+        ws.put({"type": "input_audio_buffer.commit", "final": True})
+        await asyncio.wait_for(engine.first_append_started.wait(), timeout=1)
+        for _ in range(5):
+            ws.put(silent_chunk)
+        for _ in range(100):
+            if native.audio_buffer.has_reserved():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("queued PCM reservation was not created")
+
+        old_epoch = session.epoch
+        for _ in range(5):
+            ws.put(speech_chunk)
+        for _ in range(100):
+            if len(engine.appended) >= 2:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("next-epoch model unit was not appended")
+    finally:
+        engine.release_first_append.set()
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    assert engine.first_append_cancelled.is_set()
+    assert session.epoch == old_epoch + 1
+    assert len(engine.appended) == 2
+    assert not native.audio_buffer.has_reserved()
+    assert not native.audio_buffer.has_pending()
+    assert session.pending_input_bytes == 0
+    assert "runtime_append_task_failed" not in {event.get("code") for event in ws.sent if event.get("type") == "error"}
+    assert len([event for event in ws.sent if event.get("type") == "audio.cancelled"]) == 1
+
+
+async def test_minicpmo_vad_barge_in_fences_response_bound_append_only():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-native-vad-append-only")
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    try:
+        for _ in range(100):
+            session = handler._registry.get("sid-native-vad-append-only")
+            if session is not None and "session.created" in ws.sent_types():
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("native duplex session did not open")
+
+        old_epoch = session.epoch
+        append_task = asyncio.create_task(asyncio.Event().wait())
+        handler._session_tasks[session.session_id].track_append_task(
+            append_task,
+            epoch=old_epoch,
+            mode="append_audio_chunk",
+            final=True,
+            response_bound=True,
+        )
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(3200, value=0.05),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "duration_ms": 200,
+            }
+        )
+        for _ in range(100):
+            if engine.signals:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("append-only barge-in did not signal the runtime")
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    assert append_task.cancelled()
+    assert session.epoch == old_epoch + 1
+    assert engine.signals == [(session.session_id, "barge_in")]
+    assert len([event for event in ws.sent if event.get("type") == "audio.cancelled"]) == 1
+    assert "error" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_minicpmo_vad_barge_in_runtime_signal_failure_closes_session():
+    engine = FakeEngineClient(fail_signal_events={"barge_in"})
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-native-vad-signal-failure")
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    for _ in range(100):
+        session = handler._registry.get("sid-native-vad-signal-failure")
+        if session is not None and "session.created" in ws.sent_types():
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("native duplex session did not open")
+
+    session.config.playback_commit_policy = DuplexPlaybackCommitPolicy.ACK_ONLY.value
+    old_epoch = session.epoch
+    session.begin_response()
+    session.mark_audio_sent(duration_ms=2000)
+    request_id = handler._native_stage0_request_id(session, old_epoch)
+    session.bind_request(request_id)
+    ws.put(
+        {
+            "type": "input_audio_buffer.append",
+            "audio": _pcm_f32_b64(3200, value=0.05),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+            "duration_ms": 200,
+        }
+    )
+    await asyncio.wait_for(handler_task, timeout=2)
+
+    errors = [event for event in ws.sent if event.get("type") == "error"]
+    assert [event.get("code") for event in errors] == ["runtime_signal_failed"]
+    closed_events = [event for event in ws.sent if event.get("type") == "session.closed"]
+    assert len(closed_events) == 1
+    assert closed_events[0]["reason"] == "runtime_signal_failed"
+    assert engine.closed == [(session.session_id, "runtime_signal_failed")]
+    assert engine.aborted == [request_id]
+    assert engine.appended == []
+    assert session.state == DuplexSessionState.CLOSED
+    assert session.pending_input_bytes == 0
 
 
 @pytest.mark.asyncio
@@ -4825,14 +5241,15 @@ async def test_duplex_handler_local_turn_signal_does_not_round_trip_runtime():
 
 
 @pytest.mark.asyncio
-async def test_duplex_barge_in_aborts_active_response_when_runtime_signal_fails():
+@pytest.mark.parametrize("cancel_event_type", ["input.cancel", "response.cancel"])
+async def test_duplex_cancel_closes_session_when_runtime_signal_fails(cancel_event_type: str):
     engine = FakeEngineClient(fail_signal_events={"barge_in"})
     chat_service = FakeChatService(engine)
     handler = OmniDuplexSessionHandler(chat_service=chat_service, config_timeout_s=0.1, idle_timeout_s=1)
 
     def on_send(ws: TimedWebSocket, data: dict[str, Any]) -> None:
         if data.get("type") == "response.created":
-            ws.put({"type": "input.cancel", "reason": "test_barge_in"})
+            ws.put({"type": cancel_event_type, "reason": "test_barge_in"})
 
     ws = TimedWebSocket(on_send=on_send)
     ws.put(_session_create("sid-barge-signal-fail"))
@@ -4846,6 +5263,32 @@ async def test_duplex_barge_in_aborts_active_response_when_runtime_signal_fails(
     assert engine.internal_abort_batches == [["chatcmpl-duplex-sid-barge-signal-fail-0-1"]]
     error = next(m for m in ws.sent if m.get("type") == "error")
     assert error["code"] == "runtime_signal_failed"
+    closed = [m for m in ws.sent if m.get("type") == "session.closed"]
+    assert len(closed) == 1
+    assert closed[0]["reason"] == "runtime_signal_failed"
+    assert engine.closed == [("sid-barge-signal-fail", "runtime_signal_failed")]
+
+
+@pytest.mark.asyncio
+async def test_turn_signal_barge_in_closes_session_when_runtime_signal_fails():
+    engine = FakeEngineClient(fail_signal_events={"barge_in"})
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=1,
+    )
+    ws = TimedWebSocket()
+    ws.put(_native_session_create("sid-turn-barge-signal-fail"))
+    ws.put({"type": "turn.signal", "event": "barge_in"})
+
+    await handler.handle_session(ws)
+
+    error = next(m for m in ws.sent if m.get("type") == "error")
+    assert error["code"] == "runtime_signal_failed"
+    closed = [m for m in ws.sent if m.get("type") == "session.closed"]
+    assert len(closed) == 1
+    assert closed[0]["reason"] == "runtime_signal_failed"
+    assert engine.closed == [("sid-turn-barge-signal-fail", "runtime_signal_failed")]
 
 
 @pytest.mark.asyncio
@@ -5674,7 +6117,7 @@ async def test_minicpmo_native_duplex_rejects_ref_audio_path():
     assert engine.opened == []
 
 
-def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen():
+def test_minicpmo_native_duplex_accepts_explicit_barge_in_request():
     engine = FakeEngineClient()
     handler = OmniDuplexSessionHandler(
         chat_service=FakeChatService(engine),
@@ -5700,14 +6143,10 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         payload,
     )
 
-    assert decision == {
-        "action": "listen",
-        "reason": "barge_in_unsupported",
-        "duration_ms": 1000,
-        "overlap_speech_ms": 1000,
-        "buffer_audio": True,
-        "defer_runtime_append": True,
-    }
+    assert decision["action"] == "barge_in"
+    assert decision["reason"] == "client_force_barge_in"
+    assert decision["duration_ms"] == 1000
+    assert decision["buffer_audio"] is True
 
 
 @pytest.mark.asyncio
@@ -5718,7 +6157,7 @@ def test_minicpmo_native_duplex_explicit_barge_in_request_is_deferred_as_listen(
         {"type": "turn.signal", "event": "barge_in"},
     ],
 )
-async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
+async def test_minicpmo_native_duplex_accepts_advertised_barge_in_control(
     barge_in_event: dict[str, object],
 ):
     engine = FakeEngineClient()
@@ -5734,9 +6173,8 @@ async def test_minicpmo_native_duplex_rejects_unadvertised_barge_in_control(
 
     await handler.handle_session(ws)
 
-    error = next(message for message in ws.sent if message.get("code") == "barge_in_unsupported")
-    assert error["session_id"] == "sid-native-barge-control-disabled"
-    assert ("sid-native-barge-control-disabled", "barge_in") not in engine.signals
+    assert not any(message.get("code") == "barge_in_unsupported" for message in ws.sent)
+    assert ("sid-native-barge-control-disabled", "barge_in") in engine.signals
 
 
 @pytest.mark.asyncio

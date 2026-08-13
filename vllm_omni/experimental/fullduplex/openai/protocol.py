@@ -101,7 +101,7 @@ class DuplexCapabilities:
         supports_multi_session = max_sessions > 1
         return cls(
             supports_model_native_turn_policy=True,
-            supports_barge_in=False,
+            supports_barge_in=True,
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -129,7 +129,7 @@ class DuplexCapabilities:
             signal_sources=["model_native", "client_event", "server_policy"],
             stage_handoff_transport="scheduler_data_plane",
             chunk_period_ms=1000,
-            target_barge_in_latency_ms=None,
+            target_barge_in_latency_ms=1000,
         )
 
     def as_dict(self) -> dict[str, object]:
