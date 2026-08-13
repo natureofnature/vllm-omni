@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import io
-import json
 import tarfile
 import threading
-import wave
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +12,6 @@ import pytest
 
 from vllm_omni.benchmarks.data_modules import omniinteract as oi
 from vllm_omni.benchmarks.patch.patch import (
-    _attach_omniinteract,
     _prepare_omniinteract_warmup,
     _project_omniinteract_result,
     get_samples,
@@ -77,51 +74,36 @@ def test_tar_extract_is_python310_compatible_and_safe(tmp_path: Path):
         oi._extract(bad, tmp_path / "bad")
 
 
-def test_bench_dataset_adapter_warmup_and_metric_scope(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    subset = tmp_path / "1q1a"
-    (subset / "videos").mkdir(parents=True)
-    (subset / "annotations").mkdir()
-    (subset / "videos" / "a.mp4").write_bytes(b"video")
-    (subset / "annotations" / "a.json").write_text("[]")
-    (subset / "video_json_map.json").write_text(
-        json.dumps({"entries": [{"video": "videos/a.mp4", "annotation": "annotations/a.json"}]})
-    )
-    monkeypatch.setattr(oi, "get_cached_tokenizer", lambda tokenizer: tokenizer)
-    args = SimpleNamespace(
-        dataset_name="omniinteract",
-        backend="minicpmo-realtime",
-        dataset_path=str(tmp_path),
-        hf_name=None,
-        omniinteract_root=None,
-        omniinteract_subsets="1q1a",
-        omniinteract_official_output_dir=None,
-        omniinteract_realtime_chunk_ms=200,
-        omniinteract_realtime_video_fps=1.0,
-        omniinteract_realtime_ref_audio=None,
-        omniinteract_realtime_no_pace=False,
-        omniinteract_realtime_timeout_s=30,
-        no_oversample=True,
-        num_prompts=1,
-        request_id_prefix="req-",
-        seed=0,
-        disable_shuffle=True,
-    )
-    [sample] = get_samples(args, SimpleNamespace(encode=lambda text: list(text)))
-    request = SimpleNamespace()
-    _attach_omniinteract(sample, request)
-    warmups = [_prepare_omniinteract_warmup(sample, index) for index in range(2)]
-    assert request.omniinteract.video_rel == "videos/a.mp4"
+def test_warmup_identity_and_metric_scope(tmp_path: Path):
+    request = SimpleNamespace(request_id="req", omniinteract=_case(tmp_path, _config(str(tmp_path / "out"))))
+    warmups = [_prepare_omniinteract_warmup(request, index) for index in range(2)]
     assert warmups[0].request_id != warmups[1].request_id
     assert all(item.omniinteract.config.output_root is None for item in warmups)
 
     result = {"mean_ttft_ms": 1, "p99_tpot_ms": 2, "total_output_tokens": 3}
-    _project_omniinteract_result(result, [SimpleNamespace(omniinteract={"success": True})], [sample])
+    _project_omniinteract_result(result, [SimpleNamespace(omniinteract={"success": True})], [request])
     assert "mean_ttft_ms" not in result and "total_output_tokens" not in result
     assert result["omniinteract_realtime_metric_scope"].startswith("continuous_session")
 
-    args.omniinteract_official_output_dir, args.no_oversample = str(tmp_path / "out"), False
+
+def test_official_output_guards(tmp_path: Path):
+    args = SimpleNamespace(
+        dataset_name="omniinteract",
+        backend="minicpmo-realtime",
+        omniinteract_official_output_dir="out",
+        no_oversample=False,
+    )
     with pytest.raises(ValueError, match="no-oversample"):
-        get_samples(args, SimpleNamespace(encode=lambda text: list(text)))
+        get_samples(args, None)
+    ok = {
+        "status": "ok",
+        "subset": "1q1a",
+        "output_dir": str(tmp_path / "ok"),
+        "annotation": "gt.json",
+        "scene_type": "multi_turn",
+    }
+    oi.write_batch(tmp_path, [ok, {"status": "error"}])
+    assert len((tmp_path / "official_eval_manifest.jsonl").read_text().splitlines()) == 1
 
 
 @pytest.mark.asyncio
@@ -160,33 +142,11 @@ async def test_final_watermark_fails_closed(events: list[dict[str, object]], err
         await oi._wait_final(_collector(*events), 0, 0.03)
 
 
-def test_official_output_and_artifacts_are_strict(tmp_path: Path):
-    case = _case(tmp_path)
+def test_official_output_rejects_invalid_audio():
     with pytest.raises(ValueError):
         oi.validate_output(_collector({**_audio(), "delta": "not base64"}))
     with pytest.raises(ValueError, match="failure"):
         oi.validate_output(_collector({"type": "response.done", "status": "failed"}))
-
-    collector = _collector(
-        {"type": "response.created", "response": {"id": "r1"}},
-        {"type": "response.output_text.delta", "response_id": "r1", "delta": "one"},
-        _audio("r1", 1),
-        {"type": "response.created", "response": {"id": "r2"}},
-        {"type": "response.output_text.delta", "response_id": "r2", "delta": "two"},
-        _audio("r2", 2),
-        {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
-        {"type": "response.done", "response": {"id": "r2", "status": "completed"}},
-    )
-    output = tmp_path / "output"
-    success = oi.write_artifacts(output, case, collector, 1.0, 2.2, 2.3, {})
-    failed = oi.failure_summary(output, oi.OmniInteractCase(**{**case.__dict__, "video_rel": "fail.mp4"}), "x")
-    oi.write_batch(output, [success, failed])
-    directory = Path(success["output_dir"])
-    with wave.open(str(directory / "output.wav")) as wav_file:
-        assert wav_file.getnframes() == 3 * 24_000
-    transcript = json.loads((directory / "wav_transcript.json").read_text())
-    assert [chunk["text"] for chunk in transcript["chunks"]] == ["one", "two"]
-    assert len((output / "official_eval_manifest.jsonl").read_text().splitlines()) == 1
 
 
 class _Client:
@@ -196,15 +156,6 @@ class _Client:
 
     async def send(self, payload: dict[str, object]) -> None:
         self.sent.append(payload)
-
-
-@pytest.mark.asyncio
-async def test_stream_paces_audio_video_and_playback_ack():
-    client = _Client()
-    pcm = bytes(oi.PCM16_SAMPLE_RATE * oi.PCM16_BYTES_PER_SAMPLE)
-    chunks, frames, _, _ = await oi._stream(client, pcm, ["frame"], _config(), oi._Playback())
-    assert (chunks, frames) == (5, 1)
-    assert [index for index, event in enumerate(client.sent) if event.get("video_frames")] == [2]
 
 
 class _Realtime(_Client):

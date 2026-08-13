@@ -5944,6 +5944,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
     request_id = "duplex-sid-native-late-output-e0-stage0"
     late_output = object()
     engine = FakeEngineClient(
+        append_result={"ok": True, "stage_results": [{"result": {"supported": True, "seq": 7}}]},
         collect_outputs=[[], [], [], [late_output]],
         collect_delay_s=0.05,
     )
@@ -5957,9 +5958,14 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
         config=DuplexSessionConfig(extra_body={"auto_response": True}),
     )
     session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.begin_response(turn_id=0)
     session.bind_request(request_id)
     native = handler._minicpmo_session_state(session)
-    native.record_accepted_input(epoch=0, seq=7, model_turn_id=0)
+    native.record_accepted_input(epoch=0, seq=6, model_turn_id=0)
+    assert await handler._append_runtime_input(
+        session, {"audio": "", "format": "pcm_f32le"}, final=True, send_json=TimedWebSocket().send_json
+    ) == (True, False)
+    assert native.pending_input_identity(epoch=0) == (7, 1)
     continuations: list[dict[str, object]] = []
 
     async def schedule_continuation(payload: object, **_kwargs: Any) -> bool:
@@ -5982,7 +5988,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
                 "is_listen": True,
                 "model_listen": True,
                 "data_plane_request_id": request_id,
-                "input_seq": 7,
+                "input_seq": 6,
                 "model_turn_id": 0,
                 "end_of_turn": True,
             },
@@ -6040,7 +6046,7 @@ async def test_minicpmo_auto_response_restarts_drain_when_append_races_idle_exit
             "type": "input.processed",
             "session_id": session.session_id,
             "epoch": 0,
-            "processed_input_seq": 7,
+            "processed_input_seq": 6,
             "outcome": "listen",
         }
     ]

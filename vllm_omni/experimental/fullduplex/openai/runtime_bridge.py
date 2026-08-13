@@ -107,11 +107,15 @@ class NativeRuntimeBridgeMixin:
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
         watermark_state = self._runtime_session_state(session) if track_input_watermark else None
-        input_model_turn_id = payload_turn_id(payload)
+        explicit_model_turn_id = payload_turn_id(payload)
+        input_model_turn_id = explicit_model_turn_id
         if input_model_turn_id is None:
             input_model_turn_id = (
                 session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id
             )
+        pending_model_turn_id = input_model_turn_id
+        if explicit_model_turn_id is None and session.active_response_turn_id is not None:
+            pending_model_turn_id = max(session.turn_id, session.active_response_turn_id + 1)
         if watermark_state is not None:
             watermark_state.begin_input_acceptance()
         try:
@@ -162,7 +166,7 @@ class NativeRuntimeBridgeMixin:
                 deferred_processed = watermark_state.record_accepted_input(
                     epoch=session.epoch,
                     seq=accepted_input_seq,
-                    model_turn_id=input_model_turn_id,
+                    model_turn_id=pending_model_turn_id,
                 )
                 if deferred_processed is not None:
                     outcome, response_id = deferred_processed

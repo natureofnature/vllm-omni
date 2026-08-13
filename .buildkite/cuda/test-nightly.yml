@@ -53,6 +53,7 @@ steps:
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Accuracy Test"
         timeout_in_minutes: 180
         commands:
+          - export VLLM_OMNI_RUN_OMNIINTERACT_E2E=1
           - export SEED_TTS_WER_EVAL=1
           - export SEED_TTS_EVAL_DEVICE=cuda:1
           - |
