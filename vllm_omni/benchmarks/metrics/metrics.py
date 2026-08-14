@@ -207,7 +207,7 @@ def print_metrics(
         process_one_metric("e2el", metrics)
     if continuous_session:
         print("{:<40} {:<10}".format("Token / TPOT / ITL metrics:", "N/A"))
-        print("Use the OmniInteract Duplex Result below for per-response latency and audio RTF.")
+        print("Use OmniInteract response metrics for response latency and audio RTF.")
     else:
         print_text_metrics(task_type, selected_percentile_metrics, metrics)
     if task_type == TaskType.GENERATION:
