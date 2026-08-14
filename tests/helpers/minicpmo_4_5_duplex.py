@@ -20,7 +20,7 @@ DEPLOY_CONFIG = modify_stage_config(
     updates={
         "base_config": get_deploy_config_path("minicpmo_4_5.yaml"),
         "stages": {
-            0: {"kv_cache_memory_bytes": 6 * 1024 * 1024 * 1024},
+            0: {"kv_cache_memory_bytes": 8 * 1024 * 1024 * 1024},
             1: {"kv_cache_memory_bytes": 512 * 1024 * 1024},
             2: {"kv_cache_memory_bytes": 256 * 1024 * 1024},
         },
