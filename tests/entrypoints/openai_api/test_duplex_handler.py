@@ -700,6 +700,97 @@ async def test_native_realtime_protocol_accepts_disabled_turn_detection():
 
 
 @pytest.mark.asyncio
+async def test_native_realtime_protocol_accepts_trusted_client_vad():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "model": "test-model",
+            "session_id": "rt-client-vad",
+            "turn_detection": {
+                "type": "client_vad",
+                "interrupt_response": True,
+            },
+        }
+    )
+
+    assert translated is not None
+    assert translated["session"]["turn_detection"] == {
+        "type": "client_vad",
+        "interrupt_response": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_protocol_canonicalizes_trusted_client_vad_edges():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "input_audio_buffer.speech_started",
+            "source": "client_vad",
+            "utterance_id": "utterance-1",
+            "sequence": 7,
+            "confidence": 0.95,
+            "ignored": "not-forwarded",
+        }
+    )
+    invalid = await protocol._to_duplex_event(
+        {
+            "type": "input_audio_buffer.speech_stopped",
+            "source": "client_vad",
+            "utterance_id": "utterance-1",
+            "sequence": True,
+        }
+    )
+
+    assert translated == {
+        "type": "input_audio_buffer.speech_started",
+        "source": "client_vad",
+        "utterance_id": "utterance-1",
+        "sequence": 7,
+        "confidence": 0.95,
+    }
+    assert invalid is None
+    assert ws.sent[-1]["error"]["code"] == "bad_event"
+
+
+@pytest.mark.asyncio
+async def test_native_realtime_protocol_rejects_conflicting_client_vad_locations():
+    ws = TimedWebSocket()
+    protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
+    protocol.bind_sender(ws.send_json)
+
+    translated = await protocol._to_duplex_event(
+        {
+            "type": "session.update",
+            "model": "test-model",
+            "turn_detection": {
+                "type": "client_vad",
+                "interrupt_response": True,
+            },
+            "audio": {
+                "input": {
+                    "turn_detection": {
+                        "type": "client_vad",
+                        "interrupt_response": False,
+                    }
+                }
+            },
+        }
+    )
+
+    assert translated is None
+    assert ws.sent[-1]["error"]["code"] == "unsupported_turn_detection"
+    assert "conflict" in ws.sent[-1]["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_native_realtime_protocol_rejects_nested_vad_even_when_top_level_is_disabled():
     ws = TimedWebSocket()
     protocol = NativeRealtimeSessionProtocol(ws)  # type: ignore[arg-type]
@@ -1308,6 +1399,22 @@ def _native_session_create(
     return event
 
 
+def _enable_client_vad(event: dict[str, Any]) -> None:
+    event["session"]["turn_detection"] = {
+        "type": "client_vad",
+        "interrupt_response": True,
+    }
+
+
+def _client_vad_edge(edge: str, utterance_id: str, sequence: int) -> dict[str, Any]:
+    return {
+        "type": f"input_audio_buffer.{edge}",
+        "source": "client_vad",
+        "utterance_id": utterance_id,
+        "sequence": sequence,
+    }
+
+
 def _native_realtime_session_update(
     session_id: str,
     *,
@@ -1564,8 +1671,10 @@ def test_auto_response_playback_overlap_admits_model_units_and_tracks_speech():
 def test_minicpmo_auto_response_barge_in_on_speech_interrupts_active_response():
     handler, session = _auto_response_context("sid-native-auto-barge", playback_active=True)
     session.capabilities = DuplexCapabilities.minicpmo45_native()
-    session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    assert session.config.overlap_policy == DuplexOverlapPolicy.LISTEN_ONLY.value
 
+    session.config.turn_detection = {"type": "client_vad", "interrupt_response": True}
+    assert session.apply_client_vad_edge(edge="speech_started", utterance_id="utterance-1", sequence=0) == "started"
     decision = handler._overlap_decision(
         session,
         {"duration_ms": 200, "is_speech": True},
@@ -1574,8 +1683,304 @@ def test_minicpmo_auto_response_barge_in_on_speech_interrupts_active_response():
 
     assert session.capabilities.supports_barge_in is True
     assert decision["action"] == "barge_in"
-    assert decision["reason"] == "policy_barge_in_on_speech"
+    assert decision["reason"] == "trusted_client_vad_speech_started"
     assert decision["buffer_audio"] is True
+
+
+def test_minicpmo_auto_response_high_energy_pcm_requires_trusted_vad_edge():
+    handler, session = _auto_response_context("sid-native-auto-no-vad-edge", playback_active=True)
+    session.capabilities = DuplexCapabilities.minicpmo45_native()
+    session.config.overlap_policy = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    session.config.turn_detection = {"type": "client_vad", "interrupt_response": True}
+
+    decision = handler._overlap_decision(
+        session,
+        {"duration_ms": 200, "is_speech": True},
+        _native_audio_payload(samples=3200),
+    )
+
+    assert decision["action"] == "listen"
+    assert decision["reason"] == "auto_response_continuous"
+    assert decision["buffer_audio"] is True
+
+
+def test_client_vad_edges_are_ordered_idempotent_and_rearm_after_stop():
+    _, session = _auto_response_context("sid-client-vad-state", playback_active=True)
+
+    assert session.apply_client_vad_edge(edge="speech_started", utterance_id="utterance-1", sequence=10) == "started"
+    assert session.client_vad_can_interrupt() is True
+    session.mark_client_vad_interrupted(epoch=1)
+    assert session.client_vad_can_interrupt() is False
+    assert session.client_vad_resume_state() == {
+        "last_sequence": 10,
+        "active_utterance_id": "utterance-1",
+        "interrupt_decided": True,
+    }
+    assert session.client_vad_stop_is_current(utterance_id="utterance-1", sequence=11)
+    assert not session.client_vad_stop_is_current(utterance_id="other", sequence=11)
+    assert session.client_vad_force_listen_pending(epoch=1) is True
+
+    assert session.apply_client_vad_edge(edge="speech_started", utterance_id="utterance-1", sequence=10) == "duplicate"
+    assert (
+        session.apply_client_vad_edge(edge="speech_stopped", utterance_id="utterance-1", sequence=10)
+        == "sequence_conflict"
+    )
+    assert session.apply_client_vad_edge(edge="speech_stopped", utterance_id="utterance-1", sequence=9) == "stale"
+    assert session.apply_client_vad_edge(edge="speech_stopped", utterance_id="other", sequence=11) == "mismatched_stop"
+    assert session.active_client_vad_utterance_id == "utterance-1"
+
+    assert session.apply_client_vad_edge(edge="speech_stopped", utterance_id="utterance-1", sequence=12) == "stopped"
+    assert session.client_vad_force_listen_pending(epoch=1) is False
+    assert session.apply_client_vad_edge(edge="speech_started", utterance_id="utterance-2", sequence=13) == "started"
+    assert session.client_vad_can_interrupt() is True
+    session.mark_client_vad_interrupt_decided()
+    assert session.client_vad_can_interrupt() is False
+
+
+def test_open_session_turn_detection_update_is_idempotent_only():
+    handler, session = _auto_response_context("sid-client-vad-config-update", playback_active=False)
+    configured = {"type": "client_vad", "interrupt_response": True}
+    session.config.turn_detection = dict(configured)
+
+    assert (
+        handler._apply_session_update(
+            session,
+            {"turn_detection": dict(configured)},
+        )
+        is None
+    )
+    update_error = handler._apply_session_update(
+        session,
+        {"turn_detection": None},
+    )
+
+    assert update_error is not None
+    assert update_error["code"] == "turn_detection_update_unsupported"
+    assert session.config.turn_detection == configured
+
+
+@pytest.mark.asyncio
+async def test_client_vad_continued_speech_interrupts_once_and_rearms_after_stop():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-client-vad-floor-collision")
+    _enable_client_vad(create)
+    create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    async def wait_for(predicate, label: str) -> None:
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"timeout waiting for {label}")
+
+    chunk = {
+        "type": "input_audio_buffer.append",
+        "audio": _pcm_f32_b64(3200, value=0.05),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "duration_ms": 200,
+    }
+
+    try:
+        await wait_for(
+            lambda: handler._registry.get("sid-client-vad-floor-collision") is not None
+            and "session.created" in ws.sent_types(),
+            "native duplex session",
+        )
+        session = handler._registry.get("sid-client-vad-floor-collision")
+        assert session is not None
+
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
+        await wait_for(
+            lambda: session.active_client_vad_utterance_id == "utterance-1",
+            "first trusted speech edge",
+        )
+
+        first_epoch = session.epoch
+        session.begin_response()
+        session.mark_audio_sent(duration_ms=1000)
+        session.bind_request(handler._native_stage0_request_id(session, first_epoch))
+        ws.put(chunk)
+        await wait_for(lambda: len(engine.signals) == 1, "continued-speech interruption")
+        assert session.epoch == first_epoch + 1
+
+        second_epoch = session.epoch
+        session.begin_response()
+        session.mark_audio_sent(duration_ms=1000)
+        session.bind_request(handler._native_stage0_request_id(session, second_epoch))
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
+        ws.put(chunk)
+        await asyncio.sleep(0.1)
+        assert session.epoch == second_epoch
+        assert len(engine.signals) == 1
+
+        ws.put(_client_vad_edge("speech_stopped", "utterance-1", 1))
+        ws.put(_client_vad_edge("speech_started", "utterance-2", 2))
+        await wait_for(lambda: len(engine.signals) == 2, "rearmed interruption")
+        assert session.epoch == second_epoch + 1
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    cancelled = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+    assert len(cancelled) == 2
+    assert "error" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_client_vad_natural_response_end_does_not_consume_interrupt():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    original_emit_overlap_decision = handler._emit_overlap_decision
+    finish_response_during_first_decision = True
+
+    async def emit_overlap_decision(send_json, session, decision):
+        nonlocal finish_response_during_first_decision
+        await original_emit_overlap_decision(send_json, session, decision)
+        if finish_response_during_first_decision:
+            finish_response_during_first_decision = False
+            session.end_response(commit_text=False)
+
+    handler._emit_overlap_decision = emit_overlap_decision
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-client-vad-response-end-race")
+    _enable_client_vad(create)
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    async def wait_for(predicate, label: str) -> None:
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"timeout waiting for {label}")
+
+    chunk = {
+        "type": "input_audio_buffer.append",
+        "audio": _pcm_f32_b64(3200, value=0.05),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "duration_ms": 200,
+    }
+
+    try:
+        await wait_for(
+            lambda: handler._registry.get("sid-client-vad-response-end-race") is not None
+            and "session.created" in ws.sent_types(),
+            "native duplex session",
+        )
+        session = handler._registry.get("sid-client-vad-response-end-race")
+        assert session is not None
+
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
+        await wait_for(
+            lambda: session.active_client_vad_utterance_id == "utterance-1",
+            "trusted speech edge",
+        )
+
+        initial_epoch = session.epoch
+        session.begin_response()
+        session.bind_request(handler._native_stage0_request_id(session, initial_epoch))
+        ws.put(chunk)
+        await wait_for(
+            lambda: not finish_response_during_first_decision,
+            "first overlap decision",
+        )
+        assert session.epoch == initial_epoch
+        assert session.client_vad_can_interrupt() is True
+        assert engine.signals == []
+
+        session.begin_response()
+        session.bind_request(handler._native_stage0_request_id(session, initial_epoch))
+        ws.put(chunk)
+        await wait_for(lambda: len(engine.signals) == 1, "second response interruption")
+        assert session.epoch == initial_epoch + 1
+        assert session.client_vad_can_interrupt() is False
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
+
+    cancelled = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+    assert len(cancelled) == 1
+    assert "error" not in ws.sent_types()
+
+
+@pytest.mark.asyncio
+async def test_client_vad_matching_stop_interrupts_response_started_after_last_pcm():
+    engine = FakeEngineClient()
+    handler = OmniDuplexSessionHandler(
+        chat_service=FakeChatService(engine),
+        config_timeout_s=0.1,
+        idle_timeout_s=2,
+    )
+    ws = TimedWebSocket(receive_timeout_s=2)
+    create = _native_session_create("sid-client-vad-stop-race")
+    _enable_client_vad(create)
+    create["session"]["extra_body"]["auto_response"] = True
+    ws.put(create)
+    handler_task = asyncio.create_task(handler.handle_session(ws))
+
+    async def wait_for(predicate, label: str) -> None:
+        for _ in range(100):
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+        pytest.fail(f"timeout waiting for {label}")
+
+    try:
+        await wait_for(
+            lambda: handler._registry.get("sid-client-vad-stop-race") is not None
+            and "session.created" in ws.sent_types(),
+            "native duplex session",
+        )
+        session = handler._registry.get("sid-client-vad-stop-race")
+        assert session is not None
+
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
+        ws.put(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": _pcm_f32_b64(3200, value=0.001),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "duration_ms": 200,
+            }
+        )
+        await wait_for(
+            lambda: session.active_client_vad_utterance_id == "utterance-1",
+            "trusted speech edge",
+        )
+
+        old_epoch = session.epoch
+        response_id = session.begin_response()
+        request_id = handler._native_stage0_request_id(session, old_epoch)
+        session.bind_request(request_id)
+        ws.put(_client_vad_edge("speech_stopped", "utterance-1", 1))
+        await wait_for(lambda: len(engine.signals) == 1, "stop-edge interruption")
+
+        assert session.epoch == old_epoch + 1
+        assert session.active_client_vad_utterance_id is None
+        assert engine.aborted == [request_id]
+        cancelled = [event for event in ws.sent if event.get("type") == "audio.cancelled"]
+        assert len(cancelled) == 1
+        assert cancelled[0]["response_id"] == response_id
+    finally:
+        ws.put({"type": "session.close"})
+        await asyncio.wait_for(handler_task, timeout=2)
 
 
 @pytest.mark.asyncio
@@ -1588,6 +1993,7 @@ async def test_minicpmo_auto_response_vad_barge_in_cancels_and_retains_audio():
     )
     ws = TimedWebSocket()
     create = _native_session_create("sid-native-auto-vad-barge")
+    _enable_client_vad(create)
     create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     create["session"]["extra_body"]["auto_response"] = True
     ws.put(create)
@@ -1617,12 +2023,15 @@ async def test_minicpmo_auto_response_vad_barge_in_cancels_and_retains_audio():
 
         chunk = {
             "type": "input_audio_buffer.append",
-            "audio": _pcm_f32_b64(3200, value=0.05),
+            "audio": _pcm_f32_b64(3200, value=0.0),
             "format": "pcm_f32le",
             "sample_rate_hz": 16000,
             "duration_ms": 200,
         }
-        for _ in range(5):
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
+        ws.put(chunk)
+        ws.put(_client_vad_edge("speech_stopped", "utterance-1", 1))
+        for _ in range(4):
             ws.put(chunk)
         for _ in range(100):
             if engine.appended:
@@ -1642,7 +2051,7 @@ async def test_minicpmo_auto_response_vad_barge_in_cancels_and_retains_audio():
     overlap_events = [event for event in ws.sent if event.get("type") == "overlap.decision"]
     assert len(overlap_events) == 1
     assert overlap_events[0]["action"] == "barge_in"
-    assert overlap_events[0]["reason"] == "policy_barge_in_on_speech"
+    assert overlap_events[0]["reason"] == "trusted_client_vad_speech_started"
     assert engine.aborted == [request_id]
     assert engine.signals == [(session.session_id, "barge_in")]
     assert engine.signal_fences == [cancelled_fence]
@@ -1660,6 +2069,8 @@ async def test_minicpmo_auto_response_vad_barge_in_cancels_and_retains_audio():
     assert mode == "append_audio_chunk"
     assert final is False
     assert isinstance(payload, dict)
+    assert payload["force_listen"] is True
+    assert payload["is_speech"] is True
     assert np.frombuffer(base64.b64decode(payload["audio"]), dtype="<f4").shape == (16000,)
     assert engine.appended_fences[0] is not None
     assert engine.appended_fences[0].epoch == old_epoch + 1
@@ -1695,6 +2106,7 @@ async def test_minicpmo_vad_barge_in_cancels_inflight_pcm_and_keeps_preroll():
     )
     ws = TimedWebSocket(receive_timeout_s=2)
     create = _native_session_create("sid-native-vad-inflight-pcm")
+    _enable_client_vad(create)
     create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     create["session"]["extra_body"]["auto_response"] = True
     ws.put(create)
@@ -1731,6 +2143,7 @@ async def test_minicpmo_vad_barge_in_cancels_inflight_pcm_and_keeps_preroll():
         request_id = handler._native_stage0_request_id(session, old_epoch)
         session.bind_request(request_id)
 
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
         ws.put(silent_chunk)
         for _ in range(4):
             ws.put(speech_chunk)
@@ -1801,6 +2214,7 @@ async def test_minicpmo_vad_barge_in_discards_queued_pcm_reservation():
     )
     ws = TimedWebSocket(receive_timeout_s=2)
     create = _native_session_create("sid-native-vad-queued-pcm")
+    _enable_client_vad(create)
     create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     create["session"]["extra_body"]["auto_response"] = True
     ws.put(create)
@@ -1842,6 +2256,7 @@ async def test_minicpmo_vad_barge_in_discards_queued_pcm_reservation():
             pytest.fail("queued PCM reservation was not created")
 
         old_epoch = session.epoch
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
         for _ in range(5):
             ws.put(speech_chunk)
         for _ in range(100):
@@ -1875,6 +2290,7 @@ async def test_minicpmo_vad_barge_in_fences_response_bound_append_only():
     )
     ws = TimedWebSocket(receive_timeout_s=2)
     create = _native_session_create("sid-native-vad-append-only")
+    _enable_client_vad(create)
     create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     create["session"]["extra_body"]["auto_response"] = True
     ws.put(create)
@@ -1898,6 +2314,7 @@ async def test_minicpmo_vad_barge_in_fences_response_bound_append_only():
             final=True,
             response_bound=True,
         )
+        ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
         ws.put(
             {
                 "type": "input_audio_buffer.append",
@@ -1934,6 +2351,7 @@ async def test_minicpmo_vad_barge_in_runtime_signal_failure_closes_session():
     )
     ws = TimedWebSocket(receive_timeout_s=2)
     create = _native_session_create("sid-native-vad-signal-failure")
+    _enable_client_vad(create)
     create["session"]["overlap_policy"] = DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
     create["session"]["extra_body"]["auto_response"] = True
     ws.put(create)
@@ -1953,6 +2371,7 @@ async def test_minicpmo_vad_barge_in_runtime_signal_failure_closes_session():
     session.mark_audio_sent(duration_ms=2000)
     request_id = handler._native_stage0_request_id(session, old_epoch)
     session.bind_request(request_id)
+    ws.put(_client_vad_edge("speech_started", "utterance-1", 0))
     ws.put(
         {
             "type": "input_audio_buffer.append",
@@ -4525,7 +4944,10 @@ async def test_realtime_resume_rotates_token_replays_and_preserves_runtime_ident
         idle_timeout_s=1,
     )
     first = TimedWebSocket(receive_timeout_s=0.01)
-    first.put(_native_realtime_session_update("sid-realtime-resume"))
+    session_update = _native_realtime_session_update("sid-realtime-resume")
+    _enable_client_vad(session_update)
+    first.put(session_update)
+    first.put(_client_vad_edge("speech_started", "utterance-resume", 7))
     first.put({"type": "session.heartbeat"})
 
     await handler.handle_realtime_session(first)
@@ -4564,6 +4986,11 @@ async def test_realtime_resume_rotates_token_replays_and_preserves_runtime_ident
     assert resumed["incarnation"] == incarnation
     assert resumed["attachment_generation"] == 2
     assert resumed["resume_token"] != token
+    assert resumed["client_vad"] == {
+        "last_sequence": 7,
+        "active_utterance_id": "utterance-resume",
+        "interrupt_decided": False,
+    }
     assert replayed == [heartbeat]
     assert engine.opened == ["sid-realtime-resume"]
     assert engine.resumed == [("sid-realtime-resume", 0)]

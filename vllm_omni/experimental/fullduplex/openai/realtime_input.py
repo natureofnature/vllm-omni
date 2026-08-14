@@ -242,6 +242,47 @@ class RealtimeInputTranslator:
                 }
             )
             return None
+        if event_type in {
+            "input_audio_buffer.speech_started",
+            "input_audio_buffer.speech_stopped",
+        }:
+            source = event.get("source")
+            utterance_id = event.get("utterance_id")
+            sequence = event.get("sequence")
+            if source != "client_vad":
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "bad_event",
+                        "trusted client VAD events require source='client_vad'",
+                        event_id=event.get("event_id"),
+                    )
+                )
+                return None
+            if (
+                not isinstance(utterance_id, str)
+                or not utterance_id
+                or not isinstance(sequence, int)
+                or sequence < 0
+                or isinstance(sequence, bool)
+            ):
+                await self._send_realtime_payload(
+                    self._realtime_error_payload(
+                        "bad_event",
+                        "trusted client VAD events require a non-empty utterance_id and non-negative integer sequence",
+                        event_id=event.get("event_id"),
+                    )
+                )
+                return None
+            translated = {
+                "type": event_type,
+                "source": source,
+                "utterance_id": utterance_id,
+                "sequence": sequence,
+            }
+            for key in ("event_id", "confidence"):
+                if key in event:
+                    translated[key] = event[key]
+            return translated
         if event_type == "input_audio_buffer.append":
             audio = event.get("audio") or event.get("delta")
             fmt, format_rate = self._parse_realtime_audio_format(
@@ -958,6 +999,15 @@ class RealtimeInputTranslator:
             if isinstance(value, int | float):
                 fields[key] = value
 
+        turn_detection = session_payload.get("turn_detection")
+        audio_config = session_payload.get("audio")
+        if turn_detection is None and isinstance(audio_config, dict):
+            audio_input = audio_config.get("input")
+            if isinstance(audio_input, dict):
+                turn_detection = audio_input.get("turn_detection")
+        if isinstance(turn_detection, dict):
+            fields["turn_detection"] = dict(turn_detection)
+
         if isinstance(session_payload.get("playback_commit_policy"), str):
             fields["playback_commit_policy"] = session_payload["playback_commit_policy"]
         return fields
@@ -1001,14 +1051,26 @@ class RealtimeInputTranslator:
             audio_input = audio_config.get("input")
             if isinstance(audio_input, dict) and "turn_detection" in audio_input:
                 configured_values.append(("audio.input.turn_detection", audio_input["turn_detection"]))
+        if len(configured_values) == 2:
+            top_level = configured_values[0][1]
+            nested = configured_values[1][1]
+            if top_level != nested:
+                return "turn_detection and audio.input.turn_detection must not conflict"
+
         for field_path, turn_detection in configured_values:
             if turn_detection is None:
                 continue
-            turn_detection_type = turn_detection.get("type") if isinstance(turn_detection, dict) else turn_detection
-            return (
-                f"{field_path}={turn_detection_type!r} is not implemented by the duplex Realtime adapter; "
-                "set turn_detection to null and commit input explicitly, or use the model-owned duplex policy"
-            )
+            if not isinstance(turn_detection, dict):
+                return f"{field_path} must be an object or null"
+            turn_detection_type = turn_detection.get("type")
+            if turn_detection_type != "client_vad":
+                return (
+                    f"{field_path}={turn_detection_type!r} is not implemented by the duplex Realtime adapter; "
+                    "use type='client_vad', set turn_detection to null, or use the model-owned duplex policy"
+                )
+            interrupt_response = turn_detection.get("interrupt_response")
+            if interrupt_response is not None and not isinstance(interrupt_response, bool):
+                return f"{field_path}.interrupt_response must be a boolean"
         return None
 
     @staticmethod

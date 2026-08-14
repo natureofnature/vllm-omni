@@ -65,6 +65,8 @@ class DuplexCapabilities:
     supports_external_turn_signal: bool = True
     supports_client_commit: bool = True
     supports_barge_in: bool = True
+    supports_automatic_barge_in: bool = False
+    automatic_barge_in_sources: list[str] = field(default_factory=list)
     supports_playback_ack: bool = True
     supports_input_append: bool = False
     supports_replace_latest_chunk: bool = True
@@ -102,6 +104,8 @@ class DuplexCapabilities:
         return cls(
             supports_model_native_turn_policy=True,
             supports_barge_in=True,
+            supports_automatic_barge_in=True,
+            automatic_barge_in_sources=["client_vad"],
             supports_input_append=True,
             supports_replace_latest_chunk=False,
             supports_reencode_context=False,
@@ -139,6 +143,8 @@ class DuplexCapabilities:
             "supports_external_turn_signal": self.supports_external_turn_signal,
             "supports_client_commit": self.supports_client_commit,
             "supports_barge_in": self.supports_barge_in,
+            "supports_automatic_barge_in": self.supports_automatic_barge_in,
+            "automatic_barge_in_sources": list(self.automatic_barge_in_sources),
             "supports_playback_ack": self.supports_playback_ack,
             "supports_input_append": self.supports_input_append,
             "supports_replace_latest_chunk": self.supports_replace_latest_chunk,
@@ -240,6 +246,7 @@ class DuplexSessionConfig:
     overlap_short_ack_ms: int = 700
     overlap_barge_in_ms: int = 1200
     overlap_silence_rms: float = 0.003
+    turn_detection: dict[str, object] | None = None
     playback_commit_policy: str = DuplexPlaybackCommitPolicy.COMMIT_ALL_ON_DONE.value
     extra_body: dict[str, object] = field(default_factory=dict)
 
@@ -260,6 +267,7 @@ class DuplexSessionConfig:
             "overlap_short_ack_ms": self.overlap_short_ack_ms,
             "overlap_barge_in_ms": self.overlap_barge_in_ms,
             "overlap_silence_rms": self.overlap_silence_rms,
+            "turn_detection": dict(self.turn_detection) if self.turn_detection is not None else None,
             "playback_commit_policy": self.playback_commit_policy,
             "extra_body": dict(self.extra_body),
         }
@@ -301,6 +309,8 @@ class DuplexSessionConfig:
             config.overlap_barge_in_ms = max(0, int(source["overlap_barge_in_ms"]))
         if isinstance(source.get("overlap_silence_rms"), int | float):
             config.overlap_silence_rms = max(0.0, float(source["overlap_silence_rms"]))
+        if isinstance(source.get("turn_detection"), dict):
+            config.turn_detection = dict(source["turn_detection"])
         if isinstance(source.get("playback_commit_policy"), str):
             config.playback_commit_policy = cls._normalize_playback_commit_policy(source["playback_commit_policy"])
         if isinstance(source.get("modalities"), list) and all(isinstance(x, str) for x in source["modalities"]):
@@ -319,6 +329,9 @@ class DuplexSessionConfig:
             if isinstance(extra.get("playback_commit_policy"), str):
                 config.playback_commit_policy = cls._normalize_playback_commit_policy(extra["playback_commit_policy"])
         return config
+
+    def uses_client_vad(self) -> bool:
+        return self.turn_detection is not None and self.turn_detection.get("type") == "client_vad"
 
     @staticmethod
     def _normalize_overlap_policy(value: str) -> str:
@@ -381,6 +394,17 @@ class InputBufferState:
 
 
 @dataclass
+class ClientVadState:
+    active_utterance_id: str | None = None
+    last_sequence: int = -1
+    interrupt_decided_utterance_id: str | None = None
+    last_edge: str | None = None
+    last_edge_utterance_id: str | None = None
+    force_listen_utterance_id: str | None = None
+    force_listen_epoch: int | None = None
+
+
+@dataclass
 class ResponseState:
     active_request_id: str | None = None
     active_response_id: str | None = None
@@ -425,6 +449,7 @@ class DuplexSession:
     epoch: int = 0
     turn_id: int = 0
     _input: InputBufferState = field(default_factory=InputBufferState, repr=False)
+    _client_vad: ClientVadState = field(default_factory=ClientVadState, repr=False)
     _response: ResponseState = field(default_factory=ResponseState, repr=False)
     _playback: PlaybackLedger = field(default_factory=PlaybackLedger, repr=False)
     _conversation: ConversationHistory = field(default_factory=ConversationHistory, repr=False)
@@ -825,6 +850,88 @@ class DuplexSession:
         previous = self._input.overlap_speech_ms
         self._input.overlap_speech_ms = 0
         return previous
+
+    @property
+    def active_client_vad_utterance_id(self) -> str | None:
+        return self._client_vad.active_utterance_id
+
+    def client_vad_stop_is_current(self, *, utterance_id: str, sequence: int) -> bool:
+        """Return whether a stop would close the current trusted utterance."""
+        return self._client_vad.active_utterance_id == utterance_id and sequence > self._client_vad.last_sequence
+
+    def client_vad_resume_state(self) -> dict[str, object]:
+        """Return the cursor a resumed client needs to continue VAD ordering."""
+        active = self._client_vad.active_utterance_id
+        return {
+            "last_sequence": self._client_vad.last_sequence,
+            "active_utterance_id": active,
+            "interrupt_decided": (active is not None and self._client_vad.interrupt_decided_utterance_id == active),
+        }
+
+    def apply_client_vad_edge(self, *, edge: str, utterance_id: str, sequence: int) -> str:
+        """Apply one ordered trusted-client VAD edge."""
+        if sequence < self._client_vad.last_sequence:
+            return "stale"
+        if sequence == self._client_vad.last_sequence:
+            if edge == self._client_vad.last_edge and utterance_id == self._client_vad.last_edge_utterance_id:
+                return "duplicate"
+            return "sequence_conflict"
+        self._client_vad.last_sequence = sequence
+        self._client_vad.last_edge = edge
+        self._client_vad.last_edge_utterance_id = utterance_id
+        active = self._client_vad.active_utterance_id
+        if edge == "speech_started":
+            if active is None:
+                self._client_vad.active_utterance_id = utterance_id
+                self._client_vad.interrupt_decided_utterance_id = None
+                return "started"
+            return "duplicate" if active == utterance_id else "overlap_rejected"
+        if edge == "speech_stopped":
+            if active != utterance_id:
+                return "mismatched_stop"
+            self._client_vad.active_utterance_id = None
+            self._client_vad.interrupt_decided_utterance_id = None
+            self.clear_client_vad_force_listen()
+            return "stopped"
+        raise ValueError(f"unsupported client VAD edge: {edge}")
+
+    def client_vad_can_interrupt(self) -> bool:
+        utterance_id = self._client_vad.active_utterance_id
+        return utterance_id is not None and self._client_vad.interrupt_decided_utterance_id != utterance_id
+
+    def mark_client_vad_interrupt_decided(self) -> None:
+        utterance_id = self._client_vad.active_utterance_id
+        if utterance_id is not None:
+            self._client_vad.interrupt_decided_utterance_id = utterance_id
+
+    def mark_client_vad_interrupted(self, *, epoch: int) -> None:
+        utterance_id = self._client_vad.active_utterance_id
+        if utterance_id is None:
+            return
+        self.mark_client_vad_interrupt_decided()
+        self._client_vad.force_listen_utterance_id = utterance_id
+        self._client_vad.force_listen_epoch = int(epoch)
+
+    def client_vad_force_listen_pending(self, *, epoch: int) -> bool:
+        return self._client_vad.force_listen_utterance_id is not None and self._client_vad.force_listen_epoch == int(
+            epoch
+        )
+
+    def consume_client_vad_force_listen(self, *, epoch: int) -> bool:
+        if self._client_vad.force_listen_utterance_id is None or self._client_vad.force_listen_epoch != int(epoch):
+            return False
+        self._client_vad.force_listen_utterance_id = None
+        self._client_vad.force_listen_epoch = None
+        return True
+
+    def clear_client_vad_force_listen(self) -> None:
+        self._client_vad.force_listen_utterance_id = None
+        self._client_vad.force_listen_epoch = None
+
+    def clear_client_vad_input(self) -> None:
+        self._client_vad.active_utterance_id = None
+        self._client_vad.interrupt_decided_utterance_id = None
+        self.clear_client_vad_force_listen()
 
     def append_assistant_text(self, text: str) -> None:
         if text:

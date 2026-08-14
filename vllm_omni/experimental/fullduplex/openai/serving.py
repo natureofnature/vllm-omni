@@ -449,6 +449,7 @@ class OmniDuplexSessionHandler(
         """
         duration_ms = self._input_audio_duration_ms(event, payload)
         is_speech = self._input_looks_like_speech(event, payload, session=session)
+        trusted_client_vad = self._trusted_client_vad_requests_barge_in(session)
         if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
             return self._defer_unsupported_barge_in(session, duration_ms=duration_ms, is_speech=is_speech)
         explicit = event.get("overlap_action") or event.get("overlap")
@@ -489,9 +490,7 @@ class OmniDuplexSessionHandler(
                 "buffer_audio": True,
             }
         policy = session.config.overlap_policy
-        if self._session_auto_responds(session) and not (
-            policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and is_speech
-        ):
+        if self._session_auto_responds(session) and not trusted_client_vad:
             # Full-duplex input remains model-owned while output is active. Feed
             # complete model units into the existing Stage0 stream immediately;
             # playback only controls history ACKs, not model admission. An
@@ -540,6 +539,16 @@ class OmniDuplexSessionHandler(
                 "defer_runtime_append": True,
             }
 
+        if trusted_client_vad:
+            session.accumulate_overlap_speech(duration_ms)
+            return {
+                "action": "barge_in",
+                "reason": "trusted_client_vad_speech_started",
+                "duration_ms": duration_ms,
+                "overlap_speech_ms": session.overlap_speech_ms,
+                "buffer_audio": True,
+            }
+
         if policy == DuplexOverlapPolicy.LISTEN_ONLY.value:
             session.accumulate_overlap_speech(duration_ms)
             return {
@@ -551,17 +560,15 @@ class OmniDuplexSessionHandler(
                 "defer_runtime_append": True,
             }
 
-        if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value and not session.capabilities.supports_barge_in:
-            return self._defer_unsupported_barge_in(session, duration_ms=duration_ms, is_speech=True)
-
         session.accumulate_overlap_speech(duration_ms)
         if policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value:
             return {
-                "action": "barge_in",
-                "reason": "policy_barge_in_on_speech",
+                "action": "listen",
+                "reason": "automatic_barge_in_unconfirmed",
                 "duration_ms": duration_ms,
                 "overlap_speech_ms": session.overlap_speech_ms,
                 "buffer_audio": True,
+                "defer_runtime_append": False,
             }
 
         if (
@@ -612,6 +619,18 @@ class OmniDuplexSessionHandler(
             "interrupt",
             "cancel",
         }
+
+    @staticmethod
+    def _trusted_client_vad_requests_barge_in(session: DuplexSession) -> bool:
+        turn_detection = session.config.turn_detection
+        return (
+            session.capabilities.supports_automatic_barge_in
+            and "client_vad" in session.capabilities.automatic_barge_in_sources
+            and session.config.uses_client_vad()
+            and isinstance(turn_detection, dict)
+            and turn_detection.get("interrupt_response") is True
+            and session.client_vad_can_interrupt()
+        )
 
     @staticmethod
     def _defer_unsupported_barge_in(
@@ -1056,6 +1075,8 @@ class OmniDuplexSessionHandler(
                 "attachment_generation": generation,
                 "resume_token": token.plaintext,
             }
+            if session.config.uses_client_vad():
+                internal["client_vad"] = session.client_vad_resume_state()
             return realtime_protocol.encode_outbound_event(internal)[0]
 
         try:
@@ -1303,6 +1324,44 @@ class OmniDuplexSessionHandler(
         audio_config = payload.get("audio")
         audio_input = audio_config.get("input") if isinstance(audio_config, dict) else None
         audio_output = audio_config.get("output") if isinstance(audio_config, dict) else None
+        top_level_turn_detection_present = "turn_detection" in payload
+        nested_turn_detection_present = isinstance(audio_input, dict) and "turn_detection" in audio_input
+        if (
+            top_level_turn_detection_present
+            and nested_turn_detection_present
+            and payload["turn_detection"] != audio_input["turn_detection"]
+        ):
+            return {
+                "type": "error",
+                "session_id": session.session_id,
+                "code": "turn_detection_update_unsupported",
+                "error": "session.update contains conflicting turn_detection configurations",
+            }
+        turn_detection_present = top_level_turn_detection_present or nested_turn_detection_present
+        turn_detection = (
+            payload["turn_detection"]
+            if top_level_turn_detection_present
+            else audio_input["turn_detection"]
+            if nested_turn_detection_present
+            else None
+        )
+        if turn_detection_present:
+            normalized_turn_detection = dict(turn_detection) if isinstance(turn_detection, dict) else None
+            if turn_detection is not None and normalized_turn_detection is None:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "turn_detection_update_unsupported",
+                    "error": "session.update turn_detection must be an object or null",
+                }
+            if normalized_turn_detection != session.config.turn_detection:
+                return {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "code": "turn_detection_update_unsupported",
+                    "error": "session.update cannot change turn_detection after the duplex session is open",
+                }
+
         voice = payload.get("voice")
         if not isinstance(voice, str) and isinstance(audio_output, dict):
             voice = audio_output.get("voice")

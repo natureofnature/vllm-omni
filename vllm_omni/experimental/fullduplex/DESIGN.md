@@ -47,11 +47,11 @@ The checkpoint keeps these verified contracts:
 - MiniCPM Stage0 conversation KV continuity;
 - Stage1 TTS and Token2Wav continuity;
 - model-owned listen/speak decisions on the normal auto-response path;
-- continuous browser PCM upload during assistant playback, without browser VAD
-  or browser-generated input commits;
-- opt-in serving-side speech interruption with epoch fencing and exactly one
-  cancellation terminal; speech is classified from an explicit client hint or
-  a lightweight PCM RMS threshold;
+- continuous browser PCM upload during assistant playback, without requiring
+  browser VAD or browser-generated input commits;
+- opt-in trusted-client VAD interruption with epoch fencing and exactly one
+  cancellation terminal per utterance; raw PCM energy is not a destructive
+  cancellation signal;
 - segment EOS and turn EOS as different boundaries;
 - transcript/audio cursors scoped to a response and turn;
 - playback acknowledgement and history commit;
@@ -66,7 +66,7 @@ The checkpoint keeps these verified contracts:
 The checkpoint does not claim:
 
 - scheduler-native KV append;
-- neural-network VAD or browser-side VAD;
+- server-side neural VAD, acoustic echo cancellation, or double-talk detection;
 - production multi-session admission, fairness, capacity, or failure recovery;
 - bounded long-session KV;
 - video input or audio/video synchronization.
@@ -608,9 +608,9 @@ machine.
 
 ### Realtime input ownership
 
-The browser is a continuous PCM producer. While the session is open and the
-microphone is unmuted, it sends `input_audio_buffer.append` every 200 ms,
-including while assistant audio is being generated or played. It does not run
+The default browser is a continuous PCM producer. While the session is open and
+the microphone is unmuted, it sends `input_audio_buffer.append` every 200 ms,
+including while assistant audio is being generated or played. It does not need
 VAD and does not send `input_audio_buffer.commit`. Native Stage0 consumes the
 stream in approximately one-second model units; MiniCPM listen, speak, and turn
 EOS decisions advance the model conversation.
@@ -646,13 +646,26 @@ item". Silent overlap no longer discards earlier user PCM. This is an input
 ownership correction. It does not add a VAD policy: overlap is admitted to
 Stage0 and the model decides whether to listen or speak.
 
-When an auto-response session explicitly selects the
-`barge_in_on_speech` overlap policy, the serving runner instead treats an
-explicit `is_speech=true` hint or PCM above the configured RMS threshold as a
-barge-in. It cancels in-flight append and response work, advances the epoch,
-signals the runtime with the old and new fences, and retains the triggering
-audio as input for the new epoch. This is a lightweight energy policy, not a
-neural VAD; the default auto-response policy remains model-owned.
+When an auto-response session explicitly selects
+`turn_detection.type=client_vad` with `interrupt_response=true`, automatic
+interruption is armed only by
+ordered trusted-client `speech_started` and `speech_stopped` events carrying a
+non-empty utterance ID and a session-monotonic sequence. The client must run
+echo control and stateful VAD, and send the start edge before the corresponding
+speech PCM, including any retained pre-roll.
+
+A start edge interrupts an active response, or an assistant response that
+starts while that same utterance remains active, exactly once. The matching
+stop edge re-arms the next utterance. Duplicate, stale, and conflicting edges
+do not change response ownership. Raw PCM energy and `is_speech` observations
+alone never trigger destructive cancellation.
+
+On a confirmed interruption, the runner cancels in-flight append and response
+work, advances the epoch, signals the runtime with the old and new fences, and
+emits exactly one cancellation terminal. The triggering speech remains input
+for the new epoch, and its first complete MiniCPM model unit receives
+`force_listen` exactly once. The client is responsible for stopping local
+playback immediately. The default auto-response policy remains model-owned.
 
 The first chunk of one overlapping input item also reserves its target model
 turn. A later Realtime commit uses that reserved identity even if response EOS
@@ -1034,6 +1047,7 @@ Passing this checkpoint supports the statement:
 > Single-session, model-owned MiniCPM-o 4.5 native duplex is reviewable on the
 > validated H20 configuration.
 
-It does not support claims for neural or browser-side VAD,
-multi-session production concurrency, bounded long-session KV,
-scheduler-native append, or video input.
+It does not support claims for server-side neural VAD, server-side AEC or
+double-talk detection, the accuracy of any particular trusted-client detector,
+multi-session production concurrency, bounded long-session KV, scheduler-native
+append, or video input.

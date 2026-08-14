@@ -18,7 +18,6 @@ from vllm_omni.experimental.fullduplex.openai.commit_policy import (
     decide_commit_action,
 )
 from vllm_omni.experimental.fullduplex.openai.protocol import (
-    DuplexOverlapPolicy,
     DuplexPlaybackCommitPolicy,
     DuplexSession,
     DuplexSessionState,
@@ -410,6 +409,52 @@ class DuplexSessionRunnerMixin:
                 return True
             await close_after_runtime_signal_failure()
             return False
+
+        async def interrupt_native_response(*, mark_client_vad: bool) -> bool:
+            assert session is not None
+            cancelled_fence = DuplexFence(
+                session.session_id,
+                epoch=session.epoch,
+                turn_id=session.turn_id,
+                incarnation=session.incarnation,
+            )
+            playback_was_active = self._assistant_playback_active(session)
+            native.audio_buffer.clear_force_listen()
+            session.clear_client_vad_force_listen()
+            session.reset_overlap_speech()
+            had_native_unbuffered_append = native.input_since_commit and not native.audio_buffer.has_pending()
+            session.release_input_bytes(native.clear_committed_audio())
+            native.input_since_commit = False
+            native.speech_since_commit = False
+            await cancel_fenced_native_response(
+                reason="barge_in",
+                response_bound_only=False,
+                had_native_unbuffered_append=had_native_unbuffered_append,
+                playback_was_active=playback_was_active,
+            )
+            if session.epoch > cancelled_fence.epoch:
+                if mark_client_vad:
+                    session.mark_client_vad_interrupted(epoch=session.epoch)
+                if not await signal_fenced_native_barge_in(cancelled_fence):
+                    return False
+            actor.active_response_task = None
+            return True
+
+        async def maybe_interrupt_for_client_vad(event: dict[str, object]) -> bool:
+            assert session is not None
+            if not native_response_in_progress() or not self._trusted_client_vad_requests_barge_in(session):
+                return True
+            decision_event = dict(event)
+            decision_event["is_speech"] = True
+            decision = self._overlap_decision(
+                session,
+                decision_event,
+                {"type": "audio", "is_speech": True},
+            )
+            await self._emit_overlap_decision(emit_event, session, decision)
+            if decision.get("action") != "barge_in":
+                return True
+            return await interrupt_native_response(mark_client_vad=True)
 
         def clear_completed_pending_silence() -> None:
             task = native.pending_silence_task
@@ -987,6 +1032,7 @@ class DuplexSessionRunnerMixin:
                 if event_type == "input_audio_buffer.clear":
                     native.audio_buffer.clear()
                     session.release_all_input_bytes()
+                    session.clear_client_vad_input()
                     native.input_since_commit = False
                     native.speech_since_commit = False
                     native.clear_committed_audio()
@@ -1242,6 +1288,61 @@ class DuplexSessionRunnerMixin:
                         await start_runtime_append(text, final=False, mode="append_tokens")
                     continue
 
+                if event_type in {
+                    "input_audio_buffer.speech_started",
+                    "input_audio_buffer.speech_stopped",
+                }:
+                    if (
+                        not session.config.uses_client_vad()
+                        or not session.capabilities.supports_automatic_barge_in
+                        or "client_vad" not in session.capabilities.automatic_barge_in_sources
+                    ):
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": "trusted client VAD is not configured for this session",
+                                "code": "client_vad_not_configured",
+                            }
+                        )
+                        continue
+                    source = event.get("source")
+                    utterance_id = event.get("utterance_id")
+                    sequence = event.get("sequence")
+                    if (
+                        source != "client_vad"
+                        or not isinstance(utterance_id, str)
+                        or not utterance_id
+                        or not isinstance(sequence, int)
+                        or sequence < 0
+                        or isinstance(sequence, bool)
+                    ):
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "error": "invalid trusted client VAD event",
+                                "code": "bad_event",
+                            }
+                        )
+                        continue
+                    edge = event_type.removeprefix("input_audio_buffer.")
+                    if (
+                        edge == "speech_stopped"
+                        and session.client_vad_stop_is_current(
+                            utterance_id=utterance_id,
+                            sequence=sequence,
+                        )
+                        and not await maybe_interrupt_for_client_vad(event)
+                    ):
+                        return
+                    edge_result = session.apply_client_vad_edge(
+                        edge=edge,
+                        utterance_id=utterance_id,
+                        sequence=sequence,
+                    )
+                    if edge_result == "started" and not await maybe_interrupt_for_client_vad(event):
+                        return
+                    continue
+
                 if event_type == "input_audio_buffer.append":
                     session.mark_user_input_activity()
                     audio = event.get("audio") or event.get("data")
@@ -1302,18 +1403,19 @@ class DuplexSessionRunnerMixin:
                         if frames:
                             payload["video_frames"] = frames
                     # Speech/silence tag for the Stage0 turn-ended latch.
-                    payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
+                    payload["is_speech"] = (
+                        session.config.uses_client_vad() and session.active_client_vad_utterance_id is not None
+                    ) or self._input_looks_like_speech(event, payload, session=session)
                     defer_native_append = False
                     buffer_overlap_audio = True
                     if self._uses_native_input_append(session):
                         mark_pending_silence_superseded()
-                        auto_barge_in = self._session_auto_responds(session) and (
-                            (
-                                session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
-                                and bool(payload["is_speech"])
-                            )
-                            or self._event_requests_barge_in(event)
-                        )
+                        if not await maybe_interrupt_for_client_vad(event):
+                            return
+                        apply_client_vad_force_listen = session.client_vad_force_listen_pending(epoch=session.epoch)
+                        if apply_client_vad_force_listen:
+                            payload["force_listen"] = True
+                        auto_barge_in = self._session_auto_responds(session) and self._event_requests_barge_in(event)
                         overlap_active = native_response_in_progress() and (
                             not self._session_auto_responds(session) or auto_barge_in
                         )
@@ -1341,34 +1443,10 @@ class DuplexSessionRunnerMixin:
                                 if decision.get("force_listen", True) is True:
                                     payload["force_listen"] = True
                             else:
-                                event["force_barge_in"] = True
-                                cancelled_fence = DuplexFence(
-                                    session.session_id,
-                                    epoch=session.epoch,
-                                    turn_id=session.turn_id,
-                                    incarnation=session.incarnation,
-                                )
-                                playback_was_active = self._assistant_playback_active(session)
                                 buffer_overlap_audio = True
                                 defer_native_append = False
-                                native.audio_buffer.clear_force_listen()
-                                session.reset_overlap_speech()
-                                had_native_unbuffered_append = (
-                                    native.input_since_commit and not native.audio_buffer.has_pending()
-                                )
-                                session.release_input_bytes(native.clear_committed_audio())
-                                native.input_since_commit = False
-                                native.speech_since_commit = False
-                                cancelled = await cancel_fenced_native_response(
-                                    reason="barge_in",
-                                    response_bound_only=False,
-                                    had_native_unbuffered_append=had_native_unbuffered_append,
-                                    playback_was_active=playback_was_active,
-                                )
-                                if session.epoch > cancelled_fence.epoch:
-                                    if not await signal_fenced_native_barge_in(cancelled_fence):
-                                        return
-                                actor.active_response_task = None
+                                if not await interrupt_native_response(mark_client_vad=False):
+                                    return
                         elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
                             event, payload, session=session
                         ):
@@ -1437,6 +1515,12 @@ class DuplexSessionRunnerMixin:
                         if pcm_reservation.byte_count == 0:
                             session.release_input_bytes(raw_audio_bytes)
                         payload = pcm_reservation.payload
+                        if (
+                            apply_client_vad_force_listen
+                            and payload.get("force_listen") is True
+                            and session.consume_client_vad_force_listen(epoch=session.epoch)
+                        ):
+                            apply_client_vad_force_listen = False
                     else:
                         session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
                     if self._uses_native_input_append(session):
