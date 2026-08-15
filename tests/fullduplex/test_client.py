@@ -89,6 +89,7 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
     session = client.sent[0]["session"]
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert "idle_timeout_s" not in session
 
 
 def test_realtime_event_collector_partitions_audio_by_response():
