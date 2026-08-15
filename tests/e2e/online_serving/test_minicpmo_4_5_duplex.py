@@ -153,7 +153,7 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, model_prefix: str,
     assert all(session["error_count"] == 0 for session in result["sessions"])
 
 
-@pytest.mark.advanced_model
+@pytest.mark.full_model
 @hardware_test(res={"cuda": "H100"}, num_cards=1)
 @pytest.mark.skipif(os.environ.get("VLLM_OMNI_RUN_OMNIINTERACT_E2E") != "1", reason="enable real OmniInteract E2E")
 @pytest.mark.parametrize("subset", ("1q1a", "1q1a_math", "1qna"))
