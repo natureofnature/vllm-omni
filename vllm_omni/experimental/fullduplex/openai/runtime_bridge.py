@@ -443,6 +443,7 @@ class NativeRuntimeBridgeMixin:
     # silence while the assistant speaks; replies span multiple units.
     _NATIVE_SILENCE_UNIT_PAYLOAD_AUDIO = base64.b64encode(bytes(16000 * 4)).decode("ascii")
     _NATIVE_RESPONSE_MAX_CONTINUATION_UNITS = 8
+    _NATIVE_AUTO_RESPONSE_FORCE_LISTEN_UNITS = 64
 
     def _native_silence_unit_payload(self) -> dict[str, object]:
         return {
@@ -534,6 +535,8 @@ class NativeRuntimeBridgeMixin:
         if not auto_response and count >= self._NATIVE_RESPONSE_MAX_CONTINUATION_UNITS:
             return
         payload = self._native_silence_unit_payload()
+        if auto_response and count + 1 >= self._NATIVE_AUTO_RESPONSE_FORCE_LISTEN_UNITS:
+            payload["force_listen"] = True
         payload["duplex_turn_id"] = payload_turn_id
         if origin_input_seq is not None and origin_input_seq > 0:
             payload["duplex_origin_input_seq"] = origin_input_seq

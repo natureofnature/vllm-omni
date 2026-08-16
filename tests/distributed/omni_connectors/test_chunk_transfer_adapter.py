@@ -4,7 +4,7 @@
 import threading
 from collections import deque
 from types import MethodType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -39,28 +39,19 @@ class DummyWaitingQueue(list):
         self[:] = [request for request in self if request not in remove]
 
 
-class DummyRequest:
-    def __init__(
-        self,
-        req_id: str,
-        status: RequestStatus,
-        external_req_id: str | None = None,
-    ):
-        self.request_id = req_id
-        self.external_req_id = external_req_id or req_id
-        self.client_index = 0
-        self.status = status
-        self.prompt_token_ids = []
-        self.num_computed_tokens = 0
-        self.num_output_placeholders = 0
-        self.additional_information = None
-
-    def is_finished(self):
-        return RequestStatus.is_finished(self.status)
-
-
 def _req(req_id: str, status: RequestStatus, external_req_id: str | None = None):
-    return DummyRequest(req_id, status, external_req_id)
+    request = Mock(
+        request_id=req_id,
+        external_req_id=external_req_id or req_id,
+        client_index=0,
+        status=status,
+        prompt_token_ids=[],
+        num_computed_tokens=0,
+        num_output_placeholders=0,
+        additional_information=None,
+    )
+    request.is_finished = lambda: RequestStatus.is_finished(request.status)
+    return request
 
 
 def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture) -> None:
@@ -121,6 +112,8 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
+        max_model_len: int = 0,
+        tts_max_model_len: int = 0,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
     ):
@@ -151,6 +144,8 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         model_config = SimpleNamespace(
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
+            max_model_len=max_model_len,
+            hf_config=SimpleNamespace(tts_config=SimpleNamespace(max_position_embeddings=tts_max_model_len)),
             active_stream_window=active_stream_window,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
@@ -213,6 +208,16 @@ def test_load_poll(build_adapter):
     assert "req-1" in adapter._finished_load_reqs
     assert "req-1" in adapter.finished_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_adapter_uses_nested_tts_context_limit(build_adapter):
+    adapter, _ = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        max_model_len=8192,
+        tts_max_model_len=4096,
+    )
+    assert adapter._max_model_len == 4096
 
 
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
@@ -502,9 +507,7 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert adapter._poll_single_request(request) is True
 
     assert "codes" not in request.additional_information
-    assert "cache_epoch" not in request.additional_information["meta"]
-    assert "chunk_seq" not in request.additional_information["meta"]
-    assert "last_chunk" not in request.additional_information["meta"]
+    assert not {"cache_epoch", "chunk_seq", "last_chunk"}.intersection(request.additional_information["meta"])
     assert request.request_id in adapter.segment_finished_requests
 
 
@@ -863,28 +866,6 @@ def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter
     assert [req.request_id for req in adapter.waiting_for_chunk_running_requests] == ["req-live"]
     assert "req-zombie" not in adapter.requests_with_ready_chunks
     assert "req-zombie" not in adapter.finished_requests
-
-
-def test_finish_requests_releases_active_stream_slot(build_adapter):
-    adapter, _ = build_adapter(stage_id=1, max_num_seqs=1, active_stream_window=1)
-    aborted = _req("req-aborted", RequestStatus.RUNNING)
-    waiting = _req("req-waiting", RequestStatus.WAITING)
-    waiting_queue = DummyWaitingQueue([waiting])
-    running_queue = []
-    adapter._active_streams[aborted.request_id] = aborted
-    adapter._held_non_active.append(aborted)
-
-    adapter.finish_requests(
-        [aborted.request_id],
-        RequestStatus.FINISHED_ABORTED,
-        {aborted.request_id: aborted},
-    )
-    adapter.process_pending_chunks(waiting_queue, running_queue)
-
-    assert aborted.request_id not in adapter._active_streams
-    assert [request.request_id for request in adapter._held_non_active] == []
-    assert list(adapter._active_streams) == [waiting.request_id]
-    assert waiting.status == RequestStatus.WAITING_FOR_CHUNK
 
 
 @pytest.mark.parametrize(

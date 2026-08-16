@@ -41,6 +41,18 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+        tts_config = getattr(getattr(model_config, "hf_config", None), "tts_config", None)
+        tts_max_model_len = (
+            tts_config.get("max_position_embeddings", 0)
+            if isinstance(tts_config, Mapping)
+            else getattr(tts_config, "max_position_embeddings", 0)
+        )
+        tts_max_model_len = int(tts_max_model_len or 0)
+        if tts_max_model_len > 0:
+            self._max_model_len = (
+                min(self._max_model_len, tts_max_model_len) if self._max_model_len else tts_max_model_len
+            )
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:

@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.intermediate import (
     set_tts_handoff,
 )
 from vllm_omni.inputs.data import OmniTokensPrompt
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 logger = logging.getLogger(__name__)
 _MINICPMO45_ASYNC_STATE = "_minicpmo45_async_codec_state"
@@ -966,6 +967,8 @@ def llm2tts(
             scheduler_prompt_token_ids = [0] * condition_length
             handoff_meta = model_intermediate_buffer.setdefault("meta", {})
             handoff_meta["next_stage_prompt_len"] = condition_length
+            if is_native_duplex_handoff:
+                handoff_meta["next_stage_generation_tokens"] = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
             # Native duplex resumes one Talker request within a turn, but a new
             # assistant turn must discard the previous turn's prompt and KV.
             if not is_native_duplex_handoff or native_turn_start:
