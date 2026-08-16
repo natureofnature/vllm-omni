@@ -58,12 +58,6 @@ Accuracy benchmarks for image generation/editing models, adapting external suite
 - **Audio output**: TTFP (time to first audio packet), E2E latency, RTF (real-time factor)
 - **Throughput**: request throughput, output token throughput, total token throughput, audio throughput
 
-Omni-specific benchmark datasets currently include:
-
-- `daily-omni` (audio-visual MCQ)
-- [`omniinteract`](omniinteract/README.md) (continuous audio-video evaluation for MiniCPM native duplex)
-- `seed-tts` / `seed-tts-text` / `seed-tts-design` / `ttsd` / `sound-effect`
-
 See `vllm_omni/benchmarks/serve.py` for the `vllm bench serve --omni` runner wrapper and `vllm_omni/benchmarks/metrics/` for Omni metric definitions.
 
 ## Adding a new benchmark
