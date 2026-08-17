@@ -10,12 +10,14 @@ import ssl
 import sys
 import time
 import traceback
+import uuid
 import wave
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import aiohttp
 import numpy as np
@@ -38,7 +40,13 @@ from vllm.logger import init_logger
 from vllm.tokenizers import TokenizerLike
 
 from vllm_omni.benchmarks.audio_continuity import compute_continuity_stats
-from vllm_omni.benchmarks.data_modules.daily_omni_dataset import DailyOmniDataset, DailyOmniSampleRequest
+from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
+    DailyOmniDataset,
+    DailyOmniSampleRequest,
+    daily_omni_local_qa_json,
+    daily_omni_local_videos_dir,
+    resolve_daily_omni_local_root,
+)
 from vllm_omni.benchmarks.data_modules.omniinteract import (
     OmniInteractCase,
     OmniInteractConfig,
@@ -60,6 +68,23 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 )
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
+from vllm_omni.benchmarks.data_modules.videomme_dataset import (
+    VIDEOMME_DEFAULT_HF_REPO,
+    VideoMMEDataset,
+    VideoMMESampleRequest,
+    ensure_videomme_subtitles_extracted,
+    ensure_videomme_videos_extracted,
+    resolve_videomme_local_root,
+    resolve_videomme_root,
+    videomme_local_parquet,
+    videomme_local_subtitle_dir,
+    videomme_local_video_dir,
+)
+from vllm_omni.experimental.fullduplex.client import (
+    RealtimeDuplexClient,
+    summarize_session_request_metrics,
+    wait_for,
+)
 from vllm_omni.metrics import definitions as defs
 from vllm_omni.metrics.utils import coerce_positive_int_scalar
 
@@ -151,6 +176,7 @@ get_samples_old = datasets.get_samples
 
 _DEFAULT_DAILY_OMNI_REPO = "liarliar/Daily-Omni"
 _DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
+_DEFAULT_VIDEOMME_REPO = VIDEOMME_DEFAULT_HF_REPO
 
 
 def _seed_tts_capture_pcm_for_wer() -> bool:
@@ -189,6 +215,17 @@ def _attach_daily_omni_to_request_func_input(sample: SampleRequest, rfi: Request
         setattr(rfi, "mm_position", sample.omni_chat_mm_position)
 
 
+def _attach_videomme_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
+    """Apply per-request OpenAI fields for Video-MME (same message path as Daily-Omni)."""
+    if not isinstance(sample, VideoMMESampleRequest):
+        return
+    rfi.extra_body = _merge_extra_body_mm_kwargs(rfi.extra_body, sample.omni_extra_body)
+    if sample.omni_chat_messages is not None:
+        setattr(rfi, "omni_chat_messages", sample.omni_chat_messages)
+    else:
+        setattr(rfi, "mm_position", sample.omni_chat_mm_position)
+
+
 def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
     """Merge Seed-TTS per-row TTS fields into ``extra_body`` and mark for PCM capture.
 
@@ -202,6 +239,9 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
     # Mark for PCM capture (WER / UTMOS eval) regardless of extra body presence.
     setattr(rfi, "seed_tts_row", True)
     sys_prompt = (sample.seed_tts_system_prompt or "").strip() or SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT
+    setattr(rfi, "seed_tts_system_prompt", sys_prompt)
+    setattr(rfi, "seed_tts_speech_extra", sample.seed_tts_speech_extra)
+    setattr(rfi, "seed_tts_turns", sample.seed_tts_turns)
     setattr(
         rfi,
         "omni_chat_messages",
@@ -335,6 +375,19 @@ def _project_omniinteract_result(
         write_batch(Path(case.config.output_root), summaries)
 
 
+def _videomme_repo_from_args(args) -> str | None:
+    """Resolve HuggingFace repo id for Video-MME from CLI args."""
+    dp = getattr(args, "dataset_path", None)
+    hn = getattr(args, "hf_name", None)
+    supported = {p.lower() for p in VideoMMEDataset.SUPPORTED_DATASET_PATHS}
+    supported.add(_DEFAULT_VIDEOMME_REPO.lower())
+    if isinstance(dp, str) and dp.strip().lower() in supported:
+        return dp.strip()
+    if isinstance(hn, str) and hn.strip().lower() in supported:
+        return hn.strip()
+    return None
+
+
 def get_samples(args, tokenizer):
     global _BENCH_NO_STREAM
     _BENCH_NO_STREAM = bool(getattr(args, "no_stream", False))
@@ -354,6 +407,9 @@ def get_samples(args, tokenizer):
             )
         )
     )
+    is_videomme = args.dataset_name == "videomme" or (
+        args.dataset_name == "hf" and _videomme_repo_from_args(args) is not None
+    )
     is_seed_tts = args.dataset_name in (
         "seed-tts",
         "seed-tts-text",
@@ -363,8 +419,14 @@ def get_samples(args, tokenizer):
     )
 
     # Check if we need to handle omni-related backends/datasets
-    is_omni_backend = args.backend in ["openai-chat-omni", "openai-audio-speech", "daily-omni", "minicpmo-realtime"]
-    is_omni_dataset = is_daily_omni or is_omniinteract or is_seed_tts or args.dataset_name == "random-mm"
+    is_omni_backend = args.backend in [
+        "openai-chat-omni",
+        "openai-audio-speech",
+        "openai-realtime-duplex",
+        "daily-omni",
+        "minicpmo-realtime",
+    ]
+    is_omni_dataset = is_daily_omni or is_omniinteract or is_videomme or is_seed_tts or args.dataset_name == "random-mm"
 
     if not is_omni_backend and not is_omni_dataset:
         # Not an omni-related request, delegate to original implementation
@@ -395,6 +457,26 @@ def get_samples(args, tokenizer):
         if isinstance(qa_json, str):
             qa_json = qa_json.strip() or None
 
+        # A local mirror of the dataset repo (plain directory or HF hub cache dir) is used
+        # directly: no Hub round-trip, so offline / air-gapped runs work without extra flags.
+        local_root: Path | None = None
+        if qa_json is None:
+            local_root = resolve_daily_omni_local_root(getattr(args, "dataset_path", None)) or (
+                resolve_daily_omni_local_root(getattr(args, "hf_name", None))
+            )
+            if local_root is not None:
+                local_qa = daily_omni_local_qa_json(local_root)
+                if local_qa is not None:
+                    qa_json = str(local_qa)
+                    if video_dir is None:
+                        video_dir = daily_omni_local_videos_dir(local_root)
+                    logger.info("Using local Daily-Omni mirror: root=%s", local_root)
+                else:
+                    logger.info(
+                        "Local Daily-Omni path %s has no qa.json; loading it with `datasets` instead",
+                        local_root,
+                    )
+
         if qa_json is not None:
             logger.info(
                 "Loading Daily-Omni dataset: qa_json=%s, video_dir=%s (Hub not used for QA)",
@@ -408,6 +490,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 disable_shuffle=getattr(args, "disable_shuffle", False),
@@ -416,7 +499,8 @@ def get_samples(args, tokenizer):
             repo_id = _hf_repo_from_args(args, DailyOmniDataset.SUPPORTED_DATASET_PATHS)
             if args.dataset_name == "daily-omni":
                 if repo_id is None:
-                    repo_id = _DEFAULT_DAILY_OMNI_REPO
+                    # Prefer an on-disk copy over the Hub id so offline runs keep working.
+                    repo_id = str(local_root) if local_root is not None else _DEFAULT_DAILY_OMNI_REPO
             elif repo_id is None:
                 raise ValueError(
                     "Daily-Omni with --dataset-name hf requires "
@@ -438,6 +522,7 @@ def get_samples(args, tokenizer):
                 random_seed=args.seed,
                 video_dir=video_dir,
                 input_mode=getattr(args, "daily_omni_input_mode", "all"),
+                pack_mode=getattr(args, "daily_omni_pack_mode", "qwen"),
                 inline_local_video=getattr(args, "daily_omni_inline_local_video", False),
                 trust_remote_code=getattr(args, "trust_remote_code", False),
                 no_stream=getattr(args, "no_stream", False),
@@ -459,11 +544,125 @@ def get_samples(args, tokenizer):
         )
         return input_requests
 
+    if is_videomme:
+        if args.backend not in ["openai-chat-omni", "daily-omni"]:
+            raise ValueError(
+                f"Video-MME dataset requires a multimodal backend that supports video. "
+                f"Got backend='{args.backend}'. Please use '--backend openai-chat-omni'"
+            )
+
+        video_dir = getattr(args, "videomme_video_dir", None)
+        subtitle_dir = getattr(args, "videomme_subtitle_dir", None)
+        parquet_path = getattr(args, "videomme_parquet", None)
+        if isinstance(parquet_path, str):
+            parquet_path = parquet_path.strip() or None
+        dataset_split = getattr(args, "hf_split", None) or "test"
+
+        # Local directory wins (absolute/relative existing path). Hub ids fall through to
+        # snapshot_download — same pattern as Seed-TTS / Daily-Omni.
+        local_root = resolve_videomme_local_root(getattr(args, "dataset_path", None)) or (
+            resolve_videomme_local_root(getattr(args, "hf_name", None))
+        )
+        repo_id = _videomme_repo_from_args(args)
+        if local_root is None and video_dir is None and parquet_path is None:
+            # Default Hub mode: download parquet + video zips on demand.
+            if args.dataset_name == "videomme":
+                hub_id = repo_id or _DEFAULT_VIDEOMME_REPO
+            elif repo_id is not None:
+                hub_id = repo_id
+            else:
+                raise ValueError(
+                    "Video-MME requires --videomme-parquet, a local --dataset-path mirror, or "
+                    f"--dataset-path / --hf-name {_DEFAULT_VIDEOMME_REPO}."
+                )
+            local_root = resolve_videomme_root(hub_id)
+            repo_id = hub_id
+            logger.info("Using Hugging Face Video-MME snapshot: root=%s repo=%s", local_root, hub_id)
+        elif local_root is not None:
+            logger.info("Using local Video-MME mirror: root=%s", local_root)
+
+        if local_root is not None:
+            if parquet_path is None:
+                local_pq = videomme_local_parquet(local_root)
+                if local_pq is not None:
+                    parquet_path = str(local_pq)
+            if video_dir is None:
+                try:
+                    video_dir = str(ensure_videomme_videos_extracted(local_root))
+                except FileNotFoundError:
+                    found = videomme_local_video_dir(local_root)
+                    video_dir = str(found) if found is not None else None
+            if subtitle_dir is None:
+                found_sub = ensure_videomme_subtitles_extracted(local_root) or videomme_local_subtitle_dir(local_root)
+                subtitle_dir = str(found_sub) if found_sub is not None else None
+
+        if parquet_path is None:
+            if args.dataset_name == "videomme":
+                repo_id = repo_id or (str(local_root) if local_root is not None else _DEFAULT_VIDEOMME_REPO)
+            elif repo_id is None and local_root is None:
+                raise ValueError(
+                    "Video-MME requires --videomme-parquet, a local --dataset-path mirror, or "
+                    f"--dataset-path / --hf-name {_DEFAULT_VIDEOMME_REPO}."
+                )
+
+        if video_dir is None:
+            raise ValueError(
+                "Video-MME requires --videomme-video-dir pointing at extracted videos "
+                "(directory of {videoID}.mp4), or a local/Hub dataset root containing video/ "
+                "or videos_chunked_*.zip."
+            )
+
+        logger.info(
+            "Loading Video-MME: parquet=%s, hf_repo=%s, video_dir=%s, pack_mode=%s",
+            parquet_path,
+            repo_id,
+            video_dir,
+            getattr(args, "videomme_pack_mode", "minicpm-frames"),
+        )
+        dataset = VideoMMEDataset(
+            parquet_path=parquet_path,
+            dataset_path=None if parquet_path is not None else (repo_id or str(local_root)),
+            dataset_split=dataset_split,
+            dataset_subset=getattr(args, "hf_subset", None),
+            random_seed=args.seed,
+            video_dir=video_dir,
+            subtitle_dir=subtitle_dir,
+            pack_mode=getattr(args, "videomme_pack_mode", "minicpm-frames"),
+            max_frames=getattr(args, "videomme_max_frames", None),
+            duration_filter=getattr(args, "videomme_duration", "all"),
+            use_subtitle=getattr(args, "videomme_use_subtitle", False),
+            inline_local_video=getattr(args, "videomme_inline_local_video", False),
+            trust_remote_code=getattr(args, "trust_remote_code", False),
+            no_stream=getattr(args, "no_stream", False),
+            disable_shuffle=getattr(args, "disable_shuffle", False),
+        )
+
+        out_len = getattr(args, "output_len", None)
+        if out_len is None:
+            out_len = getattr(args, "hf_output_len", None)
+        if out_len is None:
+            out_len = VideoMMEDataset.DEFAULT_OUTPUT_LEN
+
+        return dataset.sample(
+            tokenizer=tokenizer,
+            num_requests=args.num_prompts,
+            output_len=out_len,
+            request_id_prefix=args.request_id_prefix,
+            no_oversample=args.no_oversample,
+        )
+
     if is_seed_tts:
-        if args.backend not in ("openai-audio-speech", "openai-chat-omni"):
+        if args.backend not in (
+            "openai-audio-speech",
+            "openai-chat-omni",
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        ):
             raise ValueError(
                 "Seed-TTS requires --backend openai-audio-speech (POST /v1/audio/speech) or "
-                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text). "
+                "--backend openai-chat-omni (POST /v1/chat/completions with ref_audio/ref_text), or "
+                "--backend openai-realtime-duplex or openai-realtime-tts "
+                "(WebSocket /v1/realtime). "
                 f"Got backend={args.backend!r}."
             )
         repo_id = getattr(args, "dataset_path", None) or getattr(args, "hf_name", None)
@@ -471,6 +670,14 @@ def get_samples(args, tokenizer):
             raise ValueError(
                 "Seed-TTS requires --dataset-path (HF dataset repo id or local directory) or "
                 "--hf-name for the Hub dataset id."
+            )
+        turns_per_session = int(getattr(args, "seed_tts_turns_per_session", 1))
+        if turns_per_session > 1 and args.backend not in {
+            "openai-realtime-duplex",
+            "openai-realtime-tts",
+        }:
+            raise ValueError(
+                f"--seed-tts-turns-per-session > 1 requires a Realtime Seed-TTS backend. Got backend={args.backend!r}."
             )
 
         _cls_map = {
@@ -501,6 +708,7 @@ def get_samples(args, tokenizer):
             output_len=out_len,
             request_id_prefix=args.request_id_prefix,
             no_oversample=args.no_oversample,
+            turns_per_session=turns_per_session,
         )
 
     if is_omniinteract:
@@ -585,10 +793,14 @@ class MixRequestFuncOutput(RequestFuncOutput):
     #: Raw PCM s16le mono at 24 kHz for Seed-TTS WER: from ``/v1/audio/speech`` stream or
     #: resampled export after ``openai-chat-omni`` audio deltas.
     tts_output_pcm_bytes: bytes | None = None
+    #: Per-turn 24 kHz mono PCM for grouped Realtime Seed-TTS WER.
+    tts_turn_pcm_bytes: list[bytes] | None = None
     #: Per-stage snapshot from orchestrator ``metrics["stage_metrics"]`` (merged across SSE chunks).
     stage_metrics: dict[str, dict] | None = None
     stage_id: int | None = None
     final_output_type: str | None = None
+    duplex_request_metrics: list[dict[str, object]] | None = None
+    duplex_session_metrics: dict[str, object] | None = None
 
 
 _IMAGE_EDITS_EXTRA_BODY_FORM_FIELDS = (
@@ -818,6 +1030,29 @@ def _image_generation_ms_from_content(content: Any) -> float:
         if gen_values:
             return max(gen_values)
     return 0.0
+
+
+#: Non-200 responses are otherwise silent (only ``reason`` was kept), which turns a fully failed
+#: run into "Successful requests: 0" with no cause. Log the first few bodies, keep all of them on
+#: ``output.error`` for ``--save-detailed``.
+_HTTP_ERROR_LOG_BUDGET = 5
+_http_error_logged = 0
+
+
+async def _record_http_error(output: "MixRequestFuncOutput", response: aiohttp.ClientResponse, context: str) -> None:
+    """Store status + response body on ``output.error`` and log the first few occurrences."""
+    global _http_error_logged
+
+    try:
+        body = (await response.text())[:512]
+    except Exception:
+        body = ""
+    detail = f"HTTP {response.status} {response.reason or ''}".strip()
+    output.error = f"{detail}: {body}" if body else detail
+    output.success = False
+    if _http_error_logged < _HTTP_ERROR_LOG_BUDGET:
+        _http_error_logged += 1
+        logger.warning("%s request failed: %s", context, output.error)
 
 
 async def async_request_openai_chat_omni_completions(
@@ -1117,8 +1352,7 @@ async def async_request_openai_chat_omni_completions(
                                 logger.warning("seed_tts WER PCM export failed: %s", ex)
                     output.success = True
                 else:
-                    output.error = response.reason or ""
-                    output.success = False
+                    await _record_http_error(output, response, "openai-chat-omni")
             break
         except aiohttp.ClientError as e:
             # transient transport error: may retry
@@ -1392,8 +1626,7 @@ async def async_request_openai_audio_speech(
                     )
                 output.success = True
             else:
-                output.error = response.reason or ""
-                output.success = False
+                await _record_http_error(output, response, "openai-audio-speech")
     except Exception:
         output.success = False
         output.error = traceback.format_exc()
@@ -1436,6 +1669,180 @@ async def async_request_minicpmo_realtime(
     return output
 
 
+def _realtime_websocket_url(api_url: str) -> str:
+    parts = urlsplit(api_url)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.setdefault("duplex", "1")
+    return urlunsplit((scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+async def async_request_openai_realtime_duplex(
+    request_func_input: RequestFuncInput,
+    session: aiohttp.ClientSession,
+    pbar: tqdm | None = None,
+) -> MixRequestFuncOutput:
+    """Run one or more Seed-TTS turns through one explicit Realtime TTS session."""
+    del session
+    output = MixRequestFuncOutput()
+    output.prompt_len = request_func_input.prompt_len
+    output.start_time = time.perf_counter()
+    speech_extra = getattr(request_func_input, "seed_tts_speech_extra", None)
+    if not isinstance(speech_extra, dict):
+        speech_extra = {}
+    configured_turns = getattr(request_func_input, "seed_tts_turns", ())
+    turn_prompts = [
+        (
+            str(getattr(turn, "utterance_id", "") or ""),
+            str(getattr(turn, "target_text", "") or ""),
+        )
+        for turn in configured_turns
+        if str(getattr(turn, "target_text", "") or "").strip()
+    ]
+    if not turn_prompts:
+        turn_prompts = [("", request_func_input.prompt)]
+    session_id = f"seed-tts-{request_func_input.request_id or uuid.uuid4().hex}"
+    try:
+        async with RealtimeDuplexClient(_realtime_websocket_url(request_func_input.api_url)) as client:
+            await client.configure(
+                request_func_input.model_name or request_func_input.model,
+                output_audio_format="pcm16",
+                instructions=getattr(
+                    request_func_input,
+                    "seed_tts_system_prompt",
+                    SEED_TTS_DEFAULT_OMNI_SYSTEM_PROMPT,
+                ),
+                native_duplex=False,
+                auto_response=False,
+                extra_body=speech_extra,
+                session_id=session_id,
+                timeout_s=120.0,
+            )
+            turn_metrics: list[dict[str, object]] = []
+            turn_timings: list[dict[str, object]] = []
+            turn_pcm_bytes: list[bytes] = []
+            turn_transcripts: list[str] = []
+            measurement_origin = {
+                "ttft": "conversation.item.create client send to first non-empty text delta",
+                "ttfp": "conversation.item.create client send to first audio packet",
+                "rtf": "request-start-to-last-audio receive time divided by emitted audio duration",
+            }
+            for request_index, (utterance_id, target_text) in enumerate(turn_prompts):
+                response_offset = len(client.events.response_ids)
+                done_before = client.events.count("response.done")
+                errors_before = len(client.events.errors())
+                turn_started_at_s = time.monotonic()
+                await client.send(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": target_text}],
+                        },
+                    }
+                )
+                await client.send({"type": "response.create"})
+                await wait_for(
+                    lambda: client.events.count("response.done") > done_before
+                    or len(client.events.errors()) > errors_before,
+                    timeout_s=180.0,
+                    label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
+                )
+                errors = client.events.errors()
+                if len(errors) > errors_before:
+                    raise RuntimeError(f"Seed-TTS Realtime TTS server error: {errors[-1]}")
+                new_audio_response_ids = [
+                    response_id
+                    for response_id in client.events.response_ids[response_offset:]
+                    if client.events.audio_bytes(response_id)
+                ]
+                if len(new_audio_response_ids) != 1:
+                    raise RuntimeError(
+                        f"Seed-TTS Realtime TTS turn {request_index} expected one audio response, "
+                        f"got {len(new_audio_response_ids)}"
+                    )
+                response_id = new_audio_response_ids[0]
+                timing = client.events.timing_summary(
+                    after_s=turn_started_at_s,
+                    input_committed_at_s=turn_started_at_s,
+                    response_id=response_id,
+                    measurement_origin=measurement_origin,
+                )
+                request_metrics = timing.get("request_metrics")
+                if not isinstance(request_metrics, dict):
+                    raise RuntimeError(f"Seed-TTS duplex audio turn {response_id} omitted per-request metrics")
+                turn_timings.append(timing)
+                turn_metrics.append(
+                    {
+                        "session_id": session_id,
+                        "request_index": request_index,
+                        "utterance_id": utterance_id or None,
+                        "response_id": response_id,
+                        **request_metrics,
+                    }
+                )
+                response_audio = client.events.audio_bytes(response_id)
+                turn_pcm_bytes.append(
+                    _pcm_s16le_to_seed_tts_wer_bytes(
+                        response_audio,
+                        sample_rate=client.events.output_sample_rate_hz,
+                        channels=1,
+                    )
+                )
+                turn_transcripts.append(
+                    "".join(
+                        str(event.get("delta") or "")
+                        for event in client.events.events
+                        if client.events.response_id(event) == response_id
+                        and event.get("type")
+                        in {
+                            "response.audio_transcript.delta",
+                            "response.output_text.delta",
+                            "response.text.delta",
+                        }
+                    )
+                )
+                await client.acknowledge_playback()
+            request_finished_at = time.perf_counter()
+            session_metrics = summarize_session_request_metrics(
+                turn_metrics,
+                session_id=session_id,
+            )
+            await client.close_session(timeout_s=30.0)
+
+            output.generated_text = " ".join(filter(None, turn_transcripts))
+            output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
+            output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
+            output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
+            output.audio_duration = (
+                sum(float(metric.get("audio_duration_ms") or 0.0) for metric in turn_metrics) / 1000.0
+            )
+            output.audio_frames = int(output.audio_duration * client.events.output_sample_rate_hz)
+            output.latency = request_finished_at - output.start_time
+            output.tts_turn_pcm_bytes = turn_pcm_bytes
+            output.tts_output_pcm_bytes = b"".join(turn_pcm_bytes)
+            if bool((request_func_input.extra_body or {}).get("save_duplex_request_metrics")):
+                output.duplex_request_metrics = turn_metrics
+                output.duplex_session_metrics = session_metrics
+            output.output_tokens = sum(
+                int(stage0.get("output_token_count") or 0)
+                for timing in turn_timings
+                if isinstance((stage0 := timing.get("stage0_tokens")), dict)
+            )
+            output.success = True
+    except Exception:
+        output.success = False
+        output.error = traceback.format_exc()
+        logger.error(
+            "Seed-TTS Realtime TTS request failed: %s",
+            output.error,
+        )
+    if pbar:
+        pbar.update(1)
+    return output
+
+
 ASYNC_REQUEST_FUNCS["openai-chat-omni"] = async_request_openai_chat_omni_completions
 if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-chat-omni")
@@ -1443,6 +1850,13 @@ if "openai-chat-omni" not in OPENAI_COMPATIBLE_BACKENDS:
 ASYNC_REQUEST_FUNCS["openai-audio-speech"] = async_request_openai_audio_speech
 if "openai-audio-speech" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("openai-audio-speech")
+
+ASYNC_REQUEST_FUNCS["openai-realtime-duplex"] = async_request_openai_realtime_duplex
+if "openai-realtime-duplex" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-duplex")
+ASYNC_REQUEST_FUNCS["openai-realtime-tts"] = async_request_openai_realtime_duplex
+if "openai-realtime-tts" not in OPENAI_COMPATIBLE_BACKENDS:
+    OPENAI_COMPATIBLE_BACKENDS.append("openai-realtime-tts")
 
 ASYNC_REQUEST_FUNCS["openai-image-edits-omni"] = async_request_openai_image_edits_omni
 if "openai-image-edits-omni" not in OPENAI_COMPATIBLE_BACKENDS:
@@ -1584,6 +1998,7 @@ async def benchmark(
     )
     setattr(test_input, "no_stream", _BENCH_NO_STREAM)
     _attach_daily_omni_to_request_func_input(input_requests[0], test_input)
+    _attach_videomme_to_request_func_input(input_requests[0], test_input)
     _attach_seed_tts_to_request_func_input(input_requests[0], test_input)
     _attach_omniinteract(input_requests[0], test_input)
 
@@ -1659,6 +2074,7 @@ async def benchmark(
         )
         setattr(profile_input, "no_stream", _BENCH_NO_STREAM)
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
+        _attach_videomme_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
         _attach_omniinteract(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
@@ -1746,6 +2162,7 @@ async def benchmark(
         )
         setattr(request_func_input, "no_stream", _BENCH_NO_STREAM)
         _attach_daily_omni_to_request_func_input(request, request_func_input)
+        _attach_videomme_to_request_func_input(request, request_func_input)
         _attach_seed_tts_to_request_func_input(request, request_func_input)
         _attach_omniinteract(request, request_func_input)
         tasks.append(
@@ -1821,6 +2238,14 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "errors": [output.error for output in outputs],
         }
+    duplex_request_metrics = [metric for output in outputs for metric in (output.duplex_request_metrics or [])]
+    if duplex_request_metrics:
+        result["duplex_request_metrics"] = duplex_request_metrics
+    duplex_session_metrics = [
+        output.duplex_session_metrics for output in outputs if output.duplex_session_metrics is not None
+    ]
+    if duplex_session_metrics:
+        result["duplex_session_metrics"] = duplex_session_metrics
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,
@@ -1836,6 +2261,21 @@ async def benchmark(
     if _daily_acc is not None:
         result.update(_daily_acc)
         print_daily_omni_accuracy_summary(_daily_acc)
+
+    from vllm_omni.benchmarks.data_modules.videomme_eval import (
+        compute_videomme_accuracy_metrics,
+        print_videomme_accuracy_summary,
+    )
+
+    _save_vm = os.environ.get("VIDEOMME_SAVE_EVAL_ITEMS", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    _vm_acc = compute_videomme_accuracy_metrics(input_requests, outputs, include_per_item=_save_vm)
+    if _vm_acc is not None:
+        result.update(_vm_acc)
+        print_videomme_accuracy_summary(_vm_acc)
 
     if _seed_tts_capture_pcm_for_wer():
         from vllm_omni.benchmarks.data_modules.seed_tts_eval import (
