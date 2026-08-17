@@ -2624,6 +2624,46 @@ async def test_collective_rpc_targets_session_owner_and_releases_binding(
 
 
 @pytest.mark.asyncio
+async def test_collective_rpc_releases_binding_even_when_session_control_fails(
+    orchestrator_factory,
+) -> None:
+    """Close/reset discards worker session state either way; a failed RPC must
+    not pin the session to a replica holding garbage state."""
+    replicas = [
+        FakeCollectiveRpcStageClient(
+            stage_type="llm",
+            final_output=True,
+            rpc_result={"supported": False, "error": "worker rejected"},
+        )
+        for _ in range(2)
+    ]
+    stage_pools = _build_stage_pools([replicas])
+    session_key = "dreamzero:session-fail"
+    stage_pools[0].select_replica_id("request-fail", session_routing_key=session_key)
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        orchestrator_fixture.request_sync_q.put_nowait(
+            CollectiveRPCRequestMessage(
+                rpc_id="rpc-session-close-fail",
+                method="handle_session_control",
+                args=("close", "session-fail"),
+                kwargs={},
+                stage_ids=[0],
+                session_routing_key=session_key,
+                release_session_binding=True,
+            )
+        )
+
+        msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert msg.results == [{"supported": False, "error": "worker rejected"}]
+        assert stage_pools[0].get_session_bound_replica_id(session_key) is None
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
+
+
+@pytest.mark.asyncio
 async def test_collective_rpc_for_unknown_session_does_not_broadcast(orchestrator_factory) -> None:
     replicas = [
         FakeCollectiveRpcStageClient(

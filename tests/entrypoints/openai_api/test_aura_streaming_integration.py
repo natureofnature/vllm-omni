@@ -39,7 +39,7 @@ def _b64(data: bytes) -> str:
     return base64.b64encode(data).decode()
 
 
-def _text_result(text: str) -> OmniRequestOutput:
+def _text_result(text: str, finished: bool = True) -> OmniRequestOutput:
     class Output:
         pass
 
@@ -50,7 +50,7 @@ def _text_result(text: str) -> OmniRequestOutput:
     output.text = text
     request_output = RequestOutput()
     request_output.outputs = [output]
-    return OmniRequestOutput(final_output_type="text", request_output=request_output)
+    return OmniRequestOutput(final_output_type="text", request_output=request_output, finished=finished)
 
 
 def _transcript_result(text: str) -> OmniRequestOutput:
@@ -384,6 +384,110 @@ async def test_aura_websocket_streams_text_and_audio(monkeypatch):
     ]
     assert turn_events
     assert {message.get("request_id") for message in turn_events} == {"req-aura-audio"}
+
+
+@pytest.mark.asyncio
+async def test_aura_text_done_carries_text_streamed_after_first_audio(monkeypatch):
+    """text.done must contain the full assistant text even when sentence-level
+    TTS emits audio while later sentences are still decoding."""
+
+    class InterleavedEngine:
+        def generate(self, **_kwargs):
+            async def _gen():
+                yield _text_result("第一句。", finished=False)
+                yield _audio_result_with_b64("unused")
+                yield _text_result("第一句。第二句。", finished=True)
+                yield _audio_result_with_b64("unused2")
+
+            return _gen()
+
+    class EngineAuraHandler(AuraStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            return {"prompt": "engine"}
+
+    monkeypatch.setenv("VLLM_VIDEO_ASYNC_CHUNK", "on")
+    monkeypatch.setattr(
+        EngineAuraHandler,
+        "_extract_audio_delta_b64",
+        classmethod(lambda cls, result, chunks_drained: ("UklGRiQAAABXQVZFZm10IBAAAAABAAEA", chunks_drained + 1)),
+    )
+
+    handler = EngineAuraHandler(chat_service=object(), engine_client=InterleavedEngine())
+    config = AuraStreamingVideoSessionConfig(model="test", modalities=["text", "audio"])
+    state = AuraSessionState(history=SessionHistory(pruning_enabled=False), turn_frame_arrays=[])
+    state.turn_frame_arrays = [np.zeros((8, 8, 3), dtype=np.uint8)]
+
+    released: list[str] = []
+
+    async def _release_turn_lock(*, message_history, user_message, response_text, request_id):
+        del message_history, user_message, request_id
+        released.append(response_text)
+
+    ws = TimedWebSocket()
+    await handler._process_query_engine(
+        ws,
+        config,
+        [_b64(_make_jpeg())],
+        bytearray(b"\0\0"),
+        state,
+        "",
+        "req-aura-full-text",
+        asyncio.Event(),
+        {},
+        release_turn_lock=_release_turn_lock,
+    )
+
+    done_events = [m for m in ws.sent if m.get("type") == "response.text.done"]
+    assert len(done_events) == 1
+    assert done_events[0]["text"] == "第一句。第二句。"
+    # The turn lock releases with the complete text, so the session history
+    # and cross-turn penalty record the real assistant response.
+    assert released == ["第一句。第二句。"]
+
+
+@pytest.mark.asyncio
+async def test_aura_frame_auto_trigger_leaves_audio_buffer_for_audio_done():
+    """A silent vision turn must not steal a mid-flight utterance; audio.done
+    still opens the voice turn with the buffered audio afterwards."""
+    captured_audio: list[bytes] = []
+    turn_started = asyncio.Event()
+
+    class CapturingAuraHandler(AuraStreamingVideoHandler):
+        async def _process_query(self, websocket, config, frames, audio_buffer, *args, **kwargs):
+            captured_audio.append(bytes(audio_buffer))
+            turn_started.set()
+
+    ws = TimedWebSocket()
+    handler = CapturingAuraHandler(chat_service=object(), engine_client=MagicMock(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "auto_trigger": True,
+            "auto_trigger_min_frames": 2,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0.05)
+    # Mid-flight utterance: chunks buffered, no audio.done yet.
+    ws.put({"type": "audio.chunk", "data": _b64(b"\x01\x02\x03\x04")})
+    await asyncio.sleep(0.05)
+
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(10, 10, 10))})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(20, 20, 20))})
+    await asyncio.wait_for(turn_started.wait(), timeout=2.0)
+    turn_started.clear()
+    assert captured_audio == [b""], "frame auto-trigger must not consume buffered audio"
+
+    # The utterance completes and opens a voice turn with the buffered chunks.
+    ws.put({"type": "audio.done"})
+    await asyncio.wait_for(turn_started.wait(), timeout=2.0)
+    assert captured_audio[1] == b"\x01\x02\x03\x04"
+
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
 
 
 @pytest.mark.asyncio

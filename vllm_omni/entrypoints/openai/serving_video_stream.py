@@ -34,7 +34,10 @@ Model-specific handlers:
 from __future__ import annotations
 
 import base64
+import binascii
 import json
+import os
+import re
 from importlib import import_module
 from pathlib import Path
 from typing import Any
@@ -86,6 +89,68 @@ logger = init_logger(__name__)
 
 _AURA_PIPELINE_NAMES = frozenset({"aura_omni"})
 _AURA_ADDITIONAL_INFO_KEY = "_aura_additional_information"
+
+# Directory that WebSocket clients may reference TTS speaker audio from (by
+# bare filename). Unset = filesystem/URL references from clients are rejected.
+_TTS_REF_AUDIO_DIR_ENV = "VLLM_VIDEO_TTS_REF_AUDIO_DIR"
+
+# Raw base64 shorter than this is ambiguous with a filename; require a data
+# URI for short payloads.
+_TTS_REF_AUDIO_MIN_B64_LEN = 256
+_TTS_REF_AUDIO_B64_RE = re.compile(r"[A-Za-z0-9+/\s]+={0,2}\s*")
+
+
+def _sanitize_client_tts_ref_audio(value: str | None) -> tuple[str | None, str | None]:
+    """Validate client-supplied ``tts_ref_audio`` from ``session.config``.
+
+    ``tts_ref_audio`` reaches ``load_audio_to_np``, which resolves URLs and
+    local paths with unrestricted access (offline inference is trusted). A
+    WebSocket client is not. Accepted forms:
+
+    - ``data:audio/...;base64,...`` data URI (preferred client contract);
+    - raw base64 audio, strictly validated and normalized to a data URI so
+      the downstream path/base64 heuristic never mistakes ``/`` characters in
+      the payload for a filesystem path;
+    - a bare filename inside the server-configured reference-audio directory
+      (``VLLM_VIDEO_TTS_REF_AUDIO_DIR``).
+
+    URLs and filesystem paths are rejected so clients cannot read arbitrary
+    files or trigger SSRF.
+
+    Returns ``(sanitized_value, error)``; exactly one side is set unless the
+    input is empty.
+    """
+    if value is None:
+        return None, None
+    candidate = value.strip()
+    if not candidate:
+        return None, None
+    if candidate.startswith("data:audio"):
+        return candidate, None
+    if "://" in candidate or candidate.startswith(("data:", "file:")):
+        return None, (
+            "tts_ref_audio URLs are not permitted; send a data:audio;base64 URI or a configured speaker file name"
+        )
+    if len(candidate) >= _TTS_REF_AUDIO_MIN_B64_LEN and _TTS_REF_AUDIO_B64_RE.fullmatch(candidate):
+        compact = "".join(candidate.split())
+        try:
+            base64.b64decode(compact, validate=True)
+        except (binascii.Error, ValueError):
+            pass
+        else:
+            return f"data:audio/wav;base64,{compact}", None
+    allowed_dir = (os.environ.get(_TTS_REF_AUDIO_DIR_ENV) or "").strip()
+    if not allowed_dir:
+        return None, (
+            "tts_ref_audio file references are disabled on this server; send a data:audio;base64 URI or omit the field"
+        )
+    root = os.path.realpath(allowed_dir)
+    resolved = os.path.realpath(os.path.join(root, candidate))
+    if resolved != root and not resolved.startswith(root + os.sep):
+        return None, "tts_ref_audio must name a file inside the server's reference-audio directory"
+    if not os.path.isfile(resolved):
+        return None, "tts_ref_audio file not found in the server's reference-audio directory"
+    return resolved, None
 
 
 def _resolve_deploy_pipeline(engine_client: Any) -> str | None:
@@ -243,7 +308,14 @@ class AuraStreamingVideoSessionConfig(StreamingVideoSessionConfig):
     tts_task_type: str | None = Field(default=None, description="Qwen3-TTS task type override.")
     tts_language: str | None = Field(default=None, description="Qwen3-TTS language override.")
     tts_speaker: str | None = Field(default=None, description="CustomVoice speaker name.")
-    tts_ref_audio: str | None = Field(default=None, description="Base TTS reference audio path.")
+    tts_ref_audio: str | None = Field(
+        default=None,
+        description=(
+            "TTS speaker reference audio: a data:audio/...;base64 URI (preferred), "
+            "raw base64 audio, or a bare filename inside the directory the server "
+            "exposes via VLLM_VIDEO_TTS_REF_AUDIO_DIR. URLs and paths are rejected."
+        ),
+    )
     tts_ref_text: str | None = Field(default=None, description="Base TTS reference transcript.")
     tts_instruct: str | None = Field(default=None, description="VoiceDesign / style instruct text.")
     tts_max_new_tokens: int | None = Field(
@@ -302,6 +374,12 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def should_trigger_on_audio_done(self, *, has_audio: bool, is_turn_locked: bool) -> bool:
         """Open a turn only after the full utterance is buffered (not per chunk)."""
         return bool(has_audio) and not is_turn_locked
+
+    def frame_trigger_consumes_audio(self) -> bool:
+        # Frame auto-trigger stays independent of buffered audio: a silent
+        # vision turn must not steal a mid-flight utterance; ``audio.done``
+        # owns the buffer and opens the voice turn.
+        return False
 
     def ensure_frames_for_audio_turn(
         self,
@@ -497,10 +575,17 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 config_data[new_key] = config_data[old_key]
 
         try:
-            return AuraStreamingVideoSessionConfig(**config_data)
+            config = AuraStreamingVideoSessionConfig(**config_data)
         except ValidationError as e:
             await self._send_error(websocket, f"Invalid session config: {e}")
             return None
+
+        sanitized_ref_audio, ref_audio_error = _sanitize_client_tts_ref_audio(config.tts_ref_audio)
+        if ref_audio_error is not None:
+            await self._send_error(websocket, f"Invalid session config: {ref_audio_error}")
+            return None
+        config.tts_ref_audio = sanitized_ref_audio
+        return config
 
     async def prepare_chat_request_kwargs(
         self,
@@ -723,17 +808,6 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                     continue
 
                 if out_type == "audio":
-                    if streaming and not text_done_sent:
-                        full_text = "".join(text_parts)
-                        await websocket.send_json(
-                            _with_metrics(
-                                _response_event({"type": "response.text.done", "text": full_text}),
-                                last_text_metrics,
-                            )
-                        )
-                        text_done_sent = True
-                        await _try_release_turn_lock(full_text)
-
                     audio_chunk_count += 1
                     last_audio_metrics = metrics or last_audio_metrics
                     if streaming:
@@ -742,7 +816,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                             audio_chunks_drained,
                         )
                         if b64:
-                            logger.info(
+                            logger.debug(
                                 "[video_stream response.audio.delta] req=%s chunk=%d drained=%d "
                                 "b64_len=%d current_text_len=%d text_done_sent=%s",
                                 request_id,
@@ -788,6 +862,20 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                                     metrics,
                                 )
                             )
+                    # Assistant text stage finished: emit the complete text and
+                    # release the turn lock while TTS keeps draining. Sending at
+                    # first audio instead would truncate text still streaming
+                    # from sentence-level TTS.
+                    if getattr(output, "finished", False) and not text_done_sent:
+                        full_text = "".join(text_parts)
+                        await websocket.send_json(
+                            _with_metrics(
+                                _response_event({"type": "response.text.done", "text": full_text}),
+                                last_text_metrics,
+                            )
+                        )
+                        text_done_sent = True
+                        await _try_release_turn_lock(full_text)
 
             if not text_done_sent:
                 full_text = "".join(text_parts)
@@ -842,6 +930,7 @@ class AuraStreamingVideoHandler(OmniStreamingVideoHandlerBase):
                 self.on_turn_complete(message_history, user_message, response_text, request_id)
 
         except Exception:
+            logger.exception("[video_stream] query processing failed req=%s", request_id)
             await self._send_error(websocket, "Query processing failed")
 
         if not text_done_sent:

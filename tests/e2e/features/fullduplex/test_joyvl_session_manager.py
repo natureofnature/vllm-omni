@@ -352,6 +352,57 @@ async def test_reset_retry_does_not_invalidate_new_epoch_work():
 
 
 @pytest.mark.asyncio
+async def test_idle_eviction_retires_epoch_so_session_restarts_at_zero():
+    """TTL expiry ends the session outright: a resuming idle client restarts at
+    epoch 0 instead of hitting a permanent stale-epoch 409, and _epochs stays
+    bounded by live sessions."""
+    backend = _Backend()
+    config = InteractionConfig(enable_memory=False, enable_delegation=False, session_timeout_seconds=10.0)
+    manager = SessionManager(config, backend=backend)
+
+    await manager.step("idle", ["frame-a"], "hello", epoch=0)
+    assert manager.current_epoch("idle") == 0
+
+    # Age the session past TTL, then any step sweeps it out.
+    manager._slots["idle"].session.last_access -= 3600
+    await manager.step("other", ["frame-b"], "hi")
+
+    assert "idle" not in manager._slots
+    assert "idle" not in manager._epochs
+
+    # The idle client resumes seamlessly on a fresh epoch-0 session.
+    result = await manager.step("idle", ["frame-c"], "back again", epoch=0)
+    assert result.frame_index == 1
+    assert manager.current_epoch("idle") == 0
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_reset_epoch_entry_purged_after_ttl():
+    """A reset-then-abandoned session id must not leak its _epochs entry forever."""
+    backend = _Backend()
+    config = InteractionConfig(enable_memory=False, enable_delegation=False, session_timeout_seconds=10.0)
+    manager = SessionManager(config, backend=backend)
+
+    epoch = await manager.reset("abandoned", expected_epoch=0)
+    assert epoch == 1
+    assert manager.current_epoch("abandoned") == 1
+
+    # Within the retirement window the bumped epoch is still enforced, even
+    # under reset-only traffic on other sessions.
+    await manager.reset("other-1", expected_epoch=0)
+    assert manager.current_epoch("abandoned") == 1
+
+    # After the window elapses (slot still absent), reset-only traffic on a
+    # different session is enough to purge the abandoned entry: pure-reset
+    # clients never run step()/_evict_expired().
+    manager._epoch_retire_deadline["abandoned"] -= 3600
+    await manager.reset("other-2", expected_epoch=0)
+    assert "abandoned" not in manager._epochs
+    await manager.aclose()
+
+
+@pytest.mark.asyncio
 async def test_sessions_keep_independent_history():
     backend = _Backend()
     manager = SessionManager(_config(), backend=backend)

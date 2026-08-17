@@ -96,6 +96,18 @@ without selecting the next logical stage.
 **Rule:** Once a request reaches a terminal state, orchestration MUST NOT
 forward new work for that request.
 
+### ORCH-INV-200: Session state creation and reclamation are symmetric
+
+**Rule:** Every code path that creates per-session state (worker-side
+registries, epoch/fence entries, replica route bindings) MUST have a matching
+reclamation path that runs on session close, request failure, and idle expiry.
+State that can be created by a client-supplied identifier MUST be bounded by a
+TTL or an explicit cap when cross-process teardown cannot be guaranteed.
+Session close/reset MUST release the session's replica route binding even when
+the worker-side control RPC fails: the caller is discarding the worker state
+either way, and a retained route would pin the session to a replica holding
+garbage state.
+
 ## Invariant namespace
 
 `ORCH-INV` reserves `001-099` for dependency direction, `100-199` for

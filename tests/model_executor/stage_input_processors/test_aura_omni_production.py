@@ -729,11 +729,13 @@ def test_aura2tts_commits_stage_session_turn():
         "deferred_multi_modal_data": {"video": [(video, metadata)]},
         "aura_system_prompt": ["system"],
     }
+    # Production sync flow records and commits under the same stage request id
+    # (both derive from ``source_output.request_id``).
     build_aura_input(
         transcript="你好",
         additional_info=additional_info,
         multi_modal_data={},
-        request_id="req-sync",
+        request_id="req-1",
     )
     assert get_session_history("aura-sync-commit").current_rounds == 0
 

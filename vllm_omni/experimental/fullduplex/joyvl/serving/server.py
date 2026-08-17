@@ -93,6 +93,10 @@ class SessionManager:
         self._delegation = self._build_delegation(config) if config.enable_delegation else None
         self._slots: dict[str, _SessionSlot] = {}
         self._epochs: dict[str, int] = {}
+        # Slotless epoch entries (after an explicit reset) kept until this
+        # monotonic deadline, then purged so client-supplied session ids cannot
+        # grow _epochs without bound. Sessions with live slots are never purged.
+        self._epoch_retire_deadline: dict[str, float] = {}
         self._retired_tasks: set[asyncio.Task[None]] = set()
 
     @staticmethod
@@ -152,7 +156,22 @@ class SessionManager:
             )
             slot = _SessionSlot(session=session, epoch=self._epochs.setdefault(session_id, 0))
             self._slots[session_id] = slot
+            self._epoch_retire_deadline.pop(session_id, None)
         return slot
+
+    def _mark_epoch_retirement(self, session_id: str) -> None:
+        """Schedule a slotless epoch entry for purge one session TTL from now."""
+        ttl = self.config.session_timeout_seconds
+        if ttl <= 0:
+            return
+        self._epoch_retire_deadline[session_id] = time.monotonic() + ttl
+
+    def _purge_retired_epochs(self) -> None:
+        now = time.monotonic()
+        for sid in [sid for sid, deadline in self._epoch_retire_deadline.items() if deadline <= now]:
+            if sid not in self._slots:
+                self._epochs.pop(sid, None)
+            self._epoch_retire_deadline.pop(sid, None)
 
     async def step(
         self,
@@ -216,6 +235,10 @@ class SessionManager:
         if expected_epoch < 0:
             raise ValueError("expected_epoch must be non-negative")
 
+        # Reset-only traffic never runs step()/_evict_expired(), so purge here
+        # too or slotless epoch entries from other sessions accumulate forever.
+        self._purge_retired_epochs()
+
         while True:
             current_epoch = self._epochs.get(session_id, 0)
             if expected_epoch + 1 == current_epoch:
@@ -229,6 +252,7 @@ class SessionManager:
             if old_slot is None:
                 new_epoch = current_epoch + 1
                 self._epochs[session_id] = new_epoch
+                self._mark_epoch_retirement(session_id)
                 return new_epoch, True
 
             async with old_slot.commit_lock:
@@ -245,6 +269,7 @@ class SessionManager:
                 new_epoch = current_epoch + 1
                 self._epochs[session_id] = new_epoch
                 self._slots.pop(session_id, None)
+                self._mark_epoch_retirement(session_id)
                 task = asyncio.create_task(
                     self._retire_slot(old_slot),
                     name=f"joyvl-retire-{session_id}-{old_slot.epoch}",
@@ -322,6 +347,7 @@ class SessionManager:
         ttl = self.config.session_timeout_seconds
         if ttl <= 0:
             return
+        self._purge_retired_epochs()
         now = time.monotonic()
         expired = [
             sid
@@ -332,6 +358,12 @@ class SessionManager:
             slot = self._slots.get(sid)
             if slot is not None:
                 await self.reset(sid, expected_epoch=slot.epoch)
+                # TTL expiry retires the session outright: drop its epoch entry
+                # so an idle client resuming later restarts cleanly at epoch 0
+                # instead of hitting a permanent stale-epoch 409, and the map
+                # stays bounded by live sessions.
+                self._epochs.pop(sid, None)
+                self._epoch_retire_deadline.pop(sid, None)
 
     async def aclose(self) -> None:
         for sid in list(self._slots):

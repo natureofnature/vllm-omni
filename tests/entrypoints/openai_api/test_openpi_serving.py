@@ -384,6 +384,7 @@ def test_session_lifecycle_targets_bound_stage_and_releases_route():
         {
             "method": "handle_session_control",
             "args": ("reset", "session-a"),
+            "timeout": openpi_serving.ServingRealtimeRobotOpenPI._SESSION_CONTROL_TIMEOUT_S,
             "stage_ids": [0],
             "session_routing_key": "dreamzero:session-a",
             "release_session_binding": True,
@@ -391,6 +392,7 @@ def test_session_lifecycle_targets_bound_stage_and_releases_route():
         {
             "method": "handle_session_control",
             "args": ("close", "session-b"),
+            "timeout": openpi_serving.ServingRealtimeRobotOpenPI._SESSION_CONTROL_TIMEOUT_S,
             "stage_ids": [0],
             "session_routing_key": "dreamzero:session-b",
             "release_session_binding": True,

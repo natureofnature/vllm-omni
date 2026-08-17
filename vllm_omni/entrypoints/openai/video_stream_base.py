@@ -227,6 +227,16 @@ class OmniStreamingVideoHandler:
         del has_audio, is_turn_locked
         return False
 
+    def frame_trigger_consumes_audio(self) -> bool:
+        """Whether frame auto-trigger turns consume the buffered audio.
+
+        Default True: pipelines without ``audio.done`` voice turns fold buffered
+        audio into the vision turn. Pipelines whose utterances complete via
+        ``audio.done`` return False so a silent vision turn cannot steal a
+        mid-flight utterance.
+        """
+        return True
+
     def ensure_frames_for_audio_turn(
         self,
         frame_buffer: list[str],
@@ -466,8 +476,13 @@ class OmniStreamingVideoHandler:
                     query_task = None
                     is_turn_locked = False
 
-            async def _start_query_turn(*, query_text: str) -> None:
-                """Schedule a new inference turn from the current buffers."""
+            async def _start_query_turn(*, query_text: str, consume_audio: bool = True) -> None:
+                """Schedule a new inference turn from the current buffers.
+
+                ``consume_audio=False`` (frame auto-trigger) leaves the audio
+                buffer intact so a mid-flight utterance is not stolen by a
+                silent vision turn; ``audio.done`` keeps sole ownership of it.
+                """
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task, is_turn_locked
 
                 if self.releases_turn_after_text_done():
@@ -499,8 +514,11 @@ class OmniStreamingVideoHandler:
                 interrupt_event.clear()
                 query_frames = list(frame_buffer)
                 query_frame_metadata = list(frame_metadata)
-                query_audio_buffer = bytearray(audio_buffer)
-                audio_buffer.clear()
+                if consume_audio:
+                    query_audio_buffer = bytearray(audio_buffer)
+                    audio_buffer.clear()
+                else:
+                    query_audio_buffer = bytearray()
                 query_prewarmed_frames = dict(frame_pil_cache)
 
                 async def _run_query() -> None:
@@ -640,9 +658,10 @@ class OmniStreamingVideoHandler:
                             query_task is not None and not query_task.done()
                         )
                         trigger_turn_locked = is_turn_locked if self.releases_turn_after_text_done() else is_generating
-                        # Frame auto-trigger stays independent of buffered audio: silent vision
-                        # turns keep running while chunks accumulate; audio.done still opens a
-                        # voice turn when the utterance is complete and unlocked.
+                        # frame_trigger_consumes_audio() decides whether this turn folds in
+                        # buffered audio (legacy ride-along) or leaves it for audio.done
+                        # voice turns (AURA: silent vision turns keep running while chunks
+                        # accumulate).
                         if self.should_trigger_turn(
                             VideoStreamTurnTrigger(
                                 frame_count=self.auto_trigger_frame_count(
@@ -654,7 +673,10 @@ class OmniStreamingVideoHandler:
                                 config=config,
                             )
                         ):
-                            await _start_query_turn(query_text="")
+                            await _start_query_turn(
+                                query_text="",
+                                consume_audio=self.frame_trigger_consumes_audio(),
+                            )
 
                     elif msg_type == "audio.chunk":
                         data_b64 = msg.get("data", "")
@@ -731,6 +753,10 @@ class OmniStreamingVideoHandler:
                         await _start_query_turn(query_text=query_text)
 
                     elif msg_type == "video.done":
+                        # Session is ending: a deferred audio.done must not open
+                        # a new voice turn after session.done from the draining
+                        # turn's _flush_pending_audio_done.
+                        pending_audio_done = False
                         await _gather_pending_query_tasks()
                         query_task = None
                         await websocket.send_json({"type": "session.done"})
@@ -1203,7 +1229,7 @@ class OmniStreamingVideoHandler:
         # replaying already-sent tensors.
         if not isinstance(audio_data, list):
             tail_np = cls._tensor_to_1d_np(audio_data)
-            logger.info(
+            logger.debug(
                 "[video_stream audio.delta] single_tensor old_drained=%d samples=%s",
                 chunks_drained,
                 None if tail_np is None else len(tail_np),
@@ -1222,7 +1248,7 @@ class OmniStreamingVideoHandler:
         new_chunks = audio_data[chunks_drained:]
         tail = new_chunks[0] if len(new_chunks) == 1 else torch.cat(new_chunks, dim=-1)
         tail_np = cls._tensor_to_1d_np(tail)
-        logger.info(
+        logger.debug(
             "[video_stream audio.delta] list_chunks old_drained=%d new_drained=%d new_chunks=%d samples=%s",
             chunks_drained,
             n,
@@ -1285,15 +1311,6 @@ class OmniStreamingVideoHandler:
         if len(tail_np) == 0:
             return None, new_drained
         try:
-            logger.info(
-                "[video_stream audio.delta] encoding old_drained=%d new_drained=%d is_first=%s "
-                "samples=%d duration_s=%.3f",
-                old_drained,
-                new_drained,
-                is_first,
-                len(tail_np),
-                len(tail_np) / 24000.0,
-            )
             return cls._encode_audio_wav_b64(tail_np), new_drained
         except Exception:
             logger.exception("Failed to encode audio delta WAV")

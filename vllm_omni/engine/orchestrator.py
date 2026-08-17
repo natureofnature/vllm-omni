@@ -942,11 +942,16 @@ class Orchestrator:
                 )
                 stage_ids.append(pool.stage_id)
                 results.append(stage_result)
-                if (
-                    msg.session_routing_key is not None
-                    and msg.release_session_binding
-                    and self._session_control_succeeded(stage_result)
-                ):
+                if msg.session_routing_key is not None and msg.release_session_binding:
+                    # The caller is discarding the Session's worker state either
+                    # way; retaining the route on RPC failure would only pin the
+                    # session to a replica holding garbage state.
+                    if not self._session_control_succeeded(stage_result):
+                        logger.warning(
+                            "[Orchestrator] Session control %s failed for key=%s; releasing binding anyway",
+                            method,
+                            msg.session_routing_key,
+                        )
                     pool.release_session_binding(msg.session_routing_key)
 
         await self.rpc_async_queue.put(
@@ -2226,7 +2231,22 @@ class Orchestrator:
                 or _resolve_prompt_additional_information(req_state.prompt)
                 or {}
             )
-            await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            injected = await self._inject_bypassed_stage0_chunk(request_id, additional_info)
+            if not injected:
+                # Prewarmed Stage1+ would otherwise wait forever on the missing
+                # SHM chunk: fail the request and abort downstream submissions.
+                await self.output_async_queue.put(
+                    ErrorMessage(
+                        request_id=request_id,
+                        stage_id=0,
+                        error="Failed to inject bypassed Stage0 chunk; aborting request",
+                    )
+                )
+                await self._cleanup_request_ids(
+                    [request_id],
+                    abort=True,
+                    close_duplex_sessions=True,
+                )
             return
 
         await self._forward_bypassed_stage_zero(request_id, req_state)
@@ -2286,8 +2306,12 @@ class Orchestrator:
         self,
         request_id: str,
         additional_info: dict[str, Any],
-    ) -> None:
-        """Put a finished empty ASR→AURA chunk so prewarmed Stage1 can proceed."""
+    ) -> bool:
+        """Put a finished empty ASR→AURA chunk so prewarmed Stage1 can proceed.
+
+        Returns whether the chunk was stored; the caller must fail the request
+        on ``False`` so prewarmed downstream stages do not wait forever.
+        """
         payload = build_empty_asr_aura_chunk_payload(additional_info)
         put_key = f"{request_id}_0_0"
         connector = self._get_stage0_bypass_connector()
@@ -2303,13 +2327,14 @@ class Orchestrator:
                 request_id,
                 put_key,
             )
-            return
+            return False
         logger.debug(
             "[Orchestrator] Injected bypassed Stage0 chunk req=%s key=%s size=%s",
             request_id,
             put_key,
             size,
         )
+        return True
 
     async def _prewarm_async_chunk_stages(
         self,

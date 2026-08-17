@@ -33,6 +33,21 @@ except ImportError:
 
 from PIL import Image
 
+_AUDIO_MIME_BY_SUFFIX = {".wav": "audio/wav", ".mp3": "audio/mpeg", ".flac": "audio/flac", ".ogg": "audio/ogg"}
+
+
+def encode_tts_ref_audio(value: str) -> str:
+    """Send local reference audio inline; the server rejects paths and URLs."""
+    if value.startswith("data:audio"):
+        return value
+    path = Path(value).expanduser()
+    if path.is_file():
+        mime = _AUDIO_MIME_BY_SUFFIX.get(path.suffix.lower(), "audio/wav")
+        return f"data:{mime};base64,{base64.b64encode(path.read_bytes()).decode()}"
+    # Not a local file: assume a bare filename the server allows via
+    # VLLM_VIDEO_TTS_REF_AUDIO_DIR and let the server validate it.
+    return value
+
 
 @dataclass
 class _AudioCollector:
@@ -158,7 +173,7 @@ async def run(args: argparse.Namespace) -> None:
             "tts_instruct": args.tts_instruct,
         }
         if args.tts_ref_audio:
-            config["tts_ref_audio"] = args.tts_ref_audio
+            config["tts_ref_audio"] = encode_tts_ref_audio(args.tts_ref_audio)
         if args.tts_ref_text:
             config["tts_ref_text"] = args.tts_ref_text
         if args.cross_turn_penalty > 0:
@@ -264,7 +279,15 @@ def main() -> None:
     parser.add_argument("--tts-language", default="Chinese")
     parser.add_argument("--tts-speaker", default="Vivian")
     parser.add_argument("--tts-instruct", default="")
-    parser.add_argument("--tts-ref-audio", default="")
+    parser.add_argument(
+        "--tts-ref-audio",
+        default="",
+        help=(
+            "TTS speaker reference audio: a local audio file (sent inline as a "
+            "data:audio;base64 URI), an existing data URI, or a bare filename "
+            "the server allows via VLLM_VIDEO_TTS_REF_AUDIO_DIR"
+        ),
+    )
     parser.add_argument("--tts-ref-text", default="")
     parser.add_argument(
         "--output-wav",

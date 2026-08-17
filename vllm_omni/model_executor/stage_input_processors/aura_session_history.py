@@ -7,6 +7,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -715,9 +716,8 @@ class AuraSessionState:
         pending still exists (e.g. text-only sync that skips the TTS stage).
         """
         del video_fps, max_frames_per_round
-        del request_id
         if self.session_id:
-            commit_session_turn(self.session_id, response_text)
+            commit_session_turn(self.session_id, response_text, request_id=request_id)
 
         self.pending_turn_video = None
         # Drop only frames that belonged to the frozen turn; keep frames that
@@ -778,7 +778,41 @@ _SESSION_STATES: dict[str, AuraSessionState] = {}
 # registry. It remains process-local and is not durable across multiple heads.
 _STAGE_WORKER_LOCK = threading.Lock()
 _STAGE_WORKER_SESSIONS: dict[str, SessionHistory] = {}
-_STAGE_PENDING_TURNS: dict[str, dict[str, Any]] = {}
+# session_id -> {request_id -> pending turn} (insertion-ordered). Keyed by
+# request so overlapping turns (lock released at text.done while Stage-1 still
+# decodes) cannot overwrite or commit each other's pending user message.
+_STAGE_PENDING_TURNS: dict[str, dict[str, dict[str, Any]]] = {}
+# Bound per-session pending turns: aborted requests never commit, so drop the
+# oldest beyond this instead of leaking.
+_MAX_PENDING_TURNS_PER_SESSION = 8
+# Idle stage-worker sessions are evicted after this TTL (seconds); the API
+# process unregisters on disconnect only when it shares this process, so the
+# sweep is the backstop for split deployments. 0 disables eviction.
+_STAGE_WORKER_SESSION_TTL_S = float(os.environ.get("VLLM_AURA_SESSION_TTL_S", "3600") or 0)
+_STAGE_WORKER_LAST_ACCESS: dict[str, float] = {}
+
+
+def _touch_worker_session(session_id: str) -> None:
+    """Record last access and opportunistically evict idle sessions (lock held)."""
+    now = time.monotonic()
+    _STAGE_WORKER_LAST_ACCESS[session_id] = now
+    if _STAGE_WORKER_SESSION_TTL_S <= 0:
+        return
+    expired = [
+        sid
+        for sid, last_access in _STAGE_WORKER_LAST_ACCESS.items()
+        if sid != session_id and now - last_access > _STAGE_WORKER_SESSION_TTL_S
+    ]
+    for sid in expired:
+        _STAGE_WORKER_SESSIONS.pop(sid, None)
+        _STAGE_PENDING_TURNS.pop(sid, None)
+        _STAGE_WORKER_LAST_ACCESS.pop(sid, None)
+    if expired:
+        logger.info(
+            "AURA session_history evicted %d idle stage-worker session(s) (ttl=%.0fs)",
+            len(expired),
+            _STAGE_WORKER_SESSION_TTL_S,
+        )
 
 
 def create_session_id() -> str:
@@ -808,6 +842,7 @@ def unregister_session(session_id: str) -> None:
     with _STAGE_WORKER_LOCK:
         _STAGE_WORKER_SESSIONS.pop(session_id, None)
         _STAGE_PENDING_TURNS.pop(session_id, None)
+        _STAGE_WORKER_LAST_ACCESS.pop(session_id, None)
 
 
 def clear_all_sessions() -> None:
@@ -818,6 +853,7 @@ def clear_all_sessions() -> None:
     with _STAGE_WORKER_LOCK:
         _STAGE_WORKER_SESSIONS.clear()
         _STAGE_PENDING_TURNS.clear()
+        _STAGE_WORKER_LAST_ACCESS.clear()
 
 
 def get_or_create_session_history(
@@ -858,13 +894,17 @@ def get_or_create_session_history(
                     num_rounds_keep,
                     max_context_qas,
                 )
+        _touch_worker_session(session_id)
         return history
 
 
 def get_session_history(session_id: str) -> SessionHistory | None:
     """Return prompt ``SessionHistory`` if it already exists for ``session_id``."""
     with _STAGE_WORKER_LOCK:
-        return _STAGE_WORKER_SESSIONS.get(session_id)
+        history = _STAGE_WORKER_SESSIONS.get(session_id)
+        if history is not None:
+            _touch_worker_session(session_id)
+        return history
 
 
 def record_pending_turn(
@@ -880,7 +920,8 @@ def record_pending_turn(
     mm_uuid: str | None = None,
 ) -> None:
     with _STAGE_WORKER_LOCK:
-        _STAGE_PENDING_TURNS[session_id] = {
+        pending_map = _STAGE_PENDING_TURNS.setdefault(session_id, {})
+        pending_map[str(request_id)] = {
             "request_id": request_id,
             "transcript": transcript,
             "video_tuple": video_tuple,
@@ -890,17 +931,49 @@ def record_pending_turn(
             "had_vision": bool(had_vision),
             "mm_uuid": str(mm_uuid) if mm_uuid else None,
         }
+        while len(pending_map) > _MAX_PENDING_TURNS_PER_SESSION:
+            dropped_request_id = next(iter(pending_map))
+            pending_map.pop(dropped_request_id, None)
+            logger.warning(
+                "AURA session_history dropped stale pending turn session_id=%s request_id=%s",
+                session_id,
+                dropped_request_id,
+            )
+        _touch_worker_session(session_id)
 
 
-def commit_session_turn(session_id: str, response_text: str) -> None:
+def commit_session_turn(session_id: str, response_text: str, *, request_id: str | None = None) -> None:
     """Commit the finished user/assistant turn into prompt ``SessionHistory``.
 
-    No-op when there is no pending turn (idempotent if ``aura2tts`` already
-    committed and the API ``commit_turn`` fallback runs later).
+    Pops the pending turn matching ``request_id`` so overlapping turns commit
+    their own user message. Without ``request_id`` the oldest entry is used.
+    An explicit ``request_id`` that is not pending is a strict no-op: falling
+    back would let a duplicate commit of an already-committed request steal a
+    different request's pending turn. This keeps duplicate commits idempotent
+    (e.g. ``aura2tts`` already committed and the API ``commit_turn`` fallback
+    runs later).
     """
     with _STAGE_WORKER_LOCK:
         history = _STAGE_WORKER_SESSIONS.get(session_id)
-        pending = _STAGE_PENDING_TURNS.pop(session_id, None)
+        pending_map = _STAGE_PENDING_TURNS.get(session_id)
+        pending: dict[str, Any] | None = None
+        if pending_map:
+            key = str(request_id) if request_id is not None else None
+            if key is not None and key in pending_map:
+                pending = pending_map.pop(key)
+            elif key is None:
+                pending = pending_map.pop(next(iter(pending_map)))
+            else:
+                logger.warning(
+                    "AURA session_history commit skipped: request_id=%s not pending for session_id=%s (%d pending)",
+                    request_id,
+                    session_id,
+                    len(pending_map),
+                )
+            if not pending_map:
+                _STAGE_PENDING_TURNS.pop(session_id, None)
+        if history is not None:
+            _touch_worker_session(session_id)
     if history is None or pending is None:
         return
     transcript = str(pending.get("transcript", ""))

@@ -357,3 +357,76 @@ async def test_process_query_merges_cross_turn_penalty_sampling_params():
     assert merged[0] == {"temperature": 0.7}
     assert merged[1]["logit_bias"] == {42: -1.5}
     assert merged[1]["bad_words"] == ["foo"]
+
+
+class _ConfigWebSocket:
+    """Minimal WebSocket stub for _receive_config."""
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        import json
+
+        self._payload = json.dumps(payload)
+        self.sent: list[dict[str, Any]] = []
+
+    async def receive_text(self) -> str:
+        return self._payload
+
+    async def send_json(self, data: dict[str, Any]) -> None:
+        self.sent.append(data)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "ref_audio",
+    [
+        "http://169.254.169.254/latest/meta-data",
+        "file:///etc/passwd",
+        "/etc/passwd",
+        "../../../etc/passwd",
+    ],
+)
+async def test_receive_config_rejects_client_tts_ref_audio_references(monkeypatch, ref_audio):
+    """Client tts_ref_audio must not reach load_audio_to_np as a URL or path."""
+    monkeypatch.delenv("VLLM_VIDEO_TTS_REF_AUDIO_DIR", raising=False)
+    handler = AuraStreamingVideoHandler(chat_service=object(), engine_client=MagicMock())
+    ws = _ConfigWebSocket({"type": "session.config", "model": "test", "tts_ref_audio": ref_audio})
+
+    config = await handler._receive_config(ws)
+
+    assert config is None
+    assert ws.sent and ws.sent[0]["type"] == "error"
+    assert "tts_ref_audio" in ws.sent[0]["message"]
+
+
+@pytest.mark.asyncio
+async def test_receive_config_allows_inline_audio_and_allowlisted_file(monkeypatch, tmp_path):
+    handler = AuraStreamingVideoHandler(chat_service=object(), engine_client=MagicMock())
+
+    # Inline data URI is always allowed (no filesystem/network access).
+    ws = _ConfigWebSocket({"type": "session.config", "model": "test", "tts_ref_audio": "data:audio/wav;base64,AAAA"})
+    config = await handler._receive_config(ws)
+    assert config is not None
+    assert config.tts_ref_audio == "data:audio/wav;base64,AAAA"
+
+    # Raw base64 containing '/' is valid audio content, not a path: it is
+    # normalized to a data URI so downstream never treats it as a filename.
+    raw_b64 = base64.b64encode(bytes(range(256)) * 2).decode()
+    assert "/" in raw_b64 and len(raw_b64) >= 256
+    ws = _ConfigWebSocket({"type": "session.config", "model": "test", "tts_ref_audio": raw_b64})
+    config = await handler._receive_config(ws)
+    assert config is not None
+    assert config.tts_ref_audio == f"data:audio/wav;base64,{raw_b64}"
+
+    # Bare filename resolves inside the configured directory.
+    voice = tmp_path / "voice.wav"
+    voice.write_bytes(b"x")
+    monkeypatch.setenv("VLLM_VIDEO_TTS_REF_AUDIO_DIR", str(tmp_path))
+    ws = _ConfigWebSocket({"type": "session.config", "model": "test", "tts_ref_audio": "voice.wav"})
+    config = await handler._receive_config(ws)
+    assert config is not None
+    assert config.tts_ref_audio == str(voice.resolve())
+
+    # Escapes from the directory are still rejected.
+    ws = _ConfigWebSocket({"type": "session.config", "model": "test", "tts_ref_audio": "../outside.wav"})
+    config = await handler._receive_config(ws)
+    assert config is None

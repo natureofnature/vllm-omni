@@ -183,6 +183,103 @@ def test_aura_session_state_commit_turn_clears_frames_without_api_history():
     clear_all_sessions()
 
 
+def test_commit_session_turn_duplicate_explicit_id_never_steals_other_pending_turn():
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        clear_all_sessions,
+        commit_session_turn,
+        get_or_create_session_history,
+        record_pending_turn,
+    )
+
+    clear_all_sessions()
+    session_id = "sess-dup-commit"
+    history = get_or_create_session_history(session_id, system_prompt="sys")
+    record_pending_turn(session_id, request_id="req-a", transcript="user-A", video_tuple=None)
+    record_pending_turn(session_id, request_id="req-b", transcript="user-B", video_tuple=None)
+
+    commit_session_turn(session_id, "reply-A", request_id="req-a")
+    assert history.current_rounds == 1
+
+    # Duplicate commit of req-a must be a no-op even though req-b is still
+    # pending; it must not pair reply-A with user-B.
+    commit_session_turn(session_id, "duplicate-reply-A", request_id="req-a")
+    assert history.current_rounds == 1
+
+    commit_session_turn(session_id, "reply-B", request_id="req-b")
+    assert history.current_rounds == 2
+    prompt = history.get_vllm_inputs()["prompt"]
+    assert "duplicate-reply-A" not in prompt
+    assert "user-B" in prompt
+    assert "reply-B" in prompt
+    clear_all_sessions()
+
+
+def test_commit_session_turn_without_request_id_falls_back_to_oldest():
+    from vllm_omni.model_executor.stage_input_processors.aura_session_history import (
+        clear_all_sessions,
+        commit_session_turn,
+        get_or_create_session_history,
+        record_pending_turn,
+    )
+
+    clear_all_sessions()
+    session_id = "sess-fifo-commit"
+    history = get_or_create_session_history(session_id, system_prompt="sys")
+    record_pending_turn(session_id, request_id="req-1", transcript="user-1", video_tuple=None)
+
+    commit_session_turn(session_id, "reply-1")
+    assert history.current_rounds == 1
+    prompt = history.get_vllm_inputs()["prompt"]
+    assert "user-1" in prompt
+    assert "reply-1" in prompt
+    clear_all_sessions()
+
+
+def test_record_pending_turn_caps_per_session_and_drops_oldest():
+    from vllm_omni.model_executor.stage_input_processors import aura_session_history as ash
+
+    ash.clear_all_sessions()
+    session_id = "sess-pending-cap"
+    history = ash.get_or_create_session_history(session_id, system_prompt="sys")
+    cap = ash._MAX_PENDING_TURNS_PER_SESSION
+    for i in range(cap + 1):
+        ash.record_pending_turn(session_id, request_id=f"req-{i}", transcript=f"user-{i}", video_tuple=None)
+
+    # The oldest entry was dropped: committing it is a strict no-op.
+    ash.commit_session_turn(session_id, "reply-0", request_id="req-0")
+    assert history.current_rounds == 0
+
+    # All retained entries still commit under their own ids.
+    for i in range(1, cap + 1):
+        ash.commit_session_turn(session_id, f"reply-{i}", request_id=f"req-{i}")
+    assert history.current_rounds == cap
+    prompt = history.get_vllm_inputs()["prompt"]
+    assert "user-0" not in prompt
+    assert "user-1" in prompt
+    ash.clear_all_sessions()
+
+
+def test_idle_stage_worker_session_evicted_after_ttl(monkeypatch):
+    from vllm_omni.model_executor.stage_input_processors import aura_session_history as ash
+
+    ash.clear_all_sessions()
+    monkeypatch.setattr(ash, "_STAGE_WORKER_SESSION_TTL_S", 10.0)
+    ash.get_or_create_session_history("sess-idle", system_prompt="sys")
+    ash.record_pending_turn("sess-idle", request_id="req-1", transcript="stale", video_tuple=None)
+
+    # Within the TTL, activity on another session leaves it alone.
+    ash.get_or_create_session_history("sess-active", system_prompt="sys")
+    assert ash.get_session_history("sess-idle") is not None
+
+    # Once idle past the TTL, any other session's access sweeps it (and its
+    # pending turns) away.
+    ash._STAGE_WORKER_LAST_ACCESS["sess-idle"] -= 3600
+    ash.get_or_create_session_history("sess-active", system_prompt="sys")
+    assert ash.get_session_history("sess-idle") is None
+    assert "sess-idle" not in ash._STAGE_PENDING_TURNS
+    ash.clear_all_sessions()
+
+
 def test_should_stop_aura_silent_generation_on_first_token():
     assert aura_silent_stop_token_ids() == (AURA_SILENT_TOKEN_ID, AURA_IM_END_TOKEN_ID)
     assert should_stop_aura_silent_generation(token_ids=[AURA_SILENT_TOKEN_ID])

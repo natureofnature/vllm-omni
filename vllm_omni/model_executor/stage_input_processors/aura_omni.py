@@ -723,10 +723,14 @@ def build_aura_input(
     return next_input
 
 
-def _commit_session_turn_if_present(additional_info: dict[str, Any], response_text: str) -> None:
+def _commit_session_turn_if_present(
+    additional_info: dict[str, Any],
+    response_text: str,
+    request_id: str | None = None,
+) -> None:
     session_id = additional_info.get("aura_session_id")
     if session_id:
-        commit_session_turn(str(_first_value(session_id)), response_text)
+        commit_session_turn(str(_first_value(session_id)), response_text, request_id=request_id)
 
 
 _AURA_STAGE_INPUT_PROCESSORS: dict[int, Any] = {}
@@ -1759,9 +1763,14 @@ def aura2tts(
     next_inputs: list[OmniTokensPrompt] = []
     for idx, source_output in enumerate(source_outputs):
         text = _extract_text(source_output).strip()
-        src_prompt = prompt_by_request_id.get(str(getattr(source_output, "request_id", idx)), {})
+        source_request_id = getattr(source_output, "request_id", None)
+        src_prompt = prompt_by_request_id.get(str(source_request_id if source_request_id is not None else idx), {})
         additional_info = src_prompt.get("additional_information") or {}
-        _commit_session_turn_if_present(additional_info, text or SILENT_TEXT)
+        _commit_session_turn_if_present(
+            additional_info,
+            text or SILENT_TEXT,
+            request_id=str(source_request_id) if source_request_id is not None else None,
+        )
         pass_token_ids = _first_bool(additional_info.get("tts_pass_token_ids"), False)
         tts_input = build_tts_talker_input(
             text,
@@ -1812,7 +1821,7 @@ def aura2tts_async_chunk(
             )
             return None
         logger.info("[aura2tts_async_chunk] req=%s emitting silent finished payload", request_id)
-        _commit_session_turn_if_present(additional_info, SILENT_TEXT)
+        _commit_session_turn_if_present(additional_info, SILENT_TEXT, request_id=str(request_id))
         return _aura2tts_empty_finished_payload()
 
     request_payload = getattr(transfer_manager, "request_payload", None)
@@ -1917,7 +1926,7 @@ def aura2tts_async_chunk(
         return None
     if _is_silent_token_prefix(content_ids) and not pending_buf:
         logger.info("[aura2tts_async_chunk] req=%s final content is silent; emitting finish payload", request_id)
-        _commit_session_turn_if_present(additional_info, SILENT_TEXT)
+        _commit_session_turn_if_present(additional_info, SILENT_TEXT, request_id=str(request_id))
         return _aura2tts_empty_finished_payload()
 
     request_text = full_text
@@ -1938,7 +1947,7 @@ def aura2tts_async_chunk(
         if n_emitted > 0:
             # Already streamed sentences mid-gen: flush remnant as text, then
             # optional empty finish if nothing left.
-            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT, request_id=str(request_id))
             if flush_text:
                 tts_input = build_tts_talker_input(flush_text, [], emit_info, pass_token_ids=False)
                 if tts_input is not None:
@@ -1965,7 +1974,7 @@ def aura2tts_async_chunk(
     if tts_input is None:
         if is_effectively_silent(request_text) or _is_silent_token_prefix(content_ids):
             logger.info("[aura2tts_async_chunk] req=%s TTS input is silent; emitting finish payload", request_id)
-            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+            _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT, request_id=str(request_id))
             return _aura2tts_empty_finished_payload()
         logger.info(
             "[aura2tts_async_chunk] req=%s build_tts_talker_input returned None text_len=%d content_ids=%d",
@@ -1974,7 +1983,7 @@ def aura2tts_async_chunk(
             len(content_ids),
         )
         return None
-    _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT)
+    _commit_session_turn_if_present(additional_info, request_text or SILENT_TEXT, request_id=str(request_id))
     payload = _tts_payload_from_talker_input(tts_input, finished=True)
     assistant_token_ids = QWEN_ASSISTANT_PREFIX_IDS + content_ids + QWEN_ASSISTANT_SUFFIX_IDS
     if pass_token_ids and assistant_token_ids:

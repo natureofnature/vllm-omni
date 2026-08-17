@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import Request
@@ -31,9 +32,15 @@ from vllm_omni.experimental.fullduplex.joyvl.serving.server import (
 class OmniChatBackend(ModelBackend):
     """Run JoyAI policy requests through the local AsyncOmni chat service."""
 
-    def __init__(self, chat_service: OmniOpenAIServingChat, model_name: str) -> None:
+    def __init__(
+        self,
+        chat_service: OmniOpenAIServingChat,
+        model_name: str,
+        request_timeout_seconds: float | None = None,
+    ) -> None:
         self._chat_service = chat_service
         self._model_name = model_name
+        self._request_timeout_seconds = request_timeout_seconds
 
     async def generate(
         self,
@@ -54,7 +61,18 @@ class OmniChatBackend(ModelBackend):
         }
         body.update(extra_body or {})
         request = ChatCompletionRequest(**body)
-        response = await self._chat_service.create_chat_completion(request, raw_request=None)
+        completion = self._chat_service.create_chat_completion(request, raw_request=None)
+        if self._request_timeout_seconds and self._request_timeout_seconds > 0:
+            # A hung engine turn must fail the step (rolling the session back via
+            # the snapshot-restore path) instead of holding slot.lock forever.
+            try:
+                response = await asyncio.wait_for(completion, timeout=self._request_timeout_seconds)
+            except asyncio.TimeoutError as exc:
+                raise RuntimeError(
+                    f"AsyncOmni chat completion timed out after {self._request_timeout_seconds:.0f}s"
+                ) from exc
+        else:
+            response = await completion
         if isinstance(response, ErrorResponse):
             message = response.error.message if response.error is not None else "AsyncOmni request failed"
             raise RuntimeError(message)
@@ -78,8 +96,8 @@ class JoyVLSessionServingAdapter:
 
     def __init__(self, chat_service: OmniOpenAIServingChat, model_name: str) -> None:
         self._model_name = model_name
-        backend = OmniChatBackend(chat_service, model_name)
         config = InteractionConfig(main_model=model_name)
+        backend = OmniChatBackend(chat_service, model_name, config.request_timeout_seconds)
         self._manager = SessionManager(
             config,
             backend=backend,

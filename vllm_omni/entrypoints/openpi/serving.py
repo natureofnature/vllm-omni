@@ -124,10 +124,15 @@ class ServingRealtimeRobotOpenPI:
         """Close model-runner state and release the Session's replica route."""
         return await self._control_session("close", session_id)
 
+    _SESSION_CONTROL_TIMEOUT_S = 30.0
+
     async def _control_session(self, action: str, session_id: str) -> list[Any]:
+        # Without a timeout the RPC waiter blocks forever if the worker hangs,
+        # wedging disconnect cleanup.
         return await self.engine_client.collective_rpc(
             method="handle_session_control",
             args=(action, session_id),
+            timeout=self._SESSION_CONTROL_TIMEOUT_S,
             stage_ids=[0],
             session_routing_key=self._session_routing_key(session_id),
             release_session_binding=True,
