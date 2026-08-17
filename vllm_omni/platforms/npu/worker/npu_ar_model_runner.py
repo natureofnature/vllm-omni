@@ -43,7 +43,8 @@ from vllm_ascend.worker.model_runner_v1 import graph_capture
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
-from vllm_omni.distributed.omni_connectors.utils.config import stage_sends_async_output
+from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
+from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
@@ -102,7 +103,7 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
 
-class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
+class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
 
     def __init__(self, *args, **kwargs):
@@ -125,12 +126,31 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             "DyninOmniForConditionalGeneration",
             "IndexTTS2TalkerForConditionalGeneration",
         }
-        if getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS:
+        # Mirrors gpu_ar_model_runner: an arch missing from the hardcoded allowlist
+        # still needs connectors when the deploy config hands the stage a
+        # sender/receiver role (e.g. MiniCPM-o 4.5, whose archs are not listed but
+        # whose YAML wires stage 1 -> stage 2). Without the role check the
+        # full-payload (``--no-async-chunk``) handoff never initializes: nothing
+        # accumulates, nothing flushes, and the downstream stage starves silently.
+        if (
+            getattr(self.model_config, "model_arch", None) in _OMNI_CONNECTOR_INIT_ARCHS
+            or get_stage_connector_role(self.model_config) is not None
+        ):
             self.init_omni_connectors(
                 model_config=self.model_config,
                 kv_transfer_manager=self.kv_transfer_manager,
             )
         self._downstream_payload_cache: dict[str, bool] = {}
+        self._init_duplex_sampling_state()
+
+    def load_model(self, *args, **kwargs) -> None:
+        super().load_model(*args, **kwargs)
+        self._resolve_duplex_sampling_hook(force=True)
+
+    def _update_states(self, scheduler_output: SchedulerOutput):
+        deferred_state_corrections_fn = super()._update_states(scheduler_output)
+        self._update_duplex_sampling_states(scheduler_output)
+        return deferred_state_corrections_fn
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -866,10 +886,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                         self.input_batch.idx_mapping_np,
                         self.input_batch.positions[self.input_batch.logits_indices],
                     )
-                sampler_output = model_sample(
-                    logits,
-                    self._sampling_metadata_for_model_sampler(sampling_metadata),
-                )
+                prepared_sampling_metadata = self._sampling_metadata_for_model_sampler(sampling_metadata)
+                self._apply_duplex_sampling(logits, prepared_sampling_metadata)
+                sampler_output = model_sample(logits, prepared_sampling_metadata)
                 if sampler_output is not None:
                     return sampler_output
             return self.sampler(

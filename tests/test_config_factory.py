@@ -2164,6 +2164,43 @@ class TestBaseConfigInheritance:
 class TestPlatformOverrides:
     """Test platform-specific deploy config overrides."""
 
+    def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
+        pipeline = resolve_pipeline_config("minicpmo_4_5")
+        assert isinstance(pipeline, PipelineConfig)
+        deploy_path = Path(get_deploy_config_path("minicpmo_4_5.yaml"))
+
+        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
+        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
+        # Talker KV is left to automatic sizing (no hard kv_cache_memory_bytes cap).
+        assert "kv_cache_memory_bytes" not in cuda_stages[1].yaml_engine_args
+
+        # The CUDA memory budget must not leak into the existing NPU profile.
+        npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
+        npu_stages = merge_pipeline_deploy(pipeline, npu)
+        assert "kv_cache_memory_bytes" not in npu_stages[1].yaml_engine_args
+
+        # Multi-GPU replica profiles place Talker on dedicated devices and
+        # also leave KV sizing automatic.
+        for filename in (
+            "minicpmo_4_5_3gpu_stage1_replicas.yaml",
+            "minicpmo_4_5_4gpu_stage1_replicas.yaml",
+        ):
+            replica = _apply_platform_overrides(
+                load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
+            )
+            replica_stages = merge_pipeline_deploy(pipeline, replica)
+            assert "kv_cache_memory_bytes" not in replica_stages[1].yaml_engine_args
+
+    def test_minicpmo_4_5_single_gpu_admits_four_sequences(self):
+        """Single-GPU shares leave room for Code2Wav peak activations at bs<=4."""
+        deploy = load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml")))
+        assert [stage.max_num_seqs for stage in deploy.stages] == [4, 4, 4]
+        assert [stage.gpu_memory_utilization for stage in deploy.stages] == [
+            0.55,
+            0.15,
+            0.18,
+        ]
+
     def test_npu_overrides(self):
         deploy_path = Path(__file__).parent.parent / "vllm_omni" / "deploy" / "qwen3_omni_moe.yaml"
         if not deploy_path.exists():

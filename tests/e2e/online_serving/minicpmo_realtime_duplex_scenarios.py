@@ -53,6 +53,7 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    summarize_session_request_metrics,
 )
 
 _url_with_model = build_realtime_url
@@ -193,6 +194,38 @@ class DemoState:
             }
             summaries[response_id] = timing
         return summaries
+
+    def session_request_metrics(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Return benchmark-style metrics for every response in this session."""
+        requests: list[dict[str, object]] = []
+        for request_index, (response_id, timing) in enumerate(self.response_timing_summaries().items()):
+            metrics = timing.get("request_metrics")
+            if not isinstance(metrics, dict):
+                continue
+            requests.append(
+                {
+                    "session_id": session_id,
+                    "request_index": request_index,
+                    "response_id": response_id,
+                    **metrics,
+                }
+            )
+        return requests
+
+    def session_metric_summary(
+        self,
+        *,
+        session_id: str | None = None,
+    ) -> dict[str, object]:
+        """Average TTFT, TTFP, and RTF across responses that emitted audio."""
+        return summarize_session_request_metrics(
+            self.session_request_metrics(session_id=session_id),
+            session_id=session_id,
+        )
 
     def first_index(self, event_type: str, predicate=None) -> int | None:
         for index, event in enumerate(self.events):
@@ -930,12 +963,23 @@ async def _send_clean_turn(
         if outcome == "listen":
             return None, "listen"
     else:
-        await _wait_for(
-            state,
-            lambda: state.count("response.created") > before_created,
-            timeout_s=timeout_s,
-            label=f"{transcript} response.created",
-        )
+        try:
+            await _wait_for(
+                state,
+                lambda: state.count("response.created") > before_created,
+                timeout_s=timeout_s,
+                label=f"{transcript} response.created",
+            )
+        except TimeoutError:
+            # ``auto_response`` sessions only get ``response.created`` once the model
+            # decides to speak, so report the listen decisions that took its place.
+            raise TimeoutError(
+                f"Timed out waiting for {transcript} response.created after "
+                f"{state.count('input_audio_buffer.committed')} committed input turns; "
+                f"model_listen={state.model_listen_count - before_model_listen} "
+                f"buffering_listen={state.buffering_listen_count} "
+                f"errors={state.count('error')}"
+            ) from None
         await _wait_for(
             state,
             lambda: eligible_response_id() is not None,
@@ -1523,6 +1567,8 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         "input_transcription_ok": input_transcription_ok,
         "completed_response_ids": completed_response_ids,
         "response_timings": state.response_timing_summaries(),
+        "request_metrics": state.session_request_metrics(session_id=args.session_id),
+        "session_metrics": state.session_metric_summary(session_id=args.session_id),
         "lifecycle_counts_ok": lifecycle_counts_ok,
         "validation_mode": validation_mode,
         "scenario": scenario,
