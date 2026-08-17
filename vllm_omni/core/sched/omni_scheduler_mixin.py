@@ -56,6 +56,9 @@ class OmniSchedulerMixin:
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
+            watermark = getattr(adapter, "requests_num_chunks_sent", None)
+            if watermark is not None:
+                watermark.pop(session.external_req_id, None)
         session._output_token_ids.clear()
         session._all_token_ids.clear()
         new_prompt = update.prompt_token_ids or ()

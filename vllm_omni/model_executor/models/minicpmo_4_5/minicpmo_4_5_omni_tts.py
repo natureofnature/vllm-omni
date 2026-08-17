@@ -26,6 +26,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -43,7 +44,6 @@ _CODEC_TOP_K = 25
 _CODEC_TOP_P = 0.85
 _CODEC_REPETITION_PENALTY = 1.05
 _CODEC_MIN_TOKENS = 50
-_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 
 
 def _max_audio_tokens(condition_tokens: int) -> int:
@@ -319,8 +319,8 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 bool(meta.get("turn_start", False)) or bool(meta.get("turn_end", False))
             )
             if native_duplex:
-                max_tokens = _DUPLEX_CODEC_TOKENS_PER_CHUNK
-                min_tokens = 0 if duplex_boundary else _DUPLEX_CODEC_TOKENS_PER_CHUNK
+                max_tokens = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
+                min_tokens = 0 if duplex_boundary else MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
             else:
                 max_tokens = _max_audio_tokens(int(token_ids.numel()))
                 min_tokens = self._codec_min_tokens

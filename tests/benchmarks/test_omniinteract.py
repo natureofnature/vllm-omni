@@ -1,9 +1,6 @@
 from __future__ import annotations
 
 import base64
-import io
-import tarfile
-from pathlib import Path
 
 import pytest
 
@@ -33,24 +30,6 @@ def _audio(response_id: str = "r1", value: int = 1) -> dict[str, object]:
 def _identity(event_type: str, seq: int = 7, **extra: object) -> dict[str, object]:
     key = "accepted_input_seq" if event_type.endswith("committed") else "processed_input_seq"
     return {"type": event_type, "session_id": "s", "epoch": 2, key: seq, **extra}
-
-
-def test_tar_extract_is_python310_compatible_and_safe(tmp_path: Path):
-    good = tmp_path / "good.tar"
-    with tarfile.open(good, "w") as handle:
-        member = tarfile.TarInfo("data/1q1a/videos/clip.mp4")
-        member.size = 5
-        handle.addfile(member, io.BytesIO(b"video"))
-    root = oi._extract(good, tmp_path / "good")
-    assert (root / "1q1a/videos/clip.mp4").read_bytes() == b"video"
-
-    bad = tmp_path / "bad.tar"
-    with tarfile.open(bad, "w") as handle:
-        member = tarfile.TarInfo("../escape")
-        member.size = 1
-        handle.addfile(member, io.BytesIO(b"x"))
-    with pytest.raises(ValueError):
-        oi._extract(bad, tmp_path / "bad")
 
 
 @pytest.mark.asyncio

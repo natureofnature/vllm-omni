@@ -333,6 +333,7 @@ class RealtimeDuplexClient:
         output_audio_format: str = "pcm16",
         ref_audio: str | None = None,
         session_id: str | None = None,
+        idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session: dict[str, object] = {
@@ -353,6 +354,8 @@ class RealtimeDuplexClient:
             session["ref_audio"] = ref_audio
         if session_id:
             session["session_id"] = session_id
+        if idle_timeout_s is not None:
+            session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
         await wait_for(
             lambda: self.events.count("session.created") > 0,
