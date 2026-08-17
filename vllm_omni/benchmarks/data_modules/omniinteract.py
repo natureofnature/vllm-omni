@@ -803,6 +803,7 @@ async def probe_omniinteract(case: OmniInteractCase, api_url: str, model: str) -
             model,
             ref_audio=_ref_audio(case.config),
             session_id=session_id,
+            idle_timeout_s=case.config.timeout_s,
             timeout_s=min(case.config.timeout_s, 20),
         )
         await client.close_session(timeout_s=min(case.config.timeout_s, 20))
@@ -824,6 +825,7 @@ async def run_omniinteract(case: OmniInteractCase, api_url: str, model: str, req
                 model,
                 ref_audio=_ref_audio(case.config),
                 session_id=session_id,
+                idle_timeout_s=case.config.timeout_s,
                 timeout_s=case.config.timeout_s,
             )
             try:
