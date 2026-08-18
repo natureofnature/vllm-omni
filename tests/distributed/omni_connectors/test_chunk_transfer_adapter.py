@@ -220,6 +220,67 @@ def test_adapter_uses_nested_tts_context_limit(build_adapter):
     assert adapter._max_model_len == 4096
 
 
+def test_load_poll_ar_rolls_over_over_budget_running_prompt(build_adapter):
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        max_model_len=8192,
+        tts_max_model_len=4096,
+    )
+    request = _req("req-rollover", RequestStatus.RUNNING, external_req_id="external-rollover")
+    request.resumable = True
+    request.prompt_token_ids = [0] * 4064
+    request._all_token_ids = [0] * 4064
+    request._output_token_ids = []
+    request.num_prompt_tokens = 4064
+    request.num_computed_tokens = 4064
+    request.sampling_params = SimpleNamespace(min_tokens=0)
+    request.update_block_hashes = Mock()
+    adapter.get_req_chunk[request.request_id] = 1
+    adapter.requests_num_chunks_sent[request.external_req_id] = 4064
+    adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    connector.get.return_value = (
+        {
+            "native_duplex": True,
+            "ids": {"prompt": [1]},
+            "meta": {
+                "next_stage_prompt_len": 10,
+                "next_stage_generation_tokens": 26,
+                "finished": False,
+            },
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 10
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
+    assert adapter.requests_num_chunks_sent[request.external_req_id] == 4064
+
+    # A running request must be admitted as scheduled-new so the worker
+    # replaces its cached prompt row instead of only resetting its position.
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    waiting_queue = DummyWaitingQueue()
+    adapter.process_pending_chunks(waiting_queue, running_queue)
+    assert running_queue == []
+    assert waiting_queue == [request]
+    assert request.status == RequestStatus.WAITING
+
+    # Consume the marker and reset the latest sender watermark only at the
+    # scheduled-new boundary, after any old-row output has been accounted for.
+    adapter.requests_num_chunks_sent[request.external_req_id] = 4090
+    adapter.postprocess_scheduler_output(
+        SimpleNamespace(
+            scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)],
+            scheduled_cached_reqs=SimpleNamespace(req_ids=[]),
+        )
+    )
+    assert request.request_id not in adapter.replaced_streaming_prompt_ids
+    assert request.external_req_id not in adapter.requests_num_chunks_sent
+
+
 def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter):
     adapter, connector = build_adapter(stage_id=1, model_mode="generation")
     request = _req("req-tensor", RequestStatus.WAITING, external_req_id="external-tensor")
@@ -499,6 +560,7 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
                 "finished": torch.tensor(False, dtype=torch.bool),
                 "is_segment_finished": torch.tensor(True, dtype=torch.bool),
                 "request_finished": torch.tensor(False, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
             }
         },
         1,
@@ -509,6 +571,31 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert "codes" not in request.additional_information
     assert not {"cache_epoch", "chunk_seq", "last_chunk"}.intersection(request.additional_information["meta"])
     assert request.request_id in adapter.segment_finished_requests
+
+
+def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-incremental", RequestStatus.WAITING, external_req_id="external-incremental")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 3, "chunk_seq": 2},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "finished": torch.tensor(False, dtype=torch.bool),
+                "phase": "decode",
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is False
+
+    assert torch.equal(request.additional_information["codes"]["audio"], torch.tensor([1, 2]))
+    assert request.additional_information["meta"]["cache_epoch"] == 3
+    assert request.additional_information["meta"]["chunk_seq"] == 2
+    assert request.additional_information["meta"]["phase"] == "decode"
 
 
 def test_load_poll_ar_request_additional_information_concats_tensors(build_adapter):

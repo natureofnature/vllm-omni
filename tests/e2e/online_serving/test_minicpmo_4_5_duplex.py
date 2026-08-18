@@ -220,6 +220,7 @@ def test_minicpmo_4_5_omniinteract_e2e(
             f"--omniinteract-subsets={subset}",
             f"--omniinteract-realtime-ref-audio={resolve_ref_audio(model_prefix)}",
             f"--omniinteract-official-output-dir={output}",
+            "--num-warmups=0",
             "--num-prompts=4",
             "--max-concurrency=2",
             "--no-oversample",

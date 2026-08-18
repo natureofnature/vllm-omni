@@ -285,6 +285,16 @@ def _is_local_omniinteract_root(value: str | None) -> bool:
     )
 
 
+def _is_omniinteract_dataset(args) -> bool:
+    return args.dataset_name == "omniinteract" or (
+        args.dataset_name == "hf"
+        and (
+            _is_local_omniinteract_root(getattr(args, "dataset_path", None))
+            or _hf_repo_from_args(args, OmniInteractDataset.SUPPORTED_DATASET_PATHS) is not None
+        )
+    )
+
+
 def _project_omniinteract_result(
     result: dict[str, Any], outputs: list[Any], input_requests: list[SampleRequest]
 ) -> None:
@@ -396,17 +406,7 @@ def get_samples(args, tokenizer):
     is_daily_omni = args.dataset_name == "daily-omni" or (
         args.dataset_name == "hf" and _hf_repo_from_args(args, DailyOmniDataset.SUPPORTED_DATASET_PATHS) is not None
     )
-    is_omniinteract = (
-        args.dataset_name == "omniinteract"
-        or getattr(args, "omniinteract_root", None) is not None
-        or (
-            args.dataset_name == "hf"
-            and (
-                _is_local_omniinteract_root(getattr(args, "dataset_path", None))
-                or _hf_repo_from_args(args, OmniInteractDataset.SUPPORTED_DATASET_PATHS) is not None
-            )
-        )
-    )
+    is_omniinteract = _is_omniinteract_dataset(args)
     is_videomme = args.dataset_name == "videomme" or (
         args.dataset_name == "hf" and _videomme_repo_from_args(args) is not None
     )
@@ -1744,8 +1744,10 @@ async def async_request_openai_realtime_duplex(
                 )
                 await client.send({"type": "response.create"})
                 await wait_for(
-                    lambda: client.events.count("response.done") > done_before
-                    or len(client.events.errors()) > errors_before,
+                    lambda: (
+                        client.events.count("response.done") > done_before
+                        or len(client.events.errors()) > errors_before
+                    ),
                     timeout_s=180.0,
                     label=f"Seed-TTS Realtime TTS turn {request_index} response.done",
                 )

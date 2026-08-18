@@ -444,6 +444,7 @@ def test_update_additional_information_deserializes_new_request_payload():
     from vllm_omni.engine.serialization import serialize_additional_information
 
     runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
     conditioning = {
         "tts_token_ids": torch.tensor([1, 2]),
         "tts_hidden_states": torch.ones(2, 4),
@@ -452,6 +453,7 @@ def test_update_additional_information_deserializes_new_request_payload():
         scheduled_new_reqs=[
             SimpleNamespace(
                 req_id="r1",
+                model_intermediate_buffer={},
                 additional_information=serialize_additional_information(conditioning),
             )
         ],

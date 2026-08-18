@@ -65,6 +65,30 @@ def test_native_input_append_supports_explicit_session_opt_out():
     assert OmniDuplexSessionHandler._uses_native_input_append(session) is False
 
 
+def test_accepted_input_seq_reads_only_control_result_contract_paths():
+    assert OmniDuplexSessionHandler._accepted_input_seq({"accepted_input_seq": 3}) == 3
+    assert (
+        OmniDuplexSessionHandler._accepted_input_seq({"stage_results": [{"result": {"supported": True, "seq": 7}}]})
+        == 7
+    )
+    assert (
+        OmniDuplexSessionHandler._accepted_input_seq({"data_plane_outputs": [{"metadata": {"accepted_input_seq": 99}}]})
+        is None
+    )
+
+
+def test_cancelled_acceptance_preserves_other_deferred_processed_identity():
+    state = MiniCPMO45ServingSessionState()
+    state.begin_input_acceptance()
+    assert state.defer_input_processed(epoch=0, seq=2, outcome="listen", response_id=None)
+
+    state.cancel_input_acceptance()
+    assert state.input_acceptances_inflight == 0
+    state.begin_input_acceptance()
+    assert state.record_accepted_input(epoch=0, seq=2, model_turn_id=0) == ("listen", None)
+    assert state.deferred_processed_inputs == {}
+
+
 class _ModelConfig:
     model = "test-model"
 
