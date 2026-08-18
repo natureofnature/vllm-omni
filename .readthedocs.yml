@@ -14,7 +14,7 @@ build:
       # Pre-install CPU torch so the subsequent `pip install .[docs]` does not
       # pull ~2 GB of CUDA 13 libs (cuBLAS/cuDNN/NCCL/...) that exceed RTD's
       # 1 GB memory cap and time out the mkdocs build.
-      - python -m pip install --index-url https://download.pytorch.org/whl/cpu torch
+      - python -m pip install --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple torch
 
 mkdocs:
   configuration: mkdocs.yml

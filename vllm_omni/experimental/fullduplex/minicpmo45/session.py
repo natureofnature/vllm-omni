@@ -43,8 +43,6 @@ class MiniCPMO45ServingSessionState:
 
     def cancel_input_acceptance(self) -> None:
         self.input_acceptances_inflight = max(0, self.input_acceptances_inflight - 1)
-        if self.input_acceptances_inflight == 0:
-            self.deferred_processed_inputs.clear()
 
     def begin_final_input_acceptance(self) -> None:
         self.final_input_acceptances_inflight += 1
@@ -78,8 +76,6 @@ class MiniCPMO45ServingSessionState:
             if model_turn_id is not None:
                 self.accepted_input_turns[seq] = int(model_turn_id)
         self.input_acceptances_inflight = max(0, self.input_acceptances_inflight - 1)
-        if self.input_acceptances_inflight == 0:
-            self.deferred_processed_inputs.clear()
         return deferred
 
     def accepted_input_watermark(self, *, epoch: int) -> int | None:

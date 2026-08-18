@@ -270,26 +270,27 @@ class NativeRuntimeBridgeMixin:
             return False, emitted_response
         return True, emitted_response
 
-    @classmethod
-    def _accepted_input_seq(cls, value: object) -> int | None:
-        if isinstance(value, dict):
-            seq = value.get("accepted_input_seq")
-            if not isinstance(seq, bool) and isinstance(seq, int) and seq > 0:
-                return seq
-            result = value.get("result")
-            if isinstance(result, dict) and result.get("supported") is True:
-                seq = result.get("seq")
-                if not isinstance(seq, bool) and isinstance(seq, int) and seq > 0:
+    @staticmethod
+    def _accepted_input_seq(value: object) -> int | None:
+        if not isinstance(value, dict):
+            return None
+
+        def supported_seq(result: object) -> int | None:
+            if not isinstance(result, dict) or result.get("supported") is not True:
+                return None
+            seq = result.get("seq")
+            return seq if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0 else None
+
+        seq = value.get("accepted_input_seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+            return seq
+        if (seq := supported_seq(value.get("result"))) is not None:
+            return seq
+        stage_results = value.get("stage_results")
+        if isinstance(stage_results, list | tuple):
+            for stage_result in stage_results:
+                if isinstance(stage_result, dict) and (seq := supported_seq(stage_result.get("result"))) is not None:
                     return seq
-            for child in value.values():
-                found = cls._accepted_input_seq(child)
-                if found is not None:
-                    return found
-        elif isinstance(value, list | tuple):
-            for child in value:
-                found = cls._accepted_input_seq(child)
-                if found is not None:
-                    return found
         return None
 
     @staticmethod

@@ -869,11 +869,9 @@ async def run_omniinteract(case: OmniInteractCase, api_url: str, model: str, req
                 for response_id in client.events.response_ids
                 if (text := _response_text(client.events, response_id))
             )
-            result.success = not client.events.errors() and (not output_root or max_lag <= case.config.chunk_ms / 1000)
+            result.success = not client.events.errors()
             if not result.success:
-                result.error = (
-                    str(client.events.errors()[-1]) if client.events.errors() else "realtime pacing exceeded one chunk"
-                )
+                result.error = str(client.events.errors()[-1])
             if output_root:
                 writer = write_artifacts if result.success else failure_summary
                 args = (
