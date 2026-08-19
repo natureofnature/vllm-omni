@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 import os
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 import torch
@@ -571,12 +571,21 @@ class OmniSchedulerMixin:
         finished_status: RequestStatus,
     ) -> list[Request]:
         """Finish requests and clean all Omni-owned queue/coordinator state."""
+        if isinstance(request_ids, str):
+            target_request_ids = {request_ids}
+        elif request_ids is None:
+            target_request_ids = set(self.requests)
+        else:
+            if isinstance(request_ids, Iterator):
+                request_ids = tuple(request_ids)
+            target_request_ids = set(request_ids)
+
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
         self._realign_request_status_to_queues(request_ids)
         finished = super().finish_requests(request_ids, finished_status)
-        self._purge_finished_from_running()
+        self._purge_finished_from_running(target_request_ids)
 
         for request in finished:
             self._free_input_coordinator_request(request.request_id)
@@ -618,7 +627,10 @@ class OmniSchedulerMixin:
         Realign here: if a request lives in ``self.running`` but its
         status is not ``RUNNING``, set it to ``RUNNING``; symmetrically
         flip ``RUNNING → WAITING`` when the request is actually in
-        ``self.waiting``. This is a localized safety net for
+        ``self.waiting``. A resumable segment stop still held in
+        ``self.skipped_waiting`` is restored to
+        ``WAITING_FOR_STREAMING_REQ`` so upstream also balances its
+        paused-session counter. This is a localized safety net for
         ``requests_origin_status`` staleness on the admit transition;
         it does not touch the adapter's invariants and is complementary
         to the chunk-transfer-adapter deque purge that already runs
@@ -651,17 +663,31 @@ class OmniSchedulerMixin:
 
         running_ids = {r.request_id for r in self.running}
         waiting_ids = {r.request_id for r in self.waiting}
+        skipped_waiting_ids = {r.request_id for r in getattr(self, "skipped_waiting", ())}
 
         for rid in ids_to_align:
             req = self.requests.get(rid)
-            if req is None or req.is_finished():
+            if req is None:
+                continue
+            # A persistent Session may be closed after its current segment
+            # reached FINISHED_STOPPED but while it is still owned by a live
+            # scheduler/connector queue. vLLM skips already-finished requests
+            # in finish_requests(), leaking the KV and worker slot. Only
+            # recover requests with positive queue ownership; an off-queue
+            # terminal can legitimately be waiting for deferred block free.
+            resumable_segment_stop = bool(
+                getattr(req, "resumable", False) and req.status == RequestStatus.FINISHED_STOPPED
+            )
+            if req.is_finished() and not resumable_segment_stop:
                 continue
             if rid in running_ids and req.status != RequestStatus.RUNNING:
                 req.status = RequestStatus.RUNNING
-            elif rid in waiting_ids and req.status == RequestStatus.RUNNING:
+            elif rid in skipped_waiting_ids and resumable_segment_stop:
+                req.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+            elif rid in waiting_ids and (req.status == RequestStatus.RUNNING or resumable_segment_stop):
                 req.status = RequestStatus.WAITING
 
-    def _purge_finished_from_running(self) -> None:
+    def _purge_finished_from_running(self, target_request_ids: set[str] | None = None) -> None:
         """Defensive post-finish sweep of ``self.running``.
 
         Belt-and-suspenders to ``_realign_request_status_to_queues``:
@@ -678,18 +704,10 @@ class OmniSchedulerMixin:
         residue after ``super().finish_requests`` so any stale entries
         are reclaimed).
 
-        Scope of the predicate. ``is_finished()`` covers entries the
-        upstream ``finish_requests`` already drained from ``self.requests``
-        but failed to remove from ``self.running``; the
-        ``request_id not in self.requests`` arm catches the same surface
-        from a different angle and is the post-cleanup mirror of the
-        deque purge ``_purge_untracked_chunk_requests`` already runs at
-        the chunk-transfer-adapter layer. It does **not** by itself make
-        arbitrary direct deletions of ``self.requests`` safe -- callers
-        that pop ``self.requests`` outside the standard finish path
-        still have to go through ``_free_request`` (or equivalent) for
-        block / connector / coordinator cleanup. This sweep only
-        reclaims the ``self.running`` slot reference.
+        A resumable ``FINISHED_STOPPED`` request may legitimately remain
+        in ``self.running`` between realtime segments. Preserve such a
+        request unless it belongs to this finish call. Other finished or
+        untracked entries are stale and can be swept defensively.
 
         In-place via ``self.running[:] = ...`` for minor consistency
         with idiomatic vLLM scheduler mutation; upstream
@@ -706,4 +724,16 @@ class OmniSchedulerMixin:
         """
         if not self.running:
             return
-        self.running[:] = [req for req in self.running if not req.is_finished() and req.request_id in self.requests]
+        target_request_ids = target_request_ids or set()
+
+        def keep_running(req: Request) -> bool:
+            if req.request_id not in self.requests:
+                return False
+            if not req.is_finished():
+                return True
+            resumable_segment_stop = bool(
+                getattr(req, "resumable", False) and req.status == RequestStatus.FINISHED_STOPPED
+            )
+            return resumable_segment_stop and req.request_id not in target_request_ids
+
+        self.running[:] = [req for req in self.running if keep_running(req)]
