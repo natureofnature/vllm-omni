@@ -11,13 +11,17 @@ import numpy as np
 from vllm.logger import init_logger
 
 from vllm_omni.experimental.fullduplex.engine.duplex_control_client import DuplexControlRequestError
-from vllm_omni.experimental.fullduplex.engine.duplex_runtime import duplex_data_plane_request_info
+from vllm_omni.experimental.fullduplex.engine.duplex_runtime import (
+    duplex_data_plane_request_info,
+    duplex_input_acceptance_info,
+)
 from vllm_omni.experimental.fullduplex.engine.messages import DuplexFence
 from vllm_omni.experimental.fullduplex.openai.protocol import (
     DuplexSession,
     DuplexSessionState,
 )
 from vllm_omni.experimental.fullduplex.openai.runtime_adapter import (
+    ServingInputLifecycle,
     coerce_int,
     payload_turn_id,
 )
@@ -99,6 +103,9 @@ class NativeRuntimeBridgeMixin:
         send_json,
         mode: str = "append_tokens",
         expected_epoch: int | None = None,
+        track_input_identity: bool = True,
+        input_generation: int | None = None,
+        on_input_accepted=None,
     ) -> tuple[bool, bool]:
         if not session.capabilities.supports_input_append:
             return True, False
@@ -107,6 +114,32 @@ class NativeRuntimeBridgeMixin:
             return True, False
         if expected_epoch is not None and session.epoch != expected_epoch:
             return True, False
+        lifecycle = self._input_lifecycle(session) if track_input_identity else None
+        acceptance_token = object()
+        explicit_model_turn_id = payload_turn_id(payload)
+        pending_model_turn_id = (
+            explicit_model_turn_id
+            if explicit_model_turn_id is not None
+            else (session.active_response_turn_id if session.active_response_turn_id is not None else session.turn_id)
+        )
+        if explicit_model_turn_id is None and session.active_response_turn_id is not None:
+            pending_model_turn_id = max(session.turn_id, session.active_response_turn_id + 1)
+        if lifecycle is not None:
+            if input_generation is not None:
+                pending_model_turn_id = lifecycle.target_turn_for_generation(
+                    epoch=session.epoch,
+                    generation=input_generation,
+                    minimum_turn_id=pending_model_turn_id,
+                )
+                if isinstance(payload, dict):
+                    payload = {**payload, "duplex_turn_id": pending_model_turn_id}
+                    explicit_model_turn_id = pending_model_turn_id
+            lifecycle.begin(
+                acceptance_token,
+                epoch=session.epoch,
+                final=final,
+                generation=input_generation,
+            )
         try:
             append_kwargs = {
                 "mode": mode,
@@ -119,29 +152,28 @@ class NativeRuntimeBridgeMixin:
             if expected_epoch is not None and self._callable_accepts_keyword(append_input, "expected_epoch"):
                 append_kwargs["expected_epoch"] = expected_epoch
             if self._callable_accepts_keyword(append_input, "fence"):
-                payload_turn = payload_turn_id(payload)
                 append_kwargs["fence"] = DuplexFence(
                     session.session_id,
                     epoch=session.epoch,
-                    turn_id=(
-                        payload_turn
-                        if payload_turn is not None
-                        else (
-                            session.active_response_turn_id
-                            if session.active_response_turn_id is not None
-                            else session.turn_id
-                        )
-                    ),
+                    turn_id=pending_model_turn_id,
                     incarnation=session.incarnation,
                 )
             if self._callable_accepts_keyword(append_input, "collect_outputs"):
                 append_kwargs["collect_outputs"] = False
             result = await append_input(session.session_id, **append_kwargs)
+        except asyncio.CancelledError:
+            if lifecycle is not None:
+                lifecycle.mark_ambiguous(acceptance_token)
+            raise
         except Exception as exc:
+            if lifecycle is not None:
+                lifecycle.mark_ambiguous(acceptance_token)
             logger.exception("Failed to append duplex runtime input: %s", exc)
             await self._send_runtime_error(send_json, "runtime_append_failed", exc, session=session)
             return False, False
         if isinstance(result, dict) and self._runtime_control_failed(result):
+            if lifecycle is not None:
+                lifecycle.cancel(acceptance_token)
             await self._send_runtime_control_error(
                 send_json,
                 "runtime_append_failed",
@@ -150,18 +182,116 @@ class NativeRuntimeBridgeMixin:
                 session=session,
             )
             return False, False
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if session.state != DuplexSessionState.OPEN or (expected_epoch is not None and session.epoch != expected_epoch):
+            if lifecycle is not None:
+                lifecycle.cancel(acceptance_token)
             return True, False
+        accepted_input_seq: int | None = None
+        deferred_outputs: list[dict[str, object]] = []
+        if lifecycle is not None and isinstance(result, dict):
+            accepted_input_seq, accepted_turn_id = duplex_input_acceptance_info(result)
+            if accepted_input_seq is None:
+                lifecycle.mark_ambiguous(acceptance_token)
+                await self._send_runtime_control_error(
+                    send_json,
+                    "runtime_append_missing_acceptance",
+                    "MiniCPM duplex append did not return an authoritative Stage0 input identity",
+                    result,
+                    session=session,
+                )
+                return False, False
+            else:
+                accepted_model_turn_id = accepted_turn_id if accepted_turn_id is not None else pending_model_turn_id
+                target_model_turn_id = max(pending_model_turn_id, accepted_model_turn_id)
+                if explicit_model_turn_id is None:
+                    target_model_turn_id = max(target_model_turn_id, session.turn_id)
+                    if session.active_response_turn_id is not None:
+                        target_model_turn_id = max(
+                            target_model_turn_id,
+                            session.active_response_turn_id + 1,
+                        )
+                lifecycle.accept(
+                    acceptance_token,
+                    epoch=session.epoch,
+                    seq=accepted_input_seq,
+                    accepted_turn_id=accepted_model_turn_id,
+                    target_turn_id=target_model_turn_id,
+                )
+                try:
+                    if on_input_accepted is not None:
+                        await on_input_accepted(accepted_input_seq)
+                except BaseException:
+                    lifecycle.release(
+                        epoch=session.epoch,
+                        seq=accepted_input_seq,
+                    )
+                    raise
+        elif lifecycle is not None:
+            lifecycle.mark_ambiguous(acceptance_token)
+            await self._send_runtime_error(
+                send_json,
+                "runtime_append_missing_acceptance",
+                RuntimeError("MiniCPM duplex append returned no control result"),
+                session=session,
+            )
+            return False, False
         await self._send_runtime_control_if_needed(send_json, result, session=session)
         request_id, _ = self._data_plane_request_info(result) if isinstance(result, dict) else (None, None)
         if request_id is not None:
             self._serving_runtime_adapter.data_plane.begin_request(request_id)
-        close_reason, emitted_response = await self._send_native_duplex_events(
-            send_json,
-            result,
-            session=session,
-            expected_epoch=expected_epoch,
-        )
+        if lifecycle is not None and accepted_input_seq is not None:
+            close_reason: str | None = None
+            emitted_response = False
+            try:
+                while deferred_outputs := lifecycle.drain_deferred(
+                    epoch=session.epoch,
+                    seq=accepted_input_seq,
+                ):
+                    for deferred_output in deferred_outputs:
+                        deferred_close_reason, did_emit = await self._send_one_native_duplex_event(
+                            send_json,
+                            deferred_output,
+                            session=session,
+                            expected_epoch=expected_epoch,
+                            _accepted_replay_seq=accepted_input_seq,
+                        )
+                        close_reason = close_reason or deferred_close_reason
+                        emitted_response = emitted_response or did_emit
+                embedded_close_reason, embedded_emitted = await self._send_native_duplex_events(
+                    send_json,
+                    result,
+                    session=session,
+                    expected_epoch=expected_epoch,
+                    _accepted_replay_seq=accepted_input_seq,
+                )
+                close_reason = close_reason or embedded_close_reason
+                emitted_response = emitted_response or embedded_emitted
+                while deferred_outputs := lifecycle.drain_deferred(
+                    epoch=session.epoch,
+                    seq=accepted_input_seq,
+                ):
+                    for deferred_output in deferred_outputs:
+                        deferred_close_reason, did_emit = await self._send_one_native_duplex_event(
+                            send_json,
+                            deferred_output,
+                            session=session,
+                            expected_epoch=expected_epoch,
+                            _accepted_replay_seq=accepted_input_seq,
+                        )
+                        close_reason = close_reason or deferred_close_reason
+                        emitted_response = emitted_response or did_emit
+            except BaseException:
+                lifecycle.release(epoch=session.epoch, seq=accepted_input_seq)
+                raise
+            else:
+                lifecycle.finish_release(epoch=session.epoch, seq=accepted_input_seq)
+        else:
+            close_reason, emitted_response = await self._send_native_duplex_events(
+                send_json,
+                result,
+                session=session,
+                expected_epoch=expected_epoch,
+            )
         # A resumable data-plane append remains active even when its persistent
         # drain task already exists. Treating only a newly-created drain as
         # activity clears active_request_id after later appends and prevents a
@@ -187,6 +317,12 @@ class NativeRuntimeBridgeMixin:
             )
             return False, emitted_response
         return True, emitted_response
+
+    def _input_lifecycle(self, session: DuplexSession) -> ServingInputLifecycle | None:
+        if not self._session_auto_responds(session):
+            return None
+        lifecycle = getattr(self._runtime_session_state(session), "input_lifecycle", None)
+        return lifecycle
 
     @staticmethod
     def _callable_accepts_keyword(fn, name: str) -> bool:
@@ -367,6 +503,7 @@ class NativeRuntimeBridgeMixin:
         session: DuplexSession,
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
+        origin_input_seq: int | None = None,
     ) -> None:
         """Give an active model turn another silence unit.
 
@@ -404,6 +541,18 @@ class NativeRuntimeBridgeMixin:
             return
         payload = self._native_silence_unit_payload()
         payload["duplex_turn_id"] = payload_turn_id
+        lifecycle = self._input_lifecycle(session)
+        if origin_input_seq is None and lifecycle is not None and response_id is not None:
+            origin_input_seq = lifecycle.response_origin_input_seq(
+                response_id=response_id,
+                epoch=session.epoch,
+            )
+        if origin_input_seq is None and lifecycle is not None and not native.input_since_commit:
+            accepted = lifecycle.accepted_identity(epoch=session.epoch)
+            if accepted is not None and lifecycle.is_final(epoch=session.epoch, seq=accepted[0]):
+                origin_input_seq = accepted[0]
+        if origin_input_seq is not None and origin_input_seq > 0:
+            payload["duplex_origin_input_seq"] = origin_input_seq
 
         scheduler = native.silence_continuation_scheduler
         if scheduler is None:
@@ -426,6 +575,145 @@ class NativeRuntimeBridgeMixin:
         if scheduled:
             native.continuation_owner_id = owner_id
             native.continuation_units = count + 1
+
+    def _promote_latest_native_input(
+        self,
+        session: DuplexSession,
+        *,
+        generation: int,
+    ) -> tuple[int, int] | None:
+        lifecycle = self._input_lifecycle(session)
+        if lifecycle is None:
+            return None
+        accepted = lifecycle.accepted_identity(epoch=session.epoch, generation=generation)
+        if accepted is None:
+            return None
+        input_seq, accepted_turn_id = accepted
+        target_turn_id = max(accepted_turn_id, session.turn_id)
+        if session.active_response_turn_id is not None:
+            target_turn_id = max(target_turn_id, session.active_response_turn_id + 1)
+        promoted = lifecycle.promote_latest_final(
+            epoch=session.epoch,
+            generation=generation,
+            target_model_turn_id=target_turn_id,
+        )
+        return (promoted, target_turn_id) if promoted is not None else None
+
+    async def _emit_input_processed(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        native_result: dict[str, object],
+        outcome: str,
+        response_id: str | None = None,
+    ) -> None:
+        lifecycle = self._input_lifecycle(session)
+        input_seq = coerce_int(native_result.get("input_seq"))
+        if lifecycle is None or input_seq is None:
+            return
+        lifecycle.remember_decision(
+            epoch=session.epoch,
+            seq=input_seq,
+            model_turn_id=coerce_int(native_result.get("model_turn_id")),
+            outcome=outcome,
+            response_id=response_id,
+        )
+        if not self._session_auto_responds(session):
+            return
+        model_turn_id = coerce_int(native_result.get("model_turn_id"))
+        if not lifecycle.is_final(
+            epoch=session.epoch,
+            seq=input_seq,
+            model_turn_id=model_turn_id,
+        ):
+            return
+        final_turn_id = lifecycle.final_target_turn(epoch=session.epoch, seq=input_seq)
+        if model_turn_id is not None:
+            final_turn_id = model_turn_id
+        if final_turn_id is None or not lifecycle.mark_processed_emitted(
+            epoch=session.epoch,
+            seq=input_seq,
+            model_turn_id=final_turn_id,
+        ):
+            return
+        payload: dict[str, object] = {
+            "type": "input.processed",
+            "session_id": session.session_id,
+            "epoch": session.epoch,
+            "processed_input_seq": input_seq,
+            "outcome": outcome,
+        }
+        if response_id is not None:
+            payload["response_id"] = response_id
+        await send_json(payload)
+
+    async def _settle_superseded_input_finals(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        before_seq: int,
+        native_result: dict[str, object] | None = None,
+    ) -> None:
+        lifecycle = self._input_lifecycle(session)
+        if lifecycle is None:
+            return
+        base_result = native_result or {}
+        for superseded_seq, superseded_turn in lifecycle.superseded_finals(
+            epoch=session.epoch,
+            before_seq=before_seq,
+        ):
+            await self._emit_input_processed(
+                send_json,
+                session=session,
+                native_result={
+                    **base_result,
+                    "input_seq": superseded_seq,
+                    "model_turn_id": superseded_turn,
+                },
+                outcome="superseded",
+            )
+            lifecycle.resolve_final(
+                epoch=session.epoch,
+                seq=superseded_seq,
+                model_turn_id=superseded_turn,
+            )
+
+    async def _emit_stored_input_processed(
+        self,
+        send_json,
+        *,
+        session: DuplexSession,
+        input_seq: int,
+        target_model_turn_id: int,
+    ) -> tuple[str, str | None] | None:
+        lifecycle = self._input_lifecycle(session)
+        if lifecycle is None:
+            return None
+        pending = lifecycle.pending_processed(
+            epoch=session.epoch,
+            seq=input_seq,
+            model_turn_id=target_model_turn_id,
+        )
+        if pending is None or not lifecycle.mark_processed_emitted(
+            epoch=session.epoch,
+            seq=input_seq,
+            model_turn_id=target_model_turn_id,
+        ):
+            return None
+        outcome, response_id = pending
+        payload: dict[str, object] = {
+            "type": "input.processed",
+            "session_id": session.session_id,
+            "epoch": session.epoch,
+            "processed_input_seq": input_seq,
+            "outcome": outcome,
+        }
+        if response_id is not None:
+            payload["response_id"] = response_id
+        await send_json(payload)
+        return pending
 
     async def _cancel_native_data_plane_stream(self, session: DuplexSession) -> bool:
         native = self._runtime_session_state(session)
@@ -642,6 +930,7 @@ class NativeRuntimeBridgeMixin:
         *,
         session: DuplexSession,
         expected_epoch: int | None = None,
+        _accepted_replay_seq: int | None = None,
     ) -> tuple[str | None, bool]:
         if send_json is None:
             return None, False
@@ -661,6 +950,7 @@ class NativeRuntimeBridgeMixin:
                 native_result,
                 session=session,
                 expected_epoch=expected_epoch,
+                _accepted_replay_seq=_accepted_replay_seq,
             )
             emitted_response = emitted_response or did_emit
             close_reason = close_reason or close_reason_for_result
@@ -782,10 +1072,26 @@ class NativeRuntimeBridgeMixin:
         *,
         session: DuplexSession,
         expected_epoch: int | None = None,
+        _accepted_replay_seq: int | None = None,
     ) -> tuple[str | None, bool]:
         close_reason: str | None = None
         emitted_response = False
-        if expected_epoch is not None and session.epoch != expected_epoch:
+        if session.state != DuplexSessionState.OPEN or (expected_epoch is not None and session.epoch != expected_epoch):
+            return close_reason, emitted_response
+        lifecycle = self._input_lifecycle(session)
+        input_seq = coerce_int(native_result.get("input_seq"))
+        if lifecycle is not None and input_seq is None:
+            return close_reason, emitted_response
+        if (
+            lifecycle is not None
+            and input_seq is not None
+            and input_seq != _accepted_replay_seq
+            and lifecycle.defer_unaccepted_output(
+                epoch=session.epoch,
+                seq=input_seq,
+                output=native_result,
+            )
+        ):
             return close_reason, emitted_response
         data_plane_request_id = native_result.get("data_plane_request_id")
         if isinstance(data_plane_request_id, str) and self._serving_runtime_adapter.data_plane.is_terminal(
@@ -797,8 +1103,53 @@ class NativeRuntimeBridgeMixin:
         )
         if isinstance(data_plane_request_id, str) and not active_request_matches:
             return close_reason, emitted_response
+        model_turn_id = coerce_int(native_result.get("model_turn_id"))
+        output_target_turn = (
+            lifecycle.output_target_turn(
+                epoch=session.epoch,
+                seq=input_seq,
+                model_turn_id=model_turn_id,
+            )
+            if lifecycle is not None and input_seq is not None
+            else model_turn_id
+        )
+        if lifecycle is not None and input_seq is not None and output_target_turn is None:
+            return close_reason, emitted_response
         if isinstance(native_result.get("error_code"), str):
+            if (
+                lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_latest_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            ):
+                await self._settle_superseded_input_finals(
+                    send_json,
+                    session=session,
+                    before_seq=input_seq,
+                    native_result=native_result,
+                )
             response_id = session.active_response_id
+            response_matches_input = not (
+                response_id is not None
+                and lifecycle is not None
+                and input_seq is not None
+                and not lifecycle.response_accepts_or_claims(
+                    response_id=response_id,
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=coerce_int(native_result.get("model_turn_id")),
+                )
+            )
+            await self._emit_input_processed(
+                send_json,
+                session=session,
+                native_result=native_result,
+                outcome="failed",
+                response_id=response_id if response_matches_input else None,
+            )
             await send_json(
                 {
                     "type": "error",
@@ -808,7 +1159,7 @@ class NativeRuntimeBridgeMixin:
                     "error": str(native_result.get("error") or "Duplex native data-plane error"),
                 }
             )
-            if response_id is not None:
+            if response_id is not None and response_matches_input:
                 session.end_response(commit_text=False)
                 await send_json(
                     {
@@ -825,6 +1176,16 @@ class NativeRuntimeBridgeMixin:
                         "playback": session.playback.as_dict(),
                     }
                 )
+            if (
+                lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=coerce_int(native_result.get("model_turn_id")),
+                )
+            ):
+                lifecycle.resolve_final(epoch=session.epoch, seq=input_seq)
             return close_reason, True
         if native_result.get("requires_stage_handoff") is True or native_result.get("requires_tts_stage") is True:
             # Stage0 announces a talker handoff before Stage1 has produced
@@ -834,8 +1195,24 @@ class NativeRuntimeBridgeMixin:
             # model turns cannot create empty responses or steal later audio.
             return close_reason, False
         is_listen = native_result.get("is_listen")
-        model_turn_id = coerce_int(native_result.get("model_turn_id"))
         if native_result.get("is_buffering") is True or native_result.get("prefill_success") is False:
+            if lifecycle is not None and input_seq is not None:
+                response_id = session.active_response_id
+                if response_id is None:
+                    affects_current_response = lifecycle.can_claim_response(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                else:
+                    affects_current_response = lifecycle.response_accepts_or_claims(
+                        response_id=response_id,
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                if not affects_current_response:
+                    return close_reason, emitted_response
             if native_result.get("data_plane_request_id") == session.active_request_id:
                 session.clear_request()
             payload = {
@@ -850,6 +1227,54 @@ class NativeRuntimeBridgeMixin:
             await send_json(payload)
             return close_reason, emitted_response
         if is_listen is True:
+            if lifecycle is not None and input_seq is not None:
+                response_id = session.active_response_id
+                response_accepts = (
+                    lifecycle.can_claim_response(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                    if response_id is None
+                    else lifecycle.response_accepts_or_claims(
+                        response_id=response_id,
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                )
+                if not response_accepts:
+                    active_turn = session.active_response_turn_id
+                    can_advance = bool(
+                        response_id is not None
+                        and active_turn is not None
+                        and output_target_turn is not None
+                        and output_target_turn > active_turn
+                        and lifecycle.can_claim_response(
+                            epoch=session.epoch,
+                            seq=input_seq,
+                            model_turn_id=model_turn_id,
+                        )
+                    )
+                    if not can_advance:
+                        await self._emit_input_processed(
+                            send_json,
+                            session=session,
+                            native_result=native_result,
+                            outcome="listen",
+                        )
+                        if lifecycle.is_final(
+                            epoch=session.epoch,
+                            seq=input_seq,
+                            model_turn_id=model_turn_id,
+                        ):
+                            lifecycle.resolve_final(
+                                epoch=session.epoch,
+                                seq=input_seq,
+                                model_turn_id=model_turn_id,
+                            )
+                        return close_reason, emitted_response
+                model_turn_id = output_target_turn
             await self._end_active_response_before_future_model_turn(
                 send_json,
                 session=session,
@@ -861,28 +1286,79 @@ class NativeRuntimeBridgeMixin:
                 and not session.active_response_accepts_model_turn(model_turn_id)
             ):
                 return close_reason, emitted_response
+            auto_response = self._session_auto_responds(session)
+            model_listen = native_result.get("model_listen")
+            if not isinstance(model_listen, bool):
+                model_listen = native_result.get("reason") in {None, "", "model_listen"}
+            final_model_listen = bool(
+                auto_response
+                and model_listen
+                and lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            )
             non_terminal_auto_listen = (
-                self._session_auto_responds(session)
-                and session.active_response_id is not None
-                and session.active_request_id is not None
-                and native_result.get("end_of_turn") is not True
+                auto_response
+                and not final_model_listen
+                and (
+                    model_listen is False
+                    or (
+                        session.active_response_id is not None
+                        and session.active_request_id is not None
+                        and native_result.get("end_of_turn") is not True
+                    )
+                )
             )
             if non_terminal_auto_listen:
+                if model_listen and lifecycle is not None and input_seq is not None:
+                    lifecycle.remember_decision(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                        outcome="listen",
+                        response_id=session.active_response_id,
+                    )
                 await self._maybe_continue_native_response(
                     send_json,
                     session=session,
                     expected_epoch=expected_epoch,
+                    expected_model_turn_id=model_turn_id,
+                    origin_input_seq=input_seq,
                 )
                 return close_reason, emitted_response
-            auto_response = self._session_auto_responds(session)
             if not auto_response and data_plane_request_id == session.active_request_id:
                 session.clear_request()
-            model_listen = native_result.get("model_listen")
-            if not isinstance(model_listen, bool):
-                model_listen = native_result.get("reason") in {None, "", "model_listen"}
             response_id = session.active_response_id
-            if isinstance(data_plane_request_id, str) and not auto_response:
+            terminal_request = bool(
+                final_model_listen
+                and lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_latest_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            )
+            if terminal_request and lifecycle is not None and input_seq is not None:
+                await self._settle_superseded_input_finals(
+                    send_json,
+                    session=session,
+                    before_seq=input_seq,
+                    native_result=native_result,
+                )
+            if isinstance(data_plane_request_id, str) and (not auto_response or terminal_request):
                 self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
+            await self._emit_input_processed(
+                send_json,
+                session=session,
+                native_result=native_result,
+                outcome="listen",
+                response_id=response_id,
+            )
             emitted_response = True
             payload = {
                 "type": "response.listen",
@@ -924,6 +1400,12 @@ class NativeRuntimeBridgeMixin:
                         "playback": session.playback.as_dict(),
                     }
                 )
+            if final_model_listen and lifecycle is not None and input_seq is not None:
+                lifecycle.resolve_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
             return close_reason, emitted_response
 
         text = native_result.get("text")
@@ -931,6 +1413,61 @@ class NativeRuntimeBridgeMixin:
         end_of_turn = bool(native_result.get("end_of_turn", False))
         has_text = isinstance(text, str) and bool(text)
         has_audio = isinstance(audio, str) and bool(audio)
+        if lifecycle is not None and input_seq is not None:
+            response_id = session.active_response_id
+            response_accepts = (
+                lifecycle.can_claim_response(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+                if response_id is None
+                else lifecycle.response_accepts_or_claims(
+                    response_id=response_id,
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            )
+            if not response_accepts:
+                active_turn = session.active_response_turn_id
+                can_advance = bool(
+                    response_id is not None
+                    and active_turn is not None
+                    and output_target_turn is not None
+                    and output_target_turn > active_turn
+                    and lifecycle.can_claim_response(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                )
+                if can_advance:
+                    await self._end_active_response_before_future_model_turn(
+                        send_json,
+                        session=session,
+                        model_turn_id=output_target_turn,
+                    )
+                else:
+                    if end_of_turn or has_text or has_audio:
+                        await self._emit_input_processed(
+                            send_json,
+                            session=session,
+                            native_result=native_result,
+                            outcome="listen" if end_of_turn and not has_text and not has_audio else "failed",
+                        )
+                    if lifecycle.is_final(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    ):
+                        lifecycle.resolve_final(
+                            epoch=session.epoch,
+                            seq=input_seq,
+                            model_turn_id=model_turn_id,
+                        )
+                    return close_reason, emitted_response
+            model_turn_id = output_target_turn
         if not has_text and not has_audio and not end_of_turn:
             tts_segment_ended = (
                 native_result.get("stage_role") == "tts" and native_result.get("abort_data_plane_request") is True
@@ -945,13 +1482,39 @@ class NativeRuntimeBridgeMixin:
                     session=session,
                     expected_epoch=expected_epoch,
                     expected_model_turn_id=model_turn_id,
+                    origin_input_seq=input_seq,
                 )
             return close_reason, emitted_response
         if end_of_turn and not has_text and not has_audio and session.active_response_id is None:
+            final_empty_turn = bool(
+                lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            )
             if isinstance(data_plane_request_id, str):
                 if not self._session_auto_responds(session) and data_plane_request_id == session.active_request_id:
                     session.clear_request()
                 if not self._session_auto_responds(session):
+                    self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
+                elif (
+                    final_empty_turn
+                    and lifecycle is not None
+                    and lifecycle.is_latest_final(
+                        epoch=session.epoch,
+                        seq=input_seq,
+                        model_turn_id=model_turn_id,
+                    )
+                ):
+                    await self._settle_superseded_input_finals(
+                        send_json,
+                        session=session,
+                        before_seq=input_seq,
+                        native_result=native_result,
+                    )
                     self._serving_runtime_adapter.data_plane.mark_terminal(data_plane_request_id)
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
@@ -966,7 +1529,19 @@ class NativeRuntimeBridgeMixin:
                     "model_listen": True,
                 }
                 self._attach_native_runtime_metadata(payload, native_result)
+                await self._emit_input_processed(
+                    send_json,
+                    session=session,
+                    native_result=native_result,
+                    outcome="listen",
+                )
                 await send_json(payload)
+            if final_empty_turn and lifecycle is not None and input_seq is not None:
+                lifecycle.resolve_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
             return close_reason, emitted_response
         if session.active_response_id is None and model_turn_id is not None and model_turn_id < session.turn_id:
             # A continuation append can already be in flight when the prior
@@ -990,6 +1565,13 @@ class NativeRuntimeBridgeMixin:
         response_id = session.active_response_id
         if response_id is None:
             response_id = session.begin_response(turn_id=model_turn_id)
+            if lifecycle is not None and input_seq is not None:
+                lifecycle.response_accepts_or_claims(
+                    response_id=response_id,
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
             response_created = True
             await send_json(
                 self._response_created_payload(
@@ -998,6 +1580,29 @@ class NativeRuntimeBridgeMixin:
                     epoch=session.epoch,
                 )
             )
+        if (
+            end_of_turn
+            and lifecycle is not None
+            and input_seq is not None
+            and lifecycle.is_latest_final(
+                epoch=session.epoch,
+                seq=input_seq,
+                model_turn_id=model_turn_id,
+            )
+        ):
+            await self._settle_superseded_input_finals(
+                send_json,
+                session=session,
+                before_seq=input_seq,
+                native_result=native_result,
+            )
+        await self._emit_input_processed(
+            send_json,
+            session=session,
+            native_result=native_result,
+            outcome="speak",
+            response_id=response_id,
+        )
         response_stage_metrics = session.accumulate_response_stage_metrics(
             native_result.get("stage_metrics") if isinstance(native_result.get("stage_metrics"), Mapping) else None
         )
@@ -1095,6 +1700,7 @@ class NativeRuntimeBridgeMixin:
                 send_json,
                 session=session,
                 expected_epoch=expected_epoch,
+                origin_input_seq=input_seq,
             )
         if end_of_turn:
             data_plane_request_id = native_result.get("data_plane_request_id")
@@ -1110,7 +1716,6 @@ class NativeRuntimeBridgeMixin:
                 commit_text=should_commit,
                 preserve_request=self._session_auto_responds(session),
             )
-            model_turn_id = coerce_int(native_result.get("model_turn_id"))
             if model_turn_id is not None:
                 session.complete_model_turn(model_turn_id)
             if should_commit:
@@ -1125,6 +1730,20 @@ class NativeRuntimeBridgeMixin:
                     "playback": session.playback.as_dict(),
                 }
             )
+            if (
+                lifecycle is not None
+                and input_seq is not None
+                and lifecycle.is_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
+            ):
+                lifecycle.resolve_final(
+                    epoch=session.epoch,
+                    seq=input_seq,
+                    model_turn_id=model_turn_id,
+                )
         return close_reason, emitted_response
 
     async def _end_active_response_before_future_model_turn(

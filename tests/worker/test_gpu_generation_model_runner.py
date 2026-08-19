@@ -92,6 +92,24 @@ def test_sample_tokens_dict_output():
     assert output.multimodal_outputs[0]["audio"].shape == (1, 4)
 
 
+@pytest.mark.parametrize("input_seq", [-1, 0])
+def test_sample_tokens_non_async_drops_invalid_duplex_identity(input_seq: int):
+    runner = _make_runner(
+        {
+            "audio": [torch.randn(1, 4)],
+            "meta.duplex_epoch": [torch.tensor(-1)],
+            "meta.duplex_input_seq": [torch.tensor(input_seq)],
+            "meta.duplex_turn_id": [torch.tensor(-1)],
+        }
+    )
+
+    output = GPUGenerationModelRunner.sample_tokens(runner)
+
+    payload = output.multimodal_outputs[0]
+    assert "audio" in payload
+    assert not any(key.startswith("meta.duplex_") for key in payload)
+
+
 class _StubSchedulerOutput:
     def __init__(self, total_num_scheduled_tokens):
         self.total_num_scheduled_tokens = total_num_scheduled_tokens

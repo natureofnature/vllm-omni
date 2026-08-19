@@ -150,6 +150,47 @@ def test_pcm_commit_keeps_prior_append_reservation_active():
     commit_reservation.commit()
 
 
+def test_clear_pending_keeps_reserved_append_and_releases_only_buffered_bytes():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    reservation = buffer.prepare_append(
+        pcm_payload(16_000),
+        operation_id="reserved-unit",
+        chunk_period_ms=1_000,
+    )
+    assert reservation is not None
+    assert (
+        buffer.prepare_append(
+            pcm_payload(8_000),
+            operation_id="buffered-tail",
+            chunk_period_ms=1_000,
+        )
+        is None
+    )
+
+    assert buffer.clear_pending() == 8_000 * 4
+    assert reservation.active
+    assert buffer.has_reserved()
+    assert not buffer.has_pending()
+    reservation.commit()
+    assert buffer.commit(chunk_period_ms=1_000) is None
+
+
+def test_pcm_append_strips_client_supplied_origin_input_sequence():
+    buffer = MiniCPMO45PcmAppendBuffer()
+    payload = pcm_payload(16_000)
+    payload["duplex_origin_input_seq"] = 99
+
+    reservation = buffer.prepare_append(
+        payload,
+        operation_id="client-origin-spoof",
+        chunk_period_ms=1_000,
+    )
+
+    assert reservation is not None
+    assert reservation.payload is not None
+    assert "duplex_origin_input_seq" not in reservation.payload
+
+
 def test_pcm_commit_reservation_rollback_restores_residual_audio():
     buffer = MiniCPMO45PcmAppendBuffer()
     original = pcm_payload(8_000)

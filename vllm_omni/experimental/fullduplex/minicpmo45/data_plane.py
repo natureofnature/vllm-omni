@@ -133,11 +133,14 @@ class MiniCPMO45DataPlaneSession:
     ) -> Iterator[dict[str, object]]:
         context = context or MiniCPMO45DataPlaneContext()
         stage_metrics = _output_stage_metrics(output)
+        output_input_seq: int | None = None
 
         def runtime_result(**values: object) -> dict[str, object]:
             result = _runtime_result(**values)
             if stage_metrics is not None:
                 result["stage_metrics"] = stage_metrics
+            if output_input_seq is not None and output_input_seq > 0:
+                result["input_seq"] = output_input_seq
             return result
 
         request_id = getattr(output, "request_id", None)
@@ -177,12 +180,19 @@ class MiniCPMO45DataPlaneSession:
 
         output_turn_id = output_turn_id_from_metadata(mm_output)
         output_epoch = output_epoch_from_metadata(mm_output)
+        output_input_seq = output_input_seq_from_metadata(mm_output)
         expected_turn_id = context.active_response_turn_id
         stale_turn = expected_turn_id is not None and output_turn_id is not None and output_turn_id < expected_turn_id
         if expected_turn_id is None and output_turn_id is not None:
             stale_turn = output_turn_id < context.turn_id
         stale_epoch = output_epoch is not None and output_epoch != context.epoch
-        if context.auto_responds and (stale_turn or stale_epoch):
+        # Identity-bearing outputs still need lifecycle bookkeeping in the
+        # bridge even when their model turn is stale.  The bridge fences their
+        # response side effects by the authoritative input owner while still
+        # emitting the matching processed event and resolving an older final.
+        if context.auto_responds and (
+            stale_epoch or (stale_turn and (output_input_seq is None or output_input_seq <= 0))
+        ):
             return
 
         mm_text = _llm_output_text(mm_output)
@@ -569,6 +579,10 @@ def output_turn_id_from_metadata(mm_output: dict[str, object]) -> int | None:
 
 def output_epoch_from_metadata(mm_output: dict[str, object]) -> int | None:
     return _first_metadata_int(mm_output, "duplex_epoch", "epoch")
+
+
+def output_input_seq_from_metadata(mm_output: dict[str, object]) -> int | None:
+    return _first_metadata_int(mm_output, "duplex_input_seq", "input_seq", "seq")
 
 
 def _first_metadata_int(mm_output: dict[str, object], *names: str) -> int | None:

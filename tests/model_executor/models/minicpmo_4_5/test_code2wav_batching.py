@@ -11,6 +11,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
 )
+from vllm_omni.utils.mm_outputs import partition_flat_payload
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -269,6 +270,9 @@ def test_model_preserves_output_slots_and_prefers_runtime_codes():
     assert len(output.multimodal_outputs["sr"]) == 2
     assert all(sr.item() == 24000 for sr in output.multimodal_outputs["sr"])
     assert all(audio.dtype == torch.float32 for audio in audios)
+    assert "meta.duplex_epoch" not in output.multimodal_outputs
+    assert "meta.duplex_turn_id" not in output.multimodal_outputs
+    assert "meta.duplex_input_seq" not in output.multimodal_outputs
     # Fake CFM uses two Euler steps whose deltas sum to one. Its conditional
     # row is mu and its unconditional row is zero, so CFG produces 1.7 * mu.
     torch.testing.assert_close(audios[0][0], torch.tensor(1.7 * 10))
@@ -284,6 +288,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
         {
             "duplex_epoch": 3,
             "duplex_turn_id": 7,
+            "duplex_input_seq": 11,
             "llm_output_text_utf8": segment_text_utf8,
             "tts_is_last_chunk": True,
             "turn_end": False,
@@ -309,6 +314,7 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert "meta" not in payload
     assert payload["meta.duplex_epoch"][0].item() == 3
     assert payload["meta.duplex_turn_id"][0].item() == 7
+    assert payload["meta.duplex_input_seq"][0].item() == 11
     torch.testing.assert_close(
         payload["meta.llm_output_text_utf8"][0],
         segment_text_utf8,
@@ -317,6 +323,32 @@ def test_code2wav_projects_duplex_metadata_to_final_audio_output():
     assert payload["meta.turn_end"][0].item() is True
     assert token2wav.flow.encoder.last_chunk_calls[-1] is True
     assert "duplex" not in model._states
+
+
+def test_code2wav_mixed_batch_hides_duplex_identity_from_plain_request():
+    model, _ = _model()
+    plain = _info("plain", 0, [10, 11])
+    duplex = _info("duplex", 0, [20, 21])
+    duplex["meta"].update(
+        {
+            "duplex_epoch": 3,
+            "duplex_turn_id": 7,
+            "duplex_input_seq": 11,
+        }
+    )
+
+    output = _forward(model, [plain, duplex]).multimodal_outputs
+    per_request = [
+        {key: value[index] if isinstance(value, list) else value for key, value in output.items()} for index in range(2)
+    ]
+    plain_inter, plain_client = partition_flat_payload(per_request[0])
+    duplex_inter, duplex_client = partition_flat_payload(per_request[1])
+
+    assert not any(key.startswith("meta.duplex_") for key in plain_inter)
+    assert not any(key.startswith("meta.duplex_") for key in plain_client)
+    for key in ("meta.duplex_epoch", "meta.duplex_turn_id", "meta.duplex_input_seq"):
+        assert key in duplex_inter
+        assert key in duplex_client
 
 
 def test_initial_empty_segment_marker_initializes_stream_without_audio():
@@ -668,6 +700,7 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
         llm_output_text_utf8=segment_text_utf8,
         duplex_turn_id=7,
         duplex_epoch=3,
+        duplex_input_seq=11,
     )
     first["meta"].pop("prompt_cache_id")
 
@@ -683,6 +716,7 @@ def test_reference_voice_and_duplex_metadata_follow_request_lifecycle():
     )
     assert output.multimodal_outputs["meta.duplex_turn_id"][0].item() == 7
     assert output.multimodal_outputs["meta.duplex_epoch"][0].item() == 3
+    assert output.multimodal_outputs["meta.duplex_input_seq"][0].item() == 11
 
     final = _info("voice-a", 1, [3, 4], last_chunk=True)
     final["meta"].pop("prompt_cache_id")

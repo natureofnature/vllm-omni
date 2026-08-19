@@ -64,6 +64,10 @@ class MiniCPMO45PcmAppendReservation:
     def byte_count(self) -> int:
         return len(self._raw)
 
+    @property
+    def turn_had_speech(self) -> bool:
+        return self._turn_had_speech
+
     def commit(self) -> None:
         self._owner._commit_reservation(self)
 
@@ -126,6 +130,16 @@ class MiniCPMO45PcmAppendBuffer:
         self._frame_queue.clear()
         self._sample_rate_hz = None
         self._turn_had_speech = False
+
+    def clear_pending(self) -> int:
+        """Clear only PCM that has not already been reserved for an append."""
+        cleared_bytes = len(self._buffer)
+        self._buffer.clear()
+        self._spans.clear()
+        self._frame_queue.clear()
+        self._sample_rate_hz = None
+        self._turn_had_speech = False
+        return cleared_bytes
 
     def clear_force_listen(self) -> None:
         self._spans = [_PcmSpan(span.byte_count, False, span.is_speech) for span in self._spans]
@@ -223,6 +237,10 @@ class MiniCPMO45PcmAppendBuffer:
         flush: bool = False,
         allow_emit: bool = True,
     ) -> MiniCPMO45PcmAppendReservation | None:
+        # Serving adds this field only to internal silence continuations.
+        # Never let a client choose which accepted input a model output ACKs.
+        payload = dict(payload)
+        payload.pop("duplex_origin_input_seq", None)
         fmt = payload.get("format")
         sample_rate_hz = payload.get("sample_rate_hz")
         audio = payload.get("audio")

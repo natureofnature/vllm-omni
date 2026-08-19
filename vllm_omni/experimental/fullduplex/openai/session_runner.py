@@ -176,6 +176,8 @@ class DuplexSessionRunnerMixin:
                     deferred_precreate_response = native.deferred_precreate_response
                     native.deferred_precreate_response = False
             if deferred_overlap_payload is not None and session is not None and not actor.closing:
+                deferred_lifecycle = self._input_lifecycle(session)
+                deferred_generation = native.pending_final_commit_generation if deferred_lifecycle is not None else None
                 await start_native_append(
                     deferred_overlap_payload,
                     final=True,
@@ -184,6 +186,7 @@ class DuplexSessionRunnerMixin:
                     retained_committed_payload=(
                         deferred_overlap_payload if native.committed_audio_payload is deferred_overlap_payload else None
                     ),
+                    input_generation=deferred_generation,
                 )
 
         writer_task = asyncio.create_task(actor.writer_loop(), name="duplex-session-writer")
@@ -309,6 +312,14 @@ class DuplexSessionRunnerMixin:
                 or actor.has_queued_input_events()
             )
 
+        def discard_pending_native_commit() -> int:
+            """Discard one unacknowledged MiniCPM final-input transaction."""
+            lifecycle = self._input_lifecycle(session) if session is not None else None
+            generation = getattr(native, "pending_final_commit_generation", None)
+            if lifecycle is not None and isinstance(generation, int):
+                lifecycle.cancel_generation(epoch=session.epoch, generation=generation)
+            return native.clear_committed_audio()
+
         async def start_native_append(
             payload: object,
             *,
@@ -319,15 +330,38 @@ class DuplexSessionRunnerMixin:
             retained_committed_payload: dict[str, object] | None = None,
             silence_continuation: bool = False,
             before_append=None,
+            on_input_accepted=None,
+            input_generation: int | None = None,
+            commit_reservation_before_append: bool = False,
+            rebase_turn_before_append: bool = False,
+            response_bound: bool = False,
         ) -> asyncio.Task[bool] | None:
             if session is None:
                 return
             if not silence_continuation:
                 mark_pending_silence_superseded()
             append_epoch = session.epoch
+            append_lifecycle = self._input_lifecycle(session) if not silence_continuation else None
+            if append_lifecycle is not None and input_generation is None:
+                input_generation = (
+                    append_lifecycle.seal_generation(epoch=append_epoch)
+                    if final
+                    else append_lifecycle.current_generation(epoch=append_epoch)
+                )
             append_turn_id = payload_turn_id(payload)
             if append_turn_id is None:
                 append_turn_id = session.turn_id
+            if precreate_response and append_lifecycle is not None and input_generation is not None:
+                minimum_turn_id = append_turn_id
+                if session.active_response_turn_id is not None:
+                    minimum_turn_id = max(minimum_turn_id, session.active_response_turn_id + 1)
+                append_turn_id = append_lifecycle.target_turn_for_generation(
+                    epoch=append_epoch,
+                    generation=input_generation,
+                    minimum_turn_id=minimum_turn_id,
+                )
+            if precreate_response and isinstance(payload, dict):
+                payload = {**payload, "duplex_turn_id": append_turn_id}
             request_id = self._native_stage0_request_id(session, append_epoch)
             if final or precreate_response:
                 session.bind_request(request_id)
@@ -343,6 +377,30 @@ class DuplexSessionRunnerMixin:
                     )
                 )
             precreated_response_id = session.active_response_id if precreate_response else None
+            reservation_committed = False
+
+            def _rollback_reservation() -> None:
+                nonlocal reservation_committed
+                if pcm_reservation is None:
+                    return
+                if not pcm_reservation.active:
+                    return
+                discarded_final = bool(
+                    commit_reservation_before_append
+                    and append_lifecycle is not None
+                    and input_generation is not None
+                    and native.pending_final_commit_generation != input_generation
+                )
+                if discarded_final:
+                    pcm_reservation.commit()
+                    reservation_committed = True
+                    session.release_input_bytes(pcm_reservation.byte_count)
+                    return
+                pcm_reservation.rollback()
+                if not reservation_committed:
+                    native.input_since_commit = True
+                    if isinstance(payload, dict):
+                        native.speech_since_commit = native.speech_since_commit or bool(payload.get("is_speech", False))
 
             async def _run() -> bool:
                 nonlocal runtime_closed
@@ -355,9 +413,12 @@ class DuplexSessionRunnerMixin:
                         send_json=emit_event,
                         mode="append_audio_chunk",
                         expected_epoch=append_epoch,
+                        track_input_identity=not silence_continuation,
+                        input_generation=input_generation,
+                        on_input_accepted=on_input_accepted,
                     )
                     if append_ok:
-                        if pcm_reservation is not None:
+                        if pcm_reservation is not None and not reservation_committed:
                             pcm_reservation.commit()
                             session.release_input_bytes(pcm_reservation.byte_count)
                         if (
@@ -365,8 +426,8 @@ class DuplexSessionRunnerMixin:
                             and native.committed_audio_payload is retained_committed_payload
                         ):
                             session.release_input_bytes(native.clear_committed_audio())
-                    elif pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    elif pcm_reservation is not None and not reservation_committed:
+                        _rollback_reservation()
                     if (
                         not append_ok
                         and precreated_response_id is not None
@@ -388,6 +449,38 @@ class DuplexSessionRunnerMixin:
                                 "playback": session.playback.as_dict(),
                             }
                         )
+                    if (
+                        not append_ok
+                        and append_lifecycle is not None
+                        and not final
+                        and input_generation is not None
+                        and append_lifecycle.has_ambiguous_generation(
+                            epoch=append_epoch,
+                            generation=input_generation,
+                        )
+                        and session.state != DuplexSessionState.CLOSED
+                    ):
+                        # A local timeout or cancellation cannot prove that the
+                        # synchronous Engine append was not committed. Keeping
+                        # the epoch open could let its late output share a turn
+                        # with the next real append and corrupt projector state.
+                        begin_close("runtime_append_failed")
+                        if await self._close_runtime_session(
+                            session,
+                            reason="runtime_append_failed",
+                            send_json=emit_event,
+                        ):
+                            runtime_closed = True
+                            session.close()
+                            await emit_event(
+                                {
+                                    "type": "session.closed",
+                                    "session_id": session.session_id,
+                                    "reason": "runtime_append_failed",
+                                }
+                            )
+                        await actor.enqueue_event({"type": "__background_terminal__"})
+                        return False
                     if not append_ok and session.state == DuplexSessionState.CLOSED:
                         runtime_closed = True
                         return False
@@ -400,10 +493,12 @@ class DuplexSessionRunnerMixin:
                             )
                     return append_ok
                 except asyncio.CancelledError:
+                    if pcm_reservation is not None and not reservation_committed:
+                        _rollback_reservation()
                     raise
                 except Exception as exc:
-                    if pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    if pcm_reservation is not None and not reservation_committed:
+                        _rollback_reservation()
                     logger.exception("Native duplex append task failed: %s", exc)
                     await self._send_runtime_error(emit_event, "runtime_append_task_failed", exc, session=session)
                     if session.state != DuplexSessionState.CLOSED:
@@ -425,6 +520,7 @@ class DuplexSessionRunnerMixin:
                     return False
 
             async def _run_in_wire_order(predecessor: asyncio.Task[bool] | None) -> bool:
+                nonlocal reservation_committed
                 if predecessor is not None:
                     try:
                         predecessor_ok = await predecessor
@@ -436,19 +532,44 @@ class DuplexSessionRunnerMixin:
                     except Exception:
                         predecessor_ok = False
                     if not predecessor_ok:
-                        if pcm_reservation is not None:
-                            pcm_reservation.rollback()
+                        _rollback_reservation()
                         return False
                 if actor.closing or runtime_closed or session.state != DuplexSessionState.OPEN:
-                    if pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    _rollback_reservation()
                     return False
                 if before_append is not None and not before_append():
-                    if pcm_reservation is not None:
-                        pcm_reservation.rollback()
+                    _rollback_reservation()
+                    return True
+                if (
+                    commit_reservation_before_append
+                    and append_lifecycle is not None
+                    and input_generation is not None
+                    and native.pending_final_commit_generation != input_generation
+                ):
+                    # A newer real-input commit superseded this transaction
+                    # while it was queued behind the wire tail. Its reservation
+                    # is no longer allowed to reach the Engine or emit an ACK.
+                    _rollback_reservation()
                     return True
                 if pcm_reservation is not None and not pcm_reservation.active:
                     return False
+                if rebase_turn_before_append and isinstance(payload, dict):
+                    target_turn_id = session.turn_id
+                    if session.active_response_turn_id is not None:
+                        target_turn_id = max(target_turn_id, session.active_response_turn_id + 1)
+                    payload["duplex_turn_id"] = target_turn_id
+                if commit_reservation_before_append and pcm_reservation is not None:
+                    pcm_reservation.commit()
+                    reservation_committed = True
+                    if (
+                        retained_committed_payload is not None
+                        and native.committed_audio_payload is not retained_committed_payload
+                    ):
+                        native.retain_committed_audio(
+                            retained_committed_payload,
+                            operation_id=pcm_reservation.operation_id,
+                            reserved_bytes=pcm_reservation.byte_count,
+                        )
                 return await _run()
 
             predecessor = actor.native_append_tail
@@ -469,8 +590,22 @@ class DuplexSessionRunnerMixin:
                 epoch=append_epoch,
                 mode="append_audio_chunk",
                 final=final,
-                response_bound=final or precreate_response,
+                response_bound=response_bound or final or precreate_response,
             )
+            if final and append_lifecycle is not None and input_generation is not None:
+
+                def _cancel_failed_final_generation(done: asyncio.Task[bool]) -> None:
+                    try:
+                        append_ok = done.result()
+                    except (asyncio.CancelledError, Exception):
+                        append_ok = False
+                    if not append_ok:
+                        append_lifecycle.cancel_generation(
+                            epoch=append_epoch,
+                            generation=input_generation,
+                        )
+
+                task.add_done_callback(_cancel_failed_final_generation)
             if silence_continuation:
                 native.pending_silence_task = task
 
@@ -482,6 +617,274 @@ class DuplexSessionRunnerMixin:
                 task.add_done_callback(_clear_done_pending_silence)
             # Let this wire-order effect start before the next mailbox event can
             # cancel it. Later native appends still serialize on predecessor.
+            await asyncio.sleep(0)
+            return task
+
+        async def start_exact_full_finalization(
+            committed_event: dict[str, object],
+            *,
+            generation: int,
+            expected_epoch: int,
+            commit_reservation: PcmAppendReservation,
+        ) -> asyncio.Task[bool]:
+            predecessor = actor.native_append_tail
+            promoted_final: tuple[int, int] | None = None
+
+            async def _continue_after_commit(input_seq: int, target_model_turn_id: int) -> bool:
+                delay_s = max(0.0, float(session.capabilities.chunk_period_ms or 1000) / 1000.0)
+                if delay_s:
+                    await asyncio.sleep(delay_s)
+                lifecycle = self._input_lifecycle(session)
+                if (
+                    native.pending_silence_owner_id != f"final-generation:{generation}"
+                    or real_native_input_waiting()
+                    or lifecycle is None
+                    or not lifecycle.is_latest_final(
+                        epoch=expected_epoch,
+                        seq=input_seq,
+                        model_turn_id=target_model_turn_id,
+                    )
+                ):
+                    return True
+                if session.active_request_id is None:
+                    request_id = self._native_stage0_request_id(session, expected_epoch)
+                    if not self._serving_runtime_adapter.data_plane.is_terminal(request_id):
+                        session.bind_request(request_id)
+                if (
+                    actor.closing
+                    or session.state != DuplexSessionState.OPEN
+                    or session.epoch != expected_epoch
+                    or session.active_request_id is None
+                ):
+                    return False
+                payload = self._native_silence_unit_payload()
+                payload["duplex_turn_id"] = target_model_turn_id
+                payload["duplex_origin_input_seq"] = input_seq
+                owner_id = f"final-generation:{generation}"
+
+                def _still_current() -> bool:
+                    current_lifecycle = self._input_lifecycle(session)
+                    return bool(
+                        native.pending_silence_owner_id == owner_id
+                        and not real_native_input_waiting()
+                        and current_lifecycle is not None
+                        and current_lifecycle.is_latest_final(
+                            epoch=expected_epoch,
+                            seq=input_seq,
+                            model_turn_id=target_model_turn_id,
+                        )
+                        and not actor.closing
+                        and session.state == DuplexSessionState.OPEN
+                        and session.epoch == expected_epoch
+                    )
+
+                append_task = await start_native_append(
+                    payload,
+                    final=False,
+                    silence_continuation=True,
+                    before_append=_still_current,
+                    response_bound=True,
+                )
+                return True if append_task is None else await append_task
+
+            def _track_post_commit_continuation(input_seq: int, target_model_turn_id: int) -> None:
+                continuation = asyncio.create_task(_continue_after_commit(input_seq, target_model_turn_id))
+                actor.track_append_task(
+                    continuation,
+                    epoch=expected_epoch,
+                    mode="finalize_exact_full_continuation",
+                    final=False,
+                    response_bound=True,
+                )
+                native.pending_silence_task = continuation
+
+                def _clear_continuation(done: asyncio.Task[bool]) -> None:
+                    if native.pending_silence_task is done:
+                        native.pending_silence_task = None
+                        native.pending_silence_owner_id = None
+                    try:
+                        done.result()
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    # A durable final remains unresolved if its optional
+                    # continuation is cancelled or fails. A later terminal
+                    # decision, superseding input, or epoch reset owns cleanup.
+
+                continuation.add_done_callback(_clear_continuation)
+
+            async def _run() -> bool:
+                nonlocal promoted_final
+                if predecessor is not None:
+                    try:
+                        if not await predecessor:
+                            lifecycle = self._input_lifecycle(session)
+                            if lifecycle is not None:
+                                lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                            return False
+                    except asyncio.CancelledError:
+                        current = asyncio.current_task()
+                        if current is not None and current.cancelling():
+                            raise
+                        lifecycle = self._input_lifecycle(session)
+                        if lifecycle is not None:
+                            lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                        return False
+                    except Exception:
+                        lifecycle = self._input_lifecycle(session)
+                        if lifecycle is not None:
+                            lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                        return False
+                if (
+                    actor.closing
+                    or session is None
+                    or session.state != DuplexSessionState.OPEN
+                    or session.epoch != expected_epoch
+                ):
+                    lifecycle = self._input_lifecycle(session) if session is not None else None
+                    if lifecycle is not None:
+                        lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                    return False
+                commit_reservation.commit()
+                promoted = self._promote_latest_native_input(
+                    session,
+                    generation=generation,
+                )
+                if promoted is None:
+                    lifecycle = self._input_lifecycle(session)
+                    if lifecycle is not None:
+                        lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                    await self._send_runtime_error(
+                        emit_event,
+                        "runtime_append_missing_acceptance",
+                        RuntimeError("MiniCPM exact-full commit has no accepted input identity"),
+                        session=session,
+                    )
+                    return False
+                input_seq, target_model_turn_id = promoted
+                promoted_final = (input_seq, target_model_turn_id)
+                await emit_event(
+                    {
+                        **committed_event,
+                        "accepted_input_seq": input_seq,
+                    }
+                )
+                if native.pending_final_commit_event is committed_event:
+                    native.pending_final_commit_event = None
+                    native.pending_final_commit_generation = None
+                stored_decision = await self._emit_stored_input_processed(
+                    emit_event,
+                    session=session,
+                    input_seq=input_seq,
+                    target_model_turn_id=target_model_turn_id,
+                )
+                if stored_decision is not None and stored_decision[0] in {"listen", "failed"}:
+                    outcome, response_id = stored_decision
+                    if response_id is not None and session.active_response_id != response_id:
+                        stored_decision = None
+                    else:
+                        lifecycle = self._input_lifecycle(session)
+                        request_id = session.active_request_id
+                        if (
+                            lifecycle is not None
+                            and request_id is not None
+                            and lifecycle.is_latest_final(
+                                epoch=expected_epoch,
+                                seq=input_seq,
+                                model_turn_id=target_model_turn_id,
+                            )
+                        ):
+                            await self._settle_superseded_input_finals(
+                                emit_event,
+                                session=session,
+                                before_seq=input_seq,
+                                native_result={
+                                    "input_seq": input_seq,
+                                    "model_turn_id": target_model_turn_id,
+                                },
+                            )
+                            self._serving_runtime_adapter.data_plane.mark_terminal(request_id)
+                        native.clear_continuation()
+                        if outcome == "listen" and response_id is not None:
+                            await emit_event(
+                                {
+                                    "type": "response.listen",
+                                    "session_id": session.session_id,
+                                    "epoch": expected_epoch,
+                                    "reason": "model_listen",
+                                    "model_listen": True,
+                                }
+                            )
+                            session.end_response(commit_text=False, preserve_request=True)
+                            await emit_event(
+                                {
+                                    "type": "response.done",
+                                    "session_id": session.session_id,
+                                    "response_id": response_id,
+                                    "epoch": expected_epoch,
+                                    "committed": False,
+                                    "playback": session.playback.as_dict(),
+                                }
+                            )
+                        if lifecycle is not None:
+                            lifecycle.resolve_final(
+                                epoch=expected_epoch,
+                                seq=input_seq,
+                                model_turn_id=target_model_turn_id,
+                            )
+                        return True
+                if native.pending_silence_owner_id != f"final-generation:{generation}" or real_native_input_waiting():
+                    return True
+                _track_post_commit_continuation(input_seq, target_model_turn_id)
+                return True
+
+            task = asyncio.create_task(_run())
+            actor.native_append_tail = task
+            actor.track_append_task(
+                task,
+                epoch=expected_epoch,
+                mode="finalize_exact_full_input",
+                final=True,
+                response_bound=True,
+            )
+            native.pending_silence_task = task
+            native.pending_silence_owner_id = f"final-generation:{generation}"
+
+            def _clear_finalizer(done: asyncio.Task[bool]) -> None:
+                if native.pending_silence_task is done:
+                    native.pending_silence_task = None
+                    native.pending_silence_owner_id = None
+                try:
+                    finalized = done.result()
+                except (asyncio.CancelledError, Exception):
+                    finalized = False
+                if not finalized:
+                    owns_pending_commit = bool(
+                        native.pending_final_commit_event is committed_event
+                        and native.pending_final_commit_generation == generation
+                    )
+                    if commit_reservation.active:
+                        if owns_pending_commit:
+                            commit_reservation.rollback()
+                            native.input_since_commit = True
+                            native.speech_since_commit = native.speech_since_commit or bool(
+                                getattr(commit_reservation, "turn_had_speech", False)
+                            )
+                        else:
+                            commit_reservation.commit()
+                    lifecycle = self._input_lifecycle(session)
+                    if lifecycle is not None:
+                        lifecycle.cancel_generation(epoch=expected_epoch, generation=generation)
+                        if promoted_final is not None:
+                            lifecycle.resolve_final(
+                                epoch=expected_epoch,
+                                seq=promoted_final[0],
+                                model_turn_id=promoted_final[1],
+                            )
+                    if native.pending_final_commit_event is committed_event:
+                        native.pending_final_commit_event = None
+                        native.pending_final_commit_generation = None
+
+            task.add_done_callback(_clear_finalizer)
             await asyncio.sleep(0)
             return task
 
@@ -541,6 +944,10 @@ class DuplexSessionRunnerMixin:
                         expected_model_turn_id=expected_model_turn_id,
                     )
                 ):
+                    return False
+                clear_completed_pending_silence()
+                pending_silence = native.pending_silence_task
+                if pending_silence is not None and not pending_silence.done():
                     return False
 
             def _still_valid() -> bool:
@@ -704,13 +1111,16 @@ class DuplexSessionRunnerMixin:
                 if event_type == "__replaced_attachment__":
                     return
 
+                if event_type == "__background_terminal__":
+                    return
+
                 if event_type == "__timeout__":
                     begin_close("timeout")
                     native.audio_buffer.clear()
                     session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_committed_audio()
+                    discard_pending_native_commit()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -830,7 +1240,7 @@ class DuplexSessionRunnerMixin:
                     session.release_all_input_bytes()
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_committed_audio()
+                    discard_pending_native_commit()
                     await actor.cancel_append_tasks()
                     await self._cancel_native_data_plane_stream(session)
                     await self._cancel_active_response(
@@ -852,12 +1262,24 @@ class DuplexSessionRunnerMixin:
                     return
 
                 if event_type == "input_audio_buffer.clear":
-                    native.audio_buffer.clear()
-                    session.release_all_input_bytes()
+                    if self._input_lifecycle(session) is None:
+                        native.audio_buffer.clear()
+                        session.release_all_input_bytes()
+                        preserved_input_bytes = 0
+                    else:
+                        clear_pending = getattr(native.audio_buffer, "clear_pending", None)
+                        if not callable(clear_pending):
+                            raise RuntimeError("MiniCPM native audio buffer does not support pending-only clear")
+                        session.release_input_bytes(clear_pending())
+                        preserved_input_bytes = session.pending_input_bytes
                     native.input_since_commit = False
                     native.speech_since_commit = False
-                    native.clear_committed_audio()
                     cancelled = session.cancel_pending_input()
+                    if preserved_input_bytes and not session.reserve_input_bytes(
+                        preserved_input_bytes,
+                        limit=self._duplex_session_config.max_pending_input_bytes_per_session,
+                    ):
+                        raise RuntimeError("Failed to restore committed native input byte reservation")
                     await emit_event(
                         {
                             "type": "input_audio_buffer.cleared",
@@ -923,7 +1345,9 @@ class DuplexSessionRunnerMixin:
                         session.release_all_input_bytes()
                         native.input_since_commit = False
                         native.speech_since_commit = False
-                        native.clear_committed_audio()
+                        discard_pending_native_commit()
+                    elif event_type in {"response.cancel", "output_audio_buffer.clear"}:
+                        session.release_input_bytes(discard_pending_native_commit())
                     had_native_append = await actor.cancel_append_tasks(
                         response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
                     )
@@ -1444,15 +1868,43 @@ class DuplexSessionRunnerMixin:
                     if (
                         self._uses_native_input_append(session)
                         and event_type in {"input.commit", "input_audio_buffer.commit"}
+                        and self._input_lifecycle(session) is None
                         and not await wait_for_native_append_tail()
                     ):
                         continue
+                    input_lifecycle = self._input_lifecycle(session)
+                    if (
+                        event_type in {"input.commit", "input_audio_buffer.commit"}
+                        and input_lifecycle is not None
+                        and native.pending_final_commit_generation is not None
+                    ):
+                        if native.input_since_commit:
+                            pending_finalizer = native.pending_silence_task
+                            if (
+                                pending_finalizer is not None
+                                and isinstance(native.pending_silence_owner_id, str)
+                                and native.pending_silence_owner_id.startswith("final-generation:")
+                            ):
+                                pending_finalizer.cancel()
+                                native.pending_silence_task = None
+                                native.pending_silence_owner_id = None
+                            session.release_input_bytes(discard_pending_native_commit())
+                        else:
+                            await emit_event(
+                                {
+                                    "type": "error",
+                                    "session_id": session.session_id,
+                                    "code": "input_commit_pending",
+                                    "error": "A previous MiniCPM final input commit is still pending",
+                                }
+                            )
+                            continue
                     if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
                         native.input_since_commit = False
                         native.speech_since_commit = False
                         native.audio_buffer.clear()
                         session.release_all_input_bytes()
-                        native.clear_committed_audio()
+                        discard_pending_native_commit()
                         await emit_event(
                             {
                                 "type": "input.committed",
@@ -1510,11 +1962,7 @@ class DuplexSessionRunnerMixin:
                             or native.committed_audio_payload is not None
                             or realtime_validated_audio_commit
                         )
-                        if (
-                            not has_pending_native_audio
-                            and not actor.native_append_tasks
-                            and native.data_plane_task is None
-                        ):
+                        if not has_pending_native_audio:
                             await emit_event(
                                 {
                                     "type": "error",
@@ -1541,7 +1989,7 @@ class DuplexSessionRunnerMixin:
                                 session.release_all_input_bytes()
                                 native.input_since_commit = False
                                 native.speech_since_commit = False
-                                native.clear_committed_audio()
+                                discard_pending_native_commit()
                                 if realtime_protocol is not None:
                                     await realtime_protocol.discard_pending_input_audio(
                                         audio_end_ms=session.overlap_speech_ms
@@ -1562,6 +2010,7 @@ class DuplexSessionRunnerMixin:
                                 session.discard_response_options()
                                 continue
 
+                            input_lifecycle = self._input_lifecycle(session)
                             commit_reservation = native.audio_buffer.prepare_commit(
                                 operation_id=uuid.uuid4().hex,
                                 chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
@@ -1575,6 +2024,11 @@ class DuplexSessionRunnerMixin:
                                         native.committed_audio_payload,
                                         deferred_payload,
                                     )
+                                if input_lifecycle is not None:
+                                    if native.pending_final_commit_generation is None:
+                                        native.pending_final_commit_generation = input_lifecycle.seal_generation(
+                                            epoch=session.epoch
+                                        )
                                 native.retain_committed_audio(
                                     deferred_payload,
                                     operation_id=commit_reservation.operation_id,
@@ -1615,32 +2069,50 @@ class DuplexSessionRunnerMixin:
                                     )
                                 else:
                                     final_payload = native.committed_audio_payload
-                            commit_reservation.commit()
-                            if final_payload is not None:
-                                native.retain_committed_audio(
-                                    final_payload,
-                                    operation_id=commit_reservation.operation_id,
-                                    reserved_bytes=commit_reservation.byte_count,
-                                )
                             native.deferred_response_create = False
                             native.input_since_commit = False
                             native.speech_since_commit = False
                             data_plane_turn_id = session.turn_id
+                            input_lifecycle = self._input_lifecycle(session)
+                            input_generation = (
+                                input_lifecycle.seal_generation(epoch=session.epoch)
+                                if input_lifecycle is not None
+                                else None
+                            )
                             committed = self._commit_native_audio_input(
                                 session,
                                 realtime_item_id=event.get("realtime_item_id"),
                                 transcript=event.get("transcript"),
                                 turn_id=data_plane_turn_id,
                             )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
+                            committed_event = self._native_audio_committed_payload(
+                                session,
+                                committed=committed,
+                                realtime_item_id=event.get("realtime_item_id"),
+                                transcript=event.get("transcript"),
                             )
+                            if input_lifecycle is not None:
+                                native.pending_final_commit_event = committed_event
+                                native.pending_final_commit_generation = input_generation
                             if final_payload is not None:
+                                on_input_accepted = None
+                                if input_lifecycle is None:
+                                    await emit_event(committed_event)
+                                else:
+
+                                    async def _emit_accepted_commit(accepted_input_seq: int) -> None:
+                                        await emit_event(
+                                            {
+                                                **committed_event,
+                                                "accepted_input_seq": accepted_input_seq,
+                                            }
+                                        )
+                                        if native.pending_final_commit_event is committed_event:
+                                            native.pending_final_commit_event = None
+                                            native.pending_final_commit_generation = None
+
+                                    on_input_accepted = _emit_accepted_commit
+
                                 await start_native_append(
                                     {
                                         **final_payload,
@@ -1650,10 +2122,31 @@ class DuplexSessionRunnerMixin:
                                     precreate_response=False,
                                     operation_id=commit_reservation.operation_id,
                                     retained_committed_payload=final_payload,
+                                    pcm_reservation=commit_reservation,
+                                    on_input_accepted=on_input_accepted,
+                                    input_generation=input_generation,
+                                    commit_reservation_before_append=True,
+                                    rebase_turn_before_append=True,
                                 )
+                            else:
+                                if input_generation is None:
+                                    commit_reservation.commit()
+                                    await emit_event(committed_event)
+                                else:
+                                    await start_exact_full_finalization(
+                                        committed_event,
+                                        generation=input_generation,
+                                        expected_epoch=session.epoch,
+                                        commit_reservation=commit_reservation,
+                                    )
                             continue
                     if self._uses_native_input_append(session) and event_type == "response.create":
-                        if (
+                        can_retry_committed_input = (
+                            native.committed_audio_payload is not None
+                            and session.active_response_id is None
+                            and not actor.native_append_tasks
+                        )
+                        if not can_retry_committed_input and (
                             native_response_in_progress()
                             or actor.native_append_tasks
                             or native.data_plane_task is not None
@@ -1677,16 +2170,45 @@ class DuplexSessionRunnerMixin:
                             continue
                         if native.committed_audio_payload is not None:
                             committed_payload = native.committed_audio_payload
+                            retry_payload = {
+                                **committed_payload,
+                                "duplex_turn_id": session.turn_id,
+                            }
                             operation_id = native.committed_audio_operation_id
                             if operation_id is None:
                                 operation_id = uuid.uuid4().hex
                                 native.committed_audio_operation_id = operation_id
+                            input_lifecycle = self._input_lifecycle(session)
+                            pending_commit_event = (
+                                native.pending_final_commit_event if input_lifecycle is not None else None
+                            )
+
+                            async def _emit_retried_commit(accepted_input_seq: int) -> None:
+                                if pending_commit_event is None:
+                                    return
+                                await emit_event(
+                                    {
+                                        **pending_commit_event,
+                                        "accepted_input_seq": accepted_input_seq,
+                                    }
+                                )
+                                if (
+                                    input_lifecycle is not None
+                                    and native.pending_final_commit_event is pending_commit_event
+                                ):
+                                    native.pending_final_commit_event = None
+                                    native.pending_final_commit_generation = None
+
                             await start_native_append(
-                                committed_payload,
+                                retry_payload,
                                 final=True,
                                 precreate_response=True,
                                 operation_id=operation_id,
                                 retained_committed_payload=committed_payload,
+                                on_input_accepted=(_emit_retried_commit if input_lifecycle is not None else None),
+                                input_generation=(
+                                    native.pending_final_commit_generation if input_lifecycle is not None else None
+                                ),
                             )
                             continue
                         await emit_event(

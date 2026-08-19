@@ -52,6 +52,7 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     payload = {
         "model_outputs": torch.zeros(1, 2400),
         "meta.duplex_epoch": torch.tensor([3], dtype=torch.int32),
+        "meta.duplex_input_seq": torch.tensor([7], dtype=torch.int32),
         "meta.duplex_turn_id": torch.tensor([2], dtype=torch.int32),
         "meta.llm_output_text_utf8": torch.tensor([104, 105], dtype=torch.uint8),
         "meta.audio_text_total_chars": torch.tensor([2], dtype=torch.int32),
@@ -65,11 +66,31 @@ def test_partition_duplex_audio_transcript_metadata_to_client_mm():
     assert "meta.llm_output_text_utf8" in client
     assert "meta.audio_text_total_chars" in client
     assert "meta.duplex_epoch" in client
+    assert "meta.duplex_input_seq" in client
     assert "meta.duplex_turn_id" in client
+    assert "meta.duplex_input_seq" in inter
     assert "meta.tts_is_last_chunk" in client
     assert "meta.turn_end" in client
     assert "meta.native_duplex_segment_text" not in client
     assert "meta.native_duplex_segment_text" in inter
+
+
+@pytest.mark.parametrize("input_seq", [-1, 0])
+def test_partition_mixed_batch_lane_drops_invalid_duplex_identity(input_seq: int):
+    payload = {
+        "model_outputs": torch.zeros(1, 2400),
+        "meta.duplex_epoch": torch.tensor(-1, dtype=torch.int32),
+        "meta.duplex_input_seq": torch.tensor(input_seq, dtype=torch.int32),
+        "meta.duplex_turn_id": torch.tensor(-1, dtype=torch.int32),
+        "meta.turn_end": torch.tensor(False),
+    }
+
+    inter, client = partition_flat_payload(payload)
+
+    assert not any(key.startswith("meta.duplex_") for key in inter)
+    assert not any(key.startswith("meta.duplex_") for key in client)
+    assert "meta.turn_end" in inter
+    assert "meta.turn_end" in client
 
 
 def test_snapshot_mm_payload_coalesces_compatible_tensor_list(monkeypatch):

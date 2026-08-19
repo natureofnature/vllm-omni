@@ -7,6 +7,7 @@ from vllm.sampling_params import SamplingParams
 from vllm_omni.experimental.fullduplex.engine import duplex_runtime
 from vllm_omni.experimental.fullduplex.engine.contracts import (
     duplex_data_plane_request_info,
+    duplex_input_acceptance_info,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
@@ -371,6 +372,26 @@ def test_duplex_data_plane_request_info_rejects_missing_request_id():
     ) == (None, None)
 
 
+def test_duplex_input_acceptance_info_requires_authoritative_stage_append():
+    result = {
+        "accepted_input_seq": 99,
+        "stage_results": [
+            {"result": {"supported": True, "seq": 7, "turn_id": 2}},
+            {
+                "result": {
+                    "supported": True,
+                    "data_plane_append": True,
+                    "seq": 8,
+                    "turn_id": 3,
+                }
+            },
+        ],
+    }
+
+    assert duplex_input_acceptance_info(result) == (8, 3)
+    assert duplex_input_acceptance_info({"accepted_input_seq": 99, "stage_results": []}) == (None, None)
+
+
 def test_duplex_scheduler_token_budget_estimates_pcm_slots():
     assert (
         duplex_scheduler_token_budget(
@@ -478,3 +499,22 @@ def test_placeholder_budget_is_planned_inside_omni_engine_boundary():
     assert len(prompt["prompt_token_ids"]) == 16
     assert prompt["model_intermediate_buffer"]["duplex"]["fence"] == fence
     assert prompt["model_intermediate_buffer"]["duplex"]["scheduler_token_budget"] == 16
+
+
+def test_internal_continuation_keeps_control_and_origin_input_sequences_distinct():
+    fence = DuplexFence("sid", turn_id=3)
+    prompt = build_duplex_data_plane_prompt(
+        request_id=duplex_resource_request_id(fence, "stage0"),
+        fence=fence,
+        session_config={},
+        runtime_config={},
+        seq=12,
+        turn_seq=4,
+        mode=DuplexInputMode.APPEND_AUDIO_CHUNK,
+        payload={"duplex_origin_input_seq": 7},
+        final=False,
+    )
+
+    duplex = prompt["model_intermediate_buffer"]["duplex"]
+    assert duplex["seq"] == 12
+    assert duplex["input_seq"] == 7

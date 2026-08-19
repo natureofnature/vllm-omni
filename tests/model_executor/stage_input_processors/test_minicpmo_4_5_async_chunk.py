@@ -47,6 +47,7 @@ def _duplex_delta(
     *codes: int,
     epoch: int = 3,
     turn_id: int = 7,
+    input_seq: int = 11,
     text: str = "segment",
     turn_end: bool = False,
 ):
@@ -58,6 +59,7 @@ def _duplex_delta(
             "native_duplex": torch.tensor(True),
             "duplex_epoch": torch.tensor(epoch),
             "duplex_turn_id": torch.tensor(turn_id),
+            "duplex_input_seq": torch.tensor(input_seq),
             "llm_output_text_utf8": text_utf8,
             "turn_end": torch.tensor(turn_end),
         },
@@ -179,6 +181,7 @@ def test_first_chunk_forwards_reference_voice_and_duplex_identity() -> None:
     )
     assert payload.meta.duplex_epoch == 3
     assert payload.meta.duplex_turn_id == 7
+    assert payload.meta.duplex_input_seq == 11
     assert payload.meta.tts_is_last_chunk is True
     assert payload.meta.turn_end is True
 
@@ -194,7 +197,7 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
             "segment_end": True,
             "turn_end": True,
         },
-        "duplex": {"epoch": 3, "model_turn_id": 7},
+        "duplex": {"epoch": 3, "model_turn_id": 7, "input_seq": 11},
     }
 
     payload = tts2code2wav_full_payload(
@@ -220,6 +223,7 @@ def test_full_payload_forwards_all_codes_and_request_metadata() -> None:
     assert payload.meta.native_duplex_segment_text == "hello"
     assert payload.meta.duplex_epoch == 3
     assert payload.meta.duplex_turn_id == 7
+    assert payload.meta.duplex_input_seq == 11
     assert payload.meta.segment_end is True
     assert payload.meta.turn_end is True
 

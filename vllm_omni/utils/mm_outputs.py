@@ -30,6 +30,7 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
     {
         "audio_text_total_chars",
         "duplex_epoch",
+        "duplex_input_seq",
         "duplex_turn_id",
         "llm_output_text_utf8",
         "segment_end",
@@ -37,6 +38,25 @@ _CLIENT_MM_META_KEYS: frozenset[str] = frozenset(
         "turn_end",
     }
 )
+
+_DUPLEX_IDENTITY_META_KEYS: frozenset[str] = frozenset({"duplex_epoch", "duplex_input_seq", "duplex_turn_id"})
+
+
+def _has_valid_duplex_identity(payload: Mapping[str, object]) -> bool:
+    input_seq = payload.get("meta.duplex_input_seq")
+    if isinstance(input_seq, torch.Tensor):
+        if input_seq.numel() != 1:
+            return False
+        input_seq = input_seq.item()
+    return isinstance(input_seq, int) and not isinstance(input_seq, bool) and input_seq > 0
+
+
+def strip_invalid_duplex_identity(payload: dict[str, object]) -> None:
+    """Remove an incomplete/sentinel duplex identity from one request lane."""
+    if _has_valid_duplex_identity(payload):
+        return
+    for key in _DUPLEX_IDENTITY_META_KEYS:
+        payload.pop(f"meta.{key}", None)
 
 
 def partition_flat_payload(
@@ -47,11 +67,14 @@ def partition_flat_payload(
         return {}, {}
     inter_stage: dict[str, object] = {}
     client_mm: dict[str, object] = {}
+    has_valid_duplex_identity = _has_valid_duplex_identity(payload)
     for key, value in payload.items():
         root = key.split(".", 1)[0]
         if root in _CLIENT_MM_ROOT_KEYS:
             client_mm[key] = value
         elif root == "meta" and "." in key and key.split(".", 1)[1] in _CLIENT_MM_META_KEYS:
+            if key.split(".", 1)[1] in _DUPLEX_IDENTITY_META_KEYS and not has_valid_duplex_identity:
+                continue
             # Small final-output metadata needed by serving (for example
             # transcript text attached to audio) must ride with client MM
             # output. Keep it in inter-stage too so downstream stages that read

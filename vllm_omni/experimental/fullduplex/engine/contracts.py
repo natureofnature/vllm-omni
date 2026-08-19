@@ -226,6 +226,29 @@ def duplex_data_plane_request_info(result: dict[str, object]) -> tuple[str | Non
     return None, None
 
 
+def duplex_input_acceptance_info(result: dict[str, object]) -> tuple[int | None, int | None]:
+    """Return the accepted input identity from the Stage 0 append result."""
+    stage_results = result.get("stage_results")
+    if not isinstance(stage_results, list):
+        return None, None
+    for item in stage_results:
+        if not isinstance(item, dict):
+            continue
+        inner = item.get("result")
+        if (
+            not isinstance(inner, dict)
+            or inner.get("supported") is not True
+            or inner.get("data_plane_append") is not True
+        ):
+            continue
+        seq = inner.get("seq")
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq <= 0:
+            continue
+        turn_id = inner.get("turn_id")
+        return seq, turn_id if isinstance(turn_id, int) and not isinstance(turn_id, bool) else None
+    return None, None
+
+
 def duplex_resource_request_id(fence: DuplexFence, role: str) -> str:
     if not role or any(
         character not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" for character in role
@@ -271,6 +294,7 @@ __all__ = [
     "DuplexStageSubmissionResult",
     "SessionMode",
     "duplex_data_plane_request_info",
+    "duplex_input_acceptance_info",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
 ]

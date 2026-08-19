@@ -90,6 +90,124 @@ class ServingRuntimeSessionState(Protocol):
     def clear_continuation(self) -> None: ...
 
 
+class ServingInputLifecycle(Protocol):
+    """Optional exact-input lifecycle implemented by model-native adapters."""
+
+    def begin(
+        self,
+        token: object,
+        *,
+        epoch: int,
+        final: bool,
+        generation: int | None = None,
+    ) -> None: ...
+
+    def seal_generation(self, *, epoch: int) -> int: ...
+
+    def current_generation(self, *, epoch: int) -> int: ...
+
+    def target_turn_for_generation(
+        self,
+        *,
+        epoch: int,
+        generation: int,
+        minimum_turn_id: int,
+    ) -> int: ...
+
+    def cancel_generation(self, *, epoch: int, generation: int) -> None: ...
+
+    def cancel(self, token: object) -> None: ...
+
+    def mark_ambiguous(self, token: object) -> None: ...
+
+    def has_ambiguous_generation(self, *, epoch: int, generation: int) -> bool: ...
+
+    def accept(
+        self,
+        token: object,
+        *,
+        epoch: int,
+        seq: int,
+        accepted_turn_id: int,
+        target_turn_id: int,
+    ) -> bool: ...
+
+    def release(self, *, epoch: int, seq: int) -> list[dict[str, object]]: ...
+
+    def drain_deferred(self, *, epoch: int, seq: int) -> list[dict[str, object]]: ...
+
+    def finish_release(self, *, epoch: int, seq: int) -> None: ...
+
+    def defer_unaccepted_output(self, *, epoch: int, seq: int, output: dict[str, object]) -> bool: ...
+
+    def promote_latest_final(
+        self,
+        *,
+        epoch: int,
+        generation: int,
+        target_model_turn_id: int,
+    ) -> int | None: ...
+
+    def can_claim_response(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        model_turn_id: int | None,
+    ) -> bool: ...
+
+    def output_target_turn(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        model_turn_id: int | None,
+    ) -> int | None: ...
+
+    def response_accepts_or_claims(
+        self,
+        *,
+        response_id: str,
+        epoch: int,
+        seq: int,
+        model_turn_id: int | None,
+    ) -> bool: ...
+
+    def response_origin_input_seq(self, *, response_id: str, epoch: int) -> int | None: ...
+
+    def accepted_identity(self, *, epoch: int, generation: int | None = None) -> tuple[int, int] | None: ...
+
+    def is_final(self, *, epoch: int, seq: int, model_turn_id: int | None = None) -> bool: ...
+
+    def final_target_turn(self, *, epoch: int, seq: int) -> int | None: ...
+
+    def is_latest_final(self, *, epoch: int, seq: int, model_turn_id: int | None = None) -> bool: ...
+
+    def superseded_finals(self, *, epoch: int, before_seq: int) -> list[tuple[int, int]]: ...
+
+    def resolve_final(self, *, epoch: int, seq: int, model_turn_id: int | None = None) -> None: ...
+
+    def remember_decision(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        model_turn_id: int | None,
+        outcome: str,
+        response_id: str | None = None,
+    ) -> None: ...
+
+    def pending_processed(
+        self,
+        *,
+        epoch: int,
+        seq: int,
+        model_turn_id: int,
+    ) -> tuple[str, str | None] | None: ...
+
+    def mark_processed_emitted(self, *, epoch: int, seq: int, model_turn_id: int) -> bool: ...
+
+
 class RuntimeDataPlane(Protocol):
     def begin_request(self, request_id: str) -> None: ...
 

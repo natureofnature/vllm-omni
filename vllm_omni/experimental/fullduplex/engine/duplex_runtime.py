@@ -16,6 +16,7 @@ from vllm_omni.experimental.fullduplex.engine.contracts import (
     DuplexRuntimeExtension,
     SessionMode,
     duplex_data_plane_request_info,
+    duplex_input_acceptance_info,
     duplex_resource_request_belongs_to_session,
     duplex_resource_request_id,
 )
@@ -101,6 +102,7 @@ __all__ = [
     "DuplexStageBinding",
     "SessionMode",
     "duplex_data_plane_request_info",
+    "duplex_input_acceptance_info",
     "duplex_resource_request_belongs_to_session",
     "duplex_resource_request_id",
     "load_duplex_runtime_extension",
