@@ -6,3 +6,6 @@
 # both the model registry and pipeline registry import submodules
 # directly — heavy imports here would be loaded as a side effect
 # even though nothing depends on these re-exports.
+
+# One MiniCPMTTS.generate_chunk emits 25 codec frames plus its terminator.
+MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26

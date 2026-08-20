@@ -203,6 +203,7 @@ def test_native_duplex_continuation_appends_only_new_talker_condition() -> None:
     assert "replace_streaming_prompt" not in second_input["model_intermediate_buffer"]["meta"]
     assert third_input["model_intermediate_buffer"]["meta"]["replace_streaming_prompt"] is True
     assert second_input["model_intermediate_buffer"]["meta"]["next_stage_prompt_len"] == 3
+    assert second_input["model_intermediate_buffer"]["meta"]["next_stage_generation_tokens"] == 26
     assert second_input["prompt_token_ids"] == [0, 0, 0]
 
 

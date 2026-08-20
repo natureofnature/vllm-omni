@@ -28,23 +28,19 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
 
 _REPETITION_PENALTY_CHUNK_SIZE = 16
-# Native duplex Talker must finish after one MiniCPMTTS.generate_chunk:
-# 25 codec frames (``codec_chunk_frames``) plus the terminating sample.
-# Without this, the single-vocab Sampler keeps the stage-1 request alive
-# until codec EOS / 4096 and Thinker never starts the next model turn.
-_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
     """Return ``(max_tokens, min_tokens)`` for one native-duplex Talker request."""
     boundary = isinstance(meta, Mapping) and (bool(meta.get("turn_start")) or bool(meta.get("turn_end")))
-    ceiling = _DUPLEX_CODEC_TOKENS_PER_CHUNK
+    ceiling = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
     return ceiling, 0 if boundary else ceiling
 
 
