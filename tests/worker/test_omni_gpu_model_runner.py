@@ -562,6 +562,7 @@ def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
             "finished": False,
             "is_segment_finished": True,
             "request_finished": False,
+            "replace_runtime_additional_information": True,
         }
     }
     new_req = SimpleNamespace(
@@ -588,6 +589,32 @@ def test_streaming_new_request_marker_replaces_terminal_chunk_snapshot():
     }
     assert runner.requests["r1"].additional_information_cpu == info
     assert runner.model_intermediate_buffer["r2"] == peer
+
+
+def test_cached_empty_marker_replaces_terminal_chunk_snapshot():
+    runner = _make_runner(req_ids=("r1",), hidden_size=4)
+    runner.model.replace_runtime_additional_information = True
+    runner.model_intermediate_buffer["r1"] = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    marker = {
+        "meta": {
+            "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+            "replace_runtime_additional_information": True,
+        }
+    }
+
+    OmniGPUModelRunner._update_additional_information(
+        runner,
+        SimpleNamespace(
+            scheduled_new_reqs=[],
+            scheduled_cached_reqs=SimpleNamespace(additional_information={"r1": marker}),
+        ),
+    )
+
+    assert runner.model_intermediate_buffer["r1"] == marker
+    assert runner.requests["r1"].additional_information_cpu == marker
 
 
 def test_update_intermediate_buffer_skips_empty_update():

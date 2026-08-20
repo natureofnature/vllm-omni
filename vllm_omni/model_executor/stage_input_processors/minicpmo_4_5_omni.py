@@ -264,7 +264,10 @@ def tts2code2wav_async_chunk(
         # Emit an empty replacement snapshot so Code2Wav cannot replay the
         # prior terminal audio when this control-only boundary arrives.
         return OmniPayloadStruct(
-            meta=_MiniCPMO45MetaStruct(replace_runtime_additional_information=True),
+            meta=_MiniCPMO45MetaStruct(
+                is_segment_finished=torch.tensor(True, dtype=torch.bool),
+                replace_runtime_additional_information=True,
+            ),
             request_id=request_id,
         )
 

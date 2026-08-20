@@ -672,6 +672,32 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert request.request_id in adapter.segment_finished_requests
 
 
+def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-empty-marker", RequestStatus.WAITING, external_req_id="external-empty-marker")
+    request.additional_information = {
+        "codes": {"audio": torch.tensor([1, 2])},
+        "meta": {"cache_epoch": 0, "chunk_seq": 2, "last_chunk": True},
+    }
+    connector.get.return_value = (
+        {
+            "meta": {
+                "is_segment_finished": torch.tensor(True, dtype=torch.bool),
+                "replace_runtime_additional_information": True,
+            }
+        },
+        1,
+    )
+
+    assert adapter._poll_single_request(request) is True
+
+    assert request.prompt_token_ids == [0]
+    assert "codes" not in request.additional_information
+    assert request.additional_information["meta"]["replace_runtime_additional_information"] is True
+    assert request.request_id in adapter.segment_finished_requests
+    assert request.request_id in adapter._finished_load_reqs
+
+
 def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="generation")
     request = _req("req-incremental", RequestStatus.WAITING, external_req_id="external-incremental")
