@@ -162,7 +162,10 @@ class OmniSchedulerMixin:
         # pre-replacement frame will drain, so the counter reaches exactly
         # zero; a placeholder-based seed swallowed valid new-segment frames
         # whenever placeholder counts diverged from scheduled counts.
-        session.num_stale_output_tokens += int(getattr(session, "num_in_flight_tokens", 0) or 0)
+        # num_in_flight_tokens already includes any undrained stale share.
+        # Assign instead of accumulating so callers that fenced the same
+        # rollover before entering this helper do not count it twice.
+        session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
         new_prompt = update.prompt_token_ids or ()

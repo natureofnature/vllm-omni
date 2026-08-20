@@ -298,6 +298,7 @@ def test_over_budget_model_intermediate_payload_replaces_computed_prompt() -> No
     session._all_token_ids.extend(session.prompt_token_ids)
     session.num_prompt_tokens = 59
     session.num_computed_tokens = 59
+    session.num_in_flight_tokens = 2
     update = _make_update([0] * 10)
     update.additional_information = None
     update.model_intermediate_buffer = {
@@ -316,6 +317,7 @@ def test_over_budget_model_intermediate_payload_replaces_computed_prompt() -> No
     assert list(session._all_token_ids) == [0] * 10
     assert session.num_prompt_tokens == 10
     assert session.num_computed_tokens == 0
+    assert session.num_stale_output_tokens == 2
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
