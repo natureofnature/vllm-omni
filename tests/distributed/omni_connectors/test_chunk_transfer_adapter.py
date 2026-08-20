@@ -1014,12 +1014,30 @@ def test_finish_requests_restores_status(build_adapter):
     prior = RequestStatus.RUNNING
     request = _req(req_id, RequestStatus.WAITING_FOR_CHUNK)
     adapter.requests_origin_status[req_id] = prior
+    adapter.waiting_for_chunk_running_requests.append(request)
     requests_map = {req_id: request}
 
     adapter.finish_requests([req_id], RequestStatus.FINISHED_ABORTED, requests_map)
 
     assert request.status == prior
     assert req_id not in adapter.requests_origin_status
+    assert not adapter.waiting_for_chunk_running_requests
+
+
+def test_finish_requests_does_not_restore_stale_status_without_connector_ownership(build_adapter):
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-restored", RequestStatus.WAITING_FOR_STREAMING_REQ)
+    request.resumable = True
+    adapter.requests_origin_status[request.request_id] = RequestStatus.RUNNING
+
+    adapter.finish_requests(
+        [request.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {request.request_id: request},
+    )
+
+    assert request.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+    assert request.request_id not in adapter.requests_origin_status
 
 
 def test_finish_requests_removes_zombies_from_chunk_waiting_deques(build_adapter):
@@ -1071,12 +1089,15 @@ def test_finish_requests_releases_active_stream_slot(build_adapter):
 
 @pytest.mark.parametrize("scheduler_cls", [OmniGenerationScheduler, OmniARScheduler])
 @pytest.mark.parametrize(
-    ("placement", "origin_status"),
+    ("placement", "origin_status", "initial_status", "streaming_counter_owned"),
     [
-        ("hidden", RequestStatus.RUNNING),
-        ("running", RequestStatus.WAITING),
-        ("waiting", RequestStatus.WAITING),
-        ("skipped", RequestStatus.WAITING),
+        ("hidden", RequestStatus.RUNNING, RequestStatus.FINISHED_STOPPED, False),
+        ("running", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, False),
+        ("waiting", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, False),
+        ("skipped", RequestStatus.WAITING, RequestStatus.FINISHED_STOPPED, True),
+        ("skipped_streaming", RequestStatus.RUNNING, RequestStatus.WAITING_FOR_STREAMING_REQ, True),
+        ("skipped_hidden", RequestStatus.RUNNING, RequestStatus.FINISHED_STOPPED, True),
+        ("skipped_non_streaming", RequestStatus.WAITING, RequestStatus.WAITING, False),
     ],
 )
 def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
@@ -1084,16 +1105,18 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
     scheduler_cls,
     placement,
     origin_status,
+    initial_status,
+    streaming_counter_owned,
 ):
     adapter, _ = build_adapter(stage_id=1, active_stream_window=2)
     request = _req(
         "req-segment-stop",
-        RequestStatus.FINISHED_STOPPED,
+        initial_status,
         external_req_id="ext-segment-stop",
     )
     request.resumable = True
     adapter.requests_origin_status[request.request_id] = origin_status
-    if placement == "hidden":
+    if placement in {"hidden", "skipped_hidden"}:
         adapter.waiting_for_chunk_running_requests.append(request)
     adapter._active_streams[request.request_id] = request
 
@@ -1103,8 +1126,8 @@ def test_finish_requests_reclaims_resumable_segment_and_reuses_capacity(
     scheduler.requests = {request.request_id: request}
     scheduler.running = [request] if placement == "running" else []
     scheduler.waiting = DummyWaitingQueue([request] if placement == "waiting" else [])
-    scheduler.skipped_waiting = DummyWaitingQueue([request] if placement == "skipped" else [])
-    scheduler.num_waiting_for_streaming_input = int(placement == "skipped")
+    scheduler.skipped_waiting = DummyWaitingQueue([request] if placement.startswith("skipped") else [])
+    scheduler.num_waiting_for_streaming_input = int(streaming_counter_owned)
 
     freed = []
 

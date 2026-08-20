@@ -580,10 +580,24 @@ class OmniSchedulerMixin:
                 request_ids = tuple(request_ids)
             target_request_ids = set(request_ids)
 
+        skipped_waiting_ids = {r.request_id for r in getattr(self, "skipped_waiting", ())}
+        pre_adapter_streaming_wait_ids = {
+            rid
+            for rid in target_request_ids & skipped_waiting_ids
+            if (req := self.requests.get(rid)) is not None
+            and (
+                req.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+                or (getattr(req, "resumable", False) and req.status == RequestStatus.FINISHED_STOPPED)
+            )
+        }
+
         if self.chunk_transfer_adapter:
             self.chunk_transfer_adapter.finish_requests(request_ids, finished_status, self.requests)
 
-        self._realign_request_status_to_queues(request_ids)
+        self._realign_request_status_to_queues(
+            request_ids,
+            pre_adapter_streaming_wait_ids=pre_adapter_streaming_wait_ids,
+        )
         finished = super().finish_requests(request_ids, finished_status)
         self._purge_finished_from_running(target_request_ids)
 
@@ -601,6 +615,8 @@ class OmniSchedulerMixin:
     def _realign_request_status_to_queues(
         self,
         request_ids: str | Iterable[str] | None,
+        *,
+        pre_adapter_streaming_wait_ids: set[str] | None = None,
     ) -> None:
         """Realign ``request.status`` to actual queue membership.
 
@@ -630,7 +646,10 @@ class OmniSchedulerMixin:
         ``self.waiting``. A resumable segment stop still held in
         ``self.skipped_waiting`` is restored to
         ``WAITING_FOR_STREAMING_REQ`` so upstream also balances its
-        paused-session counter. This is a localized safety net for
+        paused-session counter. Because adapter cleanup may restore a
+        connector-owned request's prior status first, ``finish_requests``
+        snapshots these counter-bearing rows before invoking the adapter.
+        This is a localized safety net for
         ``requests_origin_status`` staleness on the admit transition;
         it does not touch the adapter's invariants and is complementary
         to the chunk-transfer-adapter deque purge that already runs
@@ -678,12 +697,17 @@ class OmniSchedulerMixin:
             resumable_segment_stop = bool(
                 getattr(req, "resumable", False) and req.status == RequestStatus.FINISHED_STOPPED
             )
-            if req.is_finished() and not resumable_segment_stop:
+            streaming_wait = (
+                rid in pre_adapter_streaming_wait_ids
+                if pre_adapter_streaming_wait_ids is not None
+                else resumable_segment_stop
+            )
+            if req.is_finished() and not (resumable_segment_stop or streaming_wait):
                 continue
-            if rid in running_ids and req.status != RequestStatus.RUNNING:
-                req.status = RequestStatus.RUNNING
-            elif rid in skipped_waiting_ids and resumable_segment_stop:
+            if rid in skipped_waiting_ids and streaming_wait:
                 req.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+            elif rid in running_ids and req.status != RequestStatus.RUNNING:
+                req.status = RequestStatus.RUNNING
             elif rid in waiting_ids and (req.status == RequestStatus.RUNNING or resumable_segment_stop):
                 req.status = RequestStatus.WAITING
 
@@ -708,6 +732,10 @@ class OmniSchedulerMixin:
         in ``self.running`` between realtime segments. Preserve such a
         request unless it belongs to this finish call. Other finished or
         untracked entries are stale and can be swept defensively.
+
+        When ``target_request_ids`` is ``None`` or empty, every resumable
+        ``FINISHED_STOPPED`` entry is preserved. Production
+        ``finish_requests`` always passes its resolved finish set.
 
         In-place via ``self.running[:] = ...`` for minor consistency
         with idiomatic vLLM scheduler mutation; upstream

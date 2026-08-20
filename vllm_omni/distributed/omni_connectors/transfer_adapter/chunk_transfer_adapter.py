@@ -890,7 +890,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             )
             if request.is_finished() and not resumable_segment_stop:
                 continue
-            if req_id in self.requests_origin_status and (not resumable_segment_stop or req_id in connector_owned_ids):
+            # Once restored to a scheduler queue, the saved origin is stale and
+            # must not overwrite statuses such as WAITING_FOR_STREAMING_REQ.
+            if req_id in self.requests_origin_status and req_id in connector_owned_ids:
                 request.status = self.requests_origin_status.pop(req_id)
 
         request_ids = set(request_ids)
