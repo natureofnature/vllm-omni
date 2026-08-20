@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import threading
 from collections import deque
@@ -335,6 +335,44 @@ def test_save_async_uses_confirmed_tokens_for_async_scheduler_watermark(build_ad
 
     assert adapter.requests_num_chunks_sent["external-async"] == 8
     assert len(adapter._pending_save_reqs) == 1
+
+
+def test_segment_boundary_starts_new_send_watermark_before_background_flush(build_adapter):
+    """A queued boundary owns the end of its deduplication generation.
+
+    The next segment can start before the save thread sends the old boundary.
+    Sending that old task later must not erase the new segment's watermark.
+    """
+    adapter, _ = build_adapter(stage_id=1)
+    request = _req("req-stream", RequestStatus.WAITING, external_req_id="ext-stream")
+    request.resumable = True
+    request.num_computed_tokens = 0
+    adapter.requests_num_chunks_sent["ext-stream"] = 26
+
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=True,
+        confirmed_num_computed_tokens=26,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    boundary_task = adapter._pending_save_reqs.popleft()
+    assert "ext-stream" not in adapter.requests_num_chunks_sent
+
+    request.num_computed_tokens = 3
+    adapter.save_async(
+        multimodal_output=None,
+        request=request,
+        is_segment_finished=False,
+    )
+
+    assert len(adapter._pending_save_reqs) == 1
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
+
+    adapter._send_single_request(boundary_task)
+
+    assert adapter.requests_num_chunks_sent["ext-stream"] == 3
 
 
 def test_send_single_request_terminal_chunk_still_flushes_processor(build_adapter, monkeypatch):

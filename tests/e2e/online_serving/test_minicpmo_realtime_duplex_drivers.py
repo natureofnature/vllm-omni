@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import importlib.util
@@ -766,6 +769,67 @@ def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
         demo._event_session_id({"type": "session.closed", "event": {"type": "session.closed", "session_id": "sid"}})
         == "sid"
     )
+
+
+def test_realtime_duplex_synchronized_start_gate_releases_all_participants():
+    demo = _load_multi_demo_module()
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(3, timeout_s=0.5)
+        released = []
+
+        async def participant(index):
+            await gate.wait()
+            released.append(index)
+
+        await asyncio.wait_for(
+            asyncio.gather(*(participant(index) for index in range(3))),
+            timeout=1.0,
+        )
+        return released
+
+    assert set(asyncio.run(exercise())) == {0, 1, 2}
+
+
+def test_realtime_duplex_synchronized_start_gate_aborts_waiters_on_failure(monkeypatch):
+    demo = _load_multi_demo_module()
+
+    async def fake_run_demo(args):
+        if args.fail:
+            raise RuntimeError("session creation failed")
+        await args.start_barrier.wait()
+        return {"ok": True}
+
+    monkeypatch.setattr(demo, "run_demo", fake_run_demo)
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(2, timeout_s=0.5)
+        return await asyncio.wait_for(
+            asyncio.gather(
+                demo._run_demo_with_start_gate(SimpleNamespace(start_barrier=gate, fail=True)),
+                demo._run_demo_with_start_gate(SimpleNamespace(start_barrier=gate, fail=False)),
+                return_exceptions=True,
+            ),
+            timeout=1.0,
+        )
+
+    failed, aborted = asyncio.run(exercise())
+    assert isinstance(failed, RuntimeError)
+    assert str(failed) == "session creation failed"
+    assert isinstance(aborted, RuntimeError)
+    assert "synchronized start aborted" in str(aborted)
+    assert "session creation failed" in str(aborted)
+
+
+def test_realtime_duplex_synchronized_start_gate_has_bounded_wait():
+    demo = _load_multi_demo_module()
+
+    async def exercise():
+        gate = demo._SynchronizedStartGate(2, timeout_s=0.01)
+        await gate.wait()
+
+    with pytest.raises(TimeoutError, match=r"1/2 sessions ready"):
+        asyncio.run(exercise())
 
 
 def test_realtime_duplex_demo_resolves_distinct_turn_inputs():

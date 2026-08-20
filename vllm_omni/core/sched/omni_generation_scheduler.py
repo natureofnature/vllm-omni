@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import time
@@ -35,6 +38,16 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         model_config = self.vllm_config.model_config
         self._init_omni_io_scheduling_state()
         self._retains_state_across_chunks = bool(getattr(model_config, "retains_state_across_chunks", False))
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        connector_extra = connector_config.get("extra", {}) if isinstance(connector_config, dict) else {}
+        self._code2wav_batch_enabled = "code2wav_batch_target_size" in connector_extra
+        self._code2wav_batch_target_size = int(connector_extra.get("code2wav_batch_target_size", 0))
+        self._code2wav_initial_batch_size = int(connector_extra.get("code2wav_initial_batch_size", 0))
+        self._code2wav_batch_wait_s = float(connector_extra.get("code2wav_batch_wait_ms", 0)) / 1000
+        self._code2wav_batch_quiet_s = float(connector_extra.get("code2wav_batch_quiet_ms", 0)) / 1000
+        self._code2wav_batch_wait_started: float | None = None
+        self._code2wav_batch_last_ready_count = 0
+        self._code2wav_batch_last_progress: float | None = None
         self._pending_finish_reqs: list[Request] = []
 
     @staticmethod
@@ -99,6 +112,9 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         skipped_waiting_requests = create_request_queue(self.policy)
         req_index = 0
         self._process_pending_omni_inputs(model_mode="generation")
+        if self.chunk_transfer_adapter:
+            if self._should_wait_for_code2wav_batch(scheduled_timestamp):
+                token_budget = 0
 
         # OMNI: Track requests that are already finished (e.g., marked by connector)
         # These should be removed from running and not scheduled
@@ -618,3 +634,76 @@ class OmniGenerationScheduler(OmniSchedulerMixin, VLLMScheduler):
         Do not expend prompt id using update.
         """
         self._replace_streaming_session(session, update)
+
+    def _reset_code2wav_batch_wait(self) -> None:
+        self._code2wav_batch_wait_started = None
+        self._code2wav_batch_last_ready_count = 0
+        self._code2wav_batch_last_progress = None
+
+    def _should_wait_for_code2wav_batch(self, now: float) -> bool:
+        if (
+            not self._code2wav_batch_enabled
+            or self.chunk_transfer_adapter is None
+            or not self.chunk_transfer_adapter.receives_chunks
+            or self._code2wav_batch_target_size <= 1
+            or self._code2wav_batch_wait_s <= 0
+        ):
+            self._reset_code2wav_batch_wait()
+            return False
+
+        ready_request_ids = {
+            request.request_id
+            for request in self.running
+            if request.request_id in self.requests and len(request.prompt_token_ids) > request.num_computed_tokens
+        }
+        ready_request_ids.update(
+            request.request_id
+            for request in self.waiting
+            if request.request_id in self.requests and request.prompt_token_ids
+        )
+        ready_count = len(ready_request_ids)
+        target_size = self._code2wav_batch_target_size
+        is_initial_batch = self._code2wav_initial_batch_size > 0 and all(
+            self._code2wav_chunk_seq(self.requests[request_id]) in (0, 1) for request_id in ready_request_ids
+        )
+        if is_initial_batch:
+            target_size = min(self._code2wav_initial_batch_size, target_size)
+        elif len(self.requests) < target_size:
+            self._reset_code2wav_batch_wait()
+            return False
+        if ready_count == 0 or ready_count >= target_size:
+            self._reset_code2wav_batch_wait()
+            return False
+        if self._code2wav_batch_wait_started is None:
+            self._code2wav_batch_wait_started = now
+            self._code2wav_batch_last_ready_count = ready_count
+            self._code2wav_batch_last_progress = now
+            return True
+
+        if ready_count != self._code2wav_batch_last_ready_count:
+            self._code2wav_batch_last_ready_count = ready_count
+            self._code2wav_batch_last_progress = now
+
+        wait_elapsed = now - self._code2wav_batch_wait_started >= self._code2wav_batch_wait_s
+        quiet_elapsed = (
+            not is_initial_batch
+            and self._code2wav_batch_quiet_s > 0
+            and self._code2wav_batch_last_progress is not None
+            and now - self._code2wav_batch_last_progress >= self._code2wav_batch_quiet_s
+        )
+        if wait_elapsed or quiet_elapsed:
+            self._reset_code2wav_batch_wait()
+            return False
+        return True
+
+    @staticmethod
+    def _code2wav_chunk_seq(request: Request) -> int | None:
+        info = getattr(request, "additional_information", None)
+        meta = info.get("meta") if isinstance(info, dict) else None
+        value = meta.get("chunk_seq") if isinstance(meta, dict) else None
+        if hasattr(value, "item"):
+            value = value.item()
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
