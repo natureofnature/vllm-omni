@@ -9,6 +9,8 @@ import pytest
 import torch
 import torch.nn as nn
 
+pytest.importorskip("vllm_ascend")
+
 from tests.helpers.mark import hardware_marks
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
