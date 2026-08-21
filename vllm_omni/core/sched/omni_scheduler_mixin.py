@@ -216,7 +216,9 @@ class OmniSchedulerMixin:
             if request is None:
                 replaced_ids.discard(request_id)
                 continue
-            request.num_stale_output_tokens += int(getattr(request, "num_in_flight_tokens", 0) or 0)
+            # The streaming update may already have fenced this same in-flight
+            # frame. Seed idempotently so the replacement does not count it twice.
+            request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
             request.num_output_placeholders = 0
             request.spec_token_ids = []
             self._release_replaced_streaming_prompt_cache(request)

@@ -329,6 +329,9 @@ def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:
     session = _make_request()
     session.external_req_id = "external-ar-streaming-test"
     session.num_in_flight_tokens = 2
+    # _update_request_as_session() may have already fenced this frame before
+    # the connector marks the explicit replacement ready.
+    session.num_stale_output_tokens = 2
     session.num_output_placeholders = 2
     session.spec_token_ids = [-1, -1]
     sched.requests = {session.request_id: session}
