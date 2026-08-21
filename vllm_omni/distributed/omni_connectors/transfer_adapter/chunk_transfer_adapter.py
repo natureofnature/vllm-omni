@@ -43,18 +43,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     def __init__(self, vllm_config: Any):
         model_config = vllm_config.model_config
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
-        tts_config = getattr(getattr(model_config, "hf_config", None), "tts_config", None)
-        tts_max_model_len = (
-            tts_config.get("max_position_embeddings", 0)
-            if isinstance(tts_config, Mapping)
-            else getattr(tts_config, "max_position_embeddings", 0)
-        )
-        tts_max_model_len = int(tts_max_model_len or 0)
-        if tts_max_model_len > 0:
-            self._max_model_len = (
-                min(self._max_model_len, tts_max_model_len) if self._max_model_len else tts_max_model_len
-            )
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
@@ -259,11 +247,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 replace_prompt = meta.get("replace_streaming_prompt") is True
                 if getattr(request, "resumable", False) and (chunk_id > 0 or replace_prompt):
                     # For new streaming input segment, we should update prompt from payload
-                    replaced = construct_next_stage_streaming_input_prompt(
-                        payload_data,
-                        request,
-                        max_model_len=self._max_model_len,
-                    )
+                    replaced = construct_next_stage_streaming_input_prompt(payload_data, request)
                     if replaced:
                         self.replaced_streaming_prompt_ids.add(req_id)
 

@@ -114,8 +114,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         stage_id: int = 1,
         model_mode: str = "ar",
         max_num_seqs: int = 2,
-        max_model_len: int = 0,
-        tts_max_model_len: int = 0,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
     ):
@@ -146,12 +144,6 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         model_config = SimpleNamespace(
             worker_type=model_mode,
             max_num_seqs=max_num_seqs,
-            max_model_len=max_model_len,
-            hf_config=SimpleNamespace(
-                tts_config=SimpleNamespace(
-                    max_position_embeddings=tts_max_model_len,
-                )
-            ),
             active_stream_window=active_stream_window,
             stage_connector_config={
                 "name": "SharedMemoryConnector",
@@ -216,32 +208,25 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._pending_load_reqs
 
 
-def test_load_poll_ar_rolls_over_over_budget_running_prompt(build_adapter):
-    adapter, connector = build_adapter(
-        stage_id=1,
-        model_mode="ar",
-        max_model_len=8192,
-        tts_max_model_len=4096,
-    )
-    request = _req("req-rollover", RequestStatus.RUNNING, external_req_id="external-rollover")
+def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-replace", RequestStatus.RUNNING, external_req_id="external-replace")
     request.resumable = True
-    request.prompt_token_ids = [0] * 4064
-    request._all_token_ids = [0] * 4064
+    request.prompt_token_ids = [0] * 4
+    request._all_token_ids = [0] * 4
     request._output_token_ids = []
-    request.num_prompt_tokens = 4064
-    request.num_computed_tokens = 4064
-    request.sampling_params = SimpleNamespace(min_tokens=0)
+    request.num_prompt_tokens = 4
+    request.num_computed_tokens = 4
     request.update_block_hashes = Mock()
     adapter.get_req_chunk[request.request_id] = 1
-    adapter.requests_num_chunks_sent[request.external_req_id] = 4064
+    adapter.requests_num_chunks_sent[request.external_req_id] = 4
     adapter.request_ids_mapping[request.request_id] = request.external_req_id
     connector.get.return_value = (
         {
-            "native_duplex": True,
             "ids": {"prompt": [1]},
             "meta": {
                 "next_stage_prompt_len": 10,
-                "next_stage_generation_tokens": 26,
+                "replace_streaming_prompt": True,
                 "finished": False,
             },
         },
@@ -261,7 +246,7 @@ def test_load_poll_ar_rolls_over_over_budget_running_prompt(build_adapter):
     assert waiting_queue == [request]
     assert request.status == RequestStatus.WAITING
 
-    adapter.requests_num_chunks_sent[request.external_req_id] = 4090
+    adapter.requests_num_chunks_sent[request.external_req_id] = 9
     adapter.postprocess_scheduler_output(
         SimpleNamespace(
             scheduled_new_reqs=[SimpleNamespace(req_id=request.request_id)],

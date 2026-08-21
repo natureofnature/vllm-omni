@@ -283,14 +283,13 @@ def test_explicit_streaming_payload_replaces_placeholder_prompt() -> None:
     sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
-def test_over_budget_model_intermediate_payload_replaces_computed_prompt() -> None:
+def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_watermark() -> None:
     sched = _make_scheduler(stage_id=1)
     session = _make_request()
     sched.chunk_transfer_adapter = SimpleNamespace(
         receives_chunks=False,
         segment_finished_requests=set(),
         requests_num_chunks_sent={session.external_req_id: 59},
-        _max_model_len=64,
     )
     session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
     session.prompt_token_ids = [0] * 59
@@ -302,12 +301,11 @@ def test_over_budget_model_intermediate_payload_replaces_computed_prompt() -> No
     update = _make_update([0] * 10)
     update.additional_information = None
     update.model_intermediate_buffer = {
-        "native_duplex": True,
         "ids": {"tts": list(range(8))},
         "hidden_states": {"tts": [[0.0]] * 8},
         "meta": {
             "next_stage_prompt_len": 10,
-            "next_stage_generation_tokens": 26,
+            "replace_streaming_prompt": True,
         },
     }
 
@@ -321,6 +319,7 @@ def test_over_budget_model_intermediate_payload_replaces_computed_prompt() -> No
     assert session.additional_information is None
     assert session.model_intermediate_buffer == update.model_intermediate_buffer
     assert session.status == RequestStatus.WAITING
+    assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
     sched._free_request_blocks.assert_called_once_with(session)
     sched.encoder_cache_manager.free.assert_called_once_with(session)
 
