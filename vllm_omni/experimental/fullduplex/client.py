@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable Realtime WebSocket, PCM, and event helpers for MiniCPM-o demos."""
 
 from __future__ import annotations
@@ -56,11 +59,13 @@ def summarize_session_request_metrics(
     """Average client-observed metrics across turns that emitted audio."""
 
     def mean(metric: str, *, digits: int = 3) -> float | None:
-        values = [
-            float(request[metric])
-            for request in request_metrics
-            if isinstance(request.get(metric), int | float) and math.isfinite(float(request[metric]))
-        ]
+        values: list[float] = []
+        for request in request_metrics:
+            value = request.get(metric)
+            if isinstance(value, int | float) and not isinstance(value, bool):
+                parsed = float(value)
+                if math.isfinite(parsed):
+                    values.append(parsed)
         return round(sum(values) / len(values), digits) if values else None
 
     return {
@@ -286,11 +291,20 @@ class RealtimeEventCollector:
                 if isinstance(raw_itls, list)
                 else []
             )
+            raw_num_tokens = stage0_metrics.get("num_tokens_out")
+            raw_ttft = stage0_metrics.get("vllm_ttft_ms")
+            raw_tpot = stage0_metrics.get("vllm_tpot_ms")
             result["stage0_tokens"] = {
                 "source": "engine_stage_metrics",
-                "output_token_count": int(stage0_metrics.get("num_tokens_out") or 0),
-                "ttft_ms": float(stage0_metrics.get("vllm_ttft_ms") or 0.0),
-                "tpot_ms": float(stage0_metrics.get("vllm_tpot_ms") or 0.0),
+                "output_token_count": int(raw_num_tokens)
+                if isinstance(raw_num_tokens, int | float) and not isinstance(raw_num_tokens, bool)
+                else 0,
+                "ttft_ms": float(raw_ttft)
+                if isinstance(raw_ttft, int | float) and not isinstance(raw_ttft, bool)
+                else 0.0,
+                "tpot_ms": float(raw_tpot)
+                if isinstance(raw_tpot, int | float) and not isinstance(raw_tpot, bool)
+                else 0.0,
                 "inter_token_interval_ms": _interval_summary(itls),
             }
 
@@ -405,6 +419,19 @@ class RealtimeDuplexClient:
     async def send(self, event: dict[str, object]) -> None:
         await self._ws.send(json.dumps(event))
 
+    def raise_if_reader_stopped(self) -> None:
+        """Fail a caller waiting on events after the WebSocket reader exits."""
+
+        task = self._reader_task
+        if task is None or not task.done():
+            return
+        if task.cancelled():
+            raise ConnectionError("Realtime WebSocket reader was cancelled")
+        error = task.exception()
+        if error is not None:
+            raise ConnectionError("Realtime WebSocket reader failed") from error
+        raise ConnectionError("Realtime WebSocket closed before the requested event arrived")
+
     async def configure(
         self,
         model: str,
@@ -418,6 +445,7 @@ class RealtimeDuplexClient:
         temperature: float | None = None,
         extra_body: dict[str, object] | None = None,
         session_id: str | None = None,
+        idle_timeout_s: float | None = None,
         timeout_s: float = 20.0,
     ) -> None:
         session_extra_body = dict(extra_body or {})
@@ -448,11 +476,13 @@ class RealtimeDuplexClient:
         if instructions is not None:
             session["instructions"] = instructions
         if initial_user_text is not None:
-            extra_body = session["extra_body"]
-            assert isinstance(extra_body, dict)
-            extra_body["duplex_initial_user_text"] = initial_user_text
+            session_extra = session["extra_body"]
+            assert isinstance(session_extra, dict)
+            session_extra["duplex_initial_user_text"] = initial_user_text
         if session_id:
             session["session_id"] = session_id
+        if idle_timeout_s is not None:
+            session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
         await wait_for(
             lambda: self.events.count("session.created") > 0,
@@ -509,9 +539,10 @@ class RealtimeDuplexClient:
             )
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
+        from_index = len(self.events.events)
         await self.send({"type": "session.close"})
         await wait_for(
-            lambda: self.events.count("session.closed") > 0,
+            lambda: any(event.get("type") == "session.closed" for event in self.events.events[from_index:]),
             timeout_s=timeout_s,
             label="session.closed",
         )

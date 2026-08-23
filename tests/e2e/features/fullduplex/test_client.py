@@ -1,3 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
+import asyncio
 import base64
 import wave
 from urllib.parse import parse_qs, urlsplit
@@ -73,10 +77,15 @@ async def test_realtime_client_configure_omits_ref_audio_by_default():
 
     client = Client()
 
-    await client.configure("openbmb/MiniCPM-o-4_5", timeout_s=1)
+    await client.configure(
+        "openbmb/MiniCPM-o-4_5",
+        idle_timeout_s=900,
+        timeout_s=1,
+    )
 
     session = client.sent[0]["session"]
     assert "ref_audio" not in session
+    assert session["idle_timeout_s"] == 900
 
 
 @pytest.mark.asyncio
@@ -100,6 +109,42 @@ async def test_realtime_client_configure_sends_explicit_ref_audio():
 
     session = client.sent[0]["session"]
     assert session["ref_audio"] == "data:audio/wav;base64,AAAA"
+    assert "idle_timeout_s" not in session
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_reports_reader_exit_to_event_waiters():
+    client = RealtimeDuplexClient("ws://unused")
+
+    async def stopped():
+        return None
+
+    client._reader_task = asyncio.create_task(stopped())
+    await client._reader_task
+
+    with pytest.raises(ConnectionError, match="closed before"):
+        client.raise_if_reader_stopped()
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_close_waits_for_a_new_session_closed_event():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            assert event["type"] == "session.close"
+
+            async def acknowledge_close():
+                await asyncio.sleep(0.02)
+                self.events.add({"type": "session.closed"})
+
+            asyncio.create_task(acknowledge_close())
+
+    client = Client("ws://unused")
+    client.events.add({"type": "session.closed", "reason": "old"})
+    started_at = asyncio.get_running_loop().time()
+
+    await client.close_session(timeout_s=0.2)
+
+    assert asyncio.get_running_loop().time() - started_at >= 0.01
 
 
 @pytest.mark.asyncio
