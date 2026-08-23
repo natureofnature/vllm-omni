@@ -17,6 +17,7 @@ from types import SimpleNamespace
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import websockets
+from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -204,10 +205,14 @@ async def _receive_until(ws, event_type: str, *, timeout_s: float) -> tuple[dict
     return await asyncio.wait_for(receive(), timeout=timeout_s)
 
 
+def _server_event_sequences(events: list[dict[str, object]]) -> list[int]:
+    return [sequence for event in events if isinstance(sequence := event.get("server_event_seq"), int)]
+
+
 async def _open_admission_session(
     args: argparse.Namespace,
     session_id: str,
-) -> tuple[object, dict[str, object]]:
+) -> tuple[ClientConnection, dict[str, object]]:
     url = _url_with_model(
         args.url,
         args.model,
@@ -233,7 +238,7 @@ async def _open_admission_session(
     return ws, created
 
 
-async def _close_admission_session(ws, *, timeout_s: float) -> None:
+async def _close_admission_session(ws: ClientConnection, *, timeout_s: float) -> None:
     await ws.send(json.dumps({"type": "session.close"}))
     await _receive_until(ws, "session.closed", timeout_s=timeout_s)
     await ws.close()
@@ -243,8 +248,8 @@ async def _admission_probe(args: argparse.Namespace, *, limit: int) -> dict[str,
     if limit < 1:
         raise ValueError("admission limit must be positive")
     prefix = f"admission-{uuid.uuid4().hex}"
-    accepted: list[tuple[object, dict[str, object]]] = []
-    replacement: tuple[object, dict[str, object]] | None = None
+    accepted: list[tuple[ClientConnection, dict[str, object]]] = []
+    replacement: tuple[ClientConnection, dict[str, object]] | None = None
     overflow_code = None
     try:
         for index in range(limit):
@@ -348,14 +353,7 @@ async def _resume_probe(
         generation = created.get("attachment_generation")
         if not isinstance(token, str) or not isinstance(incarnation, int):
             raise RuntimeError("session.created omitted resumable credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
     delay_s = args.expire_after_s if expect_expired else args.resume_after_ms / 1000
     if delay_s > 0:
@@ -398,7 +396,7 @@ async def _resume_probe(
         await second.send(json.dumps({"type": "session.close"}))
         closed, close_events = await _receive_until(second, "session.closed", timeout_s=args.timeout_s)
 
-    replay_sequences = [event["server_event_seq"] for event in replay if isinstance(event.get("server_event_seq"), int)]
+    replay_sequences = _server_event_sequences(replay)
     return {
         "ok": (
             resumed.get("session_id") == session_id
@@ -460,14 +458,7 @@ async def _takeover_probe(
         generation = created.get("attachment_generation")
         if not isinstance(token, str) or not isinstance(incarnation, int) or not isinstance(generation, int):
             raise RuntimeError("session.created omitted takeover credentials")
-        last_seq = max(
-            (
-                event.get("server_event_seq", 0)
-                for event in first_events
-                if isinstance(event.get("server_event_seq"), int)
-            ),
-            default=0,
-        )
+        last_seq = max(_server_event_sequences(first_events), default=0)
 
         second = await websockets.connect(_with_resume_mode(url), max_size=64 * 1024 * 1024)
         await second.send(
@@ -713,6 +704,13 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide exactly one --session-expected-token per session")
     if args.session_expected_token and not args.session_input_wav:
         parser.error("--session-expected-token requires --session-input-wav")
+    normalized_expected_tokens = [token.strip().casefold() for token in args.session_expected_token]
+    for token_index, token in enumerate(normalized_expected_tokens):
+        if any(
+            token in other_token or other_token in token
+            for other_token in normalized_expected_tokens[token_index + 1 :]
+        ):
+            parser.error("--session-expected-token values must not overlap after normalization")
     return args
 
 

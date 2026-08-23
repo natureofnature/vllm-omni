@@ -761,6 +761,34 @@ def test_realtime_duplex_multi_session_rejects_cross_session_response_identity()
     )
 
 
+def test_realtime_duplex_multi_session_rejects_overlapping_expected_tokens(monkeypatch, capsys):
+    demo = _load_multi_demo_module()
+    monkeypatch.setattr(
+        demo.sys,
+        "argv",
+        [
+            "multi.py",
+            "--sessions",
+            "2",
+            "--input-wav",
+            "fallback.wav",
+            "--session-input-wav",
+            "a.wav",
+            "--session-input-wav",
+            "b.wav",
+            "--session-expected-token",
+            "cat",
+            "--session-expected-token",
+            "cater",
+        ],
+    )
+
+    with pytest.raises(SystemExit):
+        demo.parse_args()
+
+    assert "must not overlap after normalization" in capsys.readouterr().err
+
+
 def test_realtime_duplex_multi_session_reads_nested_terminal_identity():
     demo = _load_multi_demo_module()
 
