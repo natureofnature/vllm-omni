@@ -25,13 +25,12 @@ vllm bench omniinteract --omni \
 When `--data-root` is omitted, the runner downloads
 `lucky-lance/OmniInteract` from Hugging Face. `--num-prompts 0` runs every
 video in the selected subsets. Audio is sent as 16 kHz PCM16 in 200 ms chunks,
-video is sampled at 1 FPS, and input is paced in real time by default.
+video is sampled at 1 FPS, and input is paced in real time. These official
+replay semantics are fixed by the public CLI.
 `--ref-audio` is required because the MiniCPM-o native-duplex runtime uses it
 to condition audio output. `--media-timeout-s` bounds each direct
 `ffprobe`/`ffmpeg` command; preprocessing and WebSocket concurrency share the
 `--max-concurrency` bound.
-`--no-pace` is a transport diagnostic; its wall-clock transcript timestamps
-must not be used as accuracy-alignment evidence.
 
 Use `--require-response` only for response-required functional E2E samples. A
 normal OmniInteract model may choose LISTEN for an entire video; that is a valid
@@ -58,8 +57,8 @@ Each successful case writes:
 
 Failures remove stale success markers and write `.failed.json`. The output root
 also contains `batch_summary.json` (with per-result `status`) and an
-official-compatible `manifest.jsonl` (`sample_id`, `gt_json`, `model_json`,
-`scene_type`) for a later accuracy workflow.
+official-compatible `official_eval_manifest.jsonl` (`sample_id`, `gt_json`,
+`model_json`, `scene_type`) for a later accuracy workflow.
 
 The current Realtime protocol does not expose accepted/processed input identity
 on `main`. Consequently, `.done` proves transport, response-lifecycle, and

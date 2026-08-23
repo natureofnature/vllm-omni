@@ -98,10 +98,6 @@ class OmniInteractBenchmarkResult:
     def failed(self) -> int:
         return len(self.results) - self.succeeded
 
-    @property
-    def exit_code(self) -> int:
-        return int(self.failed > 0)
-
     def as_dict(self) -> dict[str, Any]:
         return {
             "total": len(self.results),
@@ -412,11 +408,11 @@ def _chunk_period_ms(events: list[dict[str, object]]) -> int:
 def _needs_post_commit_decision(pcm_bytes: int, events: list[dict[str, object]]) -> bool:
     period_ms = _chunk_period_ms(events)
     unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * period_ms // 1000
-    created, done = response_ledger_from_events(events)
+    created, done = _response_ledger_from_events(events)
     return bool(created - done) or bool(unit_bytes and pcm_bytes % unit_bytes)
 
 
-def response_ledger_from_events(events: list[dict[str, object]]) -> tuple[set[str], set[str]]:
+def _response_ledger_from_events(events: list[dict[str, object]]) -> tuple[set[str], set[str]]:
     collector = RealtimeEventCollector()
     collector.events = events
     collector.event_received_at_s = [0.0] * len(events)
@@ -659,7 +655,7 @@ def write_success_artifacts(
         raise
 
 
-def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInteractCaseResult) -> dict[str, Any]:
+def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInteractCaseResult) -> None:
     directory = _output_dir(root, case)
     directory.mkdir(parents=True, exist_ok=True)
     for name in SUCCESS_ARTIFACTS:
@@ -672,17 +668,15 @@ def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInte
         "scene_type": "1QnA" if case.scene_type == "1qna" else case.scene_type,
     }
     _atomic_write_json(directory / ".failed.json", summary)
-    return summary
 
 
-def clear_case_artifacts(root: Path, case: OmniInteractCase) -> Path:
+def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
     """Invalidate a previous run before starting expensive preprocessing."""
 
     directory = _output_dir(root, case)
     directory.mkdir(parents=True, exist_ok=True)
     for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
         (directory / name).unlink(missing_ok=True)
-    return directory
 
 
 def write_batch_artifacts(
@@ -697,7 +691,10 @@ def write_batch_artifacts(
         for case, result in zip(cases, benchmark.results, strict=True)
         if result.success
     ]
-    _atomic_write_text(root / "manifest.jsonl", "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+    _atomic_write_text(
+        root / "official_eval_manifest.jsonl",
+        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+    )
 
 
 def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:

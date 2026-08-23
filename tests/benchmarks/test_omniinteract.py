@@ -206,6 +206,7 @@ def test_config_requires_reference_audio():
 @pytest.mark.parametrize(
     "events, error",
     [
+        ([(_created("duplicate"), 1.0), (_created("duplicate"), 1.1)], "duplicate response.created"),
         (
             [(_created("a"), 1.0), (_created("b"), 1.1), (_done("a"), 1.2), (_done("a"), 1.3)],
             "duplicate response.done",
@@ -405,7 +406,7 @@ def test_failure_artifact_removes_stale_success_files(tmp_path: Path):
     assert json.loads((output_dir / ".failed.json").read_text())["error"] == "boom"
 
 
-def test_batch_artifacts_match_official_evaluator_schema(tmp_path: Path):
+def test_batch_artifacts_match_official_evaluator_handoff(tmp_path: Path):
     case = _case(tmp_path)
     output_root = tmp_path / "output"
     result = oi.OmniInteractCaseResult(
@@ -418,7 +419,7 @@ def test_batch_artifacts_match_official_evaluator_schema(tmp_path: Path):
     oi.write_batch_artifacts(output_root, [case], oi.OmniInteractBenchmarkResult([result]))
 
     summary_row = json.loads((output_root / "batch_summary.json").read_text())["results"][0]
-    manifest_row = json.loads((output_root / "manifest.jsonl").read_text())
+    manifest_row = json.loads((output_root / "official_eval_manifest.jsonl").read_text())
     assert summary_row["status"] == "ok"
     assert set(("sample_id", "gt_json", "model_json", "scene_type")) <= manifest_row.keys()
 
@@ -532,6 +533,10 @@ async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkey
     assert result.input_video_frames == 1
     assert Path(result.output_dir, ".done").is_file()
     assert instances[0].configured["idle_timeout_s"] == config.timeout_s
+    assert instances[0].configured["ref_audio"] == "data:audio/wav;base64,dGVzdCByZWZlcmVuY2UgYXVkaW8="
+    appends = [event for event in instances[0].sent if event["type"] == "input_audio_buffer.append"]
+    assert [event["audio_end_ms"] for event in appends] == [200, 400, 600, 800, 1000]
+    assert ["video_frames" in event for event in appends] == [False, False, True, False, False]
     assert {event["type"] for event in instances[0].sent} >= {
         "input_audio_buffer.append",
         "input_audio_buffer.commit",
@@ -695,7 +700,7 @@ async def test_benchmark_bounds_preprocessing_and_session_concurrency(tmp_path: 
     assert peak == 2
     assert benchmark.succeeded == 4
     assert json.loads((config.output_root / "batch_summary.json").read_text())["success"] == 4
-    assert len((config.output_root / "manifest.jsonl").read_text().splitlines()) == 4
+    assert len((config.output_root / "official_eval_manifest.jsonl").read_text().splitlines()) == 4
 
 
 def test_dedicated_cli_registers_e2e_parameters_without_dataset_hijack():
@@ -726,6 +731,10 @@ def test_dedicated_cli_registers_e2e_parameters_without_dataset_hijack():
     assert args.ref_audio == "/data/reference.wav"
     assert args.require_response is True
     assert not hasattr(args, "dataset_name")
+    assert not hasattr(args, "chunk_ms")
+    assert not hasattr(args, "video_fps")
+    assert not hasattr(args, "settle_s")
+    assert not hasattr(args, "no_pace")
 
 
 def test_dedicated_cli_requires_reference_audio():

@@ -48,10 +48,7 @@ class OmniInteractBenchmarkSubcommand(OmniBenchmarkSubcommandBase):
             help="Total videos to run; 0 selects all videos in the requested subsets.",
         )
         parser.add_argument("--max-concurrency", type=int, default=1)
-        parser.add_argument("--chunk-ms", type=int, default=200)
-        parser.add_argument("--video-fps", type=float, default=1.0)
         parser.add_argument("--timeout-s", type=float, default=900.0)
-        parser.add_argument("--settle-s", type=float, default=2.0)
         parser.add_argument(
             "--media-timeout-s",
             type=float,
@@ -63,7 +60,6 @@ class OmniInteractBenchmarkSubcommand(OmniBenchmarkSubcommandBase):
             required=True,
             help="Reference WAV required by MiniCPM-o native-duplex audio output.",
         )
-        parser.add_argument("--no-pace", action="store_true")
         parser.add_argument(
             "--require-response",
             action="store_true",
@@ -89,13 +85,9 @@ class OmniInteractBenchmarkSubcommand(OmniBenchmarkSubcommandBase):
             output_root=args.output_dir,
             num_prompts=args.num_prompts,
             max_concurrency=args.max_concurrency,
-            chunk_ms=args.chunk_ms,
-            video_fps=args.video_fps,
             timeout_s=args.timeout_s,
-            settle_s=args.settle_s,
             media_timeout_s=args.media_timeout_s,
             ref_audio=args.ref_audio,
-            pace=not args.no_pace,
             require_response=args.require_response,
             seed=args.seed,
             disable_shuffle=args.disable_shuffle,
