@@ -12,6 +12,7 @@ import subprocess
 import tarfile
 import time
 import wave
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -167,6 +168,30 @@ def test_archive_rejects_parent_traversal(tmp_path: Path):
         data._safe_extract(handle, tmp_path / "extract")
 
 
+def test_archive_extraction_is_serialized_across_shared_cache_users(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_root = _write_dataset(tmp_path / "source")
+    archive = tmp_path / "data.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(source_root, arcname="data")
+    target = tmp_path / "cache" / "dataset"
+    extraction_count = 0
+    original_extract = data._safe_extract
+
+    def slow_extract(handle: tarfile.TarFile, directory: Path) -> None:
+        nonlocal extraction_count
+        extraction_count += 1
+        time.sleep(0.05)
+        original_extract(handle, directory)
+
+    monkeypatch.setattr(data, "_safe_extract", slow_extract)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        roots = list(executor.map(lambda _: data._extract_archive(archive, target), range(2)))
+
+    assert roots == [target / "data", target / "data"]
+    assert extraction_count == 1
+    assert (roots[0] / "1q1a" / "video_json_map.json").is_file()
+
+
 def test_downloads_dataset_archive_through_vllm_hf_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source_root = _write_dataset(tmp_path / "source")
     archive = tmp_path / "data.tar.gz"
@@ -201,6 +226,15 @@ def test_media_command_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch):
 def test_config_requires_reference_audio():
     with pytest.raises(ValueError, match="ref_audio is required"):
         oi.validate_config(oi.OmniInteractBenchmarkConfig())
+
+
+@pytest.mark.parametrize("field", ["timeout_s", "settle_s", "media_timeout_s"])
+@pytest.mark.parametrize("value", [float("nan"), float("inf"), -float("inf")])
+def test_config_rejects_non_finite_timeouts(field: str, value: float):
+    config = oi.OmniInteractBenchmarkConfig(ref_audio="unused.wav", **{field: value})
+
+    with pytest.raises(ValueError, match="timeouts must be finite"):
+        oi.validate_config(config)
 
 
 @pytest.mark.parametrize(

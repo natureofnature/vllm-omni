@@ -124,6 +124,9 @@ def validate_config(config: OmniInteractBenchmarkConfig) -> None:
         raise ValueError("chunk_ms must be in [1, 1000]")
     if not math.isfinite(config.video_fps) or not 0 < config.video_fps <= 1:
         raise ValueError("video_fps must be in (0, 1]")
+    timeouts = (config.timeout_s, config.settle_s, config.media_timeout_s)
+    if not all(math.isfinite(value) for value in timeouts):
+        raise ValueError("timeouts must be finite")
     if config.timeout_s <= 0 or config.settle_s < 0 or config.media_timeout_s <= 0:
         raise ValueError("timeouts must be positive and settle_s must be non-negative")
     if len(set(config.subsets)) != len(config.subsets):

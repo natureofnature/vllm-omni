@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import random
@@ -72,21 +73,25 @@ def _archive_fingerprint(archive: Path) -> str:
 
 
 def _extract_archive(archive: Path, target: Path) -> Path:
-    if target.is_symlink():
-        raise ValueError(f"Refusing to extract through symlink: {target}")
-    marker = target / ".source"
-    fingerprint = _archive_fingerprint(archive)
-    if marker.is_file() and marker.read_text().strip() == fingerprint:
-        try:
-            return _data_dir(target)
-        except FileNotFoundError:
-            pass
-    shutil.rmtree(target, ignore_errors=True)
-    target.mkdir(parents=True)
-    with tarfile.open(archive, "r:*") as handle:
-        _safe_extract(handle, target)
-    marker.write_text(fingerprint)
-    return _data_dir(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = target.parent / f".{target.name}.extract.lock"
+    with lock_path.open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if target.is_symlink():
+            raise ValueError(f"Refusing to extract through symlink: {target}")
+        marker = target / ".source"
+        fingerprint = _archive_fingerprint(archive)
+        if marker.is_file() and marker.read_text().strip() == fingerprint:
+            try:
+                return _data_dir(target)
+            except FileNotFoundError:
+                pass
+        shutil.rmtree(target, ignore_errors=True)
+        target.mkdir()
+        with tarfile.open(archive, "r:*") as handle:
+            _safe_extract(handle, target)
+        marker.write_text(fingerprint)
+        return _data_dir(target)
 
 
 def resolve_omniinteract_root(
