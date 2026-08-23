@@ -135,7 +135,7 @@ class _WorkItem:
 
 
 class MiniCPMO45Code2Wav(nn.Module):
-    """LLM_GENERATION model that admits only true exact-shape GPU batches."""
+    """LLM_GENERATION model with request-owned state and compatible batching."""
 
     input_modalities = "audio"
     have_multimodal_outputs = True

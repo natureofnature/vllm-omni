@@ -272,23 +272,54 @@ def test_decode_batch_splits_overlong_prefill_inside_relpos_budget():
 
 def test_ragged_overlong_prefill_uses_relpos_safe_exact_slices():
     token2wav = _FakeToken2Wav()
+    token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
     adapter = BatchedToken2Wav(token2wav)
     prompt = adapter.prepare_prompt("shared", "/fake/prompt.wav")
     states = adapter.setup_batch(prompt, 2)
     setup_encodes = len(token2wav.flow.encoder.calls)
     adapter._max_encode_token_frames = lambda _states: 4
 
+    tokens = [
+        torch.arange(10, dtype=torch.long),
+        torch.arange(4, dtype=torch.long),
+    ]
+    last_chunks = [True, False]
     audios, next_states = adapter.decode_ragged_batch(
-        [torch.arange(10, dtype=torch.long), torch.arange(7, dtype=torch.long)],
+        tokens,
         prompt,
         states,
-        last_chunks=[True, True],
+        last_chunks=last_chunks,
     )
 
-    assert token2wav.flow.encoder.calls[setup_encodes:] == [1, 1, 1, 1, 1]
-    assert token2wav.flow.encoder.last_chunk_calls[setup_encodes:] == [False, False, True, False, True]
+    assert token2wav.flow.encoder.calls[setup_encodes:] == [1, 1, 1, 1]
+    assert token2wav.flow.encoder.last_chunk_calls[setup_encodes:] == [False, False, True, False]
     assert len(audios) == len(next_states) == 2
     assert all(audio.numel() > 0 for audio in audios)
+
+    for row, (row_tokens, last_chunk) in enumerate(zip(tokens, last_chunks, strict=True)):
+        reference_token2wav = _FakeToken2Wav()
+        reference_token2wav.flow.encoder.pre_lookahead_layer = SimpleNamespace(pre_lookahead_len=3)
+        reference_adapter = BatchedToken2Wav(reference_token2wav)
+        reference_prompt = reference_adapter.prepare_prompt("shared", "/fake/prompt.wav")
+        reference_states = reference_adapter.setup_batch(reference_prompt, 1)
+        reference_adapter._max_encode_token_frames = lambda _states: 4
+        reference_audio, reference_state = reference_adapter.decode_batch(
+            row_tokens.unsqueeze(0),
+            reference_prompt,
+            reference_states,
+            last_chunk=last_chunk,
+        )
+        torch.testing.assert_close(audios[row], reference_audio[0])
+        for cache_name, expected in reference_state[0].flow_cache.items():
+            torch.testing.assert_close(
+                next_states[row].flow_cache[cache_name],
+                expected,
+            )
+        for cache_name, expected in reference_state[0].hift_cache.items():
+            torch.testing.assert_close(
+                next_states[row].hift_cache[cache_name],
+                expected,
+            )
 
 
 def test_ragged_diffusion_batches_eight_rows_and_preserves_exact_results():
