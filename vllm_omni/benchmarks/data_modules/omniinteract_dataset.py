@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from huggingface_hub import hf_hub_download
+from vllm.transformers_utils.repo_utils import hf_fs
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
@@ -128,19 +128,25 @@ def resolve_omniinteract_root(
     cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     cache_key = dataset_repo.replace("/", "__")
     target = cache_root / "vllm_omni" / "omniinteract" / cache_key
+    archive_root = target.parent / "archives" / cache_key
+    archive_root.mkdir(parents=True, exist_ok=True)
+    filesystem = hf_fs()
     errors: list[str] = []
     downloaded_archive: Path | None = None
     for name in ("data.tar.gz", "data.tar"):
         try:
-            downloaded_archive = Path(
-                hf_hub_download(
-                    repo_id=dataset_repo,
-                    filename=name,
-                    repo_type="dataset",
-                )
-            )
+            downloaded_archive = archive_root / name
             if not downloaded_archive.is_file():
-                raise FileNotFoundError(f"Hugging Face did not download {name}")
+                with tempfile.TemporaryDirectory(dir=archive_root) as temporary_dir:
+                    candidate = Path(temporary_dir) / name
+                    filesystem.download(f"datasets/{dataset_repo}/{name}", str(candidate))
+                    if not candidate.is_file():
+                        raise FileNotFoundError(f"Hugging Face did not download {name}")
+                    try:
+                        os.link(candidate, downloaded_archive)
+                    except FileExistsError:
+                        # Another process atomically published the same cache key.
+                        pass
             break
         except (OSError, RuntimeError, ValueError) as exc:  # noqa: PERF203 - both archive names are valid
             errors.append(f"{name}: {exc}")

@@ -226,24 +226,25 @@ def test_archive_extraction_is_atomically_published_across_shared_cache_users(
     assert not list(target.glob(".tmp-*"))
 
 
-def test_downloads_dataset_archive_through_huggingface_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_downloads_dataset_archive_through_vllm_hf_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source_root = _write_dataset(tmp_path / "source")
     archive = tmp_path / "data.tar.gz"
     with tarfile.open(archive, "w:gz") as handle:
         handle.add(source_root, arcname="data")
     downloads: list[str] = []
 
-    def fake_hf_hub_download(*, repo_id: str, filename: str, repo_type: str) -> str:
-        downloads.append(f"{repo_type}/{repo_id}/{filename}")
-        return str(archive)
+    class FakeHfFileSystem:
+        def download(self, remote: str, local: str) -> None:
+            downloads.append(remote)
+            Path(local).write_bytes(archive.read_bytes())
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "cache"))
-    monkeypatch.setattr(data, "hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(data, "hf_fs", FakeHfFileSystem)
 
     root = data.resolve_omniinteract_root(None, "owner/dataset")
 
     assert (root / "1q1a").is_dir()
-    assert downloads == ["dataset/owner/dataset/data.tar.gz"]
+    assert downloads == ["datasets/owner/dataset/data.tar.gz"]
 
 
 def test_media_command_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch):
