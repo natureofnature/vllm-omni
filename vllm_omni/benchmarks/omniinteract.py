@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import binascii
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -15,7 +16,7 @@ import math
 import subprocess
 import tempfile
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin, urlsplit
@@ -42,6 +43,7 @@ from vllm_omni.experimental.fullduplex.client import (
 OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_MODEL = "openbmb/MiniCPM-o-4_5"
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
+BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
 _INPUT_CHUNK_MS = 200
 _VIDEO_FPS = 1.0
 _COMPLETION_SETTLE_S = 2.0
@@ -83,9 +85,23 @@ class OmniInteractCaseResult:
     output_tokens: int = 0
     duplex_request_metrics: list[dict[str, object]] = field(default_factory=list)
     duplex_session_metrics: dict[str, object] = field(default_factory=dict)
+    _artifact_context: _DeferredArtifactContext | None = field(default=None, repr=False, compare=False)
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        return {
+            item.name: copy.deepcopy(getattr(self, item.name))
+            for item in fields(self)
+            if item.name != "_artifact_context"
+        }
+
+
+@dataclass(frozen=True)
+class _DeferredArtifactContext:
+    collector: RealtimeEventCollector
+    playback: _Playback
+    stream_start: float
+    video_duration_s: float
+    require_response: bool
 
 
 def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
@@ -750,6 +766,33 @@ def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInte
     _atomic_write_json(directory / ".failed.json", summary)
 
 
+def publish_deferred_case_artifacts(
+    root: Path,
+    case: OmniInteractCase,
+    result: OmniInteractCaseResult,
+) -> None:
+    """Publish one measured case after the benchmark clock is frozen."""
+
+    context = result._artifact_context
+    result._artifact_context = None
+    if not result.success:
+        write_failure_artifacts(root, case, result)
+        return
+    if context is None:
+        raise RuntimeError("OmniInteract benchmark output lost its deferred artifact context")
+    write_success_artifacts(
+        root,
+        case,
+        context.collector,
+        playback=context.playback,
+        stream_start=context.stream_start,
+        video_duration_s=context.video_duration_s,
+        require_response=context.require_response,
+        result=result,
+        persist=True,
+    )
+
+
 def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
     """Invalidate a previous run before starting expensive preprocessing."""
 
@@ -757,6 +800,14 @@ def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
         (directory / name).unlink(missing_ok=True)
+
+
+def clear_batch_artifacts(root: Path) -> None:
+    """Invalidate aggregate handoff files before a measured batch starts."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    for name in BATCH_ARTIFACTS:
+        (root / name).unlink(missing_ok=True)
 
 
 def write_batch_artifacts(
@@ -852,6 +903,7 @@ async def run_omniinteract_case(
     *,
     request_index: int | str,
     persist_artifacts: bool = True,
+    defer_artifacts: bool = False,
 ) -> OmniInteractCaseResult:
     """Run one case. This public coroutine is the hook used by E2E tests."""
 
@@ -861,6 +913,8 @@ async def run_omniinteract_case(
         raise ValueError("timeout_s must be finite and positive")
     if not math.isfinite(config.media_timeout_s) or config.media_timeout_s <= 0:
         raise ValueError("media_timeout_s must be finite and positive")
+    if persist_artifacts and defer_artifacts:
+        raise ValueError("persist_artifacts and defer_artifacts are mutually exclusive")
     output_dir = _output_dir(config.output_root, case)
     session_id = f"omniinteract:{case.subset}:{request_index}:{time.monotonic_ns()}"
     result = OmniInteractCaseResult(
@@ -953,6 +1007,14 @@ async def run_omniinteract_case(
                 result=result,
                 persist=persist_artifacts,
             )
+            if defer_artifacts:
+                result._artifact_context = _DeferredArtifactContext(
+                    collector=client.events,
+                    playback=playback,
+                    stream_start=stream_start,
+                    video_duration_s=duration,
+                    require_response=config.require_response,
+                )
     except Exception as exc:
         result.success = False
         result.eligible_for_official_eval = False

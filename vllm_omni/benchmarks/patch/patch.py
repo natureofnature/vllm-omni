@@ -64,7 +64,11 @@ from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.benchmarks.omniinteract import (
     OmniInteractBenchmarkConfig,
     OmniInteractCaseResult,
+    clear_batch_artifacts,
+    clear_case_artifacts,
+    publish_deferred_case_artifacts,
     run_omniinteract_case,
+    write_failure_artifacts,
 )
 from vllm_omni.benchmarks.omniinteract import (
     benchmark_summary as omniinteract_benchmark_summary,
@@ -252,14 +256,19 @@ def _finalize_omniinteract_batch(
 ) -> dict[str, object] | None:
     """Write measured-session artifacts and return count-only result fields."""
     rows = [
-        (sample.omniinteract_case, sample.omniinteract_options, getattr(output, "omniinteract_case_result", None))
+        (
+            sample.omniinteract_case,
+            sample.omniinteract_options,
+            getattr(output, "omniinteract_case_result", None),
+            output,
+        )
         for sample, output in zip(input_requests, outputs, strict=True)
         if isinstance(sample, OmniInteractSampleRequest)
     ]
     if not rows:
         return None
-    cases = [case for case, _, _ in rows]
-    case_results = [case_result for _, _, case_result in rows]
+    cases = [case for case, _, _, _ in rows]
+    case_results = [case_result for _, _, case_result, _ in rows]
     if any(case is None for case in cases) or any(case_result is None for case_result in case_results):
         raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
     options = rows[0][1]
@@ -267,9 +276,45 @@ def _finalize_omniinteract_batch(
         raise RuntimeError("OmniInteract benchmark output lost its artifact options")
     typed_cases = [case for case in cases if case is not None]
     typed_results = [case_result for case_result in case_results if case_result is not None]
+    typed_outputs = [output for _, _, _, output in rows]
+    for output, case, case_result in zip(typed_outputs, typed_cases, typed_results, strict=True):
+        try:
+            publish_deferred_case_artifacts(options.output_root, case, case_result)
+        except Exception as exc:  # noqa: BLE001 - artifact backends raise heterogeneous errors
+            case_result.success = False
+            case_result.eligible_for_official_eval = False
+            if "artifact_write_failed" not in case_result.official_eval_ineligible_reasons:
+                case_result.official_eval_ineligible_reasons.append("artifact_write_failed")
+            case_result.error = f"Artifact publication failed: {exc}"
+            output.success = False
+            output.error = case_result.error
+            write_failure_artifacts(options.output_root, case, case_result)
     write_omniinteract_batch_artifacts(options.output_root, typed_cases, typed_results)
     summary = omniinteract_benchmark_summary(typed_results)
     return {key: value for key, value in summary.items() if key != "results"}
+
+
+def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
+    """Invalidate prior measured artifacts before benchmark timing starts."""
+
+    seen: set[tuple[Path, str, str]] = set()
+    roots: set[Path] = set()
+    for sample in input_requests:
+        if not isinstance(sample, OmniInteractSampleRequest):
+            continue
+        root = sample.omniinteract_options.output_root.resolve()
+        roots.add(root)
+        identity = (
+            root,
+            sample.omniinteract_case.subset,
+            sample.omniinteract_case.video_rel,
+        )
+        if identity in seen:
+            continue
+        seen.add(identity)
+        clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
+    for root in roots:
+        clear_batch_artifacts(root)
 
 
 def _daily_omni_repo_from_args(args) -> str | None:
@@ -1431,7 +1476,8 @@ async def _async_request_omniinteract(
             case,
             config,
             request_index=request_func_input.request_id or uuid.uuid4().hex,
-            persist_artifacts=request_func_input.request_id is not None,
+            persist_artifacts=False,
+            defer_artifacts=request_func_input.request_id is not None,
         )
         output.latency = case_result.latency_s
         output.generated_text = case_result.transcript
@@ -1939,6 +1985,7 @@ async def benchmark(
         print(f"Probe request rate: {probe_request_rate} req/s")
         probe_task = asyncio.create_task(probe_loop())
 
+    _prepare_omniinteract_batch(input_requests)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
 

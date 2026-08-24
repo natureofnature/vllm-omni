@@ -838,7 +838,12 @@ def test_websocket_url_overrides_reserved_query_per_case(base_url: str, endpoint
 
 
 @pytest.mark.asyncio
-async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("defer_artifacts", [False, True])
+async def test_public_case_runner_supports_functional_e2e(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    defer_artifacts: bool,
+):
     instances = []
 
     class FakeRealtimeClient:
@@ -899,6 +904,20 @@ async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkey
     )
     monkeypatch.setattr(oi, "RealtimeDuplexClient", FakeRealtimeClient)
     monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0)
+    artifact_writes: list[str] = []
+    atomic_write_wav = oi._atomic_write_wav
+    atomic_write_json = oi._atomic_write_json
+
+    def track_wav(path: Path, pcm: bytes, rate: int) -> None:
+        artifact_writes.append(path.name)
+        atomic_write_wav(path, pcm, rate)
+
+    def track_json(path: Path, value: object) -> None:
+        artifact_writes.append(path.name)
+        atomic_write_json(path, value)
+
+    monkeypatch.setattr(oi, "_atomic_write_wav", track_wav)
+    monkeypatch.setattr(oi, "_atomic_write_json", track_json)
     case = _case(tmp_path)
     ref_audio = tmp_path / "reference.wav"
     ref_audio.write_bytes(b"test reference audio")
@@ -909,11 +928,22 @@ async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkey
         require_response=True,
     )
 
-    result = await oi.run_omniinteract_case(case, config, request_index=0)
+    result = await oi.run_omniinteract_case(
+        case,
+        config,
+        request_index=0,
+        persist_artifacts=not defer_artifacts,
+        defer_artifacts=defer_artifacts,
+    )
 
     assert result.success, result.error
     assert result.transcript == "functional response"
     assert result.input_video_frames == 1
+    if defer_artifacts:
+        assert artifact_writes == []
+        assert not Path(result.output_dir, ".done").exists()
+        oi.publish_deferred_case_artifacts(config.output_root, case, result)
+    assert artifact_writes
     assert Path(result.output_dir, ".done").is_file()
     assert instances[0].configured["idle_timeout_s"] == config.timeout_s
     assert instances[0].configured["ref_audio"] == "data:audio/wav;base64,dGVzdCByZWZlcmVuY2UgYXVkaW8="
@@ -1247,16 +1277,16 @@ def test_serve_cli_uses_zero_to_select_all_omniinteract_samples(tmp_path: Path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(("request_id", "persist_artifacts"), [(None, False), ("measured-0", True)])
+@pytest.mark.parametrize(("request_id", "defer_artifacts"), [(None, False), ("measured-0", True)])
 @pytest.mark.parametrize(
     "metric_mode",
     ["exact", "fallback", "mixed_missing", "exact_missing_tpot", "coverage_mismatch"],
 )
-async def test_realtime_backend_runs_one_dataset_session_and_only_persists_measured_requests(
+async def test_realtime_backend_runs_one_dataset_session_and_defers_only_measured_artifacts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     request_id: str | None,
-    persist_artifacts: bool,
+    defer_artifacts: bool,
     metric_mode: str,
 ):
     case = _case(tmp_path)
@@ -1269,13 +1299,14 @@ async def test_realtime_backend_runs_one_dataset_session_and_only_persists_measu
     )
     calls: list[dict[str, object]] = []
 
-    async def fake_run(case_arg, config, *, request_index, persist_artifacts):
+    async def fake_run(case_arg, config, *, request_index, persist_artifacts, defer_artifacts):
         calls.append(
             {
                 "case": case_arg,
                 "config": config,
                 "request_index": request_index,
                 "persist_artifacts": persist_artifacts,
+                "defer_artifacts": defer_artifacts,
             }
         )
         first_stage = {"output_token_count": 3, "tpot_ms": 15.0}
@@ -1336,11 +1367,15 @@ async def test_realtime_backend_runs_one_dataset_session_and_only_persists_measu
         assert output.itl == []
         assert output.text_latency == pytest.approx(0.1)
     assert calls[0]["case"] is case
-    assert calls[0]["persist_artifacts"] is persist_artifacts
+    assert calls[0]["persist_artifacts"] is False
+    assert calls[0]["defer_artifacts"] is defer_artifacts
     assert (calls[0]["request_index"] == request_id) if request_id else bool(calls[0]["request_index"])
 
 
-def test_standard_benchmark_finalizes_only_measured_omniinteract_outputs(tmp_path: Path):
+def test_standard_benchmark_finalizes_only_measured_omniinteract_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     case = _case(tmp_path)
     options = data.OmniInteractSessionOptions(
         output_root=tmp_path / "artifacts",
@@ -1365,6 +1400,12 @@ def test_standard_benchmark_finalizes_only_measured_omniinteract_outputs(tmp_pat
         success=True,
         eligible_for_official_eval=True,
     )
+    published: list[tuple[Path, oi.OmniInteractCase, oi.OmniInteractCaseResult]] = []
+    monkeypatch.setattr(
+        benchmark_patch,
+        "publish_deferred_case_artifacts",
+        lambda root, case_arg, result: published.append((root, case_arg, result)),
+    )
 
     summary = benchmark_patch._finalize_omniinteract_batch([sample], [output])
 
@@ -1376,7 +1417,92 @@ def test_standard_benchmark_finalizes_only_measured_omniinteract_outputs(tmp_pat
         "successful_but_ineligible": 0,
         "audio_clipped_bytes": 0,
     }
+    assert published == [(options.output_root, case, output.omniinteract_case_result)]
     assert len((options.output_root / "official_eval_manifest.jsonl").read_text().splitlines()) == 1
+
+
+def test_standard_benchmark_marks_artifact_publication_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    case = _case(tmp_path)
+    options = data.OmniInteractSessionOptions(
+        output_root=tmp_path / "artifacts",
+        timeout_s=10,
+        media_timeout_s=5,
+        ref_audio="reference.wav",
+    )
+    sample = data.OmniInteractSampleRequest(
+        prompt="",
+        prompt_len=0,
+        expected_output_len=0,
+        multi_modal_data=None,
+        request_id="measured-0",
+        omniinteract_case=case,
+        omniinteract_options=options,
+    )
+    output = benchmark_patch.MixRequestFuncOutput(success=True)
+    case_result = oi.OmniInteractCaseResult(
+        subset=case.subset,
+        video=str(case.video_path),
+        output_dir=str(options.output_root),
+        success=True,
+        eligible_for_official_eval=True,
+    )
+    output.omniinteract_case_result = case_result
+
+    def fail_publication(*args) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(benchmark_patch, "publish_deferred_case_artifacts", fail_publication)
+
+    summary = benchmark_patch._finalize_omniinteract_batch([sample], [output])
+
+    assert output.success is False
+    assert case_result.success is False
+    assert case_result.eligible_for_official_eval is False
+    assert case_result.official_eval_ineligible_reasons == ["artifact_write_failed"]
+    assert case_result.error == "Artifact publication failed: disk full"
+    assert summary == {
+        "total": 1,
+        "success": 0,
+        "failed": 1,
+        "eligible_for_official_eval": 0,
+        "successful_but_ineligible": 0,
+        "audio_clipped_bytes": 0,
+    }
+    assert Path(case_result.output_dir, ".failed.json").is_file()
+    assert (options.output_root / "official_eval_manifest.jsonl").read_text() == ""
+
+
+def test_standard_benchmark_invalidates_stale_case_artifacts_before_timing(tmp_path: Path):
+    case = _case(tmp_path)
+    options = data.OmniInteractSessionOptions(
+        output_root=tmp_path / "artifacts",
+        timeout_s=10,
+        media_timeout_s=5,
+        ref_audio="reference.wav",
+    )
+    sample = data.OmniInteractSampleRequest(
+        prompt="",
+        prompt_len=0,
+        expected_output_len=0,
+        multi_modal_data=None,
+        request_id="measured-0",
+        omniinteract_case=case,
+        omniinteract_options=options,
+    )
+    case_dir = oi._output_dir(options.output_root, case)
+    case_dir.mkdir(parents=True)
+    for name in (*oi.SUCCESS_ARTIFACTS, ".failed.json"):
+        (case_dir / name).touch()
+    for name in oi.BATCH_ARTIFACTS:
+        (options.output_root / name).touch()
+
+    benchmark_patch._prepare_omniinteract_batch([sample, sample])
+
+    assert not any((case_dir / name).exists() for name in (*oi.SUCCESS_ARTIFACTS, ".failed.json"))
+    assert not any((options.output_root / name).exists() for name in oi.BATCH_ARTIFACTS)
 
 
 def test_serve_cli_requires_reference_audio_for_omniinteract():
