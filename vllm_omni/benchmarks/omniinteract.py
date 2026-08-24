@@ -22,7 +22,7 @@ from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 
 import pybase64 as base64
 
-from vllm_omni.benchmarks.data_modules.omniinteract import (
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OMNIINTERACT_SUBSETS,
     OmniInteractCase,

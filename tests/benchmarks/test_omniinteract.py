@@ -21,7 +21,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from vllm_omni.benchmarks import omniinteract as oi
-from vllm_omni.benchmarks.data_modules import omniinteract as data
+from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
 from vllm_omni.entrypoints.cli.benchmark.omniinteract import OmniInteractBenchmarkSubcommand
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 

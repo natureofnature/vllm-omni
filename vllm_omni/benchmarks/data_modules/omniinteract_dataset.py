@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Dataset discovery for the OmniInteract realtime benchmark."""
+"""OmniInteract realtime benchmark dataset discovery."""
 
 from __future__ import annotations
 

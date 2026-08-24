@@ -39,4 +39,6 @@ vllm bench serve --omni \
     --num-prompts  5
 ```
 
-See [vllm bench serve](./bench/serve.md) for the full reference of all available arguments.
+See [vllm bench serve](./bench/serve.md) for serving-throughput arguments. For
+long-lived native-duplex WebSocket sessions, see the
+[OmniInteract realtime benchmark](./bench/omniinteract.md).

@@ -1,4 +1,4 @@
-# OmniInteract local benchmark
+# OmniInteract Realtime Benchmark
 
 This runner replays the official OmniInteract videos against an already running
 MiniCPM-o native-duplex Realtime endpoint. It is intentionally separate from
