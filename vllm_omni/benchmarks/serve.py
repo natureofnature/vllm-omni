@@ -57,9 +57,13 @@ def _omniinteract_config_from_args(args: argparse.Namespace) -> OmniInteractBenc
 
     max_concurrency = getattr(args, "max_concurrency", None) or 1
     output_root = Path(getattr(args, "result_dir", None) or "omniinteract-output")
+    endpoint = getattr(args, "endpoint", None)
+    explicit_keys = getattr(args, "explicit_keys", None)
+    if not endpoint or (explicit_keys is not None and "endpoint" not in explicit_keys):
+        endpoint = "/v1/realtime"
     return OmniInteractBenchmarkConfig(
         base_url=base_url,
-        endpoint=getattr(args, "endpoint", "/v1/realtime"),
+        endpoint=endpoint,
         model=getattr(args, "model", None) or DEFAULT_MODEL,
         data_root=data_root,
         dataset_repo=dataset_repo,

@@ -25,6 +25,7 @@ from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
+from vllm_omni.utils.tracking_parser import TrackingArgumentParser
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
 
@@ -915,8 +916,16 @@ async def test_benchmark_bounds_preprocessing_and_session_concurrency(tmp_path: 
     assert len((config.output_root / "official_eval_manifest.jsonl").read_text().splitlines()) == 4
 
 
-def test_serve_cli_maps_omniinteract_dataset_to_realtime_config(tmp_path: Path):
-    parser = argparse.ArgumentParser()
+@pytest.mark.parametrize(
+    ("endpoint_args", "expected_endpoint"),
+    [([], "/v1/realtime"), (["--endpoint", "/custom/realtime"], "/custom/realtime")],
+)
+def test_serve_cli_maps_omniinteract_dataset_to_realtime_config(
+    tmp_path: Path,
+    endpoint_args: list[str],
+    expected_endpoint: str,
+):
+    parser = TrackingArgumentParser()
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
 
     args = parser.parse_args(
@@ -931,8 +940,6 @@ def test_serve_cli_maps_omniinteract_dataset_to_realtime_config(tmp_path: Path):
             "openbmb/MiniCPM-o-4_5",
             "--base-url",
             "http://server:8000",
-            "--endpoint",
-            "/v1/realtime",
             "--omniinteract-subsets",
             "1q1a",
             "1qna",
@@ -945,11 +952,13 @@ def test_serve_cli_maps_omniinteract_dataset_to_realtime_config(tmp_path: Path):
             "--omniinteract-ref-audio",
             "/data/reference.wav",
             "--omniinteract-require-response",
+            *endpoint_args,
         ]
     )
     config = benchmark_serve._omniinteract_config_from_args(args)
 
     assert args.dataset_name == "omniinteract"
+    assert config.endpoint == expected_endpoint
     assert config.data_root == str(tmp_path)
     assert config.dataset_repo == data.DEFAULT_OMNIINTERACT_REPO
     assert config.subsets == ("1q1a", "1qna")
