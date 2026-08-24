@@ -1138,7 +1138,7 @@ class TestDeployConfigLoading:
         assert connector_extra["enable_cfm_graph"] is False
         assert connector_extra["code2wav_initial_batch_size"] == 8
         assert connector_extra["code2wav_batch_target_size"] == 8
-        assert connector_extra["code2wav_batch_wait_ms"] == 50
+        assert connector_extra["code2wav_batch_wait_ms"] == 10
         assert connector_extra["code2wav_batch_quiet_ms"] == 12
         assert "code2wav_bfloat16_attention_cache" not in connector_extra
 

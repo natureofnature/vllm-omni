@@ -29,9 +29,9 @@ connectors:
       code2wav_initial_batch_size: 8
       code2wav_batch_target_size: 8
       # Initial waves with fewer than eight ready requests may wait up to
-      # 50 ms for late arrivals and release early when the target is reached.
+      # 10 ms for late arrivals and release early when the target is reached.
       # Stable one-to-seven-session workloads usually consume the full wait.
-      code2wav_batch_wait_ms: 50
+      code2wav_batch_wait_ms: 10
       code2wav_batch_quiet_ms: 12
 duplex_session:
   idle_ttl_s: 300
