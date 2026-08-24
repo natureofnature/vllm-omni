@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import contextlib
+import errno
+import fcntl
 
 import huggingface_hub
 import pytest
@@ -9,6 +11,22 @@ import pytest
 from vllm_omni.diffusion.model_loader import hub_prefetch
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
+
+
+def test_required_cache_lock_does_not_continue_after_fallback_timeout(tmp_path, monkeypatch):
+    entered = False
+
+    def unsupported_flock(*args):
+        raise OSError(errno.ENOLCK, "flock unavailable")
+
+    monkeypatch.setattr(fcntl, "flock", unsupported_flock)
+    monkeypatch.setattr(hub_prefetch, "_dotfile_lock_acquire", lambda *args, **kwargs: False)
+
+    with pytest.raises(TimeoutError, match="required cache lock"):
+        with hub_prefetch._repo_prefetch_lock("dataset", required=True, lock_dir=tmp_path):
+            entered = True
+
+    assert entered is False
 
 
 def test_prefetch_subfolders_propagates_revision(monkeypatch):

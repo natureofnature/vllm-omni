@@ -80,6 +80,8 @@ class OmniInteractCaseResult:
     pacing_max_lag_s: float = 0.0
     responses: int = 0
     audio_bytes: int = 0
+    audio_clipped_bytes: int = 0
+    audio_overwritten_bytes: int = 0
     transcript: str = ""
 
     def as_dict(self) -> dict[str, Any]:
@@ -533,7 +535,7 @@ def _build_output(
     stream_start: float,
     video_duration_s: float,
     require_response: bool,
-) -> tuple[bytes, int, str, list[dict[str, object]]]:
+) -> tuple[bytes, int, str, list[dict[str, object]], int, int]:
     created, done = response_ledger(collector)
     if created != done:
         raise ValueError(f"unfinished response_ids: {sorted(created - done)}")
@@ -546,7 +548,11 @@ def _build_output(
     }
     horizon_s = math.ceil(video_duration_s)
     output = bytearray(horizon_s * OUTPUT_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+    # Match client playback: all response deltas share one serial output queue.
     cursor_s = 0.0
+    written_until = 0
+    clipped_bytes = 0
+    overwritten_bytes = 0
     response_times: dict[str, list[float]] = {}
     responses_with_audio: set[str] = set()
     for event, received_at in zip(collector.events, collector.event_received_at_s, strict=True):
@@ -573,9 +579,13 @@ def _build_output(
         end_s = start_s + len(raw) / (rate * PCM16_BYTES_PER_SAMPLE)
         offset = round(start_s * rate) * PCM16_BYTES_PER_SAMPLE
         writable = max(0, min(len(raw), len(output) - offset))
+        clipped_bytes += len(raw) - writable
         if writable:
             clipped = raw[:writable]
+            written_end = offset + writable
+            overwritten_bytes += max(0, min(written_end, written_until) - offset)
             output[offset : offset + writable] = clipped
+            written_until = max(written_until, written_end)
             if any(clipped):
                 responses_with_audio.add(response_id)
         cursor_s = end_s
@@ -612,7 +622,7 @@ def _build_output(
     complete_outputs = terminal_responses & responses_with_audio & responses_with_text
     if require_response and not complete_outputs:
         raise ValueError("OmniInteract E2E requires a response with audio and transcript")
-    return bytes(output), OUTPUT_SAMPLE_RATE, transcript, chunks
+    return bytes(output), OUTPUT_SAMPLE_RATE, transcript, chunks, clipped_bytes, overwritten_bytes
 
 
 def write_success_artifacts(
@@ -630,13 +640,15 @@ def write_success_artifacts(
     for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
         (directory / name).unlink(missing_ok=True)
     try:
-        pcm, rate, transcript, chunks = _build_output(
+        pcm, rate, transcript, chunks, clipped_bytes, overwritten_bytes = _build_output(
             collector,
             stream_start=stream_start,
             video_duration_s=video_duration_s,
             require_response=require_response,
         )
         result.audio_bytes = sum(len(collector.audio_bytes(response_id)) for response_id in collector.response_ids)
+        result.audio_clipped_bytes = clipped_bytes
+        result.audio_overwritten_bytes = overwritten_bytes
         result.transcript = transcript
         result.responses = len(collector.response_ids)
         result.output_dir = str(directory.resolve())
@@ -692,7 +704,7 @@ def write_batch_artifacts(
     rows = [
         case_manifest(case, _output_dir(root, case))
         for case, result in zip(cases, benchmark.results, strict=True)
-        if result.success
+        if result.success and result.audio_clipped_bytes == 0 and result.audio_overwritten_bytes == 0
     ]
     _atomic_write_text(
         root / "official_eval_manifest.jsonl",

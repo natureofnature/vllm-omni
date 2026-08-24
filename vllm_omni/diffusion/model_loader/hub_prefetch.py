@@ -147,7 +147,7 @@ def _dotfile_lock_acquire(lock_dir: str, model: str, timeout: float = 300.0, pol
         except FileExistsError:
             if time.monotonic() >= deadline:
                 logger.warning(
-                    "Timed out waiting for dotfile prefetch lock %s after %.0fs; proceeding unlocked",
+                    "Timed out waiting for dotfile prefetch lock %s after %.0fs",
                     lock_path,
                     timeout,
                 )
@@ -156,12 +156,19 @@ def _dotfile_lock_acquire(lock_dir: str, model: str, timeout: float = 300.0, pol
 
 
 @contextlib.contextmanager
-def _repo_prefetch_lock(model: str) -> Iterator[None]:
+def _repo_prefetch_lock(
+    model: str,
+    *,
+    required: bool = False,
+    lock_dir: str | os.PathLike[str] | None = None,
+) -> Iterator[None]:
     """Hold an exclusive lock keyed on the HF repo id.
 
     Tries ``fcntl.flock`` first; falls back to an atomic directory-creation
     dotfile lock when flock is unsupported (e.g. FSx for Lustre without the
-    ``flock`` mount option, which returns ``ENOLCK``).
+    ``flock`` mount option, which returns ``ENOLCK``). ``required=True`` fails
+    closed instead of entering the critical section without a lock. An
+    explicit ``lock_dir`` keeps the lock beside a shared non-HF target.
 
     Why we still need a node-wide lock on top of ``snapshot_download``'s
     own per-blob ``.lock`` files:
@@ -183,12 +190,13 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
       section, so the *first* entrant fully populates the cache and
       every subsequent ``from_pretrained`` sees a warm, complete tree.
 
-    Best-effort: if we cannot acquire any lock (no ``fcntl``, read-only
-    FS, dotfile lock timeout) we log and run the download anyway. Worst
-    case behaviour reverts to "snapshot_download + transformers v5 race"
-    which is exactly the pre-fix state.
+    By default, if we cannot acquire any lock (no ``fcntl``, read-only FS,
+    dotfile lock timeout) we log and run the download anyway. Worst-case
+    behaviour reverts to "snapshot_download + transformers v5 race", which is
+    exactly the pre-fix state. Required callers raise instead.
     """
-    lock_dir = None
+    explicit_lock_dir = lock_dir is not None
+    lock_dir = os.fspath(lock_dir) if lock_dir is not None else None
     lock_path = None
     dotfile_held = None
     fd = None
@@ -200,10 +208,21 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
     except ImportError:  # pragma: no cover - non-POSIX (Windows)
         fcntl = None
 
-    if fcntl is not None:
+    if lock_dir is not None:
+        try:
+            os.makedirs(lock_dir, exist_ok=True)
+        except OSError as exc:
+            if required:
+                raise RuntimeError(f"Could not create required lock dir for {model}: {lock_dir}") from exc
+            logger.warning("Could not create lock dir for prefetch of %s (%s); skipping flock", model, exc)
+            lock_dir = None
+
+    if fcntl is not None and lock_dir is None and not explicit_lock_dir:
         try:
             lock_dir = _node_lock_dir()
         except OSError as exc:
+            if required:
+                raise RuntimeError(f"Could not allocate required lock dir for {model}") from exc
             logger.warning("Could not allocate lock dir for prefetch of %s (%s); skipping flock", model, exc)
             fcntl = None  # force dotfile fallback
 
@@ -236,15 +255,21 @@ def _repo_prefetch_lock(model: str) -> Iterator[None]:
     # --- dotfile fallback ---
     if not flock_held:
         if lock_dir is None:
+            if explicit_lock_dir and required:
+                raise RuntimeError(f"Required lock dir is unavailable for {model}")
             try:
                 lock_dir = _node_lock_dir()
             except OSError as exc:
+                if required:
+                    raise RuntimeError(f"Could not allocate required lock dir for {model}") from exc
                 logger.warning("Could not allocate lock dir (%s); running prefetch unlocked", exc)
                 yield
                 return
 
         if _dotfile_lock_acquire(lock_dir, model):
             dotfile_held = os.path.join(lock_dir, _safe_repo_filename(model) + ".dir")
+        elif required:
+            raise TimeoutError(f"Timed out acquiring required cache lock for {model}")
 
     try:
         yield

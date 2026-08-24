@@ -23,8 +23,9 @@ vllm bench omniinteract --omni \
 ```
 
 When `--data-root` is omitted, the runner downloads
-`lucky-lance/OmniInteract` from Hugging Face. `--num-prompts 0` runs every
-video in the selected subsets. Audio is sent as 16 kHz PCM16 in 200 ms chunks,
+`lucky-lance/OmniInteract` from Hugging Face. `--num-prompts` is the total
+across all selected subsets, not a per-subset count; `0` runs every selected
+video. Audio is sent as 16 kHz PCM16 in 200 ms chunks,
 video is sampled at 1 FPS, and input is paced in real time. These official
 replay semantics are fixed by the public CLI.
 `--ref-audio` is required because the MiniCPM-o native-duplex runtime uses it
@@ -58,7 +59,11 @@ Each successful case writes:
 Failures remove stale success markers and write `.failed.json`. The output root
 also contains `batch_summary.json` (with per-result `status`) and an
 official-compatible `official_eval_manifest.jsonl` (`sample_id`, `gt_json`,
-`model_json`, `scene_type`) for a later accuracy workflow.
+`model_json`, `scene_type`) for a later accuracy workflow. `result.json`
+records `audio_clipped_bytes` at the official horizon and
+`audio_overwritten_bytes` in the WAV; a transport-successful case with either
+count above zero remains in the batch summary but is excluded from the
+evaluator manifest.
 
 The current Realtime protocol does not expose accepted/processed input identity
 on `main`. Consequently, `.done` proves transport, response-lifecycle, and
@@ -72,5 +77,5 @@ Tests can call `run_omniinteract_case()` or
 `run_omniinteract_benchmark()` directly. The same runner supports deterministic
 subset selection, `--num-prompts`, bounded preprocessing/WebSocket concurrency,
 per-case artifacts, and a batch manifest, so a Nightly test can select four
-response-required videos per subset with concurrency two without duplicating
-the client implementation.
+response-required videos from one subset per invocation with concurrency two
+without duplicating the client implementation.

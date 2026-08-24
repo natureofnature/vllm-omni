@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import base64
+import errno
+import fcntl
 import io
 import json
 import subprocess
@@ -105,6 +107,19 @@ def test_discovers_all_official_layouts_without_oversampling(tmp_path: Path):
 
     assert [case.subset for case in cases] == ["1q1a", "1q1a_math", "1qna"]
     assert cases[-1].video_rel == "videos_bench/nested/guide.mp4"
+
+
+def test_num_prompts_is_total_across_selected_subsets(tmp_path: Path):
+    _write_dataset(tmp_path)
+
+    cases = data.discover_omniinteract_cases(
+        tmp_path,
+        data.OMNIINTERACT_SUBSETS,
+        num_prompts=2,
+        disable_shuffle=True,
+    )
+
+    assert [case.subset for case in cases] == ["1q1a", "1q1a_math"]
 
 
 def test_dataset_rejects_duplicate_subsets_and_missing_capacity(tmp_path: Path):
@@ -213,6 +228,47 @@ def test_downloads_dataset_archive_through_vllm_hf_filesystem(tmp_path: Path, mo
     assert downloads == ["datasets/owner/dataset/data.tar.gz"]
 
 
+def test_shared_cache_download_and_extract_use_enolck_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    source_root = _write_dataset(tmp_path / "source")
+    archive = tmp_path / "data.tar.gz"
+    with tarfile.open(archive, "w:gz") as handle:
+        handle.add(source_root, arcname="data")
+
+    cache_root = tmp_path / "cache"
+    target = cache_root / "vllm_omni" / "omniinteract" / "owner__dataset"
+    fallback = target.parent / (data.hub_prefetch._safe_repo_filename(data._archive_lock_key(target)) + ".dir")
+    downloads: list[str] = []
+    extractions: list[Path] = []
+    original_extract = data._safe_extract
+
+    class FakeHfFileSystem:
+        def download(self, remote: str, local: str) -> None:
+            assert fallback.is_dir()
+            downloads.append(remote)
+            time.sleep(0.05)
+            Path(local).write_bytes(archive.read_bytes())
+
+    def locked_extract(handle: tarfile.TarFile, directory: Path) -> None:
+        assert fallback.is_dir()
+        extractions.append(directory)
+        original_extract(handle, directory)
+
+    def unsupported_flock(*args) -> None:
+        raise OSError(errno.ENOLCK, "flock unavailable")
+
+    monkeypatch.setenv("HF_HOME", str(cache_root))
+    monkeypatch.setattr(data, "hf_fs", FakeHfFileSystem)
+    monkeypatch.setattr(data, "_safe_extract", locked_extract)
+    monkeypatch.setattr(fcntl, "flock", unsupported_flock)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        roots = list(executor.map(lambda _: data.resolve_omniinteract_root(None, "owner/dataset"), range(2)))
+
+    assert roots == [target / "data", target / "data"]
+    assert downloads == ["datasets/owner/dataset/data.tar.gz"]
+    assert len(extractions) == 1
+    assert not fallback.exists()
+
+
 def test_media_command_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch):
     def timeout(*args, **kwargs):
         raise subprocess.TimeoutExpired("ffprobe", 3)
@@ -305,8 +361,41 @@ def test_artifacts_clip_audio_and_transcript_to_official_video_horizon(tmp_path:
     transcript_event = next(event for event in events if event["type"] == "response.audio_transcript.delta")
     assert "delta" not in audio_event
     assert transcript_event["delta"] == "hello"
+    assert summary["audio_clipped_bytes"] == 4_800
+    assert summary["audio_overwritten_bytes"] == 0
     assert (output_dir / ".done").is_file()
     assert not (output_dir / ".failed.json").exists()
+
+
+def test_overlapping_responses_are_serialized_without_overwrite(tmp_path: Path):
+    case = _case(tmp_path)
+    collector = _collector(
+        (_created("r1"), 1.0),
+        (_audio("r1", frames=4_800, value=1), 1.1),
+        (_created("r2"), 1.11),
+        (_audio("r2", frames=2_400, value=2), 1.15),
+        (_done("r1"), 1.31),
+        (_done("r2"), 1.41),
+    )
+    result = oi.OmniInteractCaseResult("1q1a", str(case.video_path), "unused")
+
+    summary = oi.write_success_artifacts(
+        tmp_path / "output",
+        case,
+        collector,
+        stream_start=1.0,
+        video_duration_s=1.0,
+        require_response=False,
+        result=result,
+    )
+
+    with wave.open(str(Path(summary["output_dir"]) / "output.wav"), "rb") as handle:
+        pcm = handle.readframes(handle.getnframes())
+    first_offset = round(0.1 * 24_000) * 2
+    assert pcm[first_offset : first_offset + 9_600] == bytes((1, 0)) * 4_800
+    assert pcm[first_offset + 9_600 : first_offset + 14_400] == bytes((2, 0)) * 2_400
+    assert summary["audio_clipped_bytes"] == 0
+    assert summary["audio_overwritten_bytes"] == 0
 
 
 def test_output_dir_flattens_backslash_traversal(tmp_path: Path):
@@ -442,6 +531,8 @@ def test_failure_artifact_removes_stale_success_files(tmp_path: Path):
 
 def test_batch_artifacts_match_official_evaluator_handoff(tmp_path: Path):
     case = _case(tmp_path)
+    clipped_case = _case(tmp_path, name="clipped.mp4")
+    overwritten_case = _case(tmp_path, name="overwritten.mp4")
     output_root = tmp_path / "output"
     result = oi.OmniInteractCaseResult(
         "1q1a",
@@ -449,13 +540,32 @@ def test_batch_artifacts_match_official_evaluator_handoff(tmp_path: Path):
         str(oi._output_dir(output_root, case)),
         success=True,
     )
+    clipped_result = oi.OmniInteractCaseResult(
+        "1q1a",
+        str(clipped_case.video_path),
+        str(oi._output_dir(output_root, clipped_case)),
+        success=True,
+        audio_clipped_bytes=2,
+    )
+    overwritten_result = oi.OmniInteractCaseResult(
+        "1q1a",
+        str(overwritten_case.video_path),
+        str(oi._output_dir(output_root, overwritten_case)),
+        success=True,
+        audio_overwritten_bytes=2,
+    )
 
-    oi.write_batch_artifacts(output_root, [case], oi.OmniInteractBenchmarkResult([result]))
+    oi.write_batch_artifacts(
+        output_root,
+        [case, clipped_case, overwritten_case],
+        oi.OmniInteractBenchmarkResult([result, clipped_result, overwritten_result]),
+    )
 
-    summary_row = json.loads((output_root / "batch_summary.json").read_text())["results"][0]
-    manifest_row = json.loads((output_root / "official_eval_manifest.jsonl").read_text())
-    assert summary_row["status"] == "ok"
-    assert set(("sample_id", "gt_json", "model_json", "scene_type")) <= manifest_row.keys()
+    summary_rows = json.loads((output_root / "batch_summary.json").read_text())["results"]
+    manifest_rows = [json.loads(row) for row in (output_root / "official_eval_manifest.jsonl").read_text().splitlines()]
+    assert [row["status"] for row in summary_rows] == ["ok", "ok", "ok"]
+    assert len(manifest_rows) == 1
+    assert manifest_rows[0] == data.case_manifest(case, oi._output_dir(output_root, case))
 
 
 class _FakeClient:
