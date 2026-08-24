@@ -18,7 +18,7 @@ import os
 import subprocess
 import tempfile
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, cast
@@ -28,6 +28,7 @@ import pybase64 as base64
 
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     OmniInteractCase,
+    OmniInteractPreparedInput,
     case_manifest,
 )
 from vllm_omni.experimental.fullduplex.client import (
@@ -49,7 +50,7 @@ SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json"
 BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
 ARTIFACT_LOCK_FILE = ".omniinteract.lock"
 _INPUT_CHUNK_MS = 200
-_VIDEO_FPS = 1.0
+VIDEO_FPS = 1.0
 _COMPLETION_SETTLE_S = 2.0
 logger = logging.getLogger(__name__)
 
@@ -335,7 +336,7 @@ class _Playback:
 async def stream_inputs(
     client: RealtimeDuplexClient,
     pcm: bytes,
-    frames: list[str | None],
+    frames: Sequence[str | None],
     playback: _Playback,
 ) -> tuple[int, int, float, float]:
     """Pace interleaved PCM and frames over one Realtime session."""
@@ -345,7 +346,7 @@ async def stream_inputs(
     def chunk_hints(_offset: int, end_ms: int) -> dict[str, object]:
         nonlocal frame_cursor, sent_frames
         ready: list[str] = []
-        while frame_cursor < len(frames) and end_ms >= (frame_cursor + 0.5) * 1000 / _VIDEO_FPS:
+        while frame_cursor < len(frames) and end_ms >= (frame_cursor + 0.5) * 1000 / VIDEO_FPS:
             if frames[frame_cursor]:
                 ready.append(frames[frame_cursor] or "")
             frame_cursor += 1
@@ -1047,6 +1048,7 @@ async def run_omniinteract_case(
     request_index: int | str,
     persist_artifacts: bool = True,
     defer_artifacts: bool = False,
+    prepared_input: OmniInteractPreparedInput | None = None,
 ) -> OmniInteractCaseResult:
     """Run one case. This public coroutine is the hook used by E2E tests."""
 
@@ -1070,13 +1072,19 @@ async def run_omniinteract_case(
     try:
         if persist_artifacts:
             await asyncio.to_thread(clear_case_artifacts, config.output_root, case)
-        reference_audio = reference_audio_data_url(config.ref_audio)
-        duration, pcm, frames = await asyncio.to_thread(
-            prepare_media,
-            case.video_path,
-            _VIDEO_FPS,
-            timeout_s=config.media_timeout_s,
-        )
+        if prepared_input is None:
+            reference_audio = reference_audio_data_url(config.ref_audio)
+            duration, pcm, frames = await asyncio.to_thread(
+                prepare_media,
+                case.video_path,
+                VIDEO_FPS,
+                timeout_s=config.media_timeout_s,
+            )
+        else:
+            reference_audio = prepared_input.ref_audio_data_url
+            duration = prepared_input.duration_s
+            pcm = prepared_input.pcm16
+            frames = prepared_input.video_frames
         if not any(frames):
             raise ValueError(f"No video frames were decoded from {case.video_path}")
         async with RealtimeDuplexClient(_websocket_url(config, session_id)) as client:

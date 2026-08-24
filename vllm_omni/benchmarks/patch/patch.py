@@ -48,6 +48,7 @@ from vllm_omni.benchmarks.data_modules.daily_omni_dataset import (
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
     DEFAULT_OMNIINTERACT_REPO,
     OmniInteractDataset,
+    OmniInteractPreparedInput,
     OmniInteractSampleRequest,
     OmniInteractSessionOptions,
 )
@@ -62,10 +63,12 @@ from vllm_omni.benchmarks.data_modules.seed_tts_dataset import (
 from vllm_omni.benchmarks.data_modules.sound_effect_dataset import SoundEffectDataset
 from vllm_omni.benchmarks.data_modules.ttsd_dataset import TTSDDataset
 from vllm_omni.benchmarks.omniinteract import (
+    VIDEO_FPS,
     OmniInteractBenchmarkConfig,
     OmniInteractCaseResult,
     clear_batch_artifacts,
     clear_case_artifacts,
+    prepare_media,
     publish_deferred_case_artifacts,
     run_omniinteract_case,
     write_failure_artifacts,
@@ -79,6 +82,7 @@ from vllm_omni.benchmarks.omniinteract import (
 from vllm_omni.experimental.fullduplex.client import (
     RealtimeDuplexClient,
     build_realtime_url,
+    reference_audio_data_url,
     summarize_session_request_metrics,
     wait_for,
 )
@@ -248,6 +252,7 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
         return
     setattr(rfi, "omniinteract_case", sample.omniinteract_case)
     setattr(rfi, "omniinteract_options", sample.omniinteract_options)
+    setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
 
 
 def _finalize_omniinteract_batch(
@@ -393,6 +398,28 @@ def get_samples(args, tokenizer):
         )
         if not requests:
             raise ValueError("No OmniInteract sessions were selected")
+        encoded_ref_audio = reference_audio_data_url(options.ref_audio)
+        if encoded_ref_audio is None:
+            raise ValueError("OmniInteract reference audio could not be prepared")
+        for request in requests:
+            if not isinstance(request, OmniInteractSampleRequest):
+                raise RuntimeError("OmniInteract dataset returned an incompatible sample")
+            case = request.omniinteract_case
+            if case is None:
+                raise RuntimeError("OmniInteract sample lost its dataset case")
+            duration, pcm, frames = prepare_media(
+                case.video_path,
+                VIDEO_FPS,
+                timeout_s=options.media_timeout_s,
+            )
+            if not any(frames):
+                raise ValueError(f"No video frames were decoded from {case.video_path}")
+            request.omniinteract_prepared_input = OmniInteractPreparedInput(
+                duration_s=duration,
+                pcm16=pcm,
+                video_frames=tuple(frames),
+                ref_audio_data_url=encoded_ref_audio,
+            )
         # ``0`` means all for OmniInteract; the standard benchmark result must
         # still report the measured request count rather than the sentinel.
         args.num_prompts = len(requests)
@@ -1463,6 +1490,9 @@ async def _async_request_omniinteract(
     try:
         if case is None or not isinstance(options, OmniInteractSessionOptions):
             raise ValueError("OmniInteract RequestFuncInput is missing its dataset session layout")
+        prepared_input = getattr(request_func_input, "omniinteract_prepared_input", None)
+        if not isinstance(prepared_input, OmniInteractPreparedInput):
+            raise ValueError("OmniInteract media must be prepared before benchmark request timing")
         config = OmniInteractBenchmarkConfig(
             endpoint=request_func_input.api_url,
             model=request_func_input.model_name or request_func_input.model,
@@ -1478,6 +1508,7 @@ async def _async_request_omniinteract(
             request_index=request_func_input.request_id or uuid.uuid4().hex,
             persist_artifacts=False,
             defer_artifacts=request_func_input.request_id is not None,
+            prepared_input=prepared_input,
         )
         output.latency = case_result.latency_s
         output.generated_text = case_result.transcript

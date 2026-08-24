@@ -13,7 +13,7 @@ import shutil
 import tarfile
 import tempfile
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -48,12 +48,23 @@ class OmniInteractSessionOptions:
     require_response: bool = False
 
 
+@dataclass(frozen=True)
+class OmniInteractPreparedInput:
+    """Immutable local media prepared before benchmark timing starts."""
+
+    duration_s: float
+    pcm16: bytes = field(repr=False)
+    video_frames: tuple[str | None, ...] = field(repr=False)
+    ref_audio_data_url: str = field(repr=False)
+
+
 @dataclass
 class OmniInteractSampleRequest(SampleRequest):
     """One native-duplex video session consumed by the Realtime backend."""
 
     omniinteract_case: OmniInteractCase | None = None
     omniinteract_options: OmniInteractSessionOptions | None = None
+    omniinteract_prepared_input: OmniInteractPreparedInput | None = field(default=None, repr=False)
 
 
 class OmniInteractDataset(BenchmarkDataset):

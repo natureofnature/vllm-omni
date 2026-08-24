@@ -305,9 +305,11 @@ dataset capacity, every available case is used. The realtime endpoint must be
 selected explicitly with `--endpoint /v1/realtime`.
 
 Audio is replayed as 16 kHz PCM16 in 200 ms chunks, video at 1 FPS, with
-real-time pacing. `--omniinteract-media-timeout-s` bounds each direct
-`ffprobe`/`ffmpeg` command, while `--max-concurrency` bounds both preprocessing
-and WebSocket sessions; OmniInteract defaults to one concurrent session.
+real-time pacing. Selected videos and reference audio are prepared sequentially
+before benchmark timing starts; prepared media remains in memory for the run.
+`--omniinteract-media-timeout-s` bounds each `ffprobe`/`ffmpeg` command, while
+`--max-concurrency` bounds active WebSocket sessions; OmniInteract defaults to
+one concurrent session.
 Request rate, warmup, concurrency, result saving, and
 the standard serving benchmark summary use the same lifecycle as other
 `vllm bench serve` datasets. Use `--omniinteract-require-response` only for

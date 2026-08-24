@@ -1076,10 +1076,17 @@ async def test_public_case_runner_supports_functional_e2e(
         def raise_if_reader_stopped(self) -> None:
             return None
 
+    prepared_input = data.OmniInteractPreparedInput(
+        duration_s=2.0,
+        pcm16=bytes(32_000),
+        video_frames=(base64.b64encode(b"frame").decode(),),
+        ref_audio_data_url="data:audio/wav;base64,dGVzdCByZWZlcmVuY2UgYXVkaW8=",
+    )
+    monkeypatch.setattr(oi, "prepare_media", lambda *args, **kwargs: pytest.fail("media decoded during request"))
     monkeypatch.setattr(
         oi,
-        "prepare_media",
-        lambda *args, **kwargs: (2.0, bytes(32_000), [base64.b64encode(b"frame").decode()]),
+        "reference_audio_data_url",
+        lambda *args, **kwargs: pytest.fail("reference audio encoded during request"),
     )
     monkeypatch.setattr(oi, "RealtimeDuplexClient", FakeRealtimeClient)
     monkeypatch.setattr(oi, "_COMPLETION_SETTLE_S", 0)
@@ -1113,6 +1120,7 @@ async def test_public_case_runner_supports_functional_e2e(
         request_index=0,
         persist_artifacts=not defer_artifacts,
         defer_artifacts=defer_artifacts,
+        prepared_input=prepared_input,
     )
 
     assert result.success, result.error
@@ -1385,6 +1393,7 @@ async def test_case_rejects_media_without_decoded_video_frames(tmp_path: Path, m
 
 def test_serve_cli_loads_omniinteract_as_standard_samples(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     parser = TrackingArgumentParser()
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
@@ -1421,6 +1430,16 @@ def test_serve_cli_loads_omniinteract_as_standard_samples(
         ]
     )
     preprocess_serve_args(args)
+    prepared_videos: list[Path] = []
+    monkeypatch.setattr(benchmark_patch, "reference_audio_data_url", lambda _path: "data:audio/wav;base64,ref")
+
+    def prepare(video: Path, fps: float, *, timeout_s: float):
+        assert fps == oi.VIDEO_FPS
+        assert timeout_s == args.omniinteract_media_timeout_s
+        prepared_videos.append(video)
+        return 1.0, bytes(32_000), [base64.b64encode(video.name.encode()).decode()]
+
+    monkeypatch.setattr(benchmark_patch, "prepare_media", prepare)
     samples = benchmark_patch.get_samples(args, tokenizer=None)
 
     assert args.dataset_name == "omniinteract"
@@ -1431,9 +1450,18 @@ def test_serve_cli_loads_omniinteract_as_standard_samples(
     assert all(sample.omniinteract_options.output_root == tmp_path / "artifacts" for sample in samples)
     assert all(sample.omniinteract_options.ref_audio == str(ref_audio) for sample in samples)
     assert all(sample.omniinteract_options.require_response is True for sample in samples)
+    assert prepared_videos == [sample.omniinteract_case.video_path for sample in samples]
+    assert all(sample.omniinteract_prepared_input is not None for sample in samples)
+    assert all(sample.omniinteract_prepared_input.ref_audio_data_url.endswith(",ref") for sample in samples)
+    for sample in samples:
+        expected_frame = base64.b64encode(sample.omniinteract_case.video_path.name.encode()).decode()
+        assert sample.omniinteract_prepared_input.video_frames == (expected_frame,)
 
 
-def test_serve_cli_uses_zero_to_select_all_omniinteract_samples(tmp_path: Path):
+def test_serve_cli_uses_zero_to_select_all_omniinteract_samples(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
     parser = TrackingArgumentParser()
     OmniBenchmarkServingSubcommand.add_cli_args(parser)
     ref_audio = tmp_path / "reference.wav"
@@ -1458,6 +1486,8 @@ def test_serve_cli_uses_zero_to_select_all_omniinteract_samples(tmp_path: Path):
 
     _write_dataset(tmp_path)
     preprocess_serve_args(args)
+    monkeypatch.setattr(benchmark_patch, "reference_audio_data_url", lambda _path: "data:audio/wav;base64,ref")
+    monkeypatch.setattr(benchmark_patch, "prepare_media", lambda *args, **kwargs: (1.0, b"pcm", ["frame"]))
     samples = benchmark_patch.get_samples(args, tokenizer=None)
 
     assert len(samples) == 3
@@ -1487,7 +1517,7 @@ async def test_realtime_backend_runs_one_dataset_session_and_defers_only_measure
     )
     calls: list[dict[str, object]] = []
 
-    async def fake_run(case_arg, config, *, request_index, persist_artifacts, defer_artifacts):
+    async def fake_run(case_arg, config, *, request_index, persist_artifacts, defer_artifacts, prepared_input):
         calls.append(
             {
                 "case": case_arg,
@@ -1495,6 +1525,7 @@ async def test_realtime_backend_runs_one_dataset_session_and_defers_only_measure
                 "request_index": request_index,
                 "persist_artifacts": persist_artifacts,
                 "defer_artifacts": defer_artifacts,
+                "prepared_input": prepared_input,
             }
         )
         first_stage = {"output_token_count": 3, "tpot_ms": 15.0}
@@ -1536,6 +1567,12 @@ async def test_realtime_backend_runs_one_dataset_session_and_defers_only_measure
     )
     request.omniinteract_case = case
     request.omniinteract_options = options
+    request.omniinteract_prepared_input = data.OmniInteractPreparedInput(
+        duration_s=1.0,
+        pcm16=b"pcm",
+        video_frames=("frame",),
+        ref_audio_data_url="data:audio/wav;base64,ref",
+    )
 
     output = await benchmark_patch.async_request_openai_realtime_duplex(request, session=None)
 
@@ -1557,7 +1594,46 @@ async def test_realtime_backend_runs_one_dataset_session_and_defers_only_measure
     assert calls[0]["case"] is case
     assert calls[0]["persist_artifacts"] is False
     assert calls[0]["defer_artifacts"] is defer_artifacts
+    assert calls[0]["prepared_input"] is request.omniinteract_prepared_input
     assert (calls[0]["request_index"] == request_id) if request_id else bool(calls[0]["request_index"])
+
+
+@pytest.mark.asyncio
+async def test_realtime_backend_rejects_media_preparation_inside_request_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    case = _case(tmp_path)
+    options = data.OmniInteractSessionOptions(
+        output_root=tmp_path / "artifacts",
+        timeout_s=10,
+        media_timeout_s=5,
+        ref_audio="reference.wav",
+    )
+    request = RequestFuncInput(
+        model=oi.DEFAULT_MODEL,
+        model_name=oi.DEFAULT_MODEL,
+        prompt="",
+        api_url="http://server:8000/v1/realtime",
+        prompt_len=0,
+        output_len=0,
+        logprobs=None,
+        multi_modal_content=None,
+        ignore_eos=False,
+        request_id="measured-0",
+    )
+    request.omniinteract_case = case
+    request.omniinteract_options = options
+    monkeypatch.setattr(
+        benchmark_patch,
+        "run_omniinteract_case",
+        lambda *args, **kwargs: pytest.fail("unprepared request reached the runner"),
+    )
+
+    output = await benchmark_patch.async_request_openai_realtime_duplex(request, session=None)
+
+    assert output.success is False
+    assert "media must be prepared before benchmark request timing" in output.error
 
 
 def test_standard_benchmark_finalizes_only_measured_omniinteract_outputs(
