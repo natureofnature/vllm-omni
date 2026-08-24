@@ -52,7 +52,12 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         default=list(OMNIINTERACT_SUBSETS),
         help="OmniInteract subsets selected when --dataset-name omniinteract is used.",
     )
-    group.add_argument("--omniinteract-timeout-s", type=_positive_finite_float, default=900.0)
+    group.add_argument(
+        "--omniinteract-timeout-s",
+        type=_positive_finite_float,
+        default=900.0,
+        help="Timeout for one complete OmniInteract Realtime session.",
+    )
     group.add_argument(
         "--omniinteract-media-timeout-s",
         type=_positive_finite_float,
@@ -68,6 +73,12 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         "--omniinteract-require-response",
         action="store_true",
         help="Fail LISTEN-only cases; intended for selected functional E2E samples, not accuracy evaluation.",
+    )
+    group.add_argument(
+        "--omniinteract-output-dir",
+        type=Path,
+        default=Path("omniinteract-output"),
+        help="Directory for per-case WAV, transcript, event, and official-evaluation artifacts.",
     )
 
 
@@ -319,10 +330,23 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
     if getattr(args, "dataset_name", None) == "omniinteract":
         if getattr(args, "backend", None) != "openai-realtime-duplex":
             raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
-        if getattr(args, "endpoint", None) in (None, "", "/v1/completions"):
+        if getattr(args, "endpoint", None) != "/v1/realtime":
             raise ValueError("OmniInteract requires --endpoint /v1/realtime")
         if not getattr(args, "omniinteract_ref_audio", None):
             raise ValueError("OmniInteract requires --omniinteract-ref-audio")
+        if getattr(args, "ignore_eos", False):
+            raise ValueError("OmniInteract does not support --ignore-eos")
+        if getattr(args, "profile", False):
+            raise ValueError("OmniInteract does not support --profile")
+        if getattr(args, "skip_tokenizer_init", False):
+            raise ValueError("OmniInteract does not support --skip-tokenizer-init")
+        if float(getattr(args, "probe_request_rate", 0.0) or 0.0) > 0:
+            raise ValueError("OmniInteract does not support --probe-request-rate")
+        max_concurrency = getattr(args, "max_concurrency", None)
+        if max_concurrency is None:
+            args.max_concurrency = 1
+        elif max_concurrency <= 0:
+            raise ValueError("OmniInteract requires --max-concurrency to be positive")
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:

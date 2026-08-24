@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import inspect
 import json
 import math
 import time
 import wave
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -98,22 +99,55 @@ def _event_stage_metrics(event: dict[str, object]) -> dict[str, object] | None:
 
 def build_realtime_url(
     url: str,
-    model: str,
+    model: str | None,
     *,
     autostart: bool | None = None,
+    native_duplex: bool | None = True,
     session_id: str | None = None,
 ) -> str:
     """Add the explicit native-duplex query parameters to a Realtime URL."""
     parts = urlsplit(url)
+    if parts.scheme in {"http", "https"}:
+        parts = parts._replace(scheme="ws" if parts.scheme == "http" else "wss")
+    if parts.scheme not in {"ws", "wss"} or not parts.netloc:
+        raise ValueError(f"Unsupported Realtime URL: {url!r}")
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.setdefault("duplex", "1")
-    query.setdefault("model", model)
-    query.setdefault("minicpmo45_native_duplex", "1")
+    query["duplex"] = "1"
+    if model:
+        query["model"] = model
+    if native_duplex is not None:
+        query["minicpmo45_native_duplex"] = "1" if native_duplex else "0"
     if autostart is not None:
-        query.setdefault("autostart", "1" if autostart else "0")
+        query["autostart"] = "1" if autostart else "0"
     if session_id:
-        query.setdefault("session_id", session_id)
+        query["session_id"] = session_id
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def reference_audio_data_url(path: str | None) -> str | None:
+    """Encode a local reference WAV for a Realtime session update."""
+    if path is None:
+        return None
+    audio = Path(path).expanduser().resolve()
+    if not audio.is_file():
+        raise FileNotFoundError(f"Reference audio does not exist: {audio}")
+    return "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
+
+
+def chunk_period_ms(events: list[dict[str, object]], *, default: int = 1000) -> int:
+    """Read the negotiated native-duplex model-unit duration."""
+    for event in reversed(events):
+        session = event.get("session")
+        capabilities = session.get("capabilities") if isinstance(session, dict) else None
+        value = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return default
+
+
+def has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
+    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
+    return bool(unit_bytes and len(pcm16) % unit_bytes)
 
 
 def read_pcm16_wav(path: Path) -> bytes:
@@ -137,6 +171,59 @@ def write_pcm16_wav(path: Path, pcm16: bytes, *, sample_rate_hz: int) -> None:
         wav_file.setsampwidth(PCM16_BYTES_PER_SAMPLE)
         wav_file.setframerate(sample_rate_hz)
         wav_file.writeframes(pcm16)
+
+
+@dataclass(frozen=True)
+class PCMStreamStats:
+    chunks: int
+    mean_lag_s: float
+    max_lag_s: float
+
+
+async def stream_pcm16_chunks(
+    send_event: Callable[[dict[str, object]], Awaitable[None]],
+    pcm16: bytes,
+    *,
+    chunk_ms: int = 200,
+    realtime: bool = True,
+    chunk_hints: Callable[[int, int], dict[str, object] | None] | None = None,
+    on_chunk_sent: Callable[[int, int], Awaitable[object] | object] | None = None,
+) -> PCMStreamStats:
+    """Send paced PCM chunks with optional protocol-specific per-chunk hints."""
+    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    chunk_bytes = max(bytes_per_second * chunk_ms // 1000, PCM16_BYTES_PER_SAMPLE)
+    started_at = time.monotonic()
+    lags: list[float] = []
+    chunks = 0
+    for offset in range(0, len(pcm16), chunk_bytes):
+        end = min(offset + chunk_bytes, len(pcm16))
+        end_ms = end * 1000 // bytes_per_second
+        lags.append(max(0.0, time.monotonic() - (started_at + offset / bytes_per_second)))
+        event: dict[str, object] = {
+            "type": "input_audio_buffer.append",
+            "audio": base64.b64encode(pcm16[offset:end]).decode("ascii"),
+            "input_audio_format": "pcm16",
+            "sample_rate_hz": PCM16_SAMPLE_RATE,
+            "duration_ms": (end - offset) * 1000 // bytes_per_second,
+            "audio_end_ms": end_ms,
+        }
+        if chunk_hints is not None:
+            event.update(chunk_hints(offset, end_ms) or {})
+        await send_event(event)
+        chunks += 1
+        if on_chunk_sent is not None:
+            callback_result = on_chunk_sent(end, end_ms)
+            if inspect.isawaitable(callback_result):
+                callback_result = await callback_result
+            if callback_result is False:
+                break
+        if realtime:
+            await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
+    return PCMStreamStats(
+        chunks=chunks,
+        mean_lag_s=sum(lags) / len(lags) if lags else 0.0,
+        max_lag_s=max(lags, default=0.0),
+    )
 
 
 async def wait_for(
@@ -205,6 +292,20 @@ class RealtimeEventCollector:
             return b"".join(self.response_audio.get(response_id, ()))
         return b"".join(
             chunk for response_id in self.response_ids for chunk in self.response_audio.get(response_id, ())
+        )
+
+    def response_text(self, response_id: str) -> str:
+        """Join all text/transcript deltas for one response identity."""
+        return "".join(
+            str(event.get("delta") or "")
+            for event in self.events
+            if self.response_id(event) == response_id
+            and event.get("type")
+            in {
+                "response.audio_transcript.delta",
+                "response.output_text.delta",
+                "response.text.delta",
+            }
         )
 
     def errors(self) -> list[dict[str, object]]:
@@ -287,7 +388,14 @@ class RealtimeEventCollector:
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (
-                [float(value) for value in raw_itls if isinstance(value, int | float)]
+                [
+                    float(value)
+                    for value in raw_itls
+                    if isinstance(value, int | float)
+                    and not isinstance(value, bool)
+                    and math.isfinite(float(value))
+                    and value >= 0
+                ]
                 if isinstance(raw_itls, list)
                 else []
             )
@@ -303,8 +411,12 @@ class RealtimeEventCollector:
                 if isinstance(raw_ttft, int | float) and not isinstance(raw_ttft, bool)
                 else 0.0,
                 "tpot_ms": float(raw_tpot)
-                if isinstance(raw_tpot, int | float) and not isinstance(raw_tpot, bool)
-                else 0.0,
+                if isinstance(raw_tpot, int | float)
+                and not isinstance(raw_tpot, bool)
+                and math.isfinite(float(raw_tpot))
+                and raw_tpot >= 0
+                else None,
+                "itls_ms": itls,
                 "inter_token_interval_ms": _interval_summary(itls),
             }
 
@@ -496,28 +608,17 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
-    ) -> None:
-        chunk_bytes = max(
-            PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
-            PCM16_BYTES_PER_SAMPLE,
+        chunk_hints: Callable[[int, int], dict[str, object] | None] | None = None,
+        on_chunk_sent: Callable[[int, int], Awaitable[object] | object] | None = None,
+    ) -> PCMStreamStats:
+        return await stream_pcm16_chunks(
+            self.send,
+            pcm16,
+            chunk_ms=chunk_ms,
+            realtime=realtime,
+            chunk_hints=chunk_hints,
+            on_chunk_sent=on_chunk_sent,
         )
-        audio_end_ms = 0
-        for offset in range(0, len(pcm16), chunk_bytes):
-            chunk = pcm16[offset : offset + chunk_bytes]
-            duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
-            audio_end_ms += duration_ms
-            await self.send(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_end_ms,
-                }
-            )
-            if realtime:
-                await asyncio.sleep(duration_ms / 1000)
 
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
@@ -528,15 +629,18 @@ class RealtimeDuplexClient:
             if not pcm16:
                 continue
             played_ms = len(pcm16) * 1000 // (self.events.output_sample_rate_hz * PCM16_BYTES_PER_SAMPLE)
-            await self.send(
-                {
-                    "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
-            )
+            await self.send_playback_ack(response_id, played_ms)
+
+    async def send_playback_ack(self, response_id: str, played_ms: int) -> None:
+        await self.send(
+            {
+                "type": "playback.ack",
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
+                "played_ms": played_ms,
+                "committed_ms": played_ms,
+            }
+        )
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
         from_index = len(self.events.events)

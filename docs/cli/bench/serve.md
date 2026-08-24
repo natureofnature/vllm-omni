@@ -287,7 +287,9 @@ vllm bench serve --omni \
   --endpoint /v1/realtime \
   --omniinteract-ref-audio /path/to/reference.wav \
   --omniinteract-subsets 1q1a 1q1a_math 1qna \
-  --result-dir ./omniinteract-output \
+  --omniinteract-output-dir ./omniinteract-artifacts \
+  --save-result \
+  --result-dir ./benchmark-results \
   --num-prompts 3 \
   --max-concurrency 2 \
   --num-warmups 0
@@ -305,18 +307,31 @@ selected explicitly with `--endpoint /v1/realtime`.
 Audio is replayed as 16 kHz PCM16 in 200 ms chunks, video at 1 FPS, with
 real-time pacing. `--omniinteract-media-timeout-s` bounds each direct
 `ffprobe`/`ffmpeg` command, while `--max-concurrency` bounds both preprocessing
-and WebSocket sessions. Use `--omniinteract-require-response` only for selected
-functional E2E samples: a model may validly remain in LISTEN for an entire
-video.
+and WebSocket sessions; OmniInteract defaults to one concurrent session.
+Request rate, warmup, concurrency, result saving, and
+the standard serving benchmark summary use the same lifecycle as other
+`vllm bench serve` datasets. Use `--omniinteract-require-response` only for
+selected functional E2E samples: a model may validly remain in LISTEN for an
+entire video.
 
 Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`,
-`result.json`, and a final `.done` marker. The result directory also contains
-`batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
-`.failed.json`. Completion validates transport, response lifecycle, and
-artifacts, but does not judge answer accuracy. Transcript timestamps follow the
-client's serialized audio playback timeline rather than raw event-arrival time.
-`audio_clipped_bytes` records audio beyond the output horizon, which is the
-input video duration rounded up to the next second.
+`result.json`, and a final `.done` marker under `--omniinteract-output-dir`.
+That directory also contains `batch_summary.json` and
+`official_eval_manifest.jsonl`; failed cases write `.failed.json`. The standard
+benchmark JSON remains under `--result-dir`. Completion validates transport,
+response lifecycle, and artifacts, but does not judge answer accuracy.
+Transcript timestamps follow the client's serialized playback queue rather
+than raw event-arrival time. Successful cases with clipped output audio or a
+cancelled response are counted as ineligible in `batch_summary.json`, omitted
+from `official_eval_manifest.jsonl`, and reported by a warning. The
+`audio_clipped_bytes` field records audio beyond the output horizon, which is
+the input video duration rounded up to the next second.
+
+Per-response TTFT, TTFP, and RTF use the client receive time of
+`response.created` as their origin. Standard TPOT/ITL fields use engine-native
+stage-0 token timing when the server reports it; ITL percentiles are populated
+only when exact per-token intervals are present. These metrics are not inferred
+from the duration of the duplex audio session.
 
 ### Multi-Modal Benchmark
 

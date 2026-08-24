@@ -19,15 +19,22 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
-    PCM16_BYTES_PER_SAMPLE,
-    PCM16_SAMPLE_RATE,
+    PCM16_BYTES_PER_SAMPLE,  # noqa: F401 - compatibility export
+    PCM16_SAMPLE_RATE,  # noqa: F401 - compatibility export
     RealtimeDuplexClient,
     RealtimeEventCollector,
     build_realtime_url,
+    chunk_period_ms,
+    has_residual_model_unit,
     read_pcm16_wav,
+    reference_audio_data_url,
     wait_for,
     write_pcm16_wav,
 )
+
+# Backward-compatible names used by the demo's focused tests.
+_has_residual_model_unit = has_residual_model_unit
+_ref_audio_data_url = reference_audio_data_url
 
 
 class _StreamingOutputWriter:
@@ -133,25 +140,6 @@ def _latest_model_decision(
     return decision
 
 
-def _chunk_period_ms(events: list[dict[str, object]]) -> int:
-    for event in reversed(events):
-        session = event.get("session")
-        if not isinstance(session, dict):
-            continue
-        capabilities = session.get("capabilities")
-        if not isinstance(capabilities, dict):
-            continue
-        chunk_period_ms = capabilities.get("chunk_period_ms")
-        if isinstance(chunk_period_ms, int) and chunk_period_ms > 0:
-            return chunk_period_ms
-    return 1000
-
-
-def _has_residual_model_unit(pcm16: bytes, *, chunk_period_ms: int) -> bool:
-    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_period_ms // 1000
-    return bool(unit_bytes > 0 and len(pcm16) % unit_bytes)
-
-
 def _response_in_progress(events: list[dict[str, object]]) -> bool:
     return sum(event.get("type") == "response.created" for event in events) > sum(
         event.get("type") == "response.done" for event in events
@@ -166,13 +154,6 @@ def _event_count_after(
     if index is None:
         return 0
     return sum(event.get("type") == event_type for event in events[index + 1 :])
-
-
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
-        return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
 
 
 async def run_demo(args: argparse.Namespace) -> dict[str, object]:
@@ -194,7 +175,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     async with client:
         await client.configure(
             args.model,
-            ref_audio=_ref_audio_data_url(args.ref_audio),
+            ref_audio=reference_audio_data_url(args.ref_audio),
             session_id=args.session_id,
             temperature=args.temperature,
             timeout_s=args.timeout_s,
@@ -207,9 +188,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         )
         commit_event_cursor = len(client.events.events)
         stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
-        input_has_residual_model_unit = _has_residual_model_unit(
+        input_has_residual_model_unit = has_residual_model_unit(
             input_pcm16,
-            chunk_period_ms=_chunk_period_ms(client.events.events),
+            chunk_period_ms=chunk_period_ms(client.events.events),
         )
         wait_for_post_commit_decision = False
         commit_sent_at_s = time.monotonic()

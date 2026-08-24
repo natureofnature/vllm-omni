@@ -13,6 +13,7 @@ from vllm_omni.experimental.fullduplex.client import (
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    stream_pcm16_chunks,
     write_pcm16_wav,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
@@ -62,6 +63,48 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
     assert query["minicpmo45_native_duplex"] == ["1"]
+
+
+def test_realtime_client_normalizes_http_url_without_forcing_a_model_mode():
+    url = build_realtime_url(
+        "https://localhost:8099/v1/realtime?minicpmo45_native_duplex=1",
+        None,
+        native_duplex=None,
+    )
+
+    parts = urlsplit(url)
+    assert parts.scheme == "wss"
+    assert parse_qs(parts.query) == {
+        "duplex": ["1"],
+        "minicpmo45_native_duplex": ["1"],
+    }
+
+
+@pytest.mark.asyncio
+async def test_stream_pcm16_chunks_applies_hints_and_callbacks_once_per_chunk():
+    sent = []
+    callbacks = []
+
+    async def send(event):
+        sent.append(event)
+
+    async def on_chunk_sent(end, end_ms):
+        callbacks.append((end, end_ms))
+
+    stats = await stream_pcm16_chunks(
+        send,
+        bytes(6_400),
+        chunk_ms=100,
+        realtime=False,
+        chunk_hints=lambda _offset, end_ms: {"video_frames": [str(end_ms)]},
+        on_chunk_sent=on_chunk_sent,
+    )
+
+    assert [event["audio_end_ms"] for event in sent] == [100, 200]
+    assert [event["video_frames"] for event in sent] == [["100"], ["200"]]
+    assert callbacks == [(3_200, 100), (6_400, 200)]
+    assert stats.chunks == 2
+    assert 0 <= stats.mean_lag_s <= stats.max_lag_s
 
 
 @pytest.mark.asyncio
@@ -219,6 +262,16 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.last_received_at("response.audio.delta") is not None
 
 
+def test_realtime_event_collector_joins_text_and_transcript_deltas_by_response():
+    collector = RealtimeEventCollector()
+    collector.add({"type": "response.created", "response": {"id": "resp-a"}})
+    collector.add({"type": "response.output_text.delta", "response_id": "resp-a", "delta": "hello "})
+    collector.add({"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": "world"})
+    collector.add({"type": "response.text.delta", "response_id": "resp-b", "delta": "ignored"})
+
+    assert collector.response_text("resp-a") == "hello world"
+
+
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
     collector = RealtimeEventCollector()
     collector.add(
@@ -280,6 +333,7 @@ def test_realtime_event_collector_reports_engine_token_and_audio_intervals():
         "output_token_count": 4,
         "ttft_ms": 120.0,
         "tpot_ms": 15.0,
+        "itls_ms": [10.0, 14.0, 18.0],
         "inter_token_interval_ms": {
             "count": 3,
             "mean": 14.0,

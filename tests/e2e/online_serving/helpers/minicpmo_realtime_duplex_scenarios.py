@@ -53,18 +53,14 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
+    reference_audio_data_url,
+    stream_pcm16_chunks,
     summarize_session_request_metrics,
 )
 
 _url_with_model = build_realtime_url
 _read_wav_pcm16 = read_pcm16_wav
-
-
-def _ref_audio_data_url(path: str | None) -> str | None:
-    if path is None:
-        return None
-    ref_path = Path(path).expanduser()
-    return "data:audio/wav;base64," + base64.b64encode(ref_path.read_bytes()).decode("ascii")
+_ref_audio_data_url = reference_audio_data_url
 
 
 @dataclass
@@ -522,7 +518,7 @@ def _session_update_event(args: argparse.Namespace) -> dict[str, object]:
         temperature = 0.0
     if temperature is not None:
         session_payload["temperature"] = temperature
-    ref_audio = _ref_audio_data_url(getattr(args, "ref_audio", None))
+    ref_audio = reference_audio_data_url(getattr(args, "ref_audio", None))
     if ref_audio is not None:
         session_payload["ref_audio"] = ref_audio
     event: dict[str, object] = {
@@ -841,15 +837,12 @@ async def _send_pcm16(
 ) -> None:
     hints = hints or {}
     first_chunk_hints = first_chunk_hints or {}
-    chunk_bytes = max(PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000, PCM16_BYTES_PER_SAMPLE)
     model_unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
-    audio_ms = 0
     next_model_unit_bytes = model_unit_bytes
     frames_sent = 0
-    for offset in range(0, len(pcm16), chunk_bytes):
-        chunk = pcm16[offset : offset + chunk_bytes]
-        duration_ms = int(len(chunk) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE) * 1000)
-        audio_ms += duration_ms
+
+    def chunk_hints(offset: int, audio_ms: int) -> dict[str, object]:
+        nonlocal frames_sent
         chunk_hints = dict(hints)
         if offset == 0:
             chunk_hints.update(first_chunk_hints)
@@ -857,20 +850,11 @@ async def _send_pcm16(
             # Omni duplex cadence: one camera frame per 1 s of audio.
             chunk_hints["video_frames"] = [frame_b64]
             frames_sent += 1
-        await ws.send(
-            json.dumps(
-                {
-                    "type": "input_audio_buffer.append",
-                    "audio": base64.b64encode(chunk).decode("ascii"),
-                    "input_audio_format": "pcm16",
-                    "sample_rate_hz": PCM16_SAMPLE_RATE,
-                    "duration_ms": duration_ms,
-                    "audio_end_ms": audio_ms,
-                    **chunk_hints,
-                }
-            )
-        )
-        while offset + len(chunk) >= next_model_unit_bytes:
+        return chunk_hints
+
+    async def on_chunk_sent(end: int, _audio_ms: int):
+        nonlocal next_model_unit_bytes
+        while end >= next_model_unit_bytes:
             next_model_unit_bytes += model_unit_bytes
             if on_model_unit_ready is None:
                 continue
@@ -878,9 +862,20 @@ async def _send_pcm16(
             if inspect.isawaitable(should_continue):
                 should_continue = await should_continue
             if should_continue is False:
-                return
-        if realtime_delay:
-            await asyncio.sleep(duration_ms / 1000)
+                return False
+        return True
+
+    async def send_event(event: dict[str, object]) -> None:
+        await ws.send(json.dumps(event))
+
+    await stream_pcm16_chunks(
+        send_event,
+        pcm16,
+        chunk_ms=chunk_ms,
+        realtime=realtime_delay,
+        chunk_hints=chunk_hints,
+        on_chunk_sent=on_chunk_sent,
+    )
 
 
 async def _wait_for(

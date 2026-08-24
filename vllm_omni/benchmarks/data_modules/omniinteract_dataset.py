@@ -17,7 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vllm.transformers_utils.repo_utils import hf_fs
+from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
+from vllm.tokenizers import TokenizerLike
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
@@ -33,6 +34,76 @@ class OmniInteractCase:
     video_path: Path
     annotation_path: Path
     scene_type: str
+
+
+@dataclass(frozen=True)
+class OmniInteractSessionOptions:
+    """Runtime options carried from one dataset row to its Realtime session."""
+
+    output_root: Path
+    timeout_s: float
+    media_timeout_s: float
+    ref_audio: str
+    require_response: bool = False
+
+
+@dataclass
+class OmniInteractSampleRequest(SampleRequest):
+    """One native-duplex video session consumed by the Realtime backend."""
+
+    omniinteract_case: OmniInteractCase | None = None
+    omniinteract_options: OmniInteractSessionOptions | None = None
+
+
+class OmniInteractDataset(BenchmarkDataset):
+    """Load official OmniInteract sessions as standard serving samples."""
+
+    def __init__(
+        self,
+        *,
+        data_root: str | None,
+        dataset_repo: str = DEFAULT_OMNIINTERACT_REPO,
+        subsets: Sequence[str] = OMNIINTERACT_SUBSETS,
+        random_seed: int = 0,
+        disable_shuffle: bool = False,
+    ) -> None:
+        super().__init__(
+            dataset_path=data_root or dataset_repo,
+            random_seed=random_seed,
+            disable_shuffle=disable_shuffle,
+        )
+        self.root = resolve_omniinteract_root(data_root, dataset_repo)
+        self.subsets = tuple(subsets)
+
+    def sample(
+        self,
+        tokenizer: TokenizerLike | None,
+        num_requests: int,
+        *,
+        request_id_prefix: str = "",
+        options: OmniInteractSessionOptions,
+        **_: Any,
+    ) -> list[SampleRequest]:
+        del tokenizer
+        cases = discover_omniinteract_cases(
+            self.root,
+            self.subsets,
+            num_prompts=num_requests,
+            seed=self.random_seed,
+            disable_shuffle=self.disable_shuffle,
+        )
+        return [
+            OmniInteractSampleRequest(
+                prompt="",
+                prompt_len=0,
+                expected_output_len=0,
+                multi_modal_data=None,
+                request_id=f"{request_id_prefix}{index}",
+                omniinteract_case=case,
+                omniinteract_options=options,
+            )
+            for index, case in enumerate(cases)
+        ]
 
 
 def _data_dir(root: Path) -> Path:
@@ -70,7 +141,8 @@ def _safe_extract(handle: tarfile.TarFile, target: Path) -> None:
 
 def _archive_fingerprint(archive: Path) -> str:
     stat = archive.stat()
-    return f"{stat.st_size}:{stat.st_mtime_ns}"
+    # Some mounted filesystems reject colons in rename targets.
+    return f"{stat.st_size}-{stat.st_mtime_ns}"
 
 
 def _extract_archive(archive: Path, target: Path) -> Path:
@@ -128,27 +200,21 @@ def resolve_omniinteract_root(
     cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     cache_key = dataset_repo.replace("/", "__")
     target = cache_root / "vllm_omni" / "omniinteract" / cache_key
-    archive_root = target.parent / "archives" / cache_key
-    archive_root.mkdir(parents=True, exist_ok=True)
-    filesystem = hf_fs()
+    from huggingface_hub import hf_hub_download
+
     errors: list[str] = []
     downloaded_archive: Path | None = None
     for name in ("data.tar.gz", "data.tar"):
         try:
-            downloaded_archive = archive_root / name
-            if not downloaded_archive.is_file():
-                with tempfile.TemporaryDirectory(dir=archive_root) as temporary_dir:
-                    candidate = Path(temporary_dir) / name
-                    filesystem.download(f"datasets/{dataset_repo}/{name}", str(candidate))
-                    if not candidate.is_file():
-                        raise FileNotFoundError(f"Hugging Face did not download {name}")
-                    try:
-                        os.link(candidate, downloaded_archive)
-                    except FileExistsError:
-                        # Another process atomically published the same cache key.
-                        pass
+            downloaded_archive = Path(
+                hf_hub_download(
+                    repo_id=dataset_repo,
+                    filename=name,
+                    repo_type="dataset",
+                )
+            )
             break
-        except (OSError, RuntimeError, ValueError) as exc:  # noqa: PERF203 - both archive names are valid
+        except Exception as exc:  # noqa: BLE001, PERF203 - Hub exceptions vary by version
             errors.append(f"{name}: {exc}")
             downloaded_archive = None
     if downloaded_archive is None:

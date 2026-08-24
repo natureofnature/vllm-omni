@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""Local OmniInteract runner for MiniCPM-o native duplex serving."""
+"""OmniInteract session execution and artifacts for serving benchmarks."""
 
 from __future__ import annotations
 
@@ -10,31 +10,33 @@ import binascii
 import contextlib
 import hashlib
 import json
+import logging
 import math
 import subprocess
 import tempfile
 import time
-import wave
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit
 
 import pybase64 as base64
 
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
-    DEFAULT_OMNIINTERACT_REPO,
-    OMNIINTERACT_SUBSETS,
     OmniInteractCase,
     case_manifest,
-    discover_omniinteract_cases,
-    resolve_omniinteract_root,
 )
 from vllm_omni.experimental.fullduplex.client import (
     PCM16_BYTES_PER_SAMPLE,
     PCM16_SAMPLE_RATE,
     RealtimeDuplexClient,
     RealtimeEventCollector,
+    build_realtime_url,
+    chunk_period_ms,
+    has_residual_model_unit,
+    reference_audio_data_url,
+    summarize_session_request_metrics,
+    write_pcm16_wav,
 )
 
 OUTPUT_SAMPLE_RATE = 24_000
@@ -43,6 +45,7 @@ SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json"
 _INPUT_CHUNK_MS = 200
 _VIDEO_FPS = 1.0
 _COMPLETION_SETTLE_S = 2.0
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -50,18 +53,11 @@ class OmniInteractBenchmarkConfig:
     base_url: str = "http://127.0.0.1:8000"
     endpoint: str = "/v1/realtime"
     model: str = DEFAULT_MODEL
-    data_root: str | None = None
-    dataset_repo: str = DEFAULT_OMNIINTERACT_REPO
-    subsets: tuple[str, ...] = OMNIINTERACT_SUBSETS
     output_root: Path = Path("omniinteract-output")
-    num_prompts: int = 0
-    max_concurrency: int = 1
     timeout_s: float = 900.0
     media_timeout_s: float = 600.0
     ref_audio: str | None = None
     require_response: bool = False
-    seed: int = 0
-    disable_shuffle: bool = False
 
 
 @dataclass
@@ -81,6 +77,12 @@ class OmniInteractCaseResult:
     audio_bytes: int = 0
     audio_clipped_bytes: int = 0
     transcript: str = ""
+    eligible_for_official_eval: bool = False
+    official_eval_ineligible_reasons: list[str] = field(default_factory=list)
+    artifact_warnings: list[str] = field(default_factory=list)
+    output_tokens: int = 0
+    duplex_request_metrics: list[dict[str, object]] = field(default_factory=list)
+    duplex_session_metrics: dict[str, object] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -88,10 +90,14 @@ class OmniInteractCaseResult:
 
 def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
     succeeded = sum(result.success for result in results)
+    eligible = sum(result.success and result.eligible_for_official_eval for result in results)
     return {
         "total": len(results),
         "success": succeeded,
         "failed": len(results) - succeeded,
+        "eligible_for_official_eval": eligible,
+        "successful_but_ineligible": succeeded - eligible,
+        "audio_clipped_bytes": sum(result.audio_clipped_bytes for result in results),
         "results": [result.as_dict() for result in results],
     }
 
@@ -194,10 +200,19 @@ def prepare_media(video: Path, fps: float, *, timeout_s: float) -> tuple[float, 
 
 @dataclass(frozen=True)
 class _AudioSegment:
+    event_index: int
     response_id: str
     start_s: float
-    samples: int
+    pcm16: bytes
     rate: int
+
+    @property
+    def samples(self) -> int:
+        return len(self.pcm16) // PCM16_BYTES_PER_SAMPLE
+
+    @property
+    def end_s(self) -> float:
+        return self.start_s + self.samples / self.rate
 
 
 class _Playback:
@@ -208,9 +223,17 @@ class _Playback:
         self.acked: dict[str, int] = {}
         self.completed: set[str] = set()
         self.completion_acked: set[str] = set()
+        self.warnings: list[str] = []
+        self._total_samples: dict[str, int] = {}
+        self._fully_played_samples: dict[str, int] = {}
+        self._drain_cursor = 0
 
-    async def acknowledge(self, client: RealtimeDuplexClient, now: float | None = None) -> None:
-        events = client.events
+    def _warn_once(self, warning: str) -> None:
+        if warning not in self.warnings:
+            self.warnings.append(warning)
+
+    def ingest(self, events: RealtimeEventCollector) -> None:
+        """Decode each new audio delta exactly once into the playback queue."""
         while self.cursor < len(events.events):
             index, self.cursor = self.cursor, self.cursor + 1
             event = events.events[index]
@@ -222,45 +245,63 @@ class _Playback:
             if event.get("type") != "response.audio.delta":
                 continue
             encoded = event.get("delta") or event.get("audio")
-            if not response_id or not isinstance(encoded, str):
-                continue
-            try:
-                samples = len(base64.b64decode(encoded, validate=True)) // PCM16_BYTES_PER_SAMPLE
-            except (ValueError, binascii.Error):
-                continue
+            if not response_id:
+                raise ValueError("response audio has no response_id")
+            if not isinstance(encoded, str):
+                raise ValueError("response audio payload is missing")
+            output_format = event.get("format")
+            if output_format is None:
+                self._warn_once("response.audio.delta omitted format; assumed pcm16")
+            elif output_format != "pcm16":
+                raise ValueError("OmniInteract output must be pcm16")
             raw_rate = event.get("sample_rate_hz")
-            rate = (
-                raw_rate
-                if isinstance(raw_rate, int) and not isinstance(raw_rate, bool) and raw_rate > 0
-                else events.output_sample_rate_hz or OUTPUT_SAMPLE_RATE
-            )
+            if raw_rate is None:
+                rate = events.output_sample_rate_hz or OUTPUT_SAMPLE_RATE
+                self._warn_once(f"response.audio.delta omitted sample_rate_hz; assumed {rate}")
+            elif isinstance(raw_rate, int) and not isinstance(raw_rate, bool) and raw_rate > 0:
+                rate = raw_rate
+            else:
+                raise ValueError("response audio sample_rate_hz must be a positive integer")
+            if rate != OUTPUT_SAMPLE_RATE:
+                raise ValueError(f"OmniInteract output must use {OUTPUT_SAMPLE_RATE} Hz audio")
+            try:
+                raw = base64.b64decode(encoded, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise ValueError("response audio is not valid base64") from exc
+            if not raw or len(raw) % PCM16_BYTES_PER_SAMPLE:
+                raise ValueError("response audio is empty or not PCM16 aligned")
             start = max(events.event_received_at_s[index], self.end_s)
-            self.segments.append(_AudioSegment(response_id, start, samples, rate))
-            self.end_s = start + samples / rate
+            segment = _AudioSegment(index, response_id, start, raw, rate)
+            self.segments.append(segment)
+            self.end_s = segment.end_s
+            self._total_samples[response_id] = self._total_samples.get(response_id, 0) + segment.samples
 
+    async def acknowledge(self, client: RealtimeDuplexClient, now: float | None = None) -> None:
+        events = client.events
+        self.ingest(events)
         now = time.monotonic() if now is None else now
-        played: dict[str, int] = {}
-        total: dict[str, int] = {}
-        for segment in self.segments:
-            samples = min(segment.samples, max(0, round((now - segment.start_s) * segment.rate)))
-            played[segment.response_id] = played.get(segment.response_id, 0) + samples * 1000 // segment.rate
-            total[segment.response_id] = total.get(segment.response_id, 0) + segment.samples * 1000 // segment.rate
-        for response_id, played_ms in played.items():
-            if (
-                response_id not in self.completed
-                or response_id in self.completion_acked
-                or played_ms < total[response_id]
-            ):
-                continue
-            await client.send(
-                {
-                    "type": "playback.ack",
-                    "response_id": response_id,
-                    "item_id": f"item_{response_id}",
-                    "played_ms": played_ms,
-                    "committed_ms": played_ms,
-                }
+        while self._drain_cursor < len(self.segments) and self.segments[self._drain_cursor].end_s <= now:
+            segment = self.segments[self._drain_cursor]
+            self._fully_played_samples[segment.response_id] = (
+                self._fully_played_samples.get(segment.response_id, 0) + segment.samples
             )
+            self._drain_cursor += 1
+        partial_response_id: str | None = None
+        partial_samples = 0
+        if self._drain_cursor < len(self.segments):
+            segment = self.segments[self._drain_cursor]
+            if now > segment.start_s:
+                partial_response_id = segment.response_id
+                partial_samples = min(segment.samples, round((now - segment.start_s) * segment.rate))
+        for response_id in self.completed - self.completion_acked:
+            played_samples = self._fully_played_samples.get(response_id, 0)
+            if response_id == partial_response_id:
+                played_samples += partial_samples
+            total_samples = self._total_samples.get(response_id, 0)
+            if not total_samples or played_samples < total_samples:
+                continue
+            played_ms = played_samples * 1000 // OUTPUT_SAMPLE_RATE
+            await client.send_playback_ack(response_id, played_ms)
             self.acked[response_id] = played_ms
             self.completion_acked.add(response_id)
 
@@ -273,35 +314,29 @@ async def stream_inputs(
 ) -> tuple[int, int, float, float]:
     """Pace interleaved PCM and frames over one Realtime session."""
 
-    chunk_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * _INPUT_CHUNK_MS // 1000
-    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
-    started_at, frame_cursor, sent_frames = time.monotonic(), 0, 0
-    lags: list[float] = []
-    for offset in range(0, len(pcm), chunk_bytes):
-        end = min(offset + chunk_bytes, len(pcm))
-        end_ms = end * 1000 // bytes_per_second
-        lags.append(max(0.0, time.monotonic() - (started_at + offset / bytes_per_second)))
+    frame_cursor, sent_frames = 0, 0
+
+    def chunk_hints(_offset: int, end_ms: int) -> dict[str, object]:
+        nonlocal frame_cursor, sent_frames
         ready: list[str] = []
         while frame_cursor < len(frames) and end_ms >= (frame_cursor + 0.5) * 1000 / _VIDEO_FPS:
             if frames[frame_cursor]:
                 ready.append(frames[frame_cursor] or "")
             frame_cursor += 1
-        payload: dict[str, object] = {
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(pcm[offset:end]).decode("ascii"),
-            "input_audio_format": "pcm16",
-            "sample_rate_hz": PCM16_SAMPLE_RATE,
-            "duration_ms": (end - offset) * 1000 // bytes_per_second,
-            "audio_end_ms": end_ms,
-        }
-        if ready:
-            payload["video_frames"] = ready
-        await client.send(payload)
         sent_frames += len(ready)
+        return {"video_frames": ready} if ready else {}
+
+    async def on_chunk_sent(_end: int, _end_ms: int) -> None:
         await playback.acknowledge(client)
-        await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
-    lags.append(max(0.0, time.monotonic() - (started_at + len(pcm) / bytes_per_second)))
-    return math.ceil(len(pcm) / chunk_bytes), sent_frames, sum(lags) / len(lags), max(lags)
+
+    stats = await client.stream_pcm16(
+        pcm,
+        chunk_ms=_INPUT_CHUNK_MS,
+        realtime=True,
+        chunk_hints=chunk_hints,
+        on_chunk_sent=on_chunk_sent,
+    )
+    return stats.chunks, sent_frames, stats.mean_lag_s, stats.max_lag_s
 
 
 def _response_status(event: dict[str, object]) -> str | None:
@@ -428,16 +463,6 @@ def _validate_explicit_session_close(
             raise RuntimeError(f"Unexpected {event_type}{detail} before explicit session close completed")
 
 
-def _chunk_period_ms(events: list[dict[str, object]]) -> int:
-    for event in reversed(events):
-        session = event.get("session")
-        capabilities = session.get("capabilities") if isinstance(session, dict) else None
-        value = capabilities.get("chunk_period_ms") if isinstance(capabilities, dict) else None
-        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
-            return value
-    return 1000
-
-
 def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> bytes:
     """Keep one almost-full model unit for the final commit decision.
 
@@ -446,9 +471,8 @@ def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> by
     commit without adding silence or materially changing the input.
     """
 
-    period_ms = _chunk_period_ms(events)
-    unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * period_ms // 1000
-    if len(pcm) >= PCM16_BYTES_PER_SAMPLE and unit_bytes and len(pcm) % unit_bytes == 0:
+    period_ms = chunk_period_ms(events)
+    if len(pcm) >= PCM16_BYTES_PER_SAMPLE and not has_residual_model_unit(pcm, chunk_period_ms=period_ms):
         return pcm[:-PCM16_BYTES_PER_SAMPLE]
     return pcm
 
@@ -511,16 +535,6 @@ async def wait_for_session_completion(
     )
 
 
-def _response_text(collector: RealtimeEventCollector, response_id: str) -> str:
-    return "".join(
-        str(event.get("delta") or "")
-        for event in collector.events
-        if collector.response_id(event) == response_id
-        and event.get("type")
-        in {"response.audio_transcript.delta", "response.output_text.delta", "response.text.delta"}
-    )
-
-
 def _output_dir(root: Path, case: OmniInteractCase) -> Path:
     relative = case.video_rel.replace("\\", "/")
     stem = Path(relative).with_suffix("").as_posix().replace("/", "__")
@@ -540,9 +554,7 @@ def _atomic_write_json(path: Path, value: object) -> None:
 
 def _atomic_write_wav(path: Path, pcm: bytes, rate: int) -> None:
     temporary = path.with_name(f".{path.name}.tmp")
-    with wave.open(str(temporary), "wb") as output:
-        output.setparams((1, PCM16_BYTES_PER_SAMPLE, rate, 0, "NONE", "not compressed"))
-        output.writeframes(pcm)
+    write_pcm16_wav(temporary, pcm, sample_rate_hz=rate)
     temporary.replace(path)
 
 
@@ -561,11 +573,13 @@ def _sanitized_events(collector: RealtimeEventCollector) -> list[dict[str, objec
 
 def _build_output(
     collector: RealtimeEventCollector,
+    playback: _Playback,
     *,
     stream_start: float,
     video_duration_s: float,
     require_response: bool,
 ) -> tuple[bytes, int, str, list[dict[str, object]], int]:
+    playback.ingest(collector)
     created, done = response_ledger(collector)
     if created != done:
         raise ValueError(f"unfinished response_ids: {sorted(created - done)}")
@@ -578,42 +592,23 @@ def _build_output(
     }
     horizon_s = math.ceil(video_duration_s)
     output = bytearray(horizon_s * OUTPUT_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
-    # Match client playback: all response deltas share one serial output queue.
-    cursor_s = 0.0
     clipped_bytes = 0
     response_times: dict[str, list[float]] = {}
     responses_with_audio: set[str] = set()
-    for event, received_at in zip(collector.events, collector.event_received_at_s, strict=True):
-        if event.get("type") != "response.audio.delta":
-            continue
-        response_id = collector.response_id(event)
-        encoded = event.get("delta") or event.get("audio")
-        if not response_id or response_id not in created:
+    for segment in playback.segments:
+        response_id = segment.response_id
+        if response_id not in created:
             raise ValueError("response audio has no matching response.created")
-        if event.get("format") != "pcm16":
-            raise ValueError("OmniInteract output must be pcm16")
-        rate = event.get("sample_rate_hz")
-        if not isinstance(rate, int) or isinstance(rate, bool) or rate != OUTPUT_SAMPLE_RATE:
-            raise ValueError(f"OmniInteract output must use {OUTPUT_SAMPLE_RATE} Hz audio")
-        if not isinstance(encoded, str):
-            raise ValueError("response audio payload is missing")
-        try:
-            raw = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as exc:
-            raise ValueError("response audio is not valid base64") from exc
-        if not raw or len(raw) % PCM16_BYTES_PER_SAMPLE:
-            raise ValueError("response audio is empty or not PCM16 aligned")
-        start_s = max(0.0, received_at - stream_start, cursor_s)
-        end_s = start_s + len(raw) / (rate * PCM16_BYTES_PER_SAMPLE)
-        offset = round(start_s * rate) * PCM16_BYTES_PER_SAMPLE
-        writable = max(0, min(len(raw), len(output) - offset))
-        clipped_bytes += len(raw) - writable
+        start_s = max(0.0, segment.start_s - stream_start)
+        end_s = max(start_s, segment.end_s - stream_start)
+        offset = round(start_s * segment.rate) * PCM16_BYTES_PER_SAMPLE
+        writable = max(0, min(len(segment.pcm16), len(output) - offset))
+        clipped_bytes += len(segment.pcm16) - writable
         if writable:
-            clipped = raw[:writable]
+            clipped = segment.pcm16[:writable]
             output[offset : offset + writable] = clipped
             if any(clipped):
                 responses_with_audio.add(response_id)
-        cursor_s = end_s
         timing = response_times.setdefault(response_id, [start_s, end_s])
         timing[0], timing[1] = min(timing[0], start_s), max(timing[1], end_s)
 
@@ -628,7 +623,7 @@ def _build_output(
             raise ValueError("response transcript has no matching response.created")
     responses_with_text: set[str] = set()
     for response_id in collector.response_ids:
-        text = _response_text(collector, response_id).strip()
+        text = collector.response_text(response_id).strip()
         if not text:
             continue
         response_timing = response_times.get(response_id)
@@ -655,18 +650,24 @@ def write_success_artifacts(
     case: OmniInteractCase,
     collector: RealtimeEventCollector,
     *,
+    playback: _Playback | None = None,
     stream_start: float,
     video_duration_s: float,
     require_response: bool,
     result: OmniInteractCaseResult,
+    persist: bool = True,
 ) -> dict[str, Any]:
     directory = _output_dir(root, case)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
-        (directory / name).unlink(missing_ok=True)
+    if persist:
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
+            (directory / name).unlink(missing_ok=True)
+    publishing = False
     try:
+        playback = playback or _Playback()
         pcm, rate, transcript, chunks, clipped_bytes = _build_output(
             collector,
+            playback,
             stream_start=stream_start,
             video_duration_s=video_duration_s,
             require_response=require_response,
@@ -677,20 +678,45 @@ def write_success_artifacts(
         result.responses = len(collector.response_ids)
         result.output_dir = str(directory.resolve())
         result.success = True
-        _atomic_write_wav(directory / "output.wav", pcm, rate)
-        _atomic_write_json(directory / "wav_transcript.json", {"text": transcript, "chunks": chunks})
-        _atomic_write_json(directory / "events.json", _sanitized_events(collector))
-        _atomic_write_json(directory / "result.json", result.as_dict())
+        result.artifact_warnings = list(playback.warnings)
+        reasons: list[str] = []
+        if clipped_bytes:
+            reasons.append("audio_clipped")
+        if any(
+            event.get("type") == "response.done" and _response_status(event) == "cancelled"
+            for event in collector.events
+        ):
+            reasons.append("cancelled_response")
+        result.official_eval_ineligible_reasons = reasons
+        result.eligible_for_official_eval = not reasons
         summary = {
             **result.as_dict(),
             "annotation": str(case.annotation_path),
             "scene_type": "1QnA" if case.scene_type == "1qna" else case.scene_type,
         }
-        _atomic_write_json(directory / ".done", summary)
+        if persist:
+            publishing = True
+            _atomic_write_wav(directory / "output.wav", pcm, rate)
+            _atomic_write_json(
+                directory / "wav_transcript.json",
+                {
+                    "text": transcript,
+                    "chunks": chunks,
+                    "timestamp_semantics": "serialized playback queue time relative to input streaming start",
+                },
+            )
+            _atomic_write_json(directory / "events.json", _sanitized_events(collector))
+            _atomic_write_json(directory / "result.json", result.as_dict())
+            _atomic_write_json(directory / ".done", summary)
         return summary
     except Exception:
-        for name in SUCCESS_ARTIFACTS:
-            (directory / name).unlink(missing_ok=True)
+        result.success = False
+        result.eligible_for_official_eval = False
+        if publishing and "artifact_write_failed" not in result.official_eval_ineligible_reasons:
+            result.official_eval_ineligible_reasons.append("artifact_write_failed")
+        if persist:
+            for name in SUCCESS_ARTIFACTS:
+                (directory / name).unlink(missing_ok=True)
         raise
 
 
@@ -701,6 +727,7 @@ def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInte
         (directory / name).unlink(missing_ok=True)
     result.output_dir = str(directory.resolve())
     result.success = False
+    result.eligible_for_official_eval = False
     summary = {
         **result.as_dict(),
         "annotation": str(case.annotation_path),
@@ -728,8 +755,19 @@ def write_batch_artifacts(
     rows = [
         case_manifest(case, _output_dir(root, case))
         for case, result in zip(cases, results, strict=True)
-        if result.success and result.audio_clipped_bytes == 0
+        if result.success and result.eligible_for_official_eval
     ]
+    ineligible = [result for result in results if result.success and not result.eligible_for_official_eval]
+    if ineligible:
+        reason_counts: dict[str, int] = {}
+        for result in ineligible:
+            for reason in result.official_eval_ineligible_reasons or ["unspecified"]:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+        logger.warning(
+            "%d successful OmniInteract cases were excluded from official evaluation: %s",
+            len(ineligible),
+            ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())),
+        )
     _atomic_write_text(
         root / "official_eval_manifest.jsonl",
         "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
@@ -742,38 +780,64 @@ def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
         if urlsplit(config.endpoint).scheme
         else urljoin(config.base_url.rstrip("/") + "/", config.endpoint.lstrip("/"))
     )
-    parts = urlsplit(endpoint)
-    if parts.scheme not in {"http", "https", "ws", "wss"} or not parts.netloc:
-        raise ValueError(f"Unsupported endpoint scheme: {parts.scheme!r}")
-    if parts.scheme in {"http", "https"}:
-        parts = parts._replace(scheme="ws" if parts.scheme == "http" else "wss")
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query.update(
-        {
-            "duplex": "1",
-            "model": config.model,
-            "minicpmo45_native_duplex": "1",
-            "autostart": "0",
-            "session_id": session_id,
-        }
+    return build_realtime_url(
+        endpoint,
+        config.model,
+        autostart=False,
+        native_duplex=True,
+        session_id=session_id,
     )
-    return urlunsplit(parts._replace(query=urlencode(query)))
 
 
-def _reference_audio(path: str | None) -> str | None:
-    if not path:
-        return None
-    audio = Path(path).expanduser().resolve()
-    if not audio.is_file():
-        raise FileNotFoundError(f"Reference audio does not exist: {audio}")
-    return "data:audio/wav;base64," + base64.b64encode(audio.read_bytes()).decode("ascii")
+def _populate_response_metrics(
+    result: OmniInteractCaseResult,
+    collector: RealtimeEventCollector,
+    *,
+    stream_start: float,
+) -> None:
+    measurement_origin = {
+        "ttft": "response.created client receive to first non-empty text delta",
+        "ttfp": "response.created client receive to first audio packet",
+        "rtf": "response.created client receive to last audio packet divided by emitted audio duration",
+    }
+    request_metrics: list[dict[str, object]] = []
+    output_tokens = 0
+    for request_index, response_id in enumerate(collector.response_ids):
+        timing = collector.timing_summary(
+            after_s=stream_start,
+            input_committed_at_s=None,
+            response_id=response_id,
+            measurement_origin=measurement_origin,
+        )
+        metric = timing.get("request_metrics")
+        stage0 = timing.get("stage0_tokens")
+        if isinstance(metric, dict) or isinstance(stage0, dict):
+            request_metric = {
+                "session_id": result.session_id,
+                "request_index": request_index,
+                "response_id": response_id,
+            }
+            if isinstance(metric, dict):
+                request_metric.update(metric)
+            if isinstance(stage0, dict):
+                request_metric["stage0_tokens"] = dict(stage0)
+            request_metrics.append(request_metric)
+        if isinstance(stage0, dict):
+            output_tokens += int(stage0.get("output_token_count") or 0)
+    result.output_tokens = output_tokens
+    result.duplex_request_metrics = request_metrics
+    result.duplex_session_metrics = summarize_session_request_metrics(
+        request_metrics,
+        session_id=result.session_id,
+    )
 
 
 async def run_omniinteract_case(
     case: OmniInteractCase,
     config: OmniInteractBenchmarkConfig,
     *,
-    request_index: int,
+    request_index: int | str,
+    persist_artifacts: bool = True,
 ) -> OmniInteractCaseResult:
     """Run one case. This public coroutine is the hook used by E2E tests."""
 
@@ -793,8 +857,9 @@ async def run_omniinteract_case(
     )
     started_at = time.monotonic()
     try:
-        clear_case_artifacts(config.output_root, case)
-        reference_audio = _reference_audio(config.ref_audio)
+        if persist_artifacts:
+            await asyncio.to_thread(clear_case_artifacts, config.output_root, case)
+        reference_audio = reference_audio_data_url(config.ref_audio)
         duration, pcm, frames = await asyncio.to_thread(
             prepare_media,
             case.video_path,
@@ -861,45 +926,26 @@ async def run_omniinteract_case(
             result.input_video_frames = frame_count
             result.pacing_mean_lag_s = mean_lag
             result.pacing_max_lag_s = max_lag
-            write_success_artifacts(
+            _populate_response_metrics(result, client.events, stream_start=stream_start)
+            await asyncio.to_thread(
+                write_success_artifacts,
                 config.output_root,
                 case,
                 client.events,
+                playback=playback,
                 stream_start=stream_start,
                 video_duration_s=duration,
                 require_response=config.require_response,
                 result=result,
+                persist=persist_artifacts,
             )
     except Exception as exc:
+        result.success = False
+        result.eligible_for_official_eval = False
+        if "case_failed" not in result.official_eval_ineligible_reasons:
+            result.official_eval_ineligible_reasons.append("case_failed")
         result.error = str(exc)
         result.latency_s = max(0.0, time.monotonic() - started_at)
-        write_failure_artifacts(config.output_root, case, result)
+        if persist_artifacts:
+            await asyncio.to_thread(write_failure_artifacts, config.output_root, case, result)
     return result
-
-
-async def run_omniinteract_benchmark(config: OmniInteractBenchmarkConfig) -> list[OmniInteractCaseResult]:
-    """Run selected cases with bounded preprocessing and WebSocket concurrency."""
-
-    if config.num_prompts < 0:
-        raise ValueError("num_prompts must be non-negative")
-    if config.max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
-    root = await asyncio.to_thread(resolve_omniinteract_root, config.data_root, config.dataset_repo)
-    cases = await asyncio.to_thread(
-        discover_omniinteract_cases,
-        root,
-        config.subsets,
-        num_prompts=config.num_prompts,
-        seed=config.seed,
-        disable_shuffle=config.disable_shuffle,
-    )
-    config.output_root.mkdir(parents=True, exist_ok=True)
-    semaphore = asyncio.Semaphore(config.max_concurrency)
-
-    async def run(index: int, case: OmniInteractCase) -> OmniInteractCaseResult:
-        async with semaphore:
-            return await run_omniinteract_case(case, config, request_index=index)
-
-    results = list(await asyncio.gather(*(run(index, case) for index, case in enumerate(cases))))
-    await asyncio.to_thread(write_batch_artifacts, config.output_root, cases, results)
-    return results
