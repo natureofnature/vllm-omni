@@ -980,6 +980,7 @@ async def test_completion_waits_for_final_decision_after_current_commit():
     async def complete_current_commit():
         await asyncio.sleep(0.01)
         collector.add({"type": "input_audio_buffer.committed"})
+        collector.add({"type": "response.listen"})
         collector.add(_listen(model_listen=False, buffering=True, reason="buffering"))
         await asyncio.sleep(0.13)
         collector.add(_listen())
