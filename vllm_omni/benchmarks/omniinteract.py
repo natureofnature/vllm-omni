@@ -401,12 +401,33 @@ def _raise_if_session_terminated(collector: RealtimeEventCollector, from_index: 
         event_type = event.get("type")
         if event_type not in {"session.expired", "session.closed"}:
             continue
-        reason = event.get("reason")
-        nested = event.get("event")
-        if reason is None and isinstance(nested, dict):
-            reason = nested.get("reason")
+        reason = _session_close_reason(event)
         detail = f": {reason}" if reason else ""
         raise RuntimeError(f"{event_type}{detail}")
+
+
+def _session_close_reason(event: dict[str, object]) -> object | None:
+    reason = event.get("reason")
+    nested = event.get("event")
+    if reason is None and isinstance(nested, dict):
+        reason = nested.get("reason")
+    return reason
+
+
+def _validate_explicit_session_close(
+    collector: RealtimeEventCollector,
+    *,
+    session_from: int,
+    close_from: int,
+) -> None:
+    for index, event in enumerate(collector.events[session_from:], start=session_from):
+        event_type = event.get("type")
+        reason = _session_close_reason(event)
+        if event_type == "session.expired" or (
+            event_type == "session.closed" and (index < close_from or reason is not None)
+        ):
+            detail = f": {reason}" if reason else ""
+            raise RuntimeError(f"Unexpected {event_type}{detail} before explicit session close completed")
 
 
 def _chunk_period_ms(events: list[dict[str, object]]) -> int:
@@ -419,25 +440,25 @@ def _chunk_period_ms(events: list[dict[str, object]]) -> int:
     return 1000
 
 
-def _needs_post_commit_decision(pcm_bytes: int, events: list[dict[str, object]]) -> bool:
+def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> bytes:
+    """Keep one almost-full model unit for the final commit decision.
+
+    A complete unit is emitted before commit and its asynchronous decision has
+    no commit correlation. Removing one sample keeps that unit buffered until
+    commit without adding silence or materially changing the input.
+    """
+
     period_ms = _chunk_period_ms(events)
     unit_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * period_ms // 1000
-    created, done = _response_ledger_from_events(events)
-    return bool(created - done) or bool(unit_bytes and pcm_bytes % unit_bytes)
-
-
-def _response_ledger_from_events(events: list[dict[str, object]]) -> tuple[set[str], set[str]]:
-    collector = RealtimeEventCollector()
-    collector.events = events
-    collector.event_received_at_s = [0.0] * len(events)
-    return response_ledger(collector)
+    if len(pcm) >= PCM16_BYTES_PER_SAMPLE and unit_bytes and len(pcm) % unit_bytes == 0:
+        return pcm[:-PCM16_BYTES_PER_SAMPLE]
+    return pcm
 
 
 async def wait_for_session_completion(
     client: RealtimeDuplexClient,
     playback: _Playback,
     *,
-    pcm_bytes: int,
     commit_from: int,
     session_from: int | None = None,
     timeout_s: float,
@@ -447,7 +468,6 @@ async def wait_for_session_completion(
 
     deadline = time.monotonic() + timeout_s
     committed_index: int | None = None
-    require_decision = False
     last_event_count = len(client.events.events)
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
@@ -467,7 +487,6 @@ async def wait_for_session_completion(
                 None,
             )
             if committed_index is not None:
-                require_decision = _needs_post_commit_decision(pcm_bytes, client.events.events[: committed_index + 1])
                 stable_since = time.monotonic()
         if committed_index is not None:
             created, done = response_ledger(client.events)
@@ -477,7 +496,7 @@ async def wait_for_session_completion(
                 or (event.get("type") == "response.done" and _response_status(event) != "cancelled")
                 for event in post_commit
             )
-            if created == done and (decision or not require_decision) and time.monotonic() - stable_since >= settle_s:
+            if created == done and decision and time.monotonic() - stable_since >= settle_s:
                 return committed_index
         await asyncio.sleep(0.05)
     missing: set[str] = set()
@@ -791,6 +810,7 @@ async def run_omniinteract_case(
                 idle_timeout_s=config.timeout_s,
                 timeout_s=min(config.timeout_s, 20.0),
             )
+            pcm = _ensure_final_commit_tail(pcm, client.events.events)
             playback = _Playback()
             stream_start = time.monotonic()
             try:
@@ -814,7 +834,6 @@ async def run_omniinteract_case(
                 await wait_for_session_completion(
                     client,
                     playback,
-                    pcm_bytes=len(pcm),
                     commit_from=commit_from,
                     session_from=session_from,
                     timeout_s=config.timeout_s,
@@ -831,11 +850,11 @@ async def run_omniinteract_case(
             errors = client.events.errors()
             if errors:
                 raise RuntimeError(str(errors[-1]))
-            for index, event in enumerate(client.events.events[session_from:], start=session_from):
-                if event.get("type") == "session.expired" or (
-                    event.get("type") == "session.closed" and index < close_from
-                ):
-                    raise RuntimeError(f"Unexpected {event.get('type')} before explicit session close")
+            _validate_explicit_session_close(
+                client.events,
+                session_from=session_from,
+                close_from=close_from,
+            )
             result.latency_s = time.monotonic() - started_at
             result.input_audio_chunks = chunks
             result.input_video_frames = frame_count

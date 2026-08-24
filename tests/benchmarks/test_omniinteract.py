@@ -731,7 +731,8 @@ async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkey
     assert instances[0].configured["idle_timeout_s"] == config.timeout_s
     assert instances[0].configured["ref_audio"] == "data:audio/wav;base64,dGVzdCByZWZlcmVuY2UgYXVkaW8="
     appends = [event for event in instances[0].sent if event["type"] == "input_audio_buffer.append"]
-    assert [event["audio_end_ms"] for event in appends] == [200, 400, 600, 800, 1000]
+    assert [event["audio_end_ms"] for event in appends] == [200, 400, 600, 800, 999]
+    assert sum(len(base64.b64decode(event["audio"])) for event in appends) == 31_998
     assert ["video_frames" in event for event in appends] == [False, False, True, False, False]
     assert {event["type"] for event in instances[0].sent} >= {
         "input_audio_buffer.append",
@@ -784,7 +785,7 @@ async def test_case_times_out_when_realtime_upload_stalls(tmp_path: Path, monkey
 
 
 @pytest.mark.asyncio
-async def test_completion_ignores_old_commit_and_has_no_input_seq_dependency():
+async def test_completion_waits_for_final_decision_after_current_commit():
     collector = _collector(({"type": "input_audio_buffer.committed"}, 1.0))
     client = _FakeClient(collector)
     commit_from = len(collector.events)
@@ -792,20 +793,40 @@ async def test_completion_ignores_old_commit_and_has_no_input_seq_dependency():
     async def complete_current_commit():
         await asyncio.sleep(0.01)
         collector.add({"type": "input_audio_buffer.committed"})
+        await asyncio.sleep(0.14)
+        collector.add({"type": "response.listen"})
 
     task = asyncio.create_task(complete_current_commit())
     index = await oi.wait_for_session_completion(
         client,
         oi._Playback(),
-        pcm_bytes=32_000,
         commit_from=commit_from,
-        timeout_s=0.2,
+        timeout_s=0.4,
         settle_s=0.01,
     )
-    await task
 
+    assert task.done()
     assert index == commit_from
-    assert "accepted_input_seq" not in collector.events[index]
+
+
+def test_exact_model_unit_reserves_one_sample_for_final_commit():
+    session_created = {
+        "type": "session.created",
+        "session": {"capabilities": {"chunk_period_ms": 1000}},
+    }
+
+    assert len(oi._ensure_final_commit_tail(bytes(32_000), [session_created])) == 31_998
+    assert len(oi._ensure_final_commit_tail(bytes(31_998), [session_created])) == 31_998
+
+
+def test_explicit_close_rejects_racing_timeout_event():
+    collector = _collector(
+        ({"type": "session.created"}, 1.0),
+        ({"type": "session.closed", "event": {"reason": "timeout"}}, 1.1),
+    )
+
+    with pytest.raises(RuntimeError, match="session.closed: timeout"):
+        oi._validate_explicit_session_close(collector, session_from=0, close_from=1)
 
 
 @pytest.mark.asyncio
@@ -819,7 +840,6 @@ async def test_completion_requires_each_created_response_to_finish():
         await oi.wait_for_session_completion(
             _FakeClient(collector),
             oi._Playback(),
-            pcm_bytes=16_000,
             commit_from=1,
             timeout_s=0.06,
             settle_s=0.01,
@@ -836,7 +856,6 @@ async def test_completion_fails_fast_on_transport_close():
         await oi.wait_for_session_completion(
             client,
             oi._Playback(),
-            pcm_bytes=32_000,
             commit_from=0,
             timeout_s=10,
             settle_s=0,
@@ -854,7 +873,6 @@ async def test_completion_rejects_session_closed_before_final_commit():
         await oi.wait_for_session_completion(
             _FakeClient(collector),
             oi._Playback(),
-            pcm_bytes=32_000,
             commit_from=1,
             session_from=0,
             timeout_s=0.2,
