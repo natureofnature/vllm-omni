@@ -777,6 +777,38 @@ async def test_completion_waits_for_final_decision_after_current_commit():
     assert index == commit_from
 
 
+@pytest.mark.asyncio
+async def test_completion_ignores_response_that_releases_deferred_final_input():
+    collector = _collector((_created("active"), 1.0))
+    client = _FakeClient(collector)
+    commit_from = len(collector.events)
+
+    async def complete_deferred_commit():
+        await asyncio.sleep(0.01)
+        collector.add(
+            {
+                "type": "input_audio_buffer.committed",
+                "event": {"overlap_deferred": True},
+            }
+        )
+        await asyncio.sleep(0.02)
+        collector.add(_done("active"))
+        await asyncio.sleep(0.08)
+        collector.add({"type": "response.listen"})
+
+    task = asyncio.create_task(complete_deferred_commit())
+    index = await oi.wait_for_session_completion(
+        client,
+        oi._Playback(),
+        commit_from=commit_from,
+        timeout_s=0.4,
+        settle_s=0.01,
+    )
+
+    assert task.done()
+    assert index == commit_from
+
+
 def test_exact_model_unit_reserves_one_sample_for_final_commit():
     session_created = {
         "type": "session.created",

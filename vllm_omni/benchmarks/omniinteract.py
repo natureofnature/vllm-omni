@@ -349,6 +349,48 @@ def response_ledger(collector: RealtimeEventCollector) -> tuple[set[str], set[st
     return created, done
 
 
+def _active_response_ids_before(collector: RealtimeEventCollector, end: int) -> set[str]:
+    created: set[str] = set()
+    done: set[str] = set()
+    for event in collector.events[:end]:
+        response_id = collector.response_id(event)
+        if not response_id:
+            continue
+        if event.get("type") == "response.created":
+            created.add(response_id)
+        elif event.get("type") == "response.done":
+            done.add(response_id)
+    return created - done
+
+
+def _commit_defers_response(event: dict[str, object]) -> bool:
+    committed = event.get("event")
+    return isinstance(committed, dict) and committed.get("overlap_deferred") is True
+
+
+def _has_post_commit_decision(
+    collector: RealtimeEventCollector,
+    events: list[dict[str, object]],
+    *,
+    prior_response_ids: set[str],
+) -> bool:
+    """Ignore terminals that only release a deferred final input."""
+
+    pending_prior = set(prior_response_ids)
+    for event in events:
+        event_type = event.get("type")
+        if event_type == "response.done":
+            response_id = collector.response_id(event)
+            if response_id in pending_prior:
+                pending_prior.remove(response_id)
+                continue
+            if not pending_prior and _response_status(event) != "cancelled":
+                return True
+        elif event_type == "response.listen" and not pending_prior:
+            return True
+    return False
+
+
 def _raise_if_session_terminated(collector: RealtimeEventCollector, from_index: int) -> None:
     errors = collector.errors()
     if errors:
@@ -424,6 +466,7 @@ async def wait_for_session_completion(
 
     deadline = time.monotonic() + timeout_s
     committed_index: int | None = None
+    prior_response_ids: set[str] = set()
     last_event_count = len(client.events.events)
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
@@ -443,14 +486,17 @@ async def wait_for_session_completion(
                 None,
             )
             if committed_index is not None:
+                committed_event = client.events.events[committed_index]
+                if _commit_defers_response(committed_event):
+                    prior_response_ids = _active_response_ids_before(client.events, committed_index)
                 stable_since = time.monotonic()
         if committed_index is not None:
             created, done = response_ledger(client.events)
             post_commit = client.events.events[committed_index + 1 :]
-            decision = any(
-                event.get("type") == "response.listen"
-                or (event.get("type") == "response.done" and _response_status(event) != "cancelled")
-                for event in post_commit
+            decision = _has_post_commit_decision(
+                client.events,
+                post_commit,
+                prior_response_ids=prior_response_ids,
             )
             if created == done and decision and time.monotonic() - stable_since >= settle_s:
                 return committed_index
