@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import json
+import multiprocessing as mp
 import shutil
 import subprocess
 import tarfile
@@ -638,6 +639,78 @@ def test_atomic_wav_failure_preserves_destination_and_cleans_temporary_file(
 
     assert target.read_bytes() == b"previous"
     assert not list(tmp_path.glob(".output.wav.*.tmp"))
+
+
+def test_success_artifact_bundle_is_serialized_across_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    context = mp.get_context("fork")
+    release = context.Event()
+    first_partial = context.Event()
+    second_started, second_publishing = context.Event(), context.Event()
+    output_root = tmp_path / "output"
+    output_dir = output_root / "case"
+    first_pcm = bytes((1, 0)) * 4
+    second_pcm = bytes((2, 0)) * 4
+    atomic_write_wav = oi._atomic_write_wav
+
+    def synchronized_write_wav(path: Path, pcm: bytes, rate: int) -> None:
+        atomic_write_wav(path, pcm, rate)
+        if pcm == second_pcm:
+            second_publishing.set()
+        elif pcm == first_pcm:
+            first_partial.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release first publisher")
+
+    def publish_bundle(marker: str) -> None:
+        if marker == "second":
+            second_started.set()
+        result = oi.OmniInteractCaseResult("1q1a", "video.mp4", str(output_dir))
+        result.transcript = marker
+        oi._replace_success_artifacts(
+            output_root,
+            output_dir,
+            result,
+            pcm=first_pcm if marker == "first" else second_pcm,
+            rate=24_000,
+            chunks=[{"marker": marker}],
+            events=[{"marker": marker}],
+            summary={"marker": marker},
+        )
+
+    monkeypatch.setattr(oi, "_atomic_write_wav", synchronized_write_wav)
+    first = context.Process(target=publish_bundle, args=("first",))
+    second = context.Process(target=publish_bundle, args=("second",))
+    try:
+        first.start()
+        assert first_partial.wait(timeout=5)
+        second.start()
+        assert second_started.wait(timeout=5)
+        assert not second_publishing.wait(timeout=0.2)
+        assert not (output_dir / ".done").exists()
+        release.set()
+        assert second_publishing.wait(timeout=5)
+    finally:
+        release.set()
+        for process in (first, second):
+            if process.pid is not None:
+                process.join(timeout=5)
+                if process.is_alive():
+                    process.terminate()
+                    process.join(timeout=5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    with wave.open(str(output_dir / "output.wav"), "rb") as handle:
+        assert handle.readframes(handle.getnframes()) == second_pcm
+    assert json.loads((output_dir / "wav_transcript.json").read_text())["text"] == "second"
+    assert json.loads((output_dir / "events.json").read_text()) == [{"marker": "second"}]
+    assert json.loads((output_dir / "result.json").read_text())["transcript"] == "second"
+    assert json.loads((output_dir / ".done").read_text()) == {"marker": "second"}
+    assert not (output_dir / ".failed.json").exists()
+    assert not list(output_dir.glob(".*.tmp"))
 
 
 def test_deferred_artifacts_keep_sparse_audio_until_publication(tmp_path: Path):

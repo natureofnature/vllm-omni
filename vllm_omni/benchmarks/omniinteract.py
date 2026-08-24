@@ -9,6 +9,7 @@ import asyncio
 import binascii
 import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import logging
@@ -17,6 +18,7 @@ import os
 import subprocess
 import tempfile
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any, cast
@@ -45,6 +47,7 @@ OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_MODEL = "openbmb/MiniCPM-o-4_5"
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
 BATCH_ARTIFACTS = ("batch_summary.json", "official_eval_manifest.jsonl")
+ARTIFACT_LOCK_FILE = ".omniinteract.lock"
 _INPUT_CHUNK_MS = 200
 _VIDEO_FPS = 1.0
 _COMPLETION_SETTLE_S = 2.0
@@ -579,6 +582,19 @@ def _output_dir(root: Path, case: OmniInteractCase) -> Path:
     return root / case.subset / f"{stem}--{digest}"
 
 
+@contextlib.contextmanager
+def _artifact_output_lock(root: Path) -> Iterator[None]:
+    """Serialize artifact mutations by benchmark processes sharing a root."""
+
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ARTIFACT_LOCK_FILE).open("a+b") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _atomic_write_text(path: Path, value: str) -> None:
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
@@ -665,6 +681,37 @@ def _publish_success_artifacts(
     _atomic_write_json(directory / "events.json", events)
     _atomic_write_json(directory / "result.json", result.as_dict())
     _atomic_write_json(directory / ".done", summary)
+
+
+def _replace_success_artifacts(
+    root: Path,
+    directory: Path,
+    result: OmniInteractCaseResult,
+    *,
+    pcm: bytes | bytearray,
+    rate: int,
+    chunks: list[dict[str, object]],
+    events: list[dict[str, object]],
+    summary: dict[str, Any],
+) -> None:
+    with _artifact_output_lock(root):
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
+                (directory / name).unlink(missing_ok=True)
+            _publish_success_artifacts(
+                directory,
+                result,
+                pcm=pcm,
+                rate=rate,
+                chunks=chunks,
+                events=events,
+                summary=summary,
+            )
+        except Exception:
+            for name in SUCCESS_ARTIFACTS:
+                (directory / name).unlink(missing_ok=True)
+            raise
 
 
 def _build_output(
@@ -772,9 +819,7 @@ def write_success_artifacts(
         raise ValueError("persist and defer are mutually exclusive")
     directory = _output_dir(root, case)
     if persist:
-        directory.mkdir(parents=True, exist_ok=True)
-        for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
-            (directory / name).unlink(missing_ok=True)
+        clear_case_artifacts(root, case)
     publishing = False
     try:
         playback = playback or _Playback()
@@ -822,7 +867,8 @@ def write_success_artifacts(
         elif persist:
             assert pcm is not None and events is not None
             publishing = True
-            _publish_success_artifacts(
+            _replace_success_artifacts(
+                root,
                 directory,
                 result,
                 pcm=pcm,
@@ -837,21 +883,19 @@ def write_success_artifacts(
         result.eligible_for_official_eval = False
         if publishing and "artifact_write_failed" not in result.official_eval_ineligible_reasons:
             result.official_eval_ineligible_reasons.append("artifact_write_failed")
-        if persist:
-            for name in SUCCESS_ARTIFACTS:
-                (directory / name).unlink(missing_ok=True)
         raise
 
 
 def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInteractCaseResult) -> None:
     directory = _output_dir(root, case)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in SUCCESS_ARTIFACTS:
-        (directory / name).unlink(missing_ok=True)
     result.output_dir = str(directory.resolve())
     result.success = False
     result.eligible_for_official_eval = False
-    _atomic_write_json(directory / ".failed.json", _artifact_summary(case, result))
+    with _artifact_output_lock(root):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in SUCCESS_ARTIFACTS:
+            (directory / name).unlink(missing_ok=True)
+        _atomic_write_json(directory / ".failed.json", _artifact_summary(case, result))
 
 
 def publish_deferred_case_artifacts(
@@ -869,14 +913,12 @@ def publish_deferred_case_artifacts(
     if context is None:
         raise RuntimeError("OmniInteract benchmark output lost its deferred artifact context")
     directory = _output_dir(root, case)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
-        (directory / name).unlink(missing_ok=True)
     try:
         pcm = bytearray(context.horizon_bytes)
         for span in context.spans:
             pcm[span.offset : span.offset + len(span.pcm16)] = span.pcm16
-        _publish_success_artifacts(
+        _replace_success_artifacts(
+            root,
             directory,
             result,
             pcm=pcm,
@@ -890,8 +932,6 @@ def publish_deferred_case_artifacts(
         result.eligible_for_official_eval = False
         if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
             result.official_eval_ineligible_reasons.append("artifact_write_failed")
-        for name in SUCCESS_ARTIFACTS:
-            (directory / name).unlink(missing_ok=True)
         raise
 
 
@@ -899,17 +939,18 @@ def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
     """Invalidate a previous run before starting expensive preprocessing."""
 
     directory = _output_dir(root, case)
-    directory.mkdir(parents=True, exist_ok=True)
-    for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
-        (directory / name).unlink(missing_ok=True)
+    with _artifact_output_lock(root):
+        directory.mkdir(parents=True, exist_ok=True)
+        for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
+            (directory / name).unlink(missing_ok=True)
 
 
 def clear_batch_artifacts(root: Path) -> None:
     """Invalidate aggregate handoff files before a measured batch starts."""
 
-    root.mkdir(parents=True, exist_ok=True)
-    for name in BATCH_ARTIFACTS:
-        (root / name).unlink(missing_ok=True)
+    with _artifact_output_lock(root):
+        for name in BATCH_ARTIFACTS:
+            (root / name).unlink(missing_ok=True)
 
 
 def write_batch_artifacts(
@@ -917,8 +958,6 @@ def write_batch_artifacts(
     cases: list[OmniInteractCase],
     results: list[OmniInteractCaseResult],
 ) -> None:
-    root.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(root / "batch_summary.json", benchmark_summary(results))
     rows = [
         case_manifest(case, _output_dir(root, case))
         for case, result in zip(cases, results, strict=True)
@@ -935,10 +974,12 @@ def write_batch_artifacts(
             len(ineligible),
             ", ".join(f"{reason}={count}" for reason, count in sorted(reason_counts.items())),
         )
-    _atomic_write_text(
-        root / "official_eval_manifest.jsonl",
-        "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
-    )
+    with _artifact_output_lock(root):
+        _atomic_write_json(root / "batch_summary.json", benchmark_summary(results))
+        _atomic_write_text(
+            root / "official_eval_manifest.jsonl",
+            "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows),
+        )
 
 
 def _websocket_url(config: OmniInteractBenchmarkConfig, session_id: str) -> str:
