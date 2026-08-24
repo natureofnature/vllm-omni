@@ -282,12 +282,17 @@ class _Playback:
 
         now = time.monotonic() if now is None else now
         played: dict[str, int] = {}
+        total: dict[str, int] = {}
         for segment in self.segments:
             samples = min(segment.samples, max(0, round((now - segment.start_s) * segment.rate)))
             played[segment.response_id] = played.get(segment.response_id, 0) + samples * 1000 // segment.rate
+            total[segment.response_id] = total.get(segment.response_id, 0) + segment.samples * 1000 // segment.rate
         for response_id, played_ms in played.items():
-            completion_due = response_id in self.completed and response_id not in self.completion_acked
-            if played_ms <= self.acked.get(response_id, -1) and not completion_due:
+            if (
+                response_id not in self.completed
+                or response_id in self.completion_acked
+                or played_ms < total[response_id]
+            ):
                 continue
             await client.send(
                 {
@@ -299,8 +304,7 @@ class _Playback:
                 }
             )
             self.acked[response_id] = played_ms
-            if response_id in self.completed:
-                self.completion_acked.add(response_id)
+            self.completion_acked.add(response_id)
 
 
 async def stream_inputs(
@@ -816,7 +820,7 @@ async def run_omniinteract_case(
                     timeout_s=config.timeout_s,
                     settle_s=config.settle_s,
                 )
-                await playback.acknowledge(client, time.monotonic())
+                await playback.acknowledge(client, playback.end_s)
                 _raise_if_session_terminated(client.events, session_from)
                 close_from = len(client.events.events)
                 await client.close_session(timeout_s=min(config.timeout_s, 20.0))

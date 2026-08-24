@@ -609,6 +609,31 @@ class _FakeClient:
             raise self.reader_error
 
 
+@pytest.mark.asyncio
+async def test_playback_commits_completed_response_only_after_audio_drains():
+    collector = _collector(
+        (_created("response"), 9.9),
+        (_audio("response", frames=24_000), 10.0),
+        (_done("response"), 10.01),
+    )
+    client = _FakeClient(collector)
+    playback = oi._Playback()
+
+    await playback.acknowledge(client, now=10.2)
+    assert client.sent == []
+
+    await playback.acknowledge(client, now=11.0)
+    assert client.sent == [
+        {
+            "type": "playback.ack",
+            "response_id": "response",
+            "item_id": "item_response",
+            "played_ms": 1_000,
+            "committed_ms": 1_000,
+        }
+    ]
+
+
 @pytest.mark.parametrize(
     ("base_url", "endpoint", "expected_scheme"),
     [
