@@ -9,10 +9,10 @@ import asyncio
 import binascii
 import contextlib
 import hashlib
-import io
 import json
 import math
 import subprocess
+import tempfile
 import time
 import wave
 from dataclasses import asdict, dataclass, field
@@ -204,28 +204,33 @@ def prepare_media(video: Path, fps: float, *, timeout_s: float) -> tuple[float, 
     target_bytes = math.ceil(duration) * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     pcm = (pcm + bytes(max(0, target_bytes - len(pcm))))[:target_bytes]
 
-    import imageio.v3 as iio
-    from PIL import Image
-
-    source_fps = float(iio.immeta(str(video)).get("fps") or 30)
-    if not math.isfinite(source_fps) or source_fps <= 0:
-        raise ValueError(f"Invalid source frame rate for {video}: {source_fps!r}")
-    indices = [int((index + 0.5) * source_fps / fps) for index in range(math.ceil(duration * fps))]
-    frames: list[str | None] = [None] * len(indices)
-    cursor = 0
-    for index, frame in enumerate(iio.imiter(str(video))):
-        if cursor == len(indices):
-            break
-        if index < indices[cursor]:
-            continue
-        image = Image.fromarray(frame)
-        image.thumbnail((640, 640))
-        output = io.BytesIO()
-        image.save(output, "JPEG", quality=85)
-        encoded = base64.b64encode(output.getvalue()).decode("ascii")
-        while cursor < len(indices) and index >= indices[cursor]:
-            frames[cursor] = encoded
-            cursor += 1
+    frame_count = math.ceil(duration * fps)
+    frames: list[str | None] = [None] * frame_count
+    with tempfile.TemporaryDirectory(prefix="vllm-omni-frames-") as temp_dir:
+        output_pattern = Path(temp_dir) / "frame-%06d.jpg"
+        frame_filter = f"select=gte(t\\,(selected_n+0.5)/{fps}),scale=640:640:force_original_aspect_ratio=decrease"
+        _run_media_command(
+            [
+                "ffmpeg",
+                "-loglevel",
+                "error",
+                "-i",
+                str(video),
+                "-an",
+                "-vf",
+                frame_filter,
+                "-frames:v",
+                str(frame_count),
+                "-vsync",
+                "vfr",
+                "-q:v",
+                "5",
+                str(output_pattern),
+            ],
+            timeout_s=timeout_s,
+        )
+        for index, frame_path in enumerate(sorted(Path(temp_dir).glob("frame-*.jpg"))[:frame_count]):
+            frames[index] = base64.b64encode(frame_path.read_bytes()).decode("ascii")
     return duration, pcm, frames
 
 
@@ -785,13 +790,21 @@ async def run_omniinteract_case(
             playback = _Playback()
             stream_start = time.monotonic()
             try:
-                chunks, frame_count, mean_lag, max_lag = await stream_inputs(
-                    client,
-                    pcm,
-                    frames,
-                    config,
-                    playback,
-                )
+                input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+                upload_timeout_s = config.timeout_s + (input_duration_s if config.pace else 0.0)
+                try:
+                    chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(
+                        stream_inputs(
+                            client,
+                            pcm,
+                            frames,
+                            config,
+                            playback,
+                        ),
+                        timeout=upload_timeout_s,
+                    )
+                except asyncio.TimeoutError as exc:
+                    raise TimeoutError(f"Realtime upload timed out after {upload_timeout_s:g}s") from exc
                 commit_from = len(client.events.events)
                 await client.commit()
                 await wait_for_session_completion(

@@ -280,6 +280,31 @@ def test_media_command_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch):
         oi._run_media_command(["ffprobe"], timeout_s=3)
 
 
+def test_prepare_media_bounds_frame_extraction(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    video = tmp_path / "video.mp4"
+    video.touch()
+    timeouts: list[float] = []
+
+    def fake_media_command(command, *, timeout_s, text=False):
+        timeouts.append(timeout_s)
+        if command[0] == "ffprobe":
+            return subprocess.CompletedProcess(command, 0, stdout="1.2", stderr="")
+        if "-vn" in command:
+            return subprocess.CompletedProcess(command, 0, stdout=bytes(32_000), stderr=b"")
+        output = Path(command[-1].replace("%06d", "000001"))
+        output.write_bytes(b"jpeg")
+        return subprocess.CompletedProcess(command, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(oi, "_run_media_command", fake_media_command)
+
+    duration, pcm, frames = oi.prepare_media(video, 1.0, timeout_s=7)
+
+    assert duration == 1.2
+    assert len(pcm) == 64_000
+    assert frames == [base64.b64encode(b"jpeg").decode("ascii"), None]
+    assert timeouts == [7, 7, 7]
+
+
 def test_config_requires_reference_audio():
     with pytest.raises(ValueError, match="ref_audio is required"):
         oi.validate_config(oi.OmniInteractBenchmarkConfig())
@@ -688,6 +713,48 @@ async def test_public_case_runner_supports_functional_e2e(tmp_path: Path, monkey
         "playback.ack",
         "session.close",
     }
+
+
+@pytest.mark.asyncio
+async def test_case_times_out_when_realtime_upload_stalls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    class StalledRealtimeClient:
+        def __init__(self, url: str):
+            self.events = RealtimeEventCollector()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def configure(self, model: str, **kwargs) -> None:
+            self.events.add({"type": "session.created"})
+
+        async def send(self, event: dict[str, object]) -> None:
+            await asyncio.Future()
+
+        async def close_session(self, *, timeout_s: float) -> None:
+            return None
+
+    encoded_frame = base64.b64encode(b"frame").decode()
+    monkeypatch.setattr(oi, "prepare_media", lambda *args, **kwargs: (0.2, bytes(6_400), [encoded_frame]))
+    monkeypatch.setattr(oi, "RealtimeDuplexClient", StalledRealtimeClient)
+    case = _case(tmp_path)
+    ref_audio = tmp_path / "reference.wav"
+    ref_audio.write_bytes(b"test reference audio")
+    config = oi.OmniInteractBenchmarkConfig(
+        data_root=str(tmp_path),
+        output_root=tmp_path / "output",
+        ref_audio=str(ref_audio),
+        timeout_s=0.02,
+        settle_s=0,
+        pace=False,
+    )
+
+    result = await asyncio.wait_for(oi.run_omniinteract_case(case, config, request_index=0), timeout=1)
+
+    assert result.error == "Realtime upload timed out after 0.02s"
+    assert Path(result.output_dir, ".failed.json").is_file()
 
 
 @pytest.mark.asyncio
