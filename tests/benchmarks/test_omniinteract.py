@@ -599,6 +599,112 @@ def test_success_artifact_write_failure_revokes_eligibility(
     assert not any((output_dir / name).exists() for name in oi.SUCCESS_ARTIFACTS)
 
 
+def test_atomic_wav_writers_use_process_unique_temporary_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    target = tmp_path / "output.wav"
+    temporary_paths: list[Path] = []
+    both_writing = threading.Barrier(2)
+
+    def synchronized_write(path: Path, pcm: bytes, *, sample_rate_hz: int) -> None:
+        temporary_paths.append(path)
+        path.write_bytes(pcm)
+        both_writing.wait(timeout=5)
+
+    monkeypatch.setattr(oi, "write_pcm16_wav", synchronized_write)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        list(executor.map(lambda payload: oi._atomic_write_wav(target, payload, 24_000), [b"one", b"two"]))
+
+    assert len(set(temporary_paths)) == 2
+    assert target.read_bytes() in {b"one", b"two"}
+    assert not list(tmp_path.glob(".output.wav.*.tmp"))
+
+
+def test_atomic_wav_failure_preserves_destination_and_cleans_temporary_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    target = tmp_path / "output.wav"
+    target.write_bytes(b"previous")
+
+    def fail_write(*args, **kwargs) -> None:
+        raise OSError("write failed")
+
+    monkeypatch.setattr(oi, "write_pcm16_wav", fail_write)
+
+    with pytest.raises(OSError, match="write failed"):
+        oi._atomic_write_wav(target, b"replacement", 24_000)
+
+    assert target.read_bytes() == b"previous"
+    assert not list(tmp_path.glob(".output.wav.*.tmp"))
+
+
+def test_deferred_artifacts_keep_sparse_audio_until_publication(tmp_path: Path):
+    case = _case(tmp_path)
+    output_root = tmp_path / "output"
+    result = oi.OmniInteractCaseResult("1q1a", str(case.video_path), "unused")
+
+    oi.write_success_artifacts(
+        output_root,
+        case,
+        _collector(),
+        stream_start=1.0,
+        video_duration_s=30.1,
+        require_response=False,
+        result=result,
+        persist=False,
+        defer=True,
+    )
+
+    context = result._artifact_context
+    assert context is not None
+    assert not hasattr(context, "pcm")
+    assert context.horizon_bytes == 31 * oi.OUTPUT_SAMPLE_RATE * oi.PCM16_BYTES_PER_SAMPLE
+    assert context.spans == ()
+    assert not Path(result.output_dir, "output.wav").exists()
+
+    oi.publish_deferred_case_artifacts(output_root, case, result)
+
+    with wave.open(str(Path(result.output_dir, "output.wav")), "rb") as handle:
+        assert handle.getframerate() == oi.OUTPUT_SAMPLE_RATE
+        assert handle.getnframes() == 31 * oi.OUTPUT_SAMPLE_RATE
+
+
+def test_deferred_publication_failure_releases_context_and_partial_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    case = _case(tmp_path)
+    output_root = tmp_path / "output"
+    result = oi.OmniInteractCaseResult("1q1a", str(case.video_path), "unused")
+    oi.write_success_artifacts(
+        output_root,
+        case,
+        _collector((_created("response"), 1.0), (_audio("response"), 1.1), (_done("response"), 1.2)),
+        stream_start=1.0,
+        video_duration_s=1.0,
+        require_response=False,
+        result=result,
+        persist=False,
+        defer=True,
+    )
+
+    def fail_json(*args, **kwargs) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(oi, "_atomic_write_json", fail_json)
+    with pytest.raises(OSError, match="disk full"):
+        oi.publish_deferred_case_artifacts(output_root, case, result)
+
+    assert result._artifact_context is None
+    assert result.success is False
+    assert result.eligible_for_official_eval is False
+    assert result.official_eval_ineligible_reasons == ["artifact_write_failed"]
+    output_dir = oi._output_dir(output_root, case)
+    assert not any((output_dir / name).exists() for name in oi.SUCCESS_ARTIFACTS)
+
+
 def test_batch_artifacts_match_official_evaluator_handoff(tmp_path: Path, caplog: pytest.LogCaptureFixture):
     case = _case(tmp_path)
     clipped_case = _case(tmp_path, name="clipped.mp4")
@@ -942,6 +1048,15 @@ async def test_public_case_runner_supports_functional_e2e(
     if defer_artifacts:
         assert artifact_writes == []
         assert not Path(result.output_dir, ".done").exists()
+        context = result._artifact_context
+        assert context is not None
+        assert not hasattr(context, "pcm")
+        assert not hasattr(context, "collector")
+        assert not hasattr(context, "playback")
+        assert sum(len(span.pcm16) for span in context.spans) == result.audio_bytes
+        audio_event = next(event for event in context.events if event.get("type") == "response.audio.delta")
+        assert "delta" not in audio_event
+        assert audio_event["audio_bytes"] == result.audio_bytes
         oi.publish_deferred_case_artifacts(config.output_root, case, result)
     assert artifact_writes
     assert Path(result.output_dir, ".done").is_file()

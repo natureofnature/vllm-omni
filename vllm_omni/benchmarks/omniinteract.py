@@ -13,12 +13,13 @@ import hashlib
 import json
 import logging
 import math
+import os
 import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import urljoin, urlsplit
 
 import pybase64 as base64
@@ -96,12 +97,18 @@ class OmniInteractCaseResult:
 
 
 @dataclass(frozen=True)
+class _ArtifactAudioSpan:
+    offset: int
+    pcm16: bytes
+
+
+@dataclass(frozen=True)
 class _DeferredArtifactContext:
-    collector: RealtimeEventCollector
-    playback: _Playback
-    stream_start: float
-    video_duration_s: float
-    require_response: bool
+    horizon_bytes: int
+    spans: tuple[_ArtifactAudioSpan, ...]
+    rate: int
+    chunks: list[dict[str, object]]
+    events: list[dict[str, object]]
 
 
 def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
@@ -573,32 +580,91 @@ def _output_dir(root: Path, case: OmniInteractCase) -> Path:
 
 
 def _atomic_write_text(path: Path, value: str) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    temporary.write_text(value)
-    temporary.replace(path)
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        temporary.write_text(value, encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def _atomic_write_json(path: Path, value: object) -> None:
     _atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2) + "\n")
 
 
-def _atomic_write_wav(path: Path, pcm: bytes, rate: int) -> None:
-    temporary = path.with_name(f".{path.name}.tmp")
-    write_pcm16_wav(temporary, pcm, sample_rate_hz=rate)
-    temporary.replace(path)
+def _atomic_write_wav(path: Path, pcm: bytes | bytearray, rate: int) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        # wave.writeframes accepts bytearray; retain the single materialized
+        # horizon buffer instead of copying it solely for the helper's annotation.
+        write_pcm16_wav(temporary, cast(bytes, pcm), sample_rate_hz=rate)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
-def _sanitized_events(collector: RealtimeEventCollector) -> list[dict[str, object]]:
+def _sanitized_events(
+    collector: RealtimeEventCollector,
+    *,
+    audio_bytes_by_event: dict[int, int] | None = None,
+) -> list[dict[str, object]]:
     sanitized: list[dict[str, object]] = []
-    for event in collector.events:
+    for index, event in enumerate(collector.events):
         if event.get("type") == "response.audio.delta":
             item = {key: value for key, value in event.items() if key not in {"delta", "audio"}}
-            encoded = event.get("delta") or event.get("audio")
-            item["audio_bytes"] = len(base64.b64decode(encoded, validate=True)) if isinstance(encoded, str) else 0
+            if audio_bytes_by_event is not None:
+                item["audio_bytes"] = audio_bytes_by_event[index]
+            else:
+                encoded = event.get("delta") or event.get("audio")
+                item["audio_bytes"] = len(base64.b64decode(encoded, validate=True)) if isinstance(encoded, str) else 0
         else:
             item = dict(event)
         sanitized.append(item)
     return sanitized
+
+
+def _artifact_summary(case: OmniInteractCase, result: OmniInteractCaseResult) -> dict[str, Any]:
+    return {
+        **result.as_dict(),
+        "annotation": str(case.annotation_path),
+        "scene_type": "1QnA" if case.scene_type == "1qna" else case.scene_type,
+    }
+
+
+def _publish_success_artifacts(
+    directory: Path,
+    result: OmniInteractCaseResult,
+    *,
+    pcm: bytes | bytearray,
+    rate: int,
+    chunks: list[dict[str, object]],
+    events: list[dict[str, object]],
+    summary: dict[str, Any],
+) -> None:
+    _atomic_write_wav(directory / "output.wav", pcm, rate)
+    _atomic_write_json(
+        directory / "wav_transcript.json",
+        {
+            "text": result.transcript,
+            "chunks": chunks,
+            "timestamp_semantics": "serialized playback queue time relative to input streaming start",
+        },
+    )
+    _atomic_write_json(directory / "events.json", events)
+    _atomic_write_json(directory / "result.json", result.as_dict())
+    _atomic_write_json(directory / ".done", summary)
 
 
 def _build_output(
@@ -608,7 +674,16 @@ def _build_output(
     stream_start: float,
     video_duration_s: float,
     require_response: bool,
-) -> tuple[bytes, int, str, list[dict[str, object]], int]:
+    materialize_pcm: bool,
+) -> tuple[
+    bytes | None,
+    int,
+    str,
+    list[dict[str, object]],
+    int,
+    int,
+    tuple[_ArtifactAudioSpan, ...],
+]:
     playback.ingest(collector)
     created, done = response_ledger(collector)
     if created != done:
@@ -621,7 +696,9 @@ def _build_output(
         and _response_status(event) != "cancelled"
     }
     horizon_s = math.ceil(video_duration_s)
-    output = bytearray(horizon_s * OUTPUT_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+    horizon_bytes = horizon_s * OUTPUT_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
+    output = bytearray(horizon_bytes) if materialize_pcm else None
+    spans: list[_ArtifactAudioSpan] = []
     clipped_bytes = 0
     response_times: dict[str, list[float]] = {}
     responses_with_audio: set[str] = set()
@@ -632,11 +709,13 @@ def _build_output(
         start_s = max(0.0, segment.start_s - stream_start)
         end_s = max(start_s, segment.end_s - stream_start)
         offset = round(start_s * segment.rate) * PCM16_BYTES_PER_SAMPLE
-        writable = max(0, min(len(segment.pcm16), len(output) - offset))
+        writable = max(0, min(len(segment.pcm16), horizon_bytes - offset))
         clipped_bytes += len(segment.pcm16) - writable
         if writable:
             clipped = segment.pcm16[:writable]
-            output[offset : offset + writable] = clipped
+            spans.append(_ArtifactAudioSpan(offset=offset, pcm16=clipped))
+            if output is not None:
+                output[offset : offset + writable] = clipped
             if any(clipped):
                 responses_with_audio.add(response_id)
         timing = response_times.setdefault(response_id, [start_s, end_s])
@@ -672,7 +751,8 @@ def _build_output(
     complete_outputs = terminal_responses & responses_with_audio & responses_with_text
     if require_response and not complete_outputs:
         raise ValueError("OmniInteract E2E requires a response with audio and transcript")
-    return bytes(output), OUTPUT_SAMPLE_RATE, transcript, chunks, clipped_bytes
+    pcm = bytes(output) if output is not None else None
+    return pcm, OUTPUT_SAMPLE_RATE, transcript, chunks, clipped_bytes, horizon_bytes, tuple(spans)
 
 
 def write_success_artifacts(
@@ -686,7 +766,10 @@ def write_success_artifacts(
     require_response: bool,
     result: OmniInteractCaseResult,
     persist: bool = True,
+    defer: bool = False,
 ) -> dict[str, Any]:
+    if persist and defer:
+        raise ValueError("persist and defer are mutually exclusive")
     directory = _output_dir(root, case)
     if persist:
         directory.mkdir(parents=True, exist_ok=True)
@@ -695,14 +778,15 @@ def write_success_artifacts(
     publishing = False
     try:
         playback = playback or _Playback()
-        pcm, rate, transcript, chunks, clipped_bytes = _build_output(
+        pcm, rate, transcript, chunks, clipped_bytes, horizon_bytes, spans = _build_output(
             collector,
             playback,
             stream_start=stream_start,
             video_duration_s=video_duration_s,
             require_response=require_response,
+            materialize_pcm=persist,
         )
-        result.audio_bytes = sum(len(collector.audio_bytes(response_id)) for response_id in collector.response_ids)
+        result.audio_bytes = sum(len(segment.pcm16) for segment in playback.segments)
         result.audio_clipped_bytes = clipped_bytes
         result.transcript = transcript
         result.responses = len(collector.response_ids)
@@ -719,25 +803,34 @@ def write_success_artifacts(
             reasons.append("cancelled_response")
         result.official_eval_ineligible_reasons = reasons
         result.eligible_for_official_eval = not reasons
-        summary = {
-            **result.as_dict(),
-            "annotation": str(case.annotation_path),
-            "scene_type": "1QnA" if case.scene_type == "1qna" else case.scene_type,
-        }
-        if persist:
-            publishing = True
-            _atomic_write_wav(directory / "output.wav", pcm, rate)
-            _atomic_write_json(
-                directory / "wav_transcript.json",
-                {
-                    "text": transcript,
-                    "chunks": chunks,
-                    "timestamp_semantics": "serialized playback queue time relative to input streaming start",
-                },
+        summary = _artifact_summary(case, result)
+        events: list[dict[str, object]] | None = None
+        if persist or defer:
+            events = _sanitized_events(
+                collector,
+                audio_bytes_by_event={segment.event_index: len(segment.pcm16) for segment in playback.segments},
             )
-            _atomic_write_json(directory / "events.json", _sanitized_events(collector))
-            _atomic_write_json(directory / "result.json", result.as_dict())
-            _atomic_write_json(directory / ".done", summary)
+        if defer:
+            assert events is not None
+            result._artifact_context = _DeferredArtifactContext(
+                horizon_bytes=horizon_bytes,
+                spans=spans,
+                rate=rate,
+                chunks=chunks,
+                events=events,
+            )
+        elif persist:
+            assert pcm is not None and events is not None
+            publishing = True
+            _publish_success_artifacts(
+                directory,
+                result,
+                pcm=pcm,
+                rate=rate,
+                chunks=chunks,
+                events=events,
+                summary=summary,
+            )
         return summary
     except Exception:
         result.success = False
@@ -758,12 +851,7 @@ def write_failure_artifacts(root: Path, case: OmniInteractCase, result: OmniInte
     result.output_dir = str(directory.resolve())
     result.success = False
     result.eligible_for_official_eval = False
-    summary = {
-        **result.as_dict(),
-        "annotation": str(case.annotation_path),
-        "scene_type": "1QnA" if case.scene_type == "1qna" else case.scene_type,
-    }
-    _atomic_write_json(directory / ".failed.json", summary)
+    _atomic_write_json(directory / ".failed.json", _artifact_summary(case, result))
 
 
 def publish_deferred_case_artifacts(
@@ -780,17 +868,31 @@ def publish_deferred_case_artifacts(
         return
     if context is None:
         raise RuntimeError("OmniInteract benchmark output lost its deferred artifact context")
-    write_success_artifacts(
-        root,
-        case,
-        context.collector,
-        playback=context.playback,
-        stream_start=context.stream_start,
-        video_duration_s=context.video_duration_s,
-        require_response=context.require_response,
-        result=result,
-        persist=True,
-    )
+    directory = _output_dir(root, case)
+    directory.mkdir(parents=True, exist_ok=True)
+    for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
+        (directory / name).unlink(missing_ok=True)
+    try:
+        pcm = bytearray(context.horizon_bytes)
+        for span in context.spans:
+            pcm[span.offset : span.offset + len(span.pcm16)] = span.pcm16
+        _publish_success_artifacts(
+            directory,
+            result,
+            pcm=pcm,
+            rate=context.rate,
+            chunks=context.chunks,
+            events=context.events,
+            summary=_artifact_summary(case, result),
+        )
+    except Exception:
+        result.success = False
+        result.eligible_for_official_eval = False
+        if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
+            result.official_eval_ineligible_reasons.append("artifact_write_failed")
+        for name in SUCCESS_ARTIFACTS:
+            (directory / name).unlink(missing_ok=True)
+        raise
 
 
 def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
@@ -1006,15 +1108,8 @@ async def run_omniinteract_case(
                 require_response=config.require_response,
                 result=result,
                 persist=persist_artifacts,
+                defer=defer_artifacts,
             )
-            if defer_artifacts:
-                result._artifact_context = _DeferredArtifactContext(
-                    collector=client.events,
-                    playback=playback,
-                    stream_start=stream_start,
-                    video_duration_s=duration,
-                    require_response=config.require_response,
-                )
     except Exception as exc:
         result.success = False
         result.eligible_for_official_eval = False
