@@ -19,6 +19,7 @@ from typing import Any
 
 from vllm.benchmarks.datasets import BenchmarkDataset, SampleRequest
 from vllm.tokenizers import TokenizerLike
+from vllm.transformers_utils.repo_utils import hf_fs
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
@@ -200,19 +201,27 @@ def resolve_omniinteract_root(
     cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     cache_key = dataset_repo.replace("/", "__")
     target = cache_root / "vllm_omni" / "omniinteract" / cache_key
-    from huggingface_hub import hf_hub_download
+    download_dir = target / ".downloads"
+    download_dir.mkdir(parents=True, exist_ok=True)
+    filesystem = hf_fs()
 
     errors: list[str] = []
     downloaded_archive: Path | None = None
     for name in ("data.tar.gz", "data.tar"):
+        cached_archive = download_dir / name
         try:
-            downloaded_archive = Path(
-                hf_hub_download(
-                    repo_id=dataset_repo,
-                    filename=name,
-                    repo_type="dataset",
-                )
-            )
+            if not cached_archive.is_file():
+                descriptor, temp_name = tempfile.mkstemp(prefix=f".{name}.", dir=download_dir)
+                os.close(descriptor)
+                temporary = Path(temp_name)
+                try:
+                    filesystem.get_file(f"datasets/{dataset_repo}/{name}", str(temporary))
+                    if not temporary.stat().st_size:
+                        raise ValueError("downloaded archive is empty")
+                    temporary.replace(cached_archive)
+                finally:
+                    temporary.unlink(missing_ok=True)
+            downloaded_archive = cached_archive
             break
         except Exception as exc:  # noqa: BLE001, PERF203 - Hub exceptions vary by version
             errors.append(f"{name}: {exc}")

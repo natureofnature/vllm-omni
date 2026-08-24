@@ -8,6 +8,7 @@ import asyncio
 import base64
 import io
 import json
+import shutil
 import subprocess
 import tarfile
 import threading
@@ -237,24 +238,25 @@ def test_archive_fingerprint_is_a_portable_directory_name(tmp_path: Path) -> Non
     assert fingerprint.replace("-", "").isdigit()
 
 
-def test_downloads_dataset_archive_through_standard_hub_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_downloads_dataset_archive_through_vllm_hf_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     source_root = _write_dataset(tmp_path / "source")
     archive = tmp_path / "data.tar.gz"
     with tarfile.open(archive, "w:gz") as handle:
         handle.add(source_root, arcname="data")
-    downloads: list[tuple[str, str, str]] = []
+    downloads: list[str] = []
 
-    def fake_hf_hub_download(*, repo_id: str, filename: str, repo_type: str) -> str:
-        downloads.append((repo_id, filename, repo_type))
-        return str(archive)
+    class FakeFilesystem:
+        def get_file(self, remote: str, local: str) -> None:
+            downloads.append(remote)
+            shutil.copyfile(archive, local)
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "cache"))
-    monkeypatch.setattr("huggingface_hub.hf_hub_download", fake_hf_hub_download)
+    monkeypatch.setattr(data, "hf_fs", FakeFilesystem)
 
     root = data.resolve_omniinteract_root(None, "owner/dataset")
 
     assert (root / "1q1a").is_dir()
-    assert downloads == [("owner/dataset", "data.tar.gz", "dataset")]
+    assert downloads == ["datasets/owner/dataset/data.tar.gz"]
 
 
 def test_media_command_timeout_is_bounded(monkeypatch: pytest.MonkeyPatch):
