@@ -15,7 +15,7 @@ import subprocess
 import tempfile
 import time
 import wave
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
@@ -40,6 +40,9 @@ from vllm_omni.experimental.fullduplex.client import (
 OUTPUT_SAMPLE_RATE = 24_000
 DEFAULT_MODEL = "openbmb/MiniCPM-o-4_5"
 SUCCESS_ARTIFACTS = (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
+_INPUT_CHUNK_MS = 200
+_VIDEO_FPS = 1.0
+_COMPLETION_SETTLE_S = 2.0
 
 
 @dataclass(frozen=True)
@@ -51,15 +54,11 @@ class OmniInteractBenchmarkConfig:
     dataset_repo: str = DEFAULT_OMNIINTERACT_REPO
     subsets: tuple[str, ...] = OMNIINTERACT_SUBSETS
     output_root: Path = Path("omniinteract-output")
-    num_prompts: int = 1
+    num_prompts: int = 0
     max_concurrency: int = 1
-    chunk_ms: int = 200
-    video_fps: float = 1.0
     timeout_s: float = 900.0
-    settle_s: float = 2.0
     media_timeout_s: float = 600.0
     ref_audio: str | None = None
-    pace: bool = True
     require_response: bool = False
     seed: int = 0
     disable_shuffle: bool = False
@@ -81,61 +80,20 @@ class OmniInteractCaseResult:
     responses: int = 0
     audio_bytes: int = 0
     audio_clipped_bytes: int = 0
-    audio_overwritten_bytes: int = 0
     transcript: str = ""
 
     def as_dict(self) -> dict[str, Any]:
-        return {**asdict(self), "status": "ok" if self.success else "failed"}
+        return asdict(self)
 
 
-@dataclass
-class OmniInteractBenchmarkResult:
-    results: list[OmniInteractCaseResult] = field(default_factory=list)
-
-    @property
-    def succeeded(self) -> int:
-        return sum(result.success for result in self.results)
-
-    @property
-    def failed(self) -> int:
-        return len(self.results) - self.succeeded
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "total": len(self.results),
-            "success": self.succeeded,
-            "failed": self.failed,
-            "results": [result.as_dict() for result in self.results],
-        }
-
-
-def validate_config(config: OmniInteractBenchmarkConfig) -> None:
-    if not config.base_url:
-        raise ValueError("base_url is required")
-    if not config.endpoint:
-        raise ValueError("endpoint is required")
-    if not config.model:
-        raise ValueError("model is required")
-    if not config.ref_audio:
-        raise ValueError("ref_audio is required for MiniCPM-o native-duplex audio output")
-    if config.num_prompts < 0:
-        raise ValueError("num_prompts must be non-negative")
-    if config.max_concurrency <= 0:
-        raise ValueError("max_concurrency must be positive")
-    if not 0 < config.chunk_ms <= 1000:
-        raise ValueError("chunk_ms must be in [1, 1000]")
-    if not math.isfinite(config.video_fps) or not 0 < config.video_fps <= 1:
-        raise ValueError("video_fps must be in (0, 1]")
-    timeouts = (config.timeout_s, config.settle_s, config.media_timeout_s)
-    if not all(math.isfinite(value) for value in timeouts):
-        raise ValueError("timeouts must be finite")
-    if config.timeout_s <= 0 or config.settle_s < 0 or config.media_timeout_s <= 0:
-        raise ValueError("timeouts must be positive and settle_s must be non-negative")
-    if len(set(config.subsets)) != len(config.subsets):
-        raise ValueError("subsets must not contain duplicates")
-    invalid = set(config.subsets) - set(OMNIINTERACT_SUBSETS)
-    if invalid:
-        raise ValueError(f"Unsupported OmniInteract subsets: {sorted(invalid)}")
+def benchmark_summary(results: list[OmniInteractCaseResult]) -> dict[str, Any]:
+    succeeded = sum(result.success for result in results)
+    return {
+        "total": len(results),
+        "success": succeeded,
+        "failed": len(results) - succeeded,
+        "results": [result.as_dict() for result in results],
+    }
 
 
 def _run_media_command(
@@ -311,12 +269,11 @@ async def stream_inputs(
     client: RealtimeDuplexClient,
     pcm: bytes,
     frames: list[str | None],
-    config: OmniInteractBenchmarkConfig,
     playback: _Playback,
 ) -> tuple[int, int, float, float]:
     """Pace interleaved PCM and frames over one Realtime session."""
 
-    chunk_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * config.chunk_ms // 1000
+    chunk_bytes = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * _INPUT_CHUNK_MS // 1000
     bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     started_at, frame_cursor, sent_frames = time.monotonic(), 0, 0
     lags: list[float] = []
@@ -325,7 +282,7 @@ async def stream_inputs(
         end_ms = end * 1000 // bytes_per_second
         lags.append(max(0.0, time.monotonic() - (started_at + offset / bytes_per_second)))
         ready: list[str] = []
-        while frame_cursor < len(frames) and end_ms >= (frame_cursor + 0.5) * 1000 / config.video_fps:
+        while frame_cursor < len(frames) and end_ms >= (frame_cursor + 0.5) * 1000 / _VIDEO_FPS:
             if frames[frame_cursor]:
                 ready.append(frames[frame_cursor] or "")
             frame_cursor += 1
@@ -341,9 +298,8 @@ async def stream_inputs(
             payload["video_frames"] = ready
         await client.send(payload)
         sent_frames += len(ready)
-        if config.pace:
-            await playback.acknowledge(client)
-            await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
+        await playback.acknowledge(client)
+        await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
     lags.append(max(0.0, time.monotonic() - (started_at + len(pcm) / bytes_per_second)))
     return math.ceil(len(pcm) / chunk_bytes), sent_frames, sum(lags) / len(lags), max(lags)
 
@@ -563,7 +519,7 @@ def _build_output(
     stream_start: float,
     video_duration_s: float,
     require_response: bool,
-) -> tuple[bytes, int, str, list[dict[str, object]], int, int]:
+) -> tuple[bytes, int, str, list[dict[str, object]], int]:
     created, done = response_ledger(collector)
     if created != done:
         raise ValueError(f"unfinished response_ids: {sorted(created - done)}")
@@ -578,9 +534,7 @@ def _build_output(
     output = bytearray(horizon_s * OUTPUT_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
     # Match client playback: all response deltas share one serial output queue.
     cursor_s = 0.0
-    written_until = 0
     clipped_bytes = 0
-    overwritten_bytes = 0
     response_times: dict[str, list[float]] = {}
     responses_with_audio: set[str] = set()
     for event, received_at in zip(collector.events, collector.event_received_at_s, strict=True):
@@ -610,10 +564,7 @@ def _build_output(
         clipped_bytes += len(raw) - writable
         if writable:
             clipped = raw[:writable]
-            written_end = offset + writable
-            overwritten_bytes += max(0, min(written_end, written_until) - offset)
             output[offset : offset + writable] = clipped
-            written_until = max(written_until, written_end)
             if any(clipped):
                 responses_with_audio.add(response_id)
         cursor_s = end_s
@@ -650,7 +601,7 @@ def _build_output(
     complete_outputs = terminal_responses & responses_with_audio & responses_with_text
     if require_response and not complete_outputs:
         raise ValueError("OmniInteract E2E requires a response with audio and transcript")
-    return bytes(output), OUTPUT_SAMPLE_RATE, transcript, chunks, clipped_bytes, overwritten_bytes
+    return bytes(output), OUTPUT_SAMPLE_RATE, transcript, chunks, clipped_bytes
 
 
 def write_success_artifacts(
@@ -668,7 +619,7 @@ def write_success_artifacts(
     for name in (*SUCCESS_ARTIFACTS, ".failed.json"):
         (directory / name).unlink(missing_ok=True)
     try:
-        pcm, rate, transcript, chunks, clipped_bytes, overwritten_bytes = _build_output(
+        pcm, rate, transcript, chunks, clipped_bytes = _build_output(
             collector,
             stream_start=stream_start,
             video_duration_s=video_duration_s,
@@ -676,7 +627,6 @@ def write_success_artifacts(
         )
         result.audio_bytes = sum(len(collector.audio_bytes(response_id)) for response_id in collector.response_ids)
         result.audio_clipped_bytes = clipped_bytes
-        result.audio_overwritten_bytes = overwritten_bytes
         result.transcript = transcript
         result.responses = len(collector.response_ids)
         result.output_dir = str(directory.resolve())
@@ -725,14 +675,14 @@ def clear_case_artifacts(root: Path, case: OmniInteractCase) -> None:
 def write_batch_artifacts(
     root: Path,
     cases: list[OmniInteractCase],
-    benchmark: OmniInteractBenchmarkResult,
+    results: list[OmniInteractCaseResult],
 ) -> None:
     root.mkdir(parents=True, exist_ok=True)
-    _atomic_write_json(root / "batch_summary.json", benchmark.as_dict())
+    _atomic_write_json(root / "batch_summary.json", benchmark_summary(results))
     rows = [
         case_manifest(case, _output_dir(root, case))
-        for case, result in zip(cases, benchmark.results, strict=True)
-        if result.success and result.audio_clipped_bytes == 0 and result.audio_overwritten_bytes == 0
+        for case, result in zip(cases, results, strict=True)
+        if result.success and result.audio_clipped_bytes == 0
     ]
     _atomic_write_text(
         root / "official_eval_manifest.jsonl",
@@ -781,7 +731,12 @@ async def run_omniinteract_case(
 ) -> OmniInteractCaseResult:
     """Run one case. This public coroutine is the hook used by E2E tests."""
 
-    validate_config(config)
+    if not config.ref_audio:
+        raise ValueError("ref_audio is required for MiniCPM-o native-duplex audio output")
+    if not math.isfinite(config.timeout_s) or config.timeout_s <= 0:
+        raise ValueError("timeout_s must be finite and positive")
+    if not math.isfinite(config.media_timeout_s) or config.media_timeout_s <= 0:
+        raise ValueError("media_timeout_s must be finite and positive")
     output_dir = _output_dir(config.output_root, case)
     session_id = f"omniinteract:{case.subset}:{request_index}:{time.monotonic_ns()}"
     result = OmniInteractCaseResult(
@@ -793,10 +748,11 @@ async def run_omniinteract_case(
     started_at = time.monotonic()
     try:
         clear_case_artifacts(config.output_root, case)
+        reference_audio = _reference_audio(config.ref_audio)
         duration, pcm, frames = await asyncio.to_thread(
             prepare_media,
             case.video_path,
-            config.video_fps,
+            _VIDEO_FPS,
             timeout_s=config.media_timeout_s,
         )
         if not any(frames):
@@ -805,7 +761,7 @@ async def run_omniinteract_case(
             session_from = len(client.events.events)
             await client.configure(
                 config.model,
-                ref_audio=_reference_audio(config.ref_audio),
+                ref_audio=reference_audio,
                 session_id=session_id,
                 idle_timeout_s=config.timeout_s,
                 timeout_s=min(config.timeout_s, 20.0),
@@ -815,14 +771,13 @@ async def run_omniinteract_case(
             stream_start = time.monotonic()
             try:
                 input_duration_s = len(pcm) / (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
-                upload_timeout_s = config.timeout_s + (input_duration_s if config.pace else 0.0)
+                upload_timeout_s = config.timeout_s + input_duration_s
                 try:
                     chunks, frame_count, mean_lag, max_lag = await asyncio.wait_for(
                         stream_inputs(
                             client,
                             pcm,
                             frames,
-                            config,
                             playback,
                         ),
                         timeout=upload_timeout_s,
@@ -837,7 +792,7 @@ async def run_omniinteract_case(
                     commit_from=commit_from,
                     session_from=session_from,
                     timeout_s=config.timeout_s,
-                    settle_s=config.settle_s,
+                    settle_s=_COMPLETION_SETTLE_S,
                 )
                 await playback.acknowledge(client, playback.end_s)
                 _raise_if_session_terminated(client.events, session_from)
@@ -876,10 +831,13 @@ async def run_omniinteract_case(
     return result
 
 
-async def run_omniinteract_benchmark(config: OmniInteractBenchmarkConfig) -> OmniInteractBenchmarkResult:
+async def run_omniinteract_benchmark(config: OmniInteractBenchmarkConfig) -> list[OmniInteractCaseResult]:
     """Run selected cases with bounded preprocessing and WebSocket concurrency."""
 
-    validate_config(config)
+    if config.num_prompts < 0:
+        raise ValueError("num_prompts must be non-negative")
+    if config.max_concurrency <= 0:
+        raise ValueError("max_concurrency must be positive")
     root = await asyncio.to_thread(resolve_omniinteract_root, config.data_root, config.dataset_repo)
     cases = await asyncio.to_thread(
         discover_omniinteract_cases,
@@ -896,7 +854,6 @@ async def run_omniinteract_benchmark(config: OmniInteractBenchmarkConfig) -> Omn
         async with semaphore:
             return await run_omniinteract_case(case, config, request_index=index)
 
-    results = await asyncio.gather(*(run(index, case) for index, case in enumerate(cases)))
-    benchmark = OmniInteractBenchmarkResult(results=list(results))
-    await asyncio.to_thread(write_batch_artifacts, config.output_root, cases, benchmark)
-    return benchmark
+    results = list(await asyncio.gather(*(run(index, case) for index, case in enumerate(cases))))
+    await asyncio.to_thread(write_batch_artifacts, config.output_root, cases, results)
+    return results

@@ -5,8 +5,8 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
+import logging
 import os
 import random
 import shutil
@@ -17,12 +17,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from vllm.transformers_utils.repo_utils import hf_fs
-
-from vllm_omni.diffusion.model_loader import hub_prefetch
+from huggingface_hub import hf_hub_download
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -38,7 +37,7 @@ class OmniInteractCase:
 
 def _data_dir(root: Path) -> Path:
     for candidate in (root, root / "data"):
-        if (candidate / "1q1a").is_dir():
+        if any((candidate / subset).is_dir() for subset in OMNIINTERACT_SUBSETS):
             return candidate
     raise FileNotFoundError(f"OmniInteract data not found under {root}")
 
@@ -66,7 +65,7 @@ def _safe_extract(handle: tarfile.TarFile, target: Path) -> None:
             or not (member.isdir() or member.isfile())
         ):
             raise ValueError(f"Unsafe path in OmniInteract archive: {member.name!r}")
-    handle.extractall(target, members=members)
+    handle.extractall(target, members=members, filter="data")
 
 
 def _archive_fingerprint(archive: Path) -> str:
@@ -74,36 +73,35 @@ def _archive_fingerprint(archive: Path) -> str:
     return f"{stat.st_size}:{stat.st_mtime_ns}"
 
 
-def _archive_lock_key(target: Path) -> str:
-    digest = hashlib.sha256(str(target.resolve()).encode()).hexdigest()
-    return f".omniinteract-{digest}"
-
-
-def _extract_archive_unlocked(archive: Path, target: Path) -> Path:
+def _extract_archive(archive: Path, target: Path) -> Path:
+    """Extract into a private directory, then atomically publish by fingerprint."""
     if target.is_symlink():
         raise ValueError(f"Refusing to extract through symlink: {target}")
-    marker = target / ".source"
     fingerprint = _archive_fingerprint(archive)
-    if marker.is_file() and marker.read_text().strip() == fingerprint:
+    published = target / fingerprint
+    if published.is_symlink():
+        raise ValueError(f"Refusing to use symlinked extraction: {published}")
+    if published.is_dir():
         try:
-            return _data_dir(target)
+            return _data_dir(published)
         except FileNotFoundError:
             pass
-    shutil.rmtree(target, ignore_errors=True)
-    target.mkdir()
-    with tarfile.open(archive, "r:*") as handle:
-        _safe_extract(handle, target)
-    marker.write_text(fingerprint)
-    return _data_dir(target)
-
-
-def _extract_archive(archive: Path, target: Path) -> Path:
-    with hub_prefetch._repo_prefetch_lock(
-        _archive_lock_key(target),
-        required=True,
-        lock_dir=target.parent,
-    ):
-        return _extract_archive_unlocked(archive, target)
+    target.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".tmp-", dir=target))
+    try:
+        with tarfile.open(archive, "r:*") as handle:
+            _safe_extract(handle, staging)
+        _data_dir(staging)
+        try:
+            staging.replace(published)
+        except OSError:
+            # Another process may have published the same complete archive.
+            if not published.is_dir():
+                raise
+            return _data_dir(published)
+        return _data_dir(published)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
 
 
 def resolve_omniinteract_root(
@@ -127,37 +125,30 @@ def resolve_omniinteract_root(
                     return _extract_archive(local_archive, local / ".vllm_omni_extracted")
             raise
 
-    cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache"))
+    cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
     cache_key = dataset_repo.replace("/", "__")
     target = cache_root / "vllm_omni" / "omniinteract" / cache_key
-    with hub_prefetch._repo_prefetch_lock(
-        _archive_lock_key(target),
-        required=True,
-        lock_dir=target.parent,
-    ):
-        archive_root = target.parent / "archives" / cache_key
-        archive_root.mkdir(parents=True, exist_ok=True)
-        filesystem = hf_fs()
-        errors: list[str] = []
-        downloaded_archive: Path | None = None
-        for name in ("data.tar.gz", "data.tar"):
-            try:
-                downloaded_archive = archive_root / name
-                if not downloaded_archive.is_file():
-                    with tempfile.TemporaryDirectory(dir=archive_root) as temporary_dir:
-                        candidate = Path(temporary_dir) / name
-                        filesystem.download(f"datasets/{dataset_repo}/{name}", str(candidate))
-                        if not candidate.is_file():
-                            raise FileNotFoundError(f"Hugging Face did not download {name}")
-                        candidate.replace(downloaded_archive)
-                break
-            except (OSError, RuntimeError, ValueError) as exc:  # noqa: PERF203 - both archive names are valid
-                errors.append(f"{name}: {exc}")
-                downloaded_archive = None
-        if downloaded_archive is None:
-            detail = "; ".join(errors)
-            raise FileNotFoundError(f"Could not download OmniInteract from {dataset_repo!r}: {detail}")
-        return _extract_archive_unlocked(downloaded_archive, target)
+    errors: list[str] = []
+    downloaded_archive: Path | None = None
+    for name in ("data.tar.gz", "data.tar"):
+        try:
+            downloaded_archive = Path(
+                hf_hub_download(
+                    repo_id=dataset_repo,
+                    filename=name,
+                    repo_type="dataset",
+                )
+            )
+            if not downloaded_archive.is_file():
+                raise FileNotFoundError(f"Hugging Face did not download {name}")
+            break
+        except (OSError, RuntimeError, ValueError) as exc:  # noqa: PERF203 - both archive names are valid
+            errors.append(f"{name}: {exc}")
+            downloaded_archive = None
+    if downloaded_archive is None:
+        detail = "; ".join(errors)
+        raise FileNotFoundError(f"Could not download OmniInteract from {dataset_repo!r}: {detail}")
+    return _extract_archive(downloaded_archive, target)
 
 
 def _mapping_cases(root: Path, subset: str) -> list[OmniInteractCase]:
@@ -255,7 +246,11 @@ def discover_omniinteract_cases(
         random.Random(seed).shuffle(cases)
     if num_prompts:
         if num_prompts > len(cases):
-            raise ValueError(f"Requested {num_prompts} prompts but only {len(cases)} are available")
+            logger.warning(
+                "Requested %d OmniInteract prompts but only %d are available; using all cases",
+                num_prompts,
+                len(cases),
+            )
         cases = cases[:num_prompts]
     return cases
 

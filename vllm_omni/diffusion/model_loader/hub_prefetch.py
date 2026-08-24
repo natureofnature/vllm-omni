@@ -62,17 +62,11 @@ from __future__ import annotations
 
 import contextlib
 import errno
-import json
 import logging
 import os
-import shutil
-import socket
-import threading
 import time
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
 from typing import Any
-from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
@@ -86,15 +80,6 @@ logger = logging.getLogger(__name__)
 # ``from_pretrained`` against the half-written cache).
 _PREFETCH_MAX_ATTEMPTS = 3
 _PREFETCH_BACKOFF_BASE_S = 1.0
-_DOTFILE_LOCK_OWNER = "owner.json"
-
-
-@dataclass
-class _DotfileLock:
-    path: str
-    token: str | None = None
-    stop_heartbeat: threading.Event | None = None
-    heartbeat: threading.Thread | None = None
 
 
 def _node_lock_dir() -> str:
@@ -140,83 +125,7 @@ def _safe_repo_filename(model: str) -> str:
     return model.replace("/", "__").replace(os.sep, "__") + ".lock"
 
 
-def _read_dotfile_lock_owner(lock_path: str) -> dict[str, object] | None:
-    owner_path = os.path.join(lock_path, _DOTFILE_LOCK_OWNER)
-    try:
-        with open(owner_path, encoding="utf-8") as handle:
-            owner = json.load(handle)
-    except (OSError, ValueError, TypeError):
-        return None
-    return owner if isinstance(owner, dict) else None
-
-
-def _dotfile_lock_is_stale(lock_path: str, *, stale_after_s: float) -> bool:
-    # The directory mtime is the lease timestamp advanced by the owner heartbeat.
-    try:
-        return time.time() - os.stat(lock_path).st_mtime >= stale_after_s
-    except OSError:
-        return False
-
-
-def _start_dotfile_lock_heartbeat(
-    lock_path: str, token: str, *, lease_s: float
-) -> tuple[threading.Event, threading.Thread]:
-    stop = threading.Event()
-    interval_s = max(0.1, min(30.0, lease_s / 3))
-
-    def heartbeat() -> None:
-        while not stop.wait(interval_s):
-            owner = _read_dotfile_lock_owner(lock_path)
-            if owner is None or owner.get("token") != token:
-                return
-            try:
-                os.utime(lock_path)
-            except OSError:
-                return
-
-    thread = threading.Thread(target=heartbeat, name="vllm-omni-cache-lock", daemon=True)
-    thread.start()
-    return stop, thread
-
-
-def _release_dotfile_lock(lock: _DotfileLock) -> None:
-    if lock.stop_heartbeat is not None:
-        lock.stop_heartbeat.set()
-    if lock.heartbeat is not None:
-        lock.heartbeat.join(timeout=1.0)
-    if lock.token is not None:
-        owner = _read_dotfile_lock_owner(lock.path)
-        if owner is None or owner.get("token") != lock.token:
-            return
-        try:
-            os.remove(os.path.join(lock.path, _DOTFILE_LOCK_OWNER))
-        except OSError:
-            return
-    with contextlib.suppress(OSError):
-        os.rmdir(lock.path)
-
-
-def _remove_stale_dotfile_lock(lock_path: str, *, stale_after_s: float) -> bool:
-    if not _dotfile_lock_is_stale(lock_path, stale_after_s=stale_after_s):
-        return False
-    stale_path = f"{lock_path}.stale-{os.getpid()}-{time.time_ns()}"
-    try:
-        os.rename(lock_path, stale_path)
-    except OSError:
-        return False
-    logger.warning("Recovered stale dotfile prefetch lock %s", lock_path)
-    shutil.rmtree(stale_path, ignore_errors=True)
-    return True
-
-
-def _dotfile_lock_acquire(
-    lock_dir: str,
-    model: str,
-    timeout: float = 300.0,
-    poll_interval: float = 0.5,
-    *,
-    recover_stale: bool = False,
-) -> _DotfileLock | None:
+def _dotfile_lock_acquire(lock_dir: str, model: str, timeout: float = 300.0, poll_interval: float = 0.5) -> bool:
     """Acquire an exclusive lock via atomic directory creation.
 
     ``os.makedirs(path, exist_ok=False)`` is atomic on POSIX filesystems
@@ -224,60 +133,35 @@ def _dotfile_lock_acquire(
     ``fcntl.flock`` is unsupported (``ENOLCK`` on FSx/Lustre mounts
     without the ``flock`` mount option).
 
-    Returns a lock handle if acquired, or ``None`` on timeout. Required locks
-    use a token-bearing heartbeat lease so a later process can recover a lock
-    directory abandoned by a terminated owner.
+    Returns ``True`` if the lock was acquired, ``False`` on timeout.
+    The caller must call ``os.rmdir(lock_path)`` to release.
     """
     lock_path = os.path.join(lock_dir, _safe_repo_filename(model) + ".dir")
-    lease_s = max(timeout, poll_interval * 4, 1.0)
 
     deadline = time.monotonic() + timeout
     while True:
         try:
             os.makedirs(lock_path, exist_ok=False)
-            if recover_stale:
-                try:
-                    token = uuid4().hex
-                    with open(os.path.join(lock_path, _DOTFILE_LOCK_OWNER), "x", encoding="utf-8") as handle:
-                        json.dump({"hostname": socket.gethostname(), "pid": os.getpid(), "token": token}, handle)
-                        handle.flush()
-                        os.fsync(handle.fileno())
-                    stop, heartbeat = _start_dotfile_lock_heartbeat(lock_path, token, lease_s=lease_s)
-                    lock = _DotfileLock(lock_path, token, stop, heartbeat)
-                except (OSError, RuntimeError):
-                    shutil.rmtree(lock_path, ignore_errors=True)
-                    raise
-            else:
-                lock = _DotfileLock(lock_path)
             logger.info("Acquired dotfile prefetch lock for %s at %s", model, lock_path)
-            return lock
+            return True
         except FileExistsError:
-            if recover_stale and _remove_stale_dotfile_lock(lock_path, stale_after_s=lease_s):
-                continue
             if time.monotonic() >= deadline:
                 logger.warning(
-                    "Timed out waiting for dotfile prefetch lock %s after %.0fs",
+                    "Timed out waiting for dotfile prefetch lock %s after %.0fs; proceeding unlocked",
                     lock_path,
                     timeout,
                 )
-                return None
+                return False
             time.sleep(poll_interval)
 
 
 @contextlib.contextmanager
-def _repo_prefetch_lock(
-    model: str,
-    *,
-    required: bool = False,
-    lock_dir: str | os.PathLike[str] | None = None,
-) -> Iterator[None]:
+def _repo_prefetch_lock(model: str) -> Iterator[None]:
     """Hold an exclusive lock keyed on the HF repo id.
 
     Tries ``fcntl.flock`` first; falls back to an atomic directory-creation
     dotfile lock when flock is unsupported (e.g. FSx for Lustre without the
-    ``flock`` mount option, which returns ``ENOLCK``). ``required=True`` fails
-    closed instead of entering the critical section without a lock. An
-    explicit ``lock_dir`` keeps the lock beside a shared non-HF target.
+    ``flock`` mount option, which returns ``ENOLCK``).
 
     Why we still need a node-wide lock on top of ``snapshot_download``'s
     own per-blob ``.lock`` files:
@@ -299,15 +183,14 @@ def _repo_prefetch_lock(
       section, so the *first* entrant fully populates the cache and
       every subsequent ``from_pretrained`` sees a warm, complete tree.
 
-    By default, if we cannot acquire any lock (no ``fcntl``, read-only FS,
-    dotfile lock timeout) we log and run the download anyway. Worst-case
-    behaviour reverts to "snapshot_download + transformers v5 race", which is
-    exactly the pre-fix state. Required callers raise instead.
+    Best-effort: if we cannot acquire any lock (no ``fcntl``, read-only
+    FS, dotfile lock timeout) we log and run the download anyway. Worst
+    case behaviour reverts to "snapshot_download + transformers v5 race"
+    which is exactly the pre-fix state.
     """
-    explicit_lock_dir = lock_dir is not None
-    lock_dir = os.fspath(lock_dir) if lock_dir is not None else None
+    lock_dir = None
     lock_path = None
-    dotfile_held: _DotfileLock | None = None
+    dotfile_held = None
     fd = None
     flock_held = False
 
@@ -317,21 +200,10 @@ def _repo_prefetch_lock(
     except ImportError:  # pragma: no cover - non-POSIX (Windows)
         fcntl = None
 
-    if lock_dir is not None:
-        try:
-            os.makedirs(lock_dir, exist_ok=True)
-        except OSError as exc:
-            if required:
-                raise RuntimeError(f"Could not create required lock dir for {model}: {lock_dir}") from exc
-            logger.warning("Could not create lock dir for prefetch of %s (%s); skipping flock", model, exc)
-            lock_dir = None
-
-    if fcntl is not None and lock_dir is None and not explicit_lock_dir:
+    if fcntl is not None:
         try:
             lock_dir = _node_lock_dir()
         except OSError as exc:
-            if required:
-                raise RuntimeError(f"Could not allocate required lock dir for {model}") from exc
             logger.warning("Could not allocate lock dir for prefetch of %s (%s); skipping flock", model, exc)
             fcntl = None  # force dotfile fallback
 
@@ -364,21 +236,15 @@ def _repo_prefetch_lock(
     # --- dotfile fallback ---
     if not flock_held:
         if lock_dir is None:
-            if explicit_lock_dir and required:
-                raise RuntimeError(f"Required lock dir is unavailable for {model}")
             try:
                 lock_dir = _node_lock_dir()
             except OSError as exc:
-                if required:
-                    raise RuntimeError(f"Could not allocate required lock dir for {model}") from exc
                 logger.warning("Could not allocate lock dir (%s); running prefetch unlocked", exc)
                 yield
                 return
 
-        if dotfile_lock := _dotfile_lock_acquire(lock_dir, model, recover_stale=required):
-            dotfile_held = dotfile_lock
-        elif required:
-            raise TimeoutError(f"Timed out acquiring required cache lock for {model}")
+        if _dotfile_lock_acquire(lock_dir, model):
+            dotfile_held = os.path.join(lock_dir, _safe_repo_filename(model) + ".dir")
 
     try:
         yield
@@ -390,7 +256,8 @@ def _repo_prefetch_lock(
             with contextlib.suppress(OSError):
                 os.close(fd)
         if dotfile_held is not None:
-            _release_dotfile_lock(dotfile_held)
+            with contextlib.suppress(OSError):
+                os.rmdir(dotfile_held)
 
 
 def prefetch_subfolders(

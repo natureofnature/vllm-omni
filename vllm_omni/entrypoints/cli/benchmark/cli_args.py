@@ -19,6 +19,25 @@ after upstream vLLM registers its arguments.
 """
 
 import argparse
+import math
+from pathlib import Path
+
+
+def _positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite positive number, got {value!r}")
+    return parsed
+
+
+def _existing_file(value: str) -> str:
+    path = Path(value).expanduser()
+    if not path.is_file():
+        raise argparse.ArgumentTypeError(f"file does not exist: {value!r}")
+    return str(path)
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -33,15 +52,16 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         default=list(OMNIINTERACT_SUBSETS),
         help="OmniInteract subsets selected when --dataset-name omniinteract is used.",
     )
-    group.add_argument("--omniinteract-timeout-s", type=float, default=900.0)
+    group.add_argument("--omniinteract-timeout-s", type=_positive_finite_float, default=900.0)
     group.add_argument(
         "--omniinteract-media-timeout-s",
-        type=float,
+        type=_positive_finite_float,
         default=600.0,
         help="Timeout for each direct ffprobe/ffmpeg media command.",
     )
     group.add_argument(
         "--omniinteract-ref-audio",
+        type=_existing_file,
         help="Reference WAV required by MiniCPM-o native-duplex audio output.",
     )
     group.add_argument(
@@ -296,6 +316,13 @@ def add_omni_args(parser: argparse.ArgumentParser) -> None:
 
 def preprocess_serve_args(args: argparse.Namespace) -> None:
     """Apply serving benchmark CLI transformations after parsing."""
+    if getattr(args, "dataset_name", None) == "omniinteract":
+        if getattr(args, "backend", None) != "openai-realtime-duplex":
+            raise ValueError("OmniInteract requires --backend openai-realtime-duplex")
+        if getattr(args, "endpoint", None) in (None, "", "/v1/completions"):
+            raise ValueError("OmniInteract requires --endpoint /v1/realtime")
+        if not getattr(args, "omniinteract_ref_audio", None):
+            raise ValueError("OmniInteract requires --omniinteract-ref-audio")
     extra_body = dict(getattr(args, "extra_body", None) or {})
     bot_task = getattr(args, "bot_task", None)
     if getattr(args, "backend", None) == "openai-image-edits-omni" and bot_task is not None:

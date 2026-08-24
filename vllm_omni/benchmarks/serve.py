@@ -58,9 +58,11 @@ def _omniinteract_config_from_args(args: argparse.Namespace) -> OmniInteractBenc
     max_concurrency = getattr(args, "max_concurrency", None) or 1
     output_root = Path(getattr(args, "result_dir", None) or "omniinteract-output")
     endpoint = getattr(args, "endpoint", None)
-    explicit_keys = getattr(args, "explicit_keys", None)
-    if not endpoint or (explicit_keys is not None and "endpoint" not in explicit_keys):
-        endpoint = "/v1/realtime"
+    if endpoint in (None, "", "/v1/completions"):
+        raise ValueError("OmniInteract requires --endpoint /v1/realtime")
+    ref_audio = getattr(args, "omniinteract_ref_audio", None)
+    if not ref_audio:
+        raise ValueError("OmniInteract requires --omniinteract-ref-audio")
     return OmniInteractBenchmarkConfig(
         base_url=base_url,
         endpoint=endpoint,
@@ -73,7 +75,7 @@ def _omniinteract_config_from_args(args: argparse.Namespace) -> OmniInteractBenc
         max_concurrency=max_concurrency,
         timeout_s=getattr(args, "omniinteract_timeout_s"),
         media_timeout_s=getattr(args, "omniinteract_media_timeout_s"),
-        ref_audio=getattr(args, "omniinteract_ref_audio"),
+        ref_audio=ref_audio,
         require_response=getattr(args, "omniinteract_require_response"),
         seed=getattr(args, "seed"),
         disable_shuffle=getattr(args, "disable_shuffle"),
@@ -81,12 +83,12 @@ def _omniinteract_config_from_args(args: argparse.Namespace) -> OmniInteractBenc
 
 
 def _run_omniinteract(args: argparse.Namespace) -> dict[str, Any]:
-    from vllm_omni.benchmarks.omniinteract import run_omniinteract_benchmark
+    from vllm_omni.benchmarks.omniinteract import benchmark_summary, run_omniinteract_benchmark
 
-    benchmark = asyncio.run(run_omniinteract_benchmark(_omniinteract_config_from_args(args)))
-    result = benchmark.as_dict()
+    results = asyncio.run(run_omniinteract_benchmark(_omniinteract_config_from_args(args)))
+    result = benchmark_summary(results)
     print(json.dumps(result, ensure_ascii=False, indent=2))
-    if benchmark.failed:
+    if result["failed"]:
         raise SystemExit(1)
     return result
 
