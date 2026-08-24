@@ -10,6 +10,8 @@ pipeline: minicpmo_4_5
 session_mode: duplex
 active_stream_window: 8
 connectors:
+  # Top-level connector mappings replace the base mapping during overlay
+  # resolution, so keep the shared transport and graph settings here.
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
@@ -18,10 +20,17 @@ connectors:
       connector_get_max_wait: 300
       codec_chunk_frames: 25
       codec_left_context_frames: 3
+      enable_hift_graph: true
+      # Per-shape CFM graphs churn under eight dynamic duplex streams and can
+      # exhaust 80 GB HBM. Keep CFM eager while retaining the HiFT graph.
+      enable_cfm_graph: false
       # Align all eight initial and steady-state request waves for one
       # physical diffusion batch whenever upstream chunks arrive together.
       code2wav_initial_batch_size: 8
       code2wav_batch_target_size: 8
+      # Initial waves with fewer than eight ready requests may wait up to
+      # 50 ms for late arrivals and release early when the target is reached.
+      # Stable one-to-seven-session workloads usually consume the full wait.
       code2wav_batch_wait_ms: 50
       code2wav_batch_quiet_ms: 12
 duplex_session:
@@ -43,8 +52,9 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 8
-    # Eight Talker sequences fit below this automatically profiled KV share;
-    # reserve the remaining HBM for a concurrent Code2Wav diffusion batch.
+    # CUDA inherits the base profile's fixed 2 GiB Talker KV cache; platforms
+    # without that override use this budget. Both leave HBM headroom for a
+    # concurrent Code2Wav diffusion batch.
     gpu_memory_utilization: 0.10
     async_scheduling: false
     # Talker context is 4096 (tts_config.max_position_embeddings).

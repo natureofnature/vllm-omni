@@ -434,7 +434,9 @@ class BatchedToken2Wav(nn.Module):
                 cnn_out,
                 att_out,
             )
-        if valid_lengths is not None and hasattr(estimator, "in_proj"):
+        if valid_lengths is not None:
+            if not hasattr(estimator, "in_proj"):
+                raise RuntimeError('MiniCPMO45Code2WavBatchError {"reason":"ragged_kernel_unavailable"}')
             result = self._blocks_forward_chunk_ragged(
                 estimator,
                 estimator_input,
@@ -1014,7 +1016,12 @@ class BatchedToken2Wav(nn.Module):
                 conformer_cnn_rows[row] = conformer_cnn[group_row : group_row + 1]
                 conformer_att_rows[row] = conformer_att[:, group_row : group_row + 1]
 
-        resolved_hidden = [value for value in hidden_rows if value is not None]
+        missing_hidden_rows = [row for row, value in enumerate(hidden_rows) if value is None]
+        if missing_hidden_rows:
+            raise RuntimeError(
+                f'MiniCPMO45Code2WavBatchError {{"reason":"incomplete_encoder_output","rows":{missing_hidden_rows}}}'
+            )
+        resolved_hidden = cast(list[torch.Tensor], hidden_rows)
         hidden_lengths = [int(value.shape[1]) for value in resolved_hidden]
         max_hidden_length = max(hidden_lengths)
         padded_hidden = resolved_hidden[0].new_zeros((batch_size, max_hidden_length, int(resolved_hidden[0].shape[2])))

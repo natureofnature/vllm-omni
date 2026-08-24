@@ -25,6 +25,7 @@ _original_decode_batch = None
 _backend_graph_runners: WeakKeyDictionary[object, NPUExactGraphRunner] = WeakKeyDictionary()
 _ENABLE_KEY = "code2wav_enable_npu_graph"
 _MAX_GRAPHS_KEY = "code2wav_max_npu_graphs"
+_BF16_ATTENTION_CACHE_KEY = "code2wav_bfloat16_attention_cache"
 
 
 def _config_bool(value: object, default: bool) -> bool:
@@ -208,6 +209,13 @@ def _patched_decode_batch(
 def _patched_build_backend(self) -> None:
     if self.backend is not None:
         return
+
+    extra = self._extra_config()
+    if bool(extra.get(_BF16_ATTENTION_CACHE_KEY, False)):
+        raise ValueError(
+            "MiniCPM-o Code2Wav code2wav_bfloat16_attention_cache is "
+            "currently supported only on CUDA; leave it unset or false on NPU."
+        )
 
     config = _graph_config(self)
     max_graphs = max(0, int(cast(int | str, config.get(_MAX_GRAPHS_KEY, 32))))
