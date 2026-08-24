@@ -2,37 +2,11 @@
 #
 # The registered minicpmo_4_5 pipeline owns the fixed
 # Thinker -> Talker -> Code2Wav topology. This overlay changes session
-# lifetime and bounds all three stages to eight live duplex sessions.
-# The eight-session settings require an accelerator with at least 80 GB HBM.
-# They were validated on H800 80GB; H100 has not been validated.
+# lifetime and bounds all three stages to two live duplex sessions.
 base_config: minicpmo_4_5.yaml
 pipeline: minicpmo_4_5
 session_mode: duplex
-active_stream_window: 8
-connectors:
-  # Top-level connector mappings replace the base mapping during overlay
-  # resolution, so keep the shared transport and graph settings here.
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
-    extra:
-      connector_get_sleep_s: 0.01
-      connector_get_max_wait_first_chunk: 3000
-      connector_get_max_wait: 300
-      codec_chunk_frames: 25
-      codec_left_context_frames: 3
-      enable_hift_graph: true
-      # Per-shape CFM graphs churn under eight dynamic duplex streams and can
-      # exhaust 80 GB HBM. Keep CFM eager while retaining the HiFT graph.
-      enable_cfm_graph: false
-      # Align all eight initial and steady-state request waves for one
-      # physical diffusion batch whenever upstream chunks arrive together.
-      code2wav_initial_batch_size: 8
-      code2wav_batch_target_size: 8
-      # Initial waves with fewer than eight ready requests may wait up to
-      # 10 ms for late arrivals and release early when the target is reached.
-      # Stable one-to-seven-session workloads usually consume the full wait.
-      code2wav_batch_wait_ms: 10
-      code2wav_batch_quiet_ms: 12
+active_stream_window: 1
 duplex_session:
   idle_ttl_s: 300
   disconnect_grace_s: 30
@@ -42,20 +16,16 @@ duplex_session:
   max_pending_input_bytes_per_session: 16777216
   max_pending_turns_per_session: 4
   # Matches the configured Stage0/Stage1 sequence capacity below.
-  max_sessions: 8
+  max_sessions: 2
   completed_append_cache_size: 256
 
 stages:
   - stage_id: 0
-    max_num_seqs: 8
+    max_num_seqs: 2
     async_scheduling: false
 
   - stage_id: 1
-    max_num_seqs: 8
-    # CUDA inherits the base profile's fixed 2 GiB Talker KV cache; platforms
-    # without that override use this budget. Both leave HBM headroom for a
-    # concurrent Code2Wav diffusion batch.
-    gpu_memory_utilization: 0.10
+    max_num_seqs: 2
     async_scheduling: false
     # Talker context is 4096 (tts_config.max_position_embeddings).
     max_model_len: 4096
@@ -68,5 +38,5 @@ stages:
       min_tokens: 0
 
   - stage_id: 2
-    max_num_seqs: 8
+    max_num_seqs: 2
     async_scheduling: false

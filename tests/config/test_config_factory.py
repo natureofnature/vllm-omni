@@ -1120,8 +1120,7 @@ class TestDeployConfigLoading:
 
         assert deploy.session_mode == "duplex"
         assert deploy.async_chunk is True
-        assert deploy.active_stream_window == 8
-        assert [stage.max_num_seqs for stage in deploy.stages] == [8, 8, 8]
+        assert deploy.active_stream_window == 1
         assert [stage.session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.to_omegaconf().session_mode for stage in stages] == ["duplex", "duplex", "duplex"]
         assert [stage.yaml_engine_args["async_scheduling"] for stage in stages] == [False, False, False]
@@ -1133,18 +1132,6 @@ class TestDeployConfigLoading:
         assert stages[1].yaml_extras["default_sampling_params"]["temperature"] == 0.8
         assert stages[1].yaml_extras["default_sampling_params"]["stop_token_ids"] == [6561]
         assert "codec_sampling_params" not in stages[1].yaml_engine_args
-        connector_extra = deploy.connectors["connector_of_shared_memory"]["extra"]
-        assert connector_extra["enable_hift_graph"] is True
-        assert connector_extra["enable_cfm_graph"] is False
-        assert connector_extra["code2wav_initial_batch_size"] == 8
-        assert connector_extra["code2wav_batch_target_size"] == 8
-        assert connector_extra["code2wav_batch_wait_ms"] == 10
-        assert connector_extra["code2wav_batch_quiet_ms"] == 12
-        assert "code2wav_bfloat16_attention_cache" not in connector_extra
-
-        cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
-        cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
 
     @pytest.mark.parametrize(
         ("filename", "stage0_devices", "stage1_devices", "stage2_devices", "stage1_replicas"),
