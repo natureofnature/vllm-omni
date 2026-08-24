@@ -57,6 +57,18 @@ def _done(response_id: str, status: str = "completed") -> dict[str, object]:
     return {"type": "response.done", "response": {"id": response_id, "status": status}}
 
 
+def _listen(*, model_listen: bool = True, buffering: bool = False, reason: str | None = None) -> dict[str, object]:
+    metadata: dict[str, object] = {
+        "type": "response.listen",
+        "model_listen": model_listen,
+    }
+    if buffering:
+        metadata["buffering"] = True
+    if reason is not None:
+        metadata["reason"] = reason
+    return {"type": "response.listen", "response": {"metadata": metadata}}
+
+
 def _audio(response_id: str, frames: int = 2400, value: int = 1) -> dict[str, object]:
     return {
         "type": "response.audio.delta",
@@ -428,7 +440,7 @@ def test_output_dir_flattens_backslash_traversal(tmp_path: Path):
 
 def test_listen_only_is_valid_but_response_required_e2e_fails(tmp_path: Path):
     case = _case(tmp_path)
-    collector = _collector(({"type": "response.listen"}, 1.0))
+    collector = _collector((_listen(), 1.0))
     result = oi.OmniInteractCaseResult("1q1a", str(case.video_path), "unused")
 
     summary = oi.write_success_artifacts(
@@ -968,8 +980,9 @@ async def test_completion_waits_for_final_decision_after_current_commit():
     async def complete_current_commit():
         await asyncio.sleep(0.01)
         collector.add({"type": "input_audio_buffer.committed"})
-        await asyncio.sleep(0.14)
-        collector.add({"type": "response.listen"})
+        collector.add(_listen(model_listen=False, buffering=True, reason="buffering"))
+        await asyncio.sleep(0.13)
+        collector.add(_listen())
 
     task = asyncio.create_task(complete_current_commit())
     index = await oi.wait_for_session_completion(
@@ -1001,7 +1014,7 @@ async def test_completion_ignores_response_that_releases_deferred_final_input():
         await asyncio.sleep(0.02)
         collector.add(_done("active"))
         await asyncio.sleep(0.08)
-        collector.add({"type": "response.listen"})
+        collector.add(_listen())
 
     task = asyncio.create_task(complete_deferred_commit())
     index = await oi.wait_for_session_completion(
@@ -1014,6 +1027,28 @@ async def test_completion_ignores_response_that_releases_deferred_final_input():
 
     assert task.done()
     assert index == commit_from
+
+
+@pytest.mark.asyncio
+async def test_completion_does_not_accept_buffering_listen_as_final_decision():
+    collector = RealtimeEventCollector()
+    client = _FakeClient(collector)
+
+    async def report_prefill_failure():
+        await asyncio.sleep(0.01)
+        collector.add({"type": "input_audio_buffer.committed"})
+        collector.add(_listen(model_listen=False, buffering=True, reason="prefill_failed"))
+
+    task = asyncio.create_task(report_prefill_failure())
+    with pytest.raises(TimeoutError, match="Timed out waiting for committed input"):
+        await oi.wait_for_session_completion(
+            client,
+            oi._Playback(),
+            commit_from=0,
+            timeout_s=0.08,
+            settle_s=0.01,
+        )
+    assert task.done()
 
 
 def test_exact_model_unit_reserves_one_sample_for_final_commit():

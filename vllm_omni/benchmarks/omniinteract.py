@@ -403,6 +403,20 @@ def _commit_defers_response(event: dict[str, object]) -> bool:
     return isinstance(committed, dict) and committed.get("overlap_deferred") is True
 
 
+def _is_model_listen_decision(event: dict[str, object]) -> bool:
+    """Distinguish a model LISTEN decision from a buffering notification."""
+
+    metadata: dict[str, object] = event
+    response = event.get("response")
+    if isinstance(response, dict) and isinstance(response.get("metadata"), dict):
+        metadata = response["metadata"]
+    elif isinstance(event.get("metadata"), dict):
+        metadata = event["metadata"]
+
+    model_listen = metadata.get("model_listen")
+    return metadata.get("buffering") is not True and model_listen is True
+
+
 def _has_post_commit_decision(
     collector: RealtimeEventCollector,
     events: list[dict[str, object]],
@@ -421,7 +435,7 @@ def _has_post_commit_decision(
                 continue
             if not pending_prior and _response_status(event) != "cancelled":
                 return True
-        elif event_type == "response.listen" and not pending_prior:
+        elif event_type == "response.listen" and not pending_prior and _is_model_listen_decision(event):
             return True
     return False
 
