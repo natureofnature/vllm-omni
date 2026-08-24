@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import argparse
 import json
 import os
@@ -22,6 +25,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
     "dataset_name",
     [
         "daily-omni",
+        "omniinteract",
         "seed-tts",
         "seed-tts-text",
         "seed-tts-design",
@@ -55,6 +59,7 @@ def test_extend_omni_choices_updates_tracking_parser_shadow(dataset_name: str) -
     [
         (["--print-stage"], "print_stage", True),
         (["--daily-omni-input-mode", "audio"], "daily_omni_input_mode", "audio"),
+        (["--omniinteract-subsets", "1qna"], "omniinteract_subsets", ["1qna"]),
         (["--seed-tts-locale", "zh"], "seed_tts_locale", "zh"),
     ],
 )
@@ -80,6 +85,7 @@ def test_add_omni_args_preserves_implicit_defaults() -> None:
     args = parser.parse_args([])
     assert args.print_stage is False
     assert args.daily_omni_input_mode == "all"
+    assert args.omniinteract_subsets == ["1q1a", "1q1a_math", "1qna"]
     assert args.seed_tts_locale == "en"
     assert args.explicit_keys == set()
 

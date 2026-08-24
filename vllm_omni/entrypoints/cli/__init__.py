@@ -9,9 +9,8 @@
 from vllm_omni.benchmarks.patch import patch
 # isort: on
 
-from vllm_omni.entrypoints.cli.benchmark.omniinteract import OmniInteractBenchmarkSubcommand
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
 
 from .serve import OmniServeCommand
 
-__all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand", "OmniInteractBenchmarkSubcommand"]
+__all__ = ["OmniServeCommand", "OmniBenchmarkServingSubcommand"]

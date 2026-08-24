@@ -21,8 +21,9 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 
 from vllm_omni.benchmarks import omniinteract as oi
+from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
-from vllm_omni.entrypoints.cli.benchmark.omniinteract import OmniInteractBenchmarkSubcommand
+from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
 from vllm_omni.experimental.fullduplex.client import RealtimeEventCollector
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.benchmark]
@@ -847,43 +848,65 @@ async def test_benchmark_bounds_preprocessing_and_session_concurrency(tmp_path: 
     assert len((config.output_root / "official_eval_manifest.jsonl").read_text().splitlines()) == 4
 
 
-def test_dedicated_cli_registers_e2e_parameters_without_dataset_hijack():
+def test_serve_cli_maps_omniinteract_dataset_to_realtime_config(tmp_path: Path):
     parser = argparse.ArgumentParser()
-    OmniInteractBenchmarkSubcommand.add_cli_args(parser)
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
 
     args = parser.parse_args(
         [
-            "--data-root",
-            "/data/OmniInteract",
-            "--subsets",
+            "--backend",
+            "openai-realtime-duplex",
+            "--dataset-name",
+            "omniinteract",
+            "--dataset-path",
+            str(tmp_path),
+            "--model",
+            "openbmb/MiniCPM-o-4_5",
+            "--base-url",
+            "http://server:8000",
+            "--endpoint",
+            "/v1/realtime",
+            "--omniinteract-subsets",
             "1q1a",
             "1qna",
             "--num-prompts",
             "8",
             "--max-concurrency",
             "2",
-            "--ref-audio",
+            "--result-dir",
+            str(tmp_path / "results"),
+            "--omniinteract-ref-audio",
             "/data/reference.wav",
-            "--require-response",
+            "--omniinteract-require-response",
         ]
     )
+    config = benchmark_serve._omniinteract_config_from_args(args)
 
-    assert args.data_root == "/data/OmniInteract"
-    assert args.subsets == ["1q1a", "1qna"]
-    assert args.num_prompts == 8
-    assert args.max_concurrency == 2
-    assert args.ref_audio == "/data/reference.wav"
-    assert args.require_response is True
-    assert not hasattr(args, "dataset_name")
-    assert not hasattr(args, "chunk_ms")
-    assert not hasattr(args, "video_fps")
-    assert not hasattr(args, "settle_s")
-    assert not hasattr(args, "no_pace")
+    assert args.dataset_name == "omniinteract"
+    assert config.data_root == str(tmp_path)
+    assert config.dataset_repo == data.DEFAULT_OMNIINTERACT_REPO
+    assert config.subsets == ("1q1a", "1qna")
+    assert config.output_root == tmp_path / "results"
+    assert config.num_prompts == 8
+    assert config.max_concurrency == 2
+    assert config.ref_audio == "/data/reference.wav"
+    assert config.require_response is True
 
 
-def test_dedicated_cli_requires_reference_audio():
+def test_serve_cli_does_not_require_omniinteract_options_for_other_datasets():
     parser = argparse.ArgumentParser()
-    OmniInteractBenchmarkSubcommand.add_cli_args(parser)
+    OmniBenchmarkServingSubcommand.add_cli_args(parser)
 
-    with pytest.raises(SystemExit):
-        parser.parse_args([])
+    args = parser.parse_args(["--dataset-name", "daily-omni"])
+
+    assert args.dataset_name == "daily-omni"
+    assert args.omniinteract_ref_audio is None
+
+
+def test_serve_main_dispatches_omniinteract_runner(monkeypatch: pytest.MonkeyPatch):
+    expected = {"total": 1, "success": 1, "failed": 0}
+    monkeypatch.setattr(benchmark_serve, "_run_omniinteract", lambda _args: expected)
+
+    result = benchmark_serve.main(argparse.Namespace(dataset_name="omniinteract"))
+
+    assert result == expected

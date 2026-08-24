@@ -1,8 +1,11 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """vLLM-Omni benchmark CLI arguments.
 
 Core functions:
-    add_omniinteract_cli_args: Register the dedicated realtime benchmark
-        arguments.
+    add_omniinteract_cli_args: Register OmniInteract-specific serving
+        benchmark arguments.
     add_omni_args: Register all Omni-specific argument groups by calling the
         serving feature-specific ``add_*_cli_args`` helpers in this module.
     extend_omni_choices: Add Omni datasets and backends to choices defined by
@@ -12,64 +15,40 @@ Core functions:
         before the serving benchmark starts.
 
 ``OmniBenchmarkServingSubcommand.add_cli_args`` invokes the serving helpers
-after upstream vLLM registers its arguments. Dedicated benchmark subcommands
-also keep their argument definitions here.
+after upstream vLLM registers its arguments.
 """
 
 import argparse
-from pathlib import Path
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add CLI arguments for the OmniInteract realtime benchmark."""
-    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
-        DEFAULT_OMNIINTERACT_REPO,
-        OMNIINTERACT_SUBSETS,
-    )
+    """Add OmniInteract-only arguments to ``vllm bench serve``."""
+    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import OMNIINTERACT_SUBSETS
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
-    group.add_argument("--model", default="openbmb/MiniCPM-o-4_5")
-    group.add_argument("--base-url", default="http://127.0.0.1:8000")
-    group.add_argument("--endpoint", default="/v1/realtime")
     group.add_argument(
-        "--data-root",
-        default=None,
-        help="Extracted OmniInteract root or local data.tar[.gz]. Downloads from Hugging Face when omitted.",
-    )
-    group.add_argument("--dataset-repo", default=DEFAULT_OMNIINTERACT_REPO)
-    group.add_argument(
-        "--subsets",
+        "--omniinteract-subsets",
         nargs="+",
         choices=OMNIINTERACT_SUBSETS,
         default=list(OMNIINTERACT_SUBSETS),
+        help="OmniInteract subsets selected when --dataset-name omniinteract is used.",
     )
-    group.add_argument("--output-dir", type=Path, default=Path("omniinteract-output"))
+    group.add_argument("--omniinteract-timeout-s", type=float, default=900.0)
     group.add_argument(
-        "--num-prompts",
-        type=int,
-        default=1,
-        help="Total videos to run; 0 selects all videos in the requested subsets.",
-    )
-    group.add_argument("--max-concurrency", type=int, default=1)
-    group.add_argument("--timeout-s", type=float, default=900.0)
-    group.add_argument(
-        "--media-timeout-s",
+        "--omniinteract-media-timeout-s",
         type=float,
         default=600.0,
         help="Timeout for each direct ffprobe/ffmpeg media command.",
     )
     group.add_argument(
-        "--ref-audio",
-        required=True,
+        "--omniinteract-ref-audio",
         help="Reference WAV required by MiniCPM-o native-duplex audio output.",
     )
     group.add_argument(
-        "--require-response",
+        "--omniinteract-require-response",
         action="store_true",
         help="Fail LISTEN-only cases; intended for selected functional E2E samples, not accuracy evaluation.",
     )
-    group.add_argument("--seed", type=int, default=0)
-    group.add_argument("--disable-shuffle", action="store_true")
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -242,6 +221,7 @@ def add_seed_tts_cli_args(parser: argparse.ArgumentParser) -> None:
 
 _OMNI_BENCH_DATASET_CHOICES = (
     "daily-omni",
+    "omniinteract",
     "seed-tts",
     "seed-tts-text",
     "seed-tts-design",
@@ -308,6 +288,7 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
 def add_omni_args(parser: argparse.ArgumentParser) -> None:
     """Register all vLLM-Omni serving benchmark arguments."""
     add_daily_omni_cli_args(parser)
+    add_omniinteract_cli_args(parser)
     add_seed_tts_cli_args(parser)
     add_multi_stage_cli_args(parser)
     add_diffusion_cli_args(parser)

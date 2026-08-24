@@ -117,7 +117,7 @@ def resolve_omniinteract_root(
         if local.is_file():
             return _extract_archive(local, local.parent / f".{local.stem}.vllm_omni_extracted")
         if not local.is_dir():
-            raise FileNotFoundError(f"--data-root does not exist: {local}")
+            raise FileNotFoundError(f"--dataset-path does not exist: {local}")
         try:
             return _data_dir(local)
         except FileNotFoundError:

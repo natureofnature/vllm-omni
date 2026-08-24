@@ -2,7 +2,8 @@
 The vllm bench command launches the vLLM-Omni benchmark to evaluate the performance of multimodal models.
 
 ## Notes
-vLLM-Omni registers the `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` serving benchmark backends.
+vLLM-Omni registers multimodal serving benchmark backends and datasets,
+including the native-duplex OmniInteract workflow.
 
 ## Basic Parameter Description
 You can use `vllm bench serve --omni --help=all` to get descriptions of all parameters. The commonly used parameters are described below:
@@ -10,7 +11,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   Enable Omni (multimodal) mode, supporting multimodal inputs and outputs such as images, videos, and audio.
 
 - `--backend`
-  Specify the backend adapter. vLLM-Omni adds `openai-chat-omni`, `openai-audio-speech`, `openai-image-edits-omni`, and `daily-omni` to the upstream vLLM backend choices.
+  Specify the backend adapter. For example, native-duplex OmniInteract uses
+  `openai-realtime-duplex`.
 
 - `--model`
   The model identifier to load, filled according to the models supported by vLLM-Omni.
@@ -19,7 +21,8 @@ You can use `vllm bench serve --omni --help=all` to get descriptions of all para
   The API endpoint exposed externally, to which clients send their requests.
 
 - `--dataset-name`
-  The name of the dataset used; random-mm indicates generating random multimodal inputs (images, videos, audio).
+  The dataset name. `random-mm` generates random multimodal inputs, while
+  `omniinteract` replays official OmniInteract videos.
 
 - `--num-prompts`
   The total number of requests to send, an integer.
@@ -268,6 +271,50 @@ Notes:
 We use audio generation time / audio duration to calculate RTF.
 
 </details>
+
+### OmniInteract Realtime Benchmark
+
+OmniInteract uses the same `vllm bench serve` dataset interface as the other
+serving benchmarks. Each sample is one long-lived native-duplex WebSocket
+session rather than one HTTP request.
+
+Start `openbmb/MiniCPM-o-4_5` with its duplex recipe, then run:
+
+```bash
+vllm bench serve --omni \
+  --backend openai-realtime-duplex \
+  --dataset-name omniinteract \
+  --dataset-path /path/to/OmniInteract \
+  --model openbmb/MiniCPM-o-4_5 \
+  --base-url http://127.0.0.1:8000 \
+  --endpoint /v1/realtime \
+  --omniinteract-ref-audio /path/to/reference.wav \
+  --omniinteract-subsets 1q1a 1q1a_math 1qna \
+  --result-dir ./omniinteract-output \
+  --num-prompts 3 \
+  --max-concurrency 2 \
+  --num-warmups 0
+```
+
+An existing local `--dataset-path` may be an extracted OmniInteract directory
+or `data.tar[.gz]`. A non-local value is treated as a Hugging Face dataset ID;
+when the option is omitted, the runner downloads
+`lucky-lance/OmniInteract`. `--num-prompts` is the total across the selected
+subsets, and `0` selects every video. `--omniinteract-ref-audio` is required by
+MiniCPM-o native-duplex audio output.
+
+Audio is replayed as 16 kHz PCM16 in 200 ms chunks, video at 1 FPS, with
+real-time pacing. `--omniinteract-media-timeout-s` bounds each direct
+`ffprobe`/`ffmpeg` command, while `--max-concurrency` bounds both preprocessing
+and WebSocket sessions. Use `--omniinteract-require-response` only for selected
+functional E2E samples: a model may validly remain in LISTEN for an entire
+video.
+
+Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`,
+`result.json`, and a final `.done` marker. The result directory also contains
+`batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
+`.failed.json`. Completion validates transport, response lifecycle, and
+artifacts, but does not judge answer accuracy.
 
 ### Multi-Modal Benchmark
 
