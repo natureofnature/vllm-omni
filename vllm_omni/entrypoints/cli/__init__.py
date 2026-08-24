@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """CLI helpers for vLLM-Omni entrypoints."""
 
 # To ensure patch imports work properly, disable unused import checks

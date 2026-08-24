@@ -1,21 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""vLLM-Omni benchmark CLI arguments.
+"""vLLM-Omni extensions for the ``vllm bench serve`` CLI.
 
 Core functions:
-    add_omniinteract_cli_args: Register OmniInteract-specific serving
-        benchmark arguments.
     add_omni_args: Register all Omni-specific argument groups by calling the
-        serving feature-specific ``add_*_cli_args`` helpers in this module.
+        feature-specific ``add_*_cli_args`` helpers in this module.
     extend_omni_choices: Add Omni datasets and backends to choices defined by
         the upstream vLLM parser, including its shadow parser.
     update_omni_help: Extend upstream help text with Omni-specific behavior.
     preprocess_serve_args: Apply transformations that require parsed values
         before the serving benchmark starts.
 
-``OmniBenchmarkServingSubcommand.add_cli_args`` invokes the serving helpers
-after upstream vLLM registers its arguments.
+``OmniBenchmarkServingSubcommand.add_cli_args`` invokes the first three after
+upstream vLLM registers its arguments. New feature arguments should normally be
+added to the corresponding ``add_*_cli_args`` helper, or to a new helper called
+by ``add_omni_args``.
 """
 
 import argparse
@@ -24,10 +24,7 @@ from pathlib import Path
 
 
 def _positive_finite_float(value: str) -> float:
-    try:
-        parsed = float(value)
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError(f"invalid float value: {value!r}") from exc
+    parsed = float(value)
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError(f"must be a finite positive number, got {value!r}")
     return parsed
@@ -41,44 +38,32 @@ def _existing_file(value: str) -> str:
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
-    """Add OmniInteract-only arguments to ``vllm bench serve``."""
     from vllm_omni.benchmarks.data_modules.omniinteract_dataset import OMNIINTERACT_SUBSETS
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
-        "--omniinteract-subsets",
-        nargs="+",
-        choices=OMNIINTERACT_SUBSETS,
-        default=list(OMNIINTERACT_SUBSETS),
-        help="OmniInteract subsets selected when --dataset-name omniinteract is used.",
+        "--omniinteract-subsets", nargs="+", choices=OMNIINTERACT_SUBSETS, default=list(OMNIINTERACT_SUBSETS)
     )
     group.add_argument(
-        "--omniinteract-timeout-s",
-        type=_positive_finite_float,
-        default=900.0,
-        help="Timeout for one complete OmniInteract Realtime session.",
+        "--omniinteract-timeout-s", type=_positive_finite_float, default=900.0, help="Complete session timeout."
     )
     group.add_argument(
         "--omniinteract-media-timeout-s",
         type=_positive_finite_float,
         default=600.0,
-        help="Timeout for each direct ffprobe/ffmpeg media command.",
+        help="Per-command media timeout.",
     )
     group.add_argument(
-        "--omniinteract-ref-audio",
-        type=_existing_file,
-        help="Reference WAV required by MiniCPM-o native-duplex audio output.",
+        "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."
     )
     group.add_argument(
-        "--omniinteract-require-response",
-        action="store_true",
-        help="Fail LISTEN-only cases; intended for selected functional E2E samples, not accuracy evaluation.",
+        "--omniinteract-require-response", action="store_true", help="Fail LISTEN-only functional E2E cases."
     )
     group.add_argument(
         "--omniinteract-output-dir",
         type=Path,
         default=Path("omniinteract-output"),
-        help="Directory for per-case WAV, transcript, event, and official-evaluation artifacts.",
+        help="Directory for case and evaluator artifacts.",
     )
 
 

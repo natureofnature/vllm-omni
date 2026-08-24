@@ -271,11 +271,7 @@ We use audio generation time / audio duration to calculate RTF.
 
 ### OmniInteract Realtime Benchmark
 
-OmniInteract uses the same `vllm bench serve` dataset interface as the other
-serving benchmarks. Each sample is one long-lived native-duplex WebSocket
-session rather than one HTTP request.
-
-Start `openbmb/MiniCPM-o-4_5` with its duplex recipe, then run:
+OmniInteract runs each video as one native-duplex WebSocket sample in the standard serving-benchmark lifecycle:
 
 ```bash
 vllm bench serve --omni \
@@ -286,54 +282,28 @@ vllm bench serve --omni \
   --base-url http://127.0.0.1:8000 \
   --endpoint /v1/realtime \
   --omniinteract-ref-audio /path/to/reference.wav \
-  --omniinteract-subsets 1q1a 1q1a_math 1qna \
   --omniinteract-output-dir ./omniinteract-artifacts \
-  --save-result \
-  --result-dir ./benchmark-results \
   --num-prompts 3 \
-  --max-concurrency 2 \
   --num-warmups 0
 ```
 
-An existing local `--dataset-path` may be an extracted OmniInteract directory
-or `data.tar[.gz]`. A non-local value is treated as a Hugging Face dataset ID;
-when the option is omitted, the runner downloads
-`lucky-lance/OmniInteract`. `--num-prompts` is the total across the selected
-subsets, and `0` selects every video. `--omniinteract-ref-audio` is required by
-MiniCPM-o native-duplex audio output. If `--num-prompts` exceeds the selected
-dataset capacity, every available case is used. The realtime endpoint must be
-selected explicitly with `--endpoint /v1/realtime`.
+`--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
+`lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets; `0` selects all and oversize values use all
+available cases. Reference audio is required, and OmniInteract uses the `/v1/realtime` endpoint.
 
-Audio is replayed as 16 kHz PCM16 in 200 ms chunks, video at 1 FPS, with
-real-time pacing. Selected videos and reference audio are prepared sequentially
-before benchmark timing starts; prepared media remains in memory for the run.
-`--omniinteract-media-timeout-s` bounds each `ffprobe`/`ffmpeg` command, while
-`--max-concurrency` bounds active WebSocket sessions; OmniInteract defaults to
-one concurrent session.
-Request rate, warmup, concurrency, result saving, and
-the standard serving benchmark summary use the same lifecycle as other
-`vllm bench serve` datasets. Use `--omniinteract-require-response` only for
-selected functional E2E samples: a model may validly remain in LISTEN for an
-entire video.
+Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. Media is decoded before
+timing, media commands are bounded by `--omniinteract-media-timeout-s`, and concurrency defaults to 1. Standard request-rate,
+warmup, result-saving, and summary options apply. Use `--omniinteract-require-response` only for functional E2E cases;
+LISTEN is a valid benchmark result.
 
-Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`,
-`result.json`, and a final `.done` marker under `--omniinteract-output-dir`.
-That directory also contains `batch_summary.json` and
-`official_eval_manifest.jsonl`; failed cases write `.failed.json`. The standard
-benchmark JSON remains under `--result-dir`. Completion validates transport,
-response lifecycle, and artifacts, but does not judge answer accuracy.
-Transcript timestamps follow the client's serialized playback queue rather
-than raw event-arrival time. Successful cases with clipped output audio or a
-cancelled response are counted as ineligible in `batch_summary.json`, omitted
-from `official_eval_manifest.jsonl`, and reported by a warning. The
-`audio_clipped_bytes` field records audio beyond the output horizon, which is
-the input video duration rounded up to the next second.
+Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
+`--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write
+`.failed.json`. Runs sharing one output root are serialized. Completion validates transport, response lifecycle, and artifacts,
+not answer accuracy. Transcript timestamps are serialized playback-queue times. Clipped or cancelled outputs are ineligible and
+omitted from the official manifest; `audio_clipped_bytes` records output beyond the rounded video horizon.
 
-Per-response TTFT, TTFP, and RTF use the client receive time of
-`response.created` as their origin. Standard TPOT/ITL fields use engine-native
-stage-0 token timing when the server reports it; ITL percentiles are populated
-only when exact per-token intervals are present. These metrics are not inferred
-from the duration of the duplex audio session.
+TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
+every token interval is present.
 
 ### Multi-Modal Benchmark
 

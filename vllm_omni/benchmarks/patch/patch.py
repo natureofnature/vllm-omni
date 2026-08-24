@@ -30,6 +30,7 @@ from vllm.benchmarks.lib.endpoint_request_func import (
     RequestFuncOutput,
     StreamedResponseHandler,
     _get_chat_content,
+    _get_headers,
     _update_headers_common,
     _update_payload_common,
     _validate_api_url,
@@ -247,7 +248,6 @@ def _attach_seed_tts_to_request_func_input(sample: SampleRequest, rfi: RequestFu
 
 
 def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: RequestFuncInput) -> None:
-    """Attach the dataset-supplied native-duplex session layout."""
     if not isinstance(sample, OmniInteractSampleRequest):
         return
     setattr(rfi, "omniinteract_case", sample.omniinteract_case)
@@ -259,64 +259,44 @@ def _finalize_omniinteract_batch(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
 ) -> dict[str, object] | None:
-    """Write measured-session artifacts and return count-only result fields."""
     rows = [
-        (
-            sample.omniinteract_case,
-            sample.omniinteract_options,
-            getattr(output, "omniinteract_case_result", None),
-            output,
-        )
+        (sample, output)
         for sample, output in zip(input_requests, outputs, strict=True)
         if isinstance(sample, OmniInteractSampleRequest)
     ]
     if not rows:
         return None
-    cases = [case for case, _, _, _ in rows]
-    case_results = [case_result for _, _, case_result, _ in rows]
-    if any(case is None for case in cases) or any(case_result is None for case_result in case_results):
-        raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
-    options = rows[0][1]
+    options = rows[0][0].omniinteract_options
     if not isinstance(options, OmniInteractSessionOptions):
         raise RuntimeError("OmniInteract benchmark output lost its artifact options")
-    typed_cases = [case for case in cases if case is not None]
-    typed_results = [case_result for case_result in case_results if case_result is not None]
-    typed_outputs = [output for _, _, _, output in rows]
-    for output, case, case_result in zip(typed_outputs, typed_cases, typed_results, strict=True):
+    cases, results = [], []
+    for sample, output in rows:
+        case = sample.omniinteract_case
+        result = getattr(output, "omniinteract_case_result", None)
+        if case is None or not isinstance(result, OmniInteractCaseResult):
+            raise RuntimeError("OmniInteract benchmark output lost its dataset identity")
+        cases.append(case)
+        results.append(result)
         try:
-            publish_deferred_case_artifacts(options.output_root, case, case_result)
+            publish_deferred_case_artifacts(options.output_root, case, result)
         except Exception as exc:  # noqa: BLE001 - artifact backends raise heterogeneous errors
-            case_result.success = False
-            case_result.eligible_for_official_eval = False
-            if "artifact_write_failed" not in case_result.official_eval_ineligible_reasons:
-                case_result.official_eval_ineligible_reasons.append("artifact_write_failed")
-            case_result.error = f"Artifact publication failed: {exc}"
-            output.success = False
-            output.error = case_result.error
-            write_failure_artifacts(options.output_root, case, case_result)
-    write_omniinteract_batch_artifacts(options.output_root, typed_cases, typed_results)
-    summary = omniinteract_benchmark_summary(typed_results)
+            result.success = result.eligible_for_official_eval = output.success = False
+            if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
+                result.official_eval_ineligible_reasons.append("artifact_write_failed")
+            result.error = output.error = f"Artifact publication failed: {exc}"
+            write_failure_artifacts(options.output_root, case, result)
+    write_omniinteract_batch_artifacts(options.output_root, cases, results)
+    summary = omniinteract_benchmark_summary(results)
     return {key: value for key, value in summary.items() if key != "results"}
 
 
 def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
-    """Invalidate prior measured artifacts before benchmark timing starts."""
-
-    seen: set[tuple[Path, str, str]] = set()
     roots: set[Path] = set()
     for sample in input_requests:
         if not isinstance(sample, OmniInteractSampleRequest):
             continue
         root = sample.omniinteract_options.output_root.resolve()
         roots.add(root)
-        identity = (
-            root,
-            sample.omniinteract_case.subset,
-            sample.omniinteract_case.video_rel,
-        )
-        if identity in seen:
-            continue
-        seen.add(identity)
         clear_case_artifacts(sample.omniinteract_options.output_root, sample.omniinteract_case)
     for root in roots:
         clear_batch_artifacts(root)
@@ -399,14 +379,10 @@ def get_samples(args, tokenizer):
         if not requests:
             raise ValueError("No OmniInteract sessions were selected")
         encoded_ref_audio = reference_audio_data_url(options.ref_audio)
-        if encoded_ref_audio is None:
-            raise ValueError("OmniInteract reference audio could not be prepared")
+        assert encoded_ref_audio is not None
         for request in requests:
-            if not isinstance(request, OmniInteractSampleRequest):
-                raise RuntimeError("OmniInteract dataset returned an incompatible sample")
             case = request.omniinteract_case
-            if case is None:
-                raise RuntimeError("OmniInteract sample lost its dataset case")
+            assert isinstance(request, OmniInteractSampleRequest) and case is not None
             duration, pcm, frames = prepare_media(
                 case.video_path,
                 VIDEO_FPS,
@@ -420,8 +396,7 @@ def get_samples(args, tokenizer):
                 video_frames=tuple(frames),
                 ref_audio_data_url=encoded_ref_audio,
             )
-        # ``0`` means all for OmniInteract; the standard benchmark result must
-        # still report the measured request count rather than the sentinel.
+        # Replace OmniInteract's ``0`` (all) with the measured request count.
         args.num_prompts = len(requests)
         return requests
 
@@ -1477,6 +1452,10 @@ def _realtime_websocket_url(api_url: str) -> str:
     return build_realtime_url(api_url, None, native_duplex=None)
 
 
+def _nonnegative_number(value: object) -> bool:
+    return isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
+
+
 async def _async_request_omniinteract(
     request_func_input: RequestFuncInput,
     *,
@@ -1493,6 +1472,8 @@ async def _async_request_omniinteract(
         prepared_input = getattr(request_func_input, "omniinteract_prepared_input", None)
         if not isinstance(prepared_input, OmniInteractPreparedInput):
             raise ValueError("OmniInteract media must be prepared before benchmark request timing")
+        headers = _get_headers()
+        _update_headers_common(headers, request_func_input)
         config = OmniInteractBenchmarkConfig(
             endpoint=request_func_input.api_url,
             model=request_func_input.model_name or request_func_input.model,
@@ -1501,13 +1482,14 @@ async def _async_request_omniinteract(
             media_timeout_s=options.media_timeout_s,
             ref_audio=options.ref_audio,
             require_response=options.require_response,
+            extra_headers=headers or None,
+            extra_body=dict(request_func_input.extra_body or {}) or None,
         )
         case_result = await run_omniinteract_case(
             case,
             config,
             request_index=request_func_input.request_id or uuid.uuid4().hex,
-            persist_artifacts=False,
-            defer_artifacts=request_func_input.request_id is not None,
+            capture_artifacts=request_func_input.request_id is not None,
             prepared_input=prepared_input,
         )
         output.latency = case_result.latency_s
@@ -1519,57 +1501,32 @@ async def _async_request_omniinteract(
         output.ttft = float(session_metrics.get("mean_ttft_ms") or 0.0) / 1000.0
         output.audio_ttfp = float(session_metrics.get("mean_ttfp_ms") or 0.0) / 1000.0
         output.audio_rtf = float(session_metrics.get("mean_rtf") or 0.0)
-        exact_itls: list[float] = []
-        weighted_tpot_s = 0.0
-        weighted_intervals = 0
-        exact_itls_available = True
-        tpot_fallback_available = True
-        covered_output_tokens = 0
+        stages: list[tuple[int, dict[str, object]]] = []
         for request_metric in case_result.duplex_request_metrics:
             stage0 = request_metric.get("stage0_tokens")
             if not isinstance(stage0, dict):
                 continue
             token_count = stage0.get("output_token_count")
-            if not isinstance(token_count, int) or isinstance(token_count, bool) or token_count < 0:
-                continue
-            covered_output_tokens += token_count
-            if token_count <= 1:
-                continue
-            interval_count = token_count - 1
-            raw_itls = stage0.get("itls_ms")
-            if (
-                isinstance(raw_itls, list)
-                and len(raw_itls) == interval_count
-                and all(
-                    isinstance(value, int | float) and not isinstance(value, bool) and np.isfinite(value) and value >= 0
-                    for value in raw_itls
-                )
-            ):
-                exact_itls.extend(float(value) / 1000.0 for value in raw_itls)
-            else:
-                exact_itls_available = False
-
-            tpot_ms = stage0.get("tpot_ms")
-            if (
-                isinstance(tpot_ms, int | float)
-                and not isinstance(tpot_ms, bool)
-                and np.isfinite(tpot_ms)
-                and tpot_ms >= 0
-            ):
-                weighted_tpot_s += float(tpot_ms) / 1000.0 * interval_count
-                weighted_intervals += interval_count
-            else:
-                tpot_fallback_available = False
-        metrics_cover_output = covered_output_tokens == output.output_tokens
-        if not metrics_cover_output:
-            exact_itls_available = False
-            tpot_fallback_available = False
-        output.itl = exact_itls if exact_itls_available else []
+            if isinstance(token_count, int) and not isinstance(token_count, bool) and token_count >= 0:
+                stages.append((token_count, stage0))
+        timed = [(count - 1, stage) for count, stage in stages if count > 1]
+        complete = (
+            len(stages) == len(case_result.duplex_request_metrics)
+            and sum(count for count, _ in stages) == output.output_tokens
+        )
+        exact = complete and all(
+            isinstance(values := stage.get("itls_ms"), list)
+            and len(values) == intervals
+            and all(_nonnegative_number(value) for value in values)
+            for intervals, stage in timed
+        )
+        output.itl = [float(value) / 1000.0 for _, stage in timed for value in stage["itls_ms"]] if exact else []
         if output.itl:
             output.text_latency = output.ttft + sum(output.itl)
-        elif tpot_fallback_available and weighted_intervals and output.output_tokens > 1:
-            mean_tpot_s = weighted_tpot_s / weighted_intervals
-            output.text_latency = output.ttft + mean_tpot_s * (output.output_tokens - 1)
+        elif complete and timed and all(_nonnegative_number(stage.get("tpot_ms")) for _, stage in timed):
+            intervals = sum(count for count, _ in timed)
+            weighted_tpot = sum(float(stage["tpot_ms"]) * count for count, stage in timed) / intervals / 1000.0
+            output.text_latency = output.ttft + weighted_tpot * (output.output_tokens - 1)
         else:
             output.text_latency = output.ttft
             if output.output_tokens > 1:
@@ -1606,7 +1563,6 @@ async def async_request_openai_realtime_duplex(
     session: aiohttp.ClientSession,
     pbar: tqdm | None = None,
 ) -> MixRequestFuncOutput:
-    """Run one dataset sample through one explicit Realtime session."""
     del session
     if getattr(request_func_input, "omniinteract_case", None) is not None:
         return await _async_request_omniinteract(request_func_input, pbar=pbar)
@@ -1965,7 +1921,6 @@ async def benchmark(
         )
         _attach_daily_omni_to_request_func_input(input_requests[0], profile_input)
         _attach_seed_tts_to_request_func_input(input_requests[0], profile_input)
-        _attach_omniinteract_to_request_func_input(input_requests[0], profile_input)
         profile_output = await request_func(request_func_input=profile_input, session=session)
         if profile_output.success:
             print("Profiler started")

@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 import asyncio
 import base64
 import wave
@@ -13,7 +10,6 @@ from vllm_omni.experimental.fullduplex.client import (
     RealtimeEventCollector,
     build_realtime_url,
     read_pcm16_wav,
-    stream_pcm16_chunks,
     write_pcm16_wav,
 )
 from vllm_omni.experimental.fullduplex.minicpmo45.policy import (
@@ -25,7 +21,7 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 def test_realtime_client_builds_explicit_native_duplex_url():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?custom=1",
+        "ws://localhost:8099/v1/realtime?custom=1&duplex=0&model=stale&minicpmo45_native_duplex=0&session_id=stale",
         "openbmb/MiniCPM-o-4_5",
         session_id="session-a",
     )
@@ -55,7 +51,7 @@ def test_seed_tts_initial_text_is_part_of_native_duplex_context():
 
 def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
     url = build_realtime_url(
-        "ws://localhost:8099/v1/realtime?duplex=1",
+        "ws://localhost:8099/v1/realtime?duplex=1&autostart=1",
         "openbmb/MiniCPM-o-4_5",
         autostart=False,
     )
@@ -63,48 +59,6 @@ def test_realtime_client_builds_resume_only_url_when_autostart_disabled():
     query = parse_qs(urlsplit(url).query)
     assert query["autostart"] == ["0"]
     assert query["minicpmo45_native_duplex"] == ["1"]
-
-
-def test_realtime_client_normalizes_http_url_without_forcing_a_model_mode():
-    url = build_realtime_url(
-        "https://localhost:8099/v1/realtime?minicpmo45_native_duplex=1",
-        None,
-        native_duplex=None,
-    )
-
-    parts = urlsplit(url)
-    assert parts.scheme == "wss"
-    assert parse_qs(parts.query) == {
-        "duplex": ["1"],
-        "minicpmo45_native_duplex": ["1"],
-    }
-
-
-@pytest.mark.asyncio
-async def test_stream_pcm16_chunks_applies_hints_and_callbacks_once_per_chunk():
-    sent = []
-    callbacks = []
-
-    async def send(event):
-        sent.append(event)
-
-    async def on_chunk_sent(end, end_ms):
-        callbacks.append((end, end_ms))
-
-    stats = await stream_pcm16_chunks(
-        send,
-        bytes(6_400),
-        chunk_ms=100,
-        realtime=False,
-        chunk_hints=lambda _offset, end_ms: {"video_frames": [str(end_ms)]},
-        on_chunk_sent=on_chunk_sent,
-    )
-
-    assert [event["audio_end_ms"] for event in sent] == [100, 200]
-    assert [event["video_frames"] for event in sent] == [["100"], ["200"]]
-    assert callbacks == [(3_200, 100), (6_400, 200)]
-    assert stats.chunks == 2
-    assert 0 <= stats.mean_lag_s <= stats.max_lag_s
 
 
 @pytest.mark.asyncio
@@ -260,16 +214,6 @@ def test_realtime_event_collector_partitions_audio_by_response():
     assert collector.output_sample_rate_hz == 16_000
     assert collector.first_received_at("response.created") is not None
     assert collector.last_received_at("response.audio.delta") is not None
-
-
-def test_realtime_event_collector_joins_text_and_transcript_deltas_by_response():
-    collector = RealtimeEventCollector()
-    collector.add({"type": "response.created", "response": {"id": "resp-a"}})
-    collector.add({"type": "response.output_text.delta", "response_id": "resp-a", "delta": "hello "})
-    collector.add({"type": "response.audio_transcript.delta", "response_id": "resp-a", "delta": "world"})
-    collector.add({"type": "response.text.delta", "response_id": "resp-b", "delta": "ignored"})
-
-    assert collector.response_text("resp-a") == "hello world"
 
 
 def test_realtime_event_collector_reports_engine_token_and_audio_intervals():

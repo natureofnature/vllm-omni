@@ -1,6 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """Online serving benchmark subcommand for vLLM-Omni.
 
 ``OmniBenchmarkServingSubcommand`` starts from vLLM's serving benchmark

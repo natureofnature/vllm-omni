@@ -24,17 +24,17 @@ from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
     RealtimeDuplexClient,
     RealtimeEventCollector,
     build_realtime_url,
-    chunk_period_ms,
-    has_residual_model_unit,
     read_pcm16_wav,
-    reference_audio_data_url,
     wait_for,
     write_pcm16_wav,
 )
-
-# Backward-compatible names used by the demo's focused tests.
-_has_residual_model_unit = has_residual_model_unit
-_ref_audio_data_url = reference_audio_data_url
+from vllm_omni.experimental.fullduplex.client import chunk_period_ms as _chunk_period_ms  # noqa: E402
+from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    has_residual_model_unit as _has_residual_model_unit,
+)
+from vllm_omni.experimental.fullduplex.client import (  # noqa: E402
+    reference_audio_data_url as _ref_audio_data_url,
+)
 
 
 class _StreamingOutputWriter:
@@ -175,7 +175,7 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
     async with client:
         await client.configure(
             args.model,
-            ref_audio=reference_audio_data_url(args.ref_audio),
+            ref_audio=_ref_audio_data_url(args.ref_audio),
             session_id=args.session_id,
             temperature=args.temperature,
             timeout_s=args.timeout_s,
@@ -188,9 +188,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         )
         commit_event_cursor = len(client.events.events)
         stream_decision = _latest_model_decision(client.events.events, stream_event_cursor)
-        input_has_residual_model_unit = has_residual_model_unit(
+        input_has_residual_model_unit = _has_residual_model_unit(
             input_pcm16,
-            chunk_period_ms=chunk_period_ms(client.events.events),
+            chunk_period_ms=_chunk_period_ms(client.events.events),
         )
         wait_for_post_commit_decision = False
         commit_sent_at_s = time.monotonic()

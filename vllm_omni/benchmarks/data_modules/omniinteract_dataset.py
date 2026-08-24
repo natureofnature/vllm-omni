@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
-"""OmniInteract realtime benchmark dataset discovery."""
+"""OmniInteract dataset discovery for the standard serving benchmark."""
 
 from __future__ import annotations
 
@@ -28,8 +28,6 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class OmniInteractCase:
-    """One video/annotation pair from the official dataset."""
-
     subset: str
     video_rel: str
     video_path: Path
@@ -39,8 +37,6 @@ class OmniInteractCase:
 
 @dataclass(frozen=True)
 class OmniInteractSessionOptions:
-    """Runtime options carried from one dataset row to its Realtime session."""
-
     output_root: Path
     timeout_s: float
     media_timeout_s: float
@@ -50,8 +46,6 @@ class OmniInteractSessionOptions:
 
 @dataclass(frozen=True)
 class OmniInteractPreparedInput:
-    """Immutable local media prepared before benchmark timing starts."""
-
     duration_s: float
     pcm16: bytes = field(repr=False)
     video_frames: tuple[str | None, ...] = field(repr=False)
@@ -60,16 +54,12 @@ class OmniInteractPreparedInput:
 
 @dataclass
 class OmniInteractSampleRequest(SampleRequest):
-    """One native-duplex video session consumed by the Realtime backend."""
-
     omniinteract_case: OmniInteractCase | None = None
     omniinteract_options: OmniInteractSessionOptions | None = None
     omniinteract_prepared_input: OmniInteractPreparedInput | None = field(default=None, repr=False)
 
 
 class OmniInteractDataset(BenchmarkDataset):
-    """Load official OmniInteract sessions as standard serving samples."""
-
     def __init__(
         self,
         *,
@@ -126,43 +116,34 @@ def _data_dir(root: Path) -> Path:
 
 
 def _confined_path(root: Path, relative: object, *, field: str) -> Path:
-    text = str(relative or "")
+    text, resolved_root = str(relative or ""), root.resolve()
     path = Path(text)
     destination = (root / path).resolve()
-    resolved_root = root.resolve()
     if not text or path.is_absolute() or ".." in path.parts or not destination.is_relative_to(resolved_root):
         raise ValueError(f"Unsafe OmniInteract {field} path: {text!r}")
     return destination
 
 
-def _safe_extract(handle: tarfile.TarFile, target: Path) -> None:
+def _safe_extract(archive: tarfile.TarFile, target: Path) -> None:
     root = target.resolve()
-    members = handle.getmembers()
+    members = archive.getmembers()
     for member in members:
         path = Path(member.name)
-        destination = (root / path).resolve()
         if (
             path.is_absolute()
             or ".." in path.parts
-            or not destination.is_relative_to(root)
+            or not (root / path).resolve().is_relative_to(root)
             or not (member.isdir() or member.isfile())
         ):
             raise ValueError(f"Unsafe path in OmniInteract archive: {member.name!r}")
-    handle.extractall(target, members=members, filter="data")
-
-
-def _archive_fingerprint(archive: Path) -> str:
-    stat = archive.stat()
-    # Some mounted filesystems reject colons in rename targets.
-    return f"{stat.st_size}-{stat.st_mtime_ns}"
+    archive.extractall(target, members=members, filter="data")
 
 
 def _extract_archive(archive: Path, target: Path) -> Path:
-    """Extract into a private directory, then atomically publish by fingerprint."""
     if target.is_symlink():
         raise ValueError(f"Refusing to extract through symlink: {target}")
-    fingerprint = _archive_fingerprint(archive)
-    published = target / fingerprint
+    stat = archive.stat()
+    published = target / f"{stat.st_size}-{stat.st_mtime_ns}"
     if published.is_symlink():
         raise ValueError(f"Refusing to use symlinked extraction: {published}")
     if published.is_dir():
@@ -175,24 +156,20 @@ def _extract_archive(archive: Path, target: Path) -> Path:
     try:
         with tarfile.open(archive, "r:*") as handle:
             _safe_extract(handle, staging)
-        _data_dir(staging)
+        root = _data_dir(staging)
         try:
             staging.replace(published)
+            return published / root.relative_to(staging)
         except OSError:
-            # Another process may have published the same complete archive.
             if not published.is_dir():
                 raise
             return _data_dir(published)
-        return _data_dir(published)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
 
-def resolve_omniinteract_root(
-    data_root: str | None,
-    dataset_repo: str = DEFAULT_OMNIINTERACT_REPO,
-) -> Path:
-    """Resolve an extracted local tree or download the official archive."""
+def resolve_omniinteract_root(data_root: str | None, dataset_repo: str = DEFAULT_OMNIINTERACT_REPO) -> Path:
+    """Resolve a local tree/archive or download the official archive."""
 
     if data_root:
         local = Path(data_root).expanduser().resolve()
@@ -204,43 +181,33 @@ def resolve_omniinteract_root(
             return _data_dir(local)
         except FileNotFoundError:
             for name in ("data.tar.gz", "data.tar"):
-                local_archive = local / name
-                if local_archive.is_file():
-                    return _extract_archive(local_archive, local / ".vllm_omni_extracted")
+                if (archive := local / name).is_file():
+                    return _extract_archive(archive, local / ".vllm_omni_extracted")
             raise
 
-    cache_root = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
-    cache_key = dataset_repo.replace("/", "__")
-    target = cache_root / "vllm_omni" / "omniinteract" / cache_key
-    download_dir = target / ".downloads"
-    download_dir.mkdir(parents=True, exist_ok=True)
-    filesystem = hf_fs()
-
-    errors: list[str] = []
-    downloaded_archive: Path | None = None
+    cache = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    target = cache / "vllm_omni" / "omniinteract" / dataset_repo.replace("/", "__")
+    downloads = target / ".downloads"
+    downloads.mkdir(parents=True, exist_ok=True)
+    filesystem, errors = hf_fs(), []
     for name in ("data.tar.gz", "data.tar"):
-        cached_archive = download_dir / name
+        archive = downloads / name
         try:
-            if not cached_archive.is_file():
-                descriptor, temp_name = tempfile.mkstemp(prefix=f".{name}.", dir=download_dir)
+            if not archive.is_file():
+                descriptor, temporary_name = tempfile.mkstemp(prefix=f".{name}.", dir=downloads)
                 os.close(descriptor)
-                temporary = Path(temp_name)
+                temporary = Path(temporary_name)
                 try:
                     filesystem.get_file(f"datasets/{dataset_repo}/{name}", str(temporary))
                     if not temporary.stat().st_size:
                         raise ValueError("downloaded archive is empty")
-                    temporary.replace(cached_archive)
+                    temporary.replace(archive)
                 finally:
                     temporary.unlink(missing_ok=True)
-            downloaded_archive = cached_archive
-            break
-        except Exception as exc:  # noqa: BLE001, PERF203 - Hub exceptions vary by version
+            return _extract_archive(archive, target)
+        except Exception as exc:  # noqa: BLE001, PERF203 - Hub errors vary by version
             errors.append(f"{name}: {exc}")
-            downloaded_archive = None
-    if downloaded_archive is None:
-        detail = "; ".join(errors)
-        raise FileNotFoundError(f"Could not download OmniInteract from {dataset_repo!r}: {detail}")
-    return _extract_archive(downloaded_archive, target)
+    raise FileNotFoundError(f"Could not download OmniInteract from {dataset_repo!r}: {'; '.join(errors)}")
 
 
 def _mapping_cases(root: Path, subset: str) -> list[OmniInteractCase]:
@@ -251,53 +218,42 @@ def _mapping_cases(root: Path, subset: str) -> list[OmniInteractCase]:
     entries = mapping.get("entries") if isinstance(mapping, dict) else None
     if not isinstance(entries, list):
         raise ValueError(f"Invalid OmniInteract mapping: {mapping_path}")
-    cases: list[OmniInteractCase] = []
+    cases = []
     for row in entries:
         if not isinstance(row, dict):
             raise ValueError(f"Invalid OmniInteract mapping row in {mapping_path}")
-        video_rel = str(row.get("video") or "")
-        annotation_rel = str(row.get("annotation") or "")
+        video_rel, annotation_rel = str(row.get("video") or ""), str(row.get("annotation") or "")
         video = _confined_path(root, video_rel, field="video")
         annotation = _confined_path(root, annotation_rel, field="annotation")
         if not video.is_file() or not annotation.is_file():
             raise FileNotFoundError(f"OmniInteract mapping references missing files: {video_rel!r}, {annotation_rel!r}")
         cases.append(
             OmniInteractCase(
-                subset=subset,
-                video_rel=video_rel,
-                video_path=video,
-                annotation_path=annotation,
-                scene_type=str(row.get("scene_type") or "multi_turn").lower(),
+                subset,
+                video_rel,
+                video,
+                annotation,
+                str(row.get("scene_type") or "multi_turn").lower(),
             )
         )
     return cases
 
 
 def _one_to_many_cases(root: Path) -> list[OmniInteractCase]:
-    videos = root / "videos_bench"
-    annotations = root / "annotations"
+    videos, annotations = root / "videos_bench", root / "annotations"
     if not videos.is_dir() or not annotations.is_dir():
         raise FileNotFoundError(f"Invalid OmniInteract 1qna layout under {root}")
-    cases: list[OmniInteractCase] = []
+    cases = []
     for video in sorted(videos.rglob("*.mp4")):
-        resolved_video = video.resolve()
-        if not resolved_video.is_relative_to(videos.resolve()):
+        if not video.resolve().is_relative_to(videos.resolve()):
             raise ValueError(f"Unsafe OmniInteract video path: {video}")
         relative = video.relative_to(videos)
         annotation = (annotations / relative).with_suffix(".json").resolve()
         if not annotation.is_relative_to(annotations.resolve()):
             raise ValueError(f"Unsafe OmniInteract annotation path: {relative}")
         if not annotation.is_file():
-            raise FileNotFoundError(f"Missing OmniInteract annotation for {video}")
-        cases.append(
-            OmniInteractCase(
-                subset="1qna",
-                video_rel=str(video.relative_to(root)),
-                video_path=resolved_video,
-                annotation_path=annotation,
-                scene_type="1qna",
-            )
-        )
+            raise FileNotFoundError(f"Missing OmniInteract annotation: {annotation}")
+        cases.append(OmniInteractCase("1qna", f"videos_bench/{relative.as_posix()}", video, annotation, "1qna"))
     return cases
 
 
@@ -309,8 +265,6 @@ def discover_omniinteract_cases(
     seed: int = 0,
     disable_shuffle: bool = False,
 ) -> list[OmniInteractCase]:
-    """Discover and deterministically select benchmark cases."""
-
     invalid = set(subsets) - set(OMNIINTERACT_SUBSETS)
     if invalid:
         raise ValueError(f"Unsupported OmniInteract subsets: {sorted(invalid)}")
@@ -320,36 +274,27 @@ def discover_omniinteract_cases(
         raise ValueError("OmniInteract subsets must not contain duplicates")
     if num_prompts < 0:
         raise ValueError("num_prompts must be non-negative")
-
-    data = _data_dir(root.resolve())
-    cases: list[OmniInteractCase] = []
+    data_root, cases = _data_dir(root.resolve()), []
     for subset in subsets:
-        subset_root = data / subset
-        subset_cases = _one_to_many_cases(subset_root) if subset == "1qna" else _mapping_cases(subset_root, subset)
-        if not subset_cases:
+        subset_root = data_root / subset
+        selected = _one_to_many_cases(subset_root) if subset == "1qna" else _mapping_cases(subset_root, subset)
+        if not selected:
             raise ValueError(f"No OmniInteract sessions found for requested subset {subset!r}")
-        cases.extend(subset_cases)
-    if not cases:
-        raise ValueError(f"No OmniInteract sessions found under {data}")
-    paths = [case.video_path for case in cases]
-    if len(set(paths)) != len(paths):
+        cases.extend(selected)
+    if len({case.video_path for case in cases}) != len(cases):
         raise ValueError("OmniInteract dataset contains duplicate video paths")
     if not disable_shuffle:
         random.Random(seed).shuffle(cases)
     if num_prompts:
         if num_prompts > len(cases):
             logger.warning(
-                "Requested %d OmniInteract prompts but only %d are available; using all cases",
-                num_prompts,
-                len(cases),
+                "Requested %d OmniInteract prompts but only %d are available; using all cases", num_prompts, len(cases)
             )
         cases = cases[:num_prompts]
     return cases
 
 
 def case_manifest(case: OmniInteractCase, output_dir: Path) -> dict[str, Any]:
-    """Build one portable manifest row for later official scoring."""
-
     return {
         "sample_id": f"{case.subset}__{output_dir.name}",
         "video": str(case.video_path),

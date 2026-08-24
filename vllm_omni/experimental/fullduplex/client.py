@@ -1,18 +1,14 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-
 """Reusable Realtime WebSocket, PCM, and event helpers for MiniCPM-o demos."""
 
 from __future__ import annotations
 
 import asyncio
 import base64
-import inspect
 import json
 import math
 import time
 import wave
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -32,6 +28,13 @@ PCM16_BYTES_PER_SAMPLE = 2
 
 def _rounded_ms(value: float) -> float:
     return round(float(value), 3)
+
+
+def _finite_number(value: object, *, nonnegative: bool = False) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    parsed = float(value)
+    return parsed if math.isfinite(parsed) and (not nonnegative or parsed >= 0) else None
 
 
 def _interval_summary(values: list[float]) -> dict[str, float | int]:
@@ -60,13 +63,7 @@ def summarize_session_request_metrics(
     """Average client-observed metrics across turns that emitted audio."""
 
     def mean(metric: str, *, digits: int = 3) -> float | None:
-        values: list[float] = []
-        for request in request_metrics:
-            value = request.get(metric)
-            if isinstance(value, int | float) and not isinstance(value, bool):
-                parsed = float(value)
-                if math.isfinite(parsed):
-                    values.append(parsed)
+        values = [value for request in request_metrics if (value := _finite_number(request.get(metric))) is not None]
         return round(sum(values) / len(values), digits) if values else None
 
     return {
@@ -171,59 +168,6 @@ def write_pcm16_wav(path: Path, pcm16: bytes, *, sample_rate_hz: int) -> None:
         wav_file.setsampwidth(PCM16_BYTES_PER_SAMPLE)
         wav_file.setframerate(sample_rate_hz)
         wav_file.writeframes(pcm16)
-
-
-@dataclass(frozen=True)
-class PCMStreamStats:
-    chunks: int
-    mean_lag_s: float
-    max_lag_s: float
-
-
-async def stream_pcm16_chunks(
-    send_event: Callable[[dict[str, object]], Awaitable[None]],
-    pcm16: bytes,
-    *,
-    chunk_ms: int = 200,
-    realtime: bool = True,
-    chunk_hints: Callable[[int, int], dict[str, object] | None] | None = None,
-    on_chunk_sent: Callable[[int, int], Awaitable[object] | object] | None = None,
-) -> PCMStreamStats:
-    """Send paced PCM chunks with optional protocol-specific per-chunk hints."""
-    bytes_per_second = PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
-    chunk_bytes = max(bytes_per_second * chunk_ms // 1000, PCM16_BYTES_PER_SAMPLE)
-    started_at = time.monotonic()
-    lags: list[float] = []
-    chunks = 0
-    for offset in range(0, len(pcm16), chunk_bytes):
-        end = min(offset + chunk_bytes, len(pcm16))
-        end_ms = end * 1000 // bytes_per_second
-        lags.append(max(0.0, time.monotonic() - (started_at + offset / bytes_per_second)))
-        event: dict[str, object] = {
-            "type": "input_audio_buffer.append",
-            "audio": base64.b64encode(pcm16[offset:end]).decode("ascii"),
-            "input_audio_format": "pcm16",
-            "sample_rate_hz": PCM16_SAMPLE_RATE,
-            "duration_ms": (end - offset) * 1000 // bytes_per_second,
-            "audio_end_ms": end_ms,
-        }
-        if chunk_hints is not None:
-            event.update(chunk_hints(offset, end_ms) or {})
-        await send_event(event)
-        chunks += 1
-        if on_chunk_sent is not None:
-            callback_result = on_chunk_sent(end, end_ms)
-            if inspect.isawaitable(callback_result):
-                callback_result = await callback_result
-            if callback_result is False:
-                break
-        if realtime:
-            await asyncio.sleep(max(0.0, started_at + end_ms / 1000 - time.monotonic()))
-    return PCMStreamStats(
-        chunks=chunks,
-        mean_lag_s=sum(lags) / len(lags) if lags else 0.0,
-        max_lag_s=max(lags, default=0.0),
-    )
 
 
 async def wait_for(
@@ -388,34 +332,15 @@ class RealtimeEventCollector:
         if stage0_metrics is not None:
             raw_itls = stage0_metrics.get("vllm_itls_ms")
             itls = (
-                [
-                    float(value)
-                    for value in raw_itls
-                    if isinstance(value, int | float)
-                    and not isinstance(value, bool)
-                    and math.isfinite(float(value))
-                    and value >= 0
-                ]
+                [parsed for value in raw_itls if (parsed := _finite_number(value, nonnegative=True)) is not None]
                 if isinstance(raw_itls, list)
                 else []
             )
-            raw_num_tokens = stage0_metrics.get("num_tokens_out")
-            raw_ttft = stage0_metrics.get("vllm_ttft_ms")
-            raw_tpot = stage0_metrics.get("vllm_tpot_ms")
             result["stage0_tokens"] = {
                 "source": "engine_stage_metrics",
-                "output_token_count": int(raw_num_tokens)
-                if isinstance(raw_num_tokens, int | float) and not isinstance(raw_num_tokens, bool)
-                else 0,
-                "ttft_ms": float(raw_ttft)
-                if isinstance(raw_ttft, int | float) and not isinstance(raw_ttft, bool)
-                else 0.0,
-                "tpot_ms": float(raw_tpot)
-                if isinstance(raw_tpot, int | float)
-                and not isinstance(raw_tpot, bool)
-                and math.isfinite(float(raw_tpot))
-                and raw_tpot >= 0
-                else None,
+                "output_token_count": int(_finite_number(stage0_metrics.get("num_tokens_out"), nonnegative=True) or 0),
+                "ttft_ms": _finite_number(stage0_metrics.get("vllm_ttft_ms"), nonnegative=True) or 0.0,
+                "tpot_ms": _finite_number(stage0_metrics.get("vllm_tpot_ms"), nonnegative=True),
                 "itls_ms": itls,
                 "inter_token_interval_ms": _interval_summary(itls),
             }
@@ -494,15 +419,26 @@ class RealtimeEventCollector:
 class RealtimeDuplexClient:
     """Small async client used by the user demo and reusable smoke probes."""
 
-    def __init__(self, url: str, *, max_size: int = 64 * 1024 * 1024) -> None:
+    def __init__(
+        self,
+        url: str,
+        *,
+        max_size: int = 64 * 1024 * 1024,
+        additional_headers: dict[str, str] | None = None,
+    ) -> None:
         self.url = url
         self.max_size = max_size
+        self.additional_headers = additional_headers
         self.events = RealtimeEventCollector()
         self._ws: Any = None
         self._reader_task: asyncio.Task[None] | None = None
 
     async def __aenter__(self) -> RealtimeDuplexClient:
-        self._ws = await websockets.connect(self.url, max_size=self.max_size)
+        self._ws = await websockets.connect(
+            self.url,
+            max_size=self.max_size,
+            additional_headers=self.additional_headers,
+        )
         self._reader_task = asyncio.create_task(self._read_events())
         return self
 
@@ -608,17 +544,28 @@ class RealtimeDuplexClient:
         *,
         chunk_ms: int = 200,
         realtime: bool = True,
-        chunk_hints: Callable[[int, int], dict[str, object] | None] | None = None,
-        on_chunk_sent: Callable[[int, int], Awaitable[object] | object] | None = None,
-    ) -> PCMStreamStats:
-        return await stream_pcm16_chunks(
-            self.send,
-            pcm16,
-            chunk_ms=chunk_ms,
-            realtime=realtime,
-            chunk_hints=chunk_hints,
-            on_chunk_sent=on_chunk_sent,
+    ) -> None:
+        chunk_bytes = max(
+            PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE * chunk_ms // 1000,
+            PCM16_BYTES_PER_SAMPLE,
         )
+        audio_end_ms = 0
+        for offset in range(0, len(pcm16), chunk_bytes):
+            chunk = pcm16[offset : offset + chunk_bytes]
+            duration_ms = len(chunk) * 1000 // (PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE)
+            audio_end_ms += duration_ms
+            await self.send(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(chunk).decode("ascii"),
+                    "input_audio_format": "pcm16",
+                    "sample_rate_hz": PCM16_SAMPLE_RATE,
+                    "duration_ms": duration_ms,
+                    "audio_end_ms": audio_end_ms,
+                }
+            )
+            if realtime:
+                await asyncio.sleep(duration_ms / 1000)
 
     async def commit(self) -> None:
         await self.send({"type": "input_audio_buffer.commit", "final": True})
