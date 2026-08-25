@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import time
 from collections.abc import Callable
 from typing import Any
+
+from vllm.v1.request import Request
 
 from vllm_omni.metrics import OrchestratorAggregator
 
@@ -216,14 +218,16 @@ def compute_talker_prompt_ids_length(prompt_ids: list[int]) -> int:
     return sum_user_len + assistant_len
 
 
-def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], request: Any) -> bool:
+def construct_next_stage_streaming_input_prompt(
+    payload_data: dict[str, Any], request: Request, *, max_model_len: int | None = None
+) -> bool:
     """Update a downstream streaming request prompt from connector payload ids.
 
     Async-chunk downstream stages are prewarmed before the real Talker prompt is
     known. When a Thinker payload carries ``ids.prompt``, this helper:
 
     * Preserves ``num_computed_tokens`` while extending the current prompt.
-      Explicit replacements reset it with the prompt.
+      Explicit replacements and capacity-managed rollovers reset it.
     * Moves already-computed output tokens into ``prompt_token_ids``.
     * Appends a new placeholder prompt slice sized from the upstream ids.
     * Refreshes block hashes so the scheduler allocates KV slots for the
@@ -232,7 +236,38 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     ids = payload_data.get("ids", {})
     meta = payload_data.get("meta", {})
     next_stage_prompt_len = meta.get("next_stage_prompt_len") if isinstance(meta, dict) else None
-    replace_prompt = isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True
+    next_generation_tokens = meta.get("next_stage_generation_tokens") if isinstance(meta, dict) else None
+    generation_reserve = (
+        next_generation_tokens
+        if isinstance(next_generation_tokens, int) and not isinstance(next_generation_tokens, bool)
+        else 0
+    )
+    capacity_managed = generation_reserve > 0 and isinstance(max_model_len, int) and max_model_len > 0
+    if capacity_managed:
+        if (
+            not isinstance(next_stage_prompt_len, int)
+            or isinstance(next_stage_prompt_len, bool)
+            or next_stage_prompt_len <= 0
+        ):
+            raise ValueError("capacity-managed streaming prompt requires a positive next_stage_prompt_len")
+        if next_stage_prompt_len + generation_reserve > max_model_len:
+            raise ValueError(
+                "fresh streaming prompt plus generation reserve exceeds max_model_len: "
+                f"prompt={next_stage_prompt_len}, reserve={generation_reserve}, limit={max_model_len}"
+            )
+    capacity_rollover = capacity_managed and (
+        request.num_computed_tokens + next_stage_prompt_len + generation_reserve > max_model_len
+    )
+    if capacity_rollover:
+        logger.warning(
+            "Rolling over streaming prompt and dropping its KV state before the context limit: "
+            "computed=%d, next=%d, reserve=%d, limit=%d",
+            request.num_computed_tokens,
+            next_stage_prompt_len,
+            generation_reserve,
+            max_model_len,
+        )
+    replace_prompt = (isinstance(meta, dict) and meta.get("replace_streaming_prompt") is True) or capacity_rollover
     if replace_prompt and isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
         # Some downstream stages consume complete, independently conditioned
         # segments instead of extending an existing KV prefix. The producer

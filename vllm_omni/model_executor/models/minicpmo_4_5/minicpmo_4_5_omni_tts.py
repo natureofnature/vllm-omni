@@ -28,6 +28,7 @@ from vllm.model_executor.models.utils import maybe_prefix
 from vllm.v1.sample.sampler import Sampler
 
 from vllm_omni.experimental.fullduplex.engine.intermediate import get_tts_handoff
+from vllm_omni.model_executor.models.minicpmo_4_5 import MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms import current_omni_platform
 
@@ -46,7 +47,7 @@ _OFFLINE_CODEC_MAX_NEW_TOKENS = 2048
 # 25 codec frames (``codec_chunk_frames``) plus the terminating sample.
 # Without this, the single-vocab Sampler keeps the stage-1 request alive
 # until codec EOS / 4096 and Thinker never starts the next model turn.
-_DUPLEX_CODEC_TOKENS_PER_CHUNK = 26
+_DUPLEX_CODEC_TOKENS_PER_CHUNK = MINICPMO45_DUPLEX_CODEC_TOKENS_PER_CHUNK
 
 
 def _native_duplex_chunk_budget(meta: Mapping[str, Any] | None) -> tuple[int, int]:
