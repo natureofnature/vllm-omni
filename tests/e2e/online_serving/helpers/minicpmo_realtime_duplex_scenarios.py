@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Strict MiniCPM-o 4.5 Realtime duplex E2E scenario harness.
 
 This script is intentionally scenario-based instead of a generic chat client.

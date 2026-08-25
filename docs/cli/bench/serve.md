@@ -288,13 +288,15 @@ vllm bench serve --omni \
 ```
 
 `--dataset-path` accepts an extracted directory, `data.tar[.gz]`, or a Hugging Face dataset ID; omitting it uses
-`lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets; `0` selects all and oversize values use all
-available cases. Reference audio is required, and OmniInteract uses the `/v1/realtime` endpoint.
+`lucky-lance/OmniInteract`. `--num-prompts` is the total across subsets and defaults to 3 for OmniInteract; explicit `0`
+selects all and oversize values use all available cases. Reference audio is required, and OmniInteract uses the
+`/v1/realtime` endpoint.
 
-Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. Media is decoded before
-timing, media commands are bounded by `--omniinteract-media-timeout-s`, and concurrency defaults to 1. Standard request-rate,
-warmup, result-saving, and summary options apply. Use `--omniinteract-require-response` only for functional E2E cases;
-LISTEN is a valid benchmark result.
+Audio is replayed as 16 kHz PCM16 in 200 ms chunks and video at 1 FPS with real-time pacing. All selected media is decoded
+before timing and remains in client memory for the run, so `--max-concurrency` does not limit media preparation memory; use
+explicit `--num-prompts 0` only when the client has enough RAM for the full dataset. Media commands are bounded by
+`--omniinteract-media-timeout-s`, and concurrency defaults to 1. Standard request-rate, warmup, result-saving, and summary
+options apply. Use `--omniinteract-require-response` only for functional E2E cases; LISTEN is a valid benchmark result.
 
 Each completed case writes `output.wav`, `wav_transcript.json`, `events.json`, `result.json`, and a final `.done` marker under
 `--omniinteract-output-dir`. The root also contains `batch_summary.json` and `official_eval_manifest.jsonl`; failed cases write

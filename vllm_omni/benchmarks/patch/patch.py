@@ -647,6 +647,7 @@ class MixRequestFuncOutput(RequestFuncOutput):
     image_pixels: int = 0
     denoise_step_latency_ms: float = 0.0
     text_latency: float = 0.0
+    tpot_measured: bool = True
     #: Worst-case streaming-audio underrun (wall-clock seconds the player
     #: would have been starved). Populated by the audio-speech backend; ``0.0``
     #: for backends that do not run continuity analysis.
@@ -1565,7 +1566,8 @@ async def _async_request_omniinteract(
             output.text_latency = output.ttft + weighted_tpot * (output.output_tokens - 1)
         else:
             output.text_latency = output.ttft
-            if output.output_tokens > 1:
+            output.tpot_measured = False
+            if output.output_tokens > 1 or (output.output_tokens == 0 and output.generated_text):
                 logger.warning(
                     "OmniInteract session %s omitted complete engine token timing; standard TPOT/ITL are unavailable",
                     case_result.session_id,

@@ -191,6 +191,90 @@ def test_all_unmeasured_duplex_latency_is_not_reported_as_zero():
     assert metrics.request_goodput == 0.0
 
 
+def test_unmeasured_duplex_tpot_does_not_add_zero_or_misalign_goodput():
+    missing_tpot = _make_output(100, output_tokens=5)
+    missing_tpot.itl = []
+    missing_tpot.text_latency = missing_tpot.ttft = 0.1
+    missing_tpot.tpot_measured = False
+    missing_tpot.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    slow_ttft = _make_output(100, output_tokens=5)
+    slow_ttft.ttft = 1.0
+    slow_ttft.text_latency = 1.4
+    slow_ttft.itl = [0.1] * 4
+    slow_ttft.duplex_session_metrics = {"mean_ttft_ms": 1000.0}
+
+    metrics = _calculate_test_metrics(
+        [missing_tpot, slow_ttft],
+        {"ttft": 500.0, "tpot": 200.0},
+    )
+
+    assert metrics.num_tpot_samples == 1
+    assert metrics.mean_tpot_ms == pytest.approx(100.0)
+    assert metrics.request_goodput == 0.0
+
+
+def test_all_unmeasured_duplex_token_timing_is_not_reported_as_zero():
+    output = _make_output(100, output_tokens=5)
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output], {"tpot": float("inf")})
+
+    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (0, 0)
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert math.isnan(metrics.mean_itl_ms)
+    assert metrics.request_goodput == 0.0
+
+
+def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
+    output = _make_output(100, output_tokens=0)
+    output.generated_text = "timing metadata missing"
+    output.itl = []
+    output.text_latency = output.ttft
+    output.tpot_measured = False
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    def tokenizer(text, *, add_special_tokens):
+        assert text == output.generated_text
+        assert add_special_tokens is False
+        return type("Tokenized", (), {"input_ids": [1, 2, 3]})()
+
+    metrics, _ = calculate_metrics(
+        input_requests=[],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=tokenizer,
+        selected_percentiles=[50.0],
+        goodput_config_dict={"tpot": float("inf")},
+        task_type=TaskType.GENERATION,
+        selected_percentile_metrics=[],
+        max_concurrency=None,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+
+    assert metrics.total_output == 3
+    assert metrics.num_tpot_samples == 0
+    assert math.isnan(metrics.mean_tpot_ms)
+    assert metrics.request_goodput == 0.0
+
+
+def test_measured_zero_itl_is_not_treated_as_missing():
+    output = _make_output(100, output_tokens=3)
+    output.itl = [0.0, 0.0]
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output], {"tpot": 1.0})
+
+    assert (metrics.num_tpot_samples, metrics.num_itl_samples) == (1, 2)
+    assert metrics.mean_tpot_ms == 0.0
+    assert metrics.mean_itl_ms == 0.0
+    assert metrics.request_goodput == 1.0
+
+
 def test_duplex_goodput_does_not_pair_measurements_from_different_requests():
     text_only, audio_only = _make_output(100), _make_output(100)
     text_only.ttft, text_only.audio_ttfp = 0.1, 0.0

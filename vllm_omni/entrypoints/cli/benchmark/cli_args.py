@@ -22,6 +22,8 @@ import argparse
 import math
 from pathlib import Path
 
+_DEFAULT_OMNIINTERACT_NUM_PROMPTS = 3
+
 
 def _positive_finite_float(value: str) -> float:
     parsed = float(value)
@@ -277,6 +279,11 @@ def extend_omni_choices(parser: argparse.ArgumentParser) -> None:
 def update_omni_help(parser: argparse.ArgumentParser) -> None:
     """Update upstream argument help text to describe Omni-specific behavior."""
     for action in parser._actions:
+        if action.dest == "num_prompts":
+            action.help = (
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} when this option is omitted; "
+                "0 selects all available cases."
+            )
         if action.dest == "percentile_metrics":
             action.help = (
                 "Comma-separated list of selected metrics to report percentiles. "
@@ -336,6 +343,8 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("OmniInteract does not support --skip-tokenizer-init")
         if float(getattr(args, "probe_request_rate", 0.0) or 0.0) > 0:
             raise ValueError("OmniInteract does not support --probe-request-rate")
+        if "num_prompts" not in getattr(args, "explicit_keys", ()):
+            args.num_prompts = _DEFAULT_OMNIINTERACT_NUM_PROMPTS
         max_concurrency = getattr(args, "max_concurrency", None)
         if max_concurrency is None:
             args.max_concurrency = 1

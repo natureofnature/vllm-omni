@@ -565,11 +565,9 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             str(case.video_path),
             str(options.output_root),
             success=True,
-            output_tokens=2,
-            duplex_request_metrics=[
-                {"stage0_tokens": {"output_token_count": 2, "itls_ms": [1.0]}},
-                {"request_metrics": {"ttft_ms": 1.0}},
-            ],
+            transcript="timing metadata missing",
+            output_tokens=0,
+            duplex_request_metrics=[{"request_metrics": {"ttft_ms": 1.0}}],
             duplex_session_metrics={"mean_ttft_ms": 10.0},
         )
 
@@ -579,6 +577,7 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
     assert seen["headers"] == {"Authorization": "Bearer secret", "X-Proxy": "test", "x-request-id": "measured-0"}
     assert seen["extra_body"] == {"custom": "value"}
     assert output.itl == []
+    assert output.tpot_measured is False
     assert seen["capture_artifacts"] is True
 
 
@@ -601,6 +600,14 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
             ],
             [],
             0.18,
+        ),
+        (
+            [
+                {"stage0_tokens": {"output_token_count": 3, "tpot_ms": 0.0}},
+                {"stage0_tokens": {"output_token_count": 2, "tpot_ms": 0.0}},
+            ],
+            [],
+            0.1,
         ),
     ],
 )
@@ -634,6 +641,7 @@ async def test_adapter_reports_exact_or_weighted_token_timing(
     assert output.success
     assert output.itl == expected_itl
     assert output.text_latency == pytest.approx(expected_text_latency)
+    assert output.tpot_measured is True
 
 
 def test_batch_finalization_publishes_only_measured_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

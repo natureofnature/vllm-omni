@@ -20,6 +20,8 @@ _INT_LIST_TYPE = list[int]
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
     ("num_ttft_samples", int, field(default=0)),
+    ("num_tpot_samples", int, field(default=0)),
+    ("num_itl_samples", int, field(default=0)),
     ("num_audio_ttfp_samples", int, field(default=0)),
     ("num_audio_rtf_samples", int, field(default=0)),
     (defs.MEAN_AUDIO_TTFP_MS, float, field(default=0.0)),
@@ -186,6 +188,8 @@ def _stage_modality_flags(
 def has_metric_samples(metrics: object, metric_name: str) -> bool:
     sample_count_attr = {
         "ttft": "num_ttft_samples",
+        "tpot": "num_tpot_samples",
+        "itl": "num_itl_samples",
         defs.AUDIO_TTFP: "num_audio_ttfp_samples",
         defs.AUDIO_RTF: "num_audio_rtf_samples",
     }.get(metric_name)
@@ -737,7 +741,7 @@ def calculate_metrics(
     good_completed = 0
     itls: list[float] = []
     tpots: list[float] = []
-    all_tpots: list[float] = []
+    all_tpots: list[float | None] = []
     ttfts: list[float] = []
     goodput_ttfts: list[float | None] = []
     e2els: list[float] = []
@@ -769,7 +773,7 @@ def calculate_metrics(
                     output_len = len(tokenizer(outputs[i].generated_text, add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += outputs[i].prompt_len
-            tpot = 0
+            tpot: float | None = 0.0
             if output_len > 1:
                 if outputs[i].itl:
                     # Use mean(ITL) directly so per-request TPOT == mean(ITL).
@@ -777,13 +781,16 @@ def calculate_metrics(
                     # bundle multiple tokens per chunk, so len(itl)+1 != output_len.
                     # Using mean(itl) keeps TPOT and ITL on the same footing.
                     tpot = sum(outputs[i].itl) / len(outputs[i].itl)
-                else:
+                elif getattr(outputs[i], "tpot_measured", True):
                     try:
                         latency_minus_ttft = outputs[i].text_latency - outputs[i].ttft
                     except Exception:
                         latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                     tpot = latency_minus_ttft / (output_len - 1)
-                tpots.append(tpot)
+                else:
+                    tpot = None
+                if tpot is not None:
+                    tpots.append(tpot)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
             itls += outputs[i].itl
@@ -930,14 +937,14 @@ def calculate_metrics(
         std_ttft_ms=np.std(ttfts or missing_duplex_value) * 1000,
         median_ttft_ms=np.median(ttfts or missing_duplex_value) * 1000,
         percentiles_ttft_ms=[(p, np.percentile(ttfts or missing_duplex_value, p) * 1000) for p in selected_percentiles],
-        mean_tpot_ms=np.mean(tpots or 0) * 1000,
-        std_tpot_ms=np.std(tpots or 0) * 1000,
-        median_tpot_ms=np.median(tpots or 0) * 1000,
-        percentiles_tpot_ms=[(p, np.percentile(tpots or 0, p) * 1000) for p in selected_percentiles],
-        mean_itl_ms=np.mean(itls or 0) * 1000,
-        std_itl_ms=np.std(itls or 0) * 1000,
-        median_itl_ms=np.median(itls or 0) * 1000,
-        percentiles_itl_ms=[(p, np.percentile(itls or 0, p) * 1000) for p in selected_percentiles],
+        mean_tpot_ms=np.mean(tpots or missing_duplex_value) * 1000,
+        std_tpot_ms=np.std(tpots or missing_duplex_value) * 1000,
+        median_tpot_ms=np.median(tpots or missing_duplex_value) * 1000,
+        percentiles_tpot_ms=[(p, np.percentile(tpots or missing_duplex_value, p) * 1000) for p in selected_percentiles],
+        mean_itl_ms=np.mean(itls or missing_duplex_value) * 1000,
+        std_itl_ms=np.std(itls or missing_duplex_value) * 1000,
+        median_itl_ms=np.median(itls or missing_duplex_value) * 1000,
+        percentiles_itl_ms=[(p, np.percentile(itls or missing_duplex_value, p) * 1000) for p in selected_percentiles],
         mean_e2el_ms=np.mean(e2els or 0) * 1000,
         std_e2el_ms=np.std(e2els or 0) * 1000,
         median_e2el_ms=np.median(e2els or 0) * 1000,
@@ -947,6 +954,8 @@ def calculate_metrics(
         rtfx=input_audio_duration / dur_s,
         **{
             "num_ttft_samples": len(ttfts),
+            "num_tpot_samples": len(tpots),
+            "num_itl_samples": len(itls),
             "num_audio_ttfp_samples": len(audio_ttfps),
             "num_audio_rtf_samples": len(audio_rtfs),
             defs.MEAN_AUDIO_TTFP_MS: np.mean(audio_ttfps or missing_duplex_value) * 1000,

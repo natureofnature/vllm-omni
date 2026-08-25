@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Minimal single-input MiniCPM-o 4.5 Realtime duplex demo.
 
 Run this after starting the duplex server. Strict lifecycle, overlap, and
