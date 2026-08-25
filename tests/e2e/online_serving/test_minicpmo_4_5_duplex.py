@@ -7,12 +7,18 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import uuid
+import wave
 from pathlib import Path
 
 import pytest
 import websockets
 
+from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
+    find_vllm_cli,
+    run_vllm_bench_subprocess,
+)
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     demo_args,
@@ -29,6 +35,7 @@ from tests.e2e.online_serving.run_minicpmo_realtime_duplex_multi_session import 
     run_multi_session,
 )
 from tests.helpers.mark import hardware_test
+from vllm_omni.benchmarks.data_modules.omniinteract_dataset import DEFAULT_OMNIINTERACT_REPO
 from vllm_omni.experimental.fullduplex.client import build_realtime_url
 
 pytestmark = pytest.mark.omni
@@ -177,3 +184,101 @@ def test_duplex_two_sessions_resume_and_takeover(omni_server, tmp_path: Path) ->
     for session in result["sessions"]:
         _assert_request_metrics(session["request_metrics"], expected_count=1)
         _assert_session_metrics(session["session_metrics"], expected_count=1)
+
+
+@pytest.mark.full_model
+@hardware_test(res={"cuda": "H100"}, num_cards=1)
+@pytest.mark.skipif(
+    os.environ.get("VLLM_OMNI_RUN_OMNIINTERACT_E2E") != "1",
+    reason="enable the real-time OmniInteract dataset E2E",
+)
+@pytest.mark.parametrize("subset", ("1q1a", "1q1a_math", "1qna"))
+@pytest.mark.parametrize("omni_server", SERVER_PARAMS, indirect=True)
+def test_minicpmo_4_5_omniinteract_nightly(
+    omni_server,
+    tmp_path: Path,
+    subset: str,
+) -> None:
+    dataset_path = os.environ.get("OMNIINTERACT_ROOT", "").strip() or DEFAULT_OMNIINTERACT_REPO
+    run_root = tmp_path / subset
+    artifact_root = run_root / "artifacts"
+    result_filename = "benchmark_result.json"
+    run_vllm_bench_subprocess(
+        find_vllm_cli(),
+        [
+            "bench",
+            "serve",
+            "--omni",
+            "--trust-remote-code",
+            "--host",
+            omni_server.host,
+            "--port",
+            str(omni_server.port),
+            "--backend",
+            "openai-realtime-duplex",
+            "--endpoint",
+            "/v1/realtime",
+            "--model",
+            omni_server.model,
+            "--dataset-name",
+            "omniinteract",
+            "--dataset-path",
+            dataset_path,
+            "--omniinteract-subsets",
+            subset,
+            "--omniinteract-ref-audio",
+            str(resolve_ref_audio()),
+            "--omniinteract-output-dir",
+            str(artifact_root),
+            "--omniinteract-require-response",
+            "--num-warmups",
+            "0",
+            "--num-prompts",
+            "4",
+            "--max-concurrency",
+            "2",
+            "--request-rate",
+            "inf",
+            "--disable-shuffle",
+            "--save-result",
+            "--result-dir",
+            str(run_root),
+            "--result-filename",
+            result_filename,
+        ],
+    )
+
+    benchmark_result = json.loads((run_root / result_filename).read_text())
+    artifact_summary = benchmark_result["omniinteract"]
+    assert artifact_summary["artifacts_complete"] is True
+    assert (artifact_summary["total"], artifact_summary["success"], artifact_summary["failed"]) == (4, 4, 0)
+
+    batch_summary = json.loads((artifact_root / "batch_summary.json").read_text())
+    assert (batch_summary["total"], batch_summary["success"], batch_summary["failed"]) == (4, 4, 0)
+    assert batch_summary["eligible_for_official_eval"] + batch_summary["successful_but_ineligible"] == 4
+    manifest_rows = (artifact_root / "official_eval_manifest.jsonl").read_text().splitlines()
+    assert len(manifest_rows) == batch_summary["eligible_for_official_eval"]
+    assert {result["subset"] for result in batch_summary["results"]} == {subset}
+    assert len({result["video"] for result in batch_summary["results"]}) == 4
+
+    for result in batch_summary["results"]:
+        assert result["success"] is True
+        assert result["input_audio_chunks"] > 0
+        assert result["input_video_frames"] > 0
+        assert result["responses"] > 0
+        sample_root = Path(result["output_dir"])
+        assert all(
+            (sample_root / name).is_file()
+            for name in (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
+        )
+        with wave.open(str(sample_root / "output.wav"), "rb") as output_wav:
+            assert output_wav.getnframes() > 0
+            assert (
+                output_wav.getframerate(),
+                output_wav.getnchannels(),
+                output_wav.getsampwidth(),
+                output_wav.getcomptype(),
+            ) == (24_000, 1, 2, "NONE")
+        assert json.loads((sample_root / "wav_transcript.json").read_text())["chunks"]
+        if not result["eligible_for_official_eval"]:
+            assert result["official_eval_ineligible_reasons"]
