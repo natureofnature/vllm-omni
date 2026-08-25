@@ -229,6 +229,23 @@ def test_all_unmeasured_duplex_token_timing_is_not_reported_as_zero():
     assert metrics.request_goodput == 0.0
 
 
+def test_duplex_response_timings_do_not_build_a_session_token_timeline():
+    output = _make_output(100, output_tokens=5)
+    output.latency = 101.0
+    output.duplex_request_metrics = [
+        {"response_id": "r1", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
+        {"response_id": "r2", "stage0_tokens": {"itls_ms": [100.0, 100.0]}},
+    ]
+    output.duplex_session_metrics = {"mean_ttft_ms": 100.0}
+
+    metrics = _calculate_test_metrics([output])
+
+    assert math.isnan(metrics.max_output_tokens_per_s)
+    assert metrics.max_concurrent_requests == 1
+    assert metrics.mean_tpot_ms == pytest.approx(100.0)
+    assert metrics.mean_itl_ms == pytest.approx(100.0)
+
+
 def test_unmeasured_tpot_stays_missing_after_tokenizer_fallback():
     output = _make_output(100, output_tokens=0)
     output.generated_text = "timing metadata missing"

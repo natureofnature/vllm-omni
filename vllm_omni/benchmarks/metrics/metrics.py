@@ -861,6 +861,7 @@ def calculate_metrics(
     # Calculate max output tokens per second metric
     max_output_tokens_per_s = 0.0
     max_concurrent_requests = 0
+    token_timeline_available = True
 
     # Find the time range across all successful requests
     successful_outputs = [output for output in outputs if output.success]
@@ -875,19 +876,26 @@ def calculate_metrics(
         concurrent_requests_per_second = np.zeros(duration_seconds)
 
         for i, output in enumerate(successful_outputs):
-            # Calculate token generation timestamp using
-            # start_time, ttft, and itl
-            token_times = [output.start_time + output.ttft]
-            current_time = token_times[0]
-            for itl_value in output.itl:
-                current_time += itl_value
-                token_times.append(current_time)
+            session_metrics = getattr(output, "duplex_session_metrics", None)
+            if isinstance(session_metrics, dict):
+                # Duplex TTFT/ITL samples are response-local. Without each
+                # response.created offset they cannot form a session-global
+                # token timeline, so do not publish a misleading peak rate.
+                token_timeline_available = False
+            else:
+                # Calculate token generation timestamp using
+                # start_time, ttft, and itl
+                token_times = [output.start_time + output.ttft]
+                current_time = token_times[0]
+                for itl_value in output.itl:
+                    current_time += itl_value
+                    token_times.append(current_time)
 
-            # Add tokens to second buckets
-            for token_time in token_times:
-                second_bucket = int(token_time - min_start_time)
-                if 0 <= second_bucket < duration_seconds:
-                    tokens_per_second[second_bucket] += 1
+                # Add tokens to second buckets
+                for token_time in token_times:
+                    second_bucket = int(token_time - min_start_time)
+                    if 0 <= second_bucket < duration_seconds:
+                        tokens_per_second[second_bucket] += 1
 
             # Track concurrent requests for each second this request was active
             request_start_second = int(output.start_time - min_start_time)
@@ -899,18 +907,22 @@ def calculate_metrics(
         # Find the maximum tokens per second and corresponding
         # concurrent requests
         if len(tokens_per_second) > 0:
-            max_output_tokens_per_s = float(np.max(tokens_per_second))
+            if token_timeline_available:
+                max_output_tokens_per_s = float(np.max(tokens_per_second))
+            else:
+                max_output_tokens_per_s = float("nan")
             max_concurrent_requests = int(np.max(concurrent_requests_per_second))
 
         if TERM_PLOTLIB_AVAILABLE:
             import termplotlib as tpl
 
             fig = tpl.figure()
-            fig.plot(
-                np.arange(len(tokens_per_second)),
-                tokens_per_second,
-                title="Output tokens per second",
-            )
+            if token_timeline_available:
+                fig.plot(
+                    np.arange(len(tokens_per_second)),
+                    tokens_per_second,
+                    title="Output tokens per second",
+                )
             fig.plot(
                 np.arange(len(concurrent_requests_per_second)),
                 concurrent_requests_per_second,

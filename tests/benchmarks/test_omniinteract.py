@@ -255,6 +255,8 @@ def test_media_duration_is_bounded_before_decode(monkeypatch: pytest.MonkeyPatch
 
 
 def test_final_commit_keeps_a_partial_model_unit():
+    """Exact units retain a sample for the server's correlated final flush."""
+
     events = [{"session": {"capabilities": {"chunk_period_ms": 1000}}}]
     exact_unit = b"\0\0" * 16_000
     assert oi._ensure_final_commit_tail(exact_unit, events) == exact_unit[:-2]

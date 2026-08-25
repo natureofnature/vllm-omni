@@ -408,6 +408,14 @@ def _raise_if_session_terminated(
 
 
 def _ensure_final_commit_tail(pcm: bytes, events: list[dict[str, object]]) -> bytes:
+    """Reserve one PCM sample so an exact model unit is flushed by commit.
+
+    A complete unit is otherwise emitted before commit, so its asynchronous
+    decision cannot be correlated with the accepted final input. Keeping an
+    almost-full unit buffered makes the server's final residual flush carry
+    that correlation; the server pads the missing sample back to a full unit.
+    """
+
     period_ms = chunk_period_ms(events)
     if len(pcm) >= PCM16_BYTES_PER_SAMPLE and not has_residual_model_unit(pcm, chunk_period_ms=period_ms):
         return pcm[:-PCM16_BYTES_PER_SAMPLE]
