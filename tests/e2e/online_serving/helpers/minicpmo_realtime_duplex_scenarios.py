@@ -1350,6 +1350,9 @@ async def run_demo(args: argparse.Namespace) -> dict[str, object]:
         try:
             await ws.send(json.dumps(_session_update_event(args)))
             await _wait_for(state, lambda: state.count("session.created") > 0, timeout_s=20, label="session.created")
+            start_barrier = getattr(args, "start_barrier", None)
+            if start_barrier is not None:
+                await start_barrier.wait()
 
             turn_transcripts = _turn_transcripts(args.first_turn_transcript, turns=args.turns)
             turn_specs = list(zip(turn_transcripts, turn_durations, strict=True))
