@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import contextlib
 import io
@@ -255,6 +258,10 @@ def _attach_omniinteract_to_request_func_input(sample: SampleRequest, rfi: Reque
     setattr(rfi, "omniinteract_prepared_input", sample.omniinteract_prepared_input)
 
 
+def _append_error(existing: str, message: str) -> str:
+    return f"{existing}\n{message}" if existing else message
+
+
 def _finalize_omniinteract_batch(
     input_requests: list[SampleRequest],
     outputs: list[RequestFuncOutput],
@@ -270,6 +277,7 @@ def _finalize_omniinteract_batch(
     if not isinstance(options, OmniInteractSessionOptions):
         raise RuntimeError("OmniInteract benchmark output lost its artifact options")
     cases, results = [], []
+    artifact_errors: list[str] = []
     for sample, output in rows:
         case = sample.omniinteract_case
         result = getattr(output, "omniinteract_case_result", None)
@@ -280,14 +288,39 @@ def _finalize_omniinteract_batch(
         try:
             publish_deferred_case_artifacts(options.output_root, case, result)
         except Exception as exc:  # noqa: BLE001 - artifact backends raise heterogeneous errors
-            result.success = result.eligible_for_official_eval = output.success = False
+            result.success = result.eligible_for_official_eval = False
             if "artifact_write_failed" not in result.official_eval_ineligible_reasons:
                 result.official_eval_ineligible_reasons.append("artifact_write_failed")
-            result.error = output.error = f"Artifact publication failed: {exc}"
-            write_failure_artifacts(options.output_root, case, result)
-    write_omniinteract_batch_artifacts(options.output_root, cases, results)
+            artifact_error = f"Artifact publication failed: {exc}"
+            result.error = _append_error(result.error, artifact_error)
+            output.error = _append_error(output.error, artifact_error)
+            message = f"{case.subset}/{case.video_rel}: {artifact_error}"
+            artifact_errors.append(message)
+            logger.exception(message)
+            try:
+                write_failure_artifacts(options.output_root, case, result)
+            except Exception as recovery_exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+                message = f"{case.subset}/{case.video_rel}: failure artifact publication failed: {recovery_exc}"
+                artifact_errors.append(message)
+                logger.exception(message)
+    try:
+        write_omniinteract_batch_artifacts(options.output_root, cases, results)
+    except Exception as exc:  # noqa: BLE001 - preserve benchmark metrics after I/O failure
+        message = f"Batch artifact publication failed: {exc}"
+        artifact_errors.append(message)
+        logger.exception(message)
+        try:
+            clear_batch_artifacts(options.output_root)
+        except Exception as cleanup_exc:  # noqa: BLE001 - best-effort removal of partial batch artifacts
+            message = f"Partial batch artifact cleanup failed: {cleanup_exc}"
+            artifact_errors.append(message)
+            logger.exception(message)
     summary = omniinteract_benchmark_summary(results)
-    return {key: value for key, value in summary.items() if key != "results"}
+    compact_summary = {key: value for key, value in summary.items() if key != "results"}
+    compact_summary["artifacts_complete"] = not artifact_errors
+    if artifact_errors:
+        compact_summary["artifact_errors"] = artifact_errors
+    return compact_summary
 
 
 def _prepare_omniinteract_batch(input_requests: list[SampleRequest]) -> None:
@@ -369,6 +402,7 @@ def get_samples(args, tokenizer):
             media_timeout_s=float(getattr(args, "omniinteract_media_timeout_s")),
             ref_audio=str(getattr(args, "omniinteract_ref_audio")),
             require_response=bool(getattr(args, "omniinteract_require_response")),
+            max_video_duration_s=float(getattr(args, "omniinteract_max_video_duration_s")),
         )
         requests = dataset.sample(
             tokenizer,
@@ -387,6 +421,7 @@ def get_samples(args, tokenizer):
                 case.video_path,
                 VIDEO_FPS,
                 timeout_s=options.media_timeout_s,
+                max_duration_s=options.max_video_duration_s,
             )
             if not any(frames):
                 raise ValueError(f"No video frames were decoded from {case.video_path}")
@@ -1480,6 +1515,7 @@ async def _async_request_omniinteract(
             output_root=options.output_root,
             timeout_s=options.timeout_s,
             media_timeout_s=options.media_timeout_s,
+            max_video_duration_s=options.max_video_duration_s,
             ref_audio=options.ref_audio,
             require_response=options.require_response,
             extra_headers=headers or None,
@@ -1749,6 +1785,7 @@ from vllm.benchmarks.serve import TaskType, calculate_metrics_for_embeddings, ge
 from vllm_omni.benchmarks.metrics.metrics import (
     MultiModalsBenchmarkMetrics,
     calculate_metrics,
+    has_metric_samples,
 )
 
 # ruff: noqa: E402
@@ -2073,6 +2110,13 @@ async def benchmark(
         actual_output_lens = 0
 
     if isinstance(metrics, MultiModalsBenchmarkMetrics):
+
+        def measured_ttft(output: RequestFuncOutput) -> float | None:
+            session_metrics = getattr(output, "duplex_session_metrics", None)
+            if isinstance(session_metrics, dict) and session_metrics.get("mean_ttft_ms") is None:
+                return None
+            return output.ttft
+
         result = {
             "duration": benchmark_duration,
             "completed": metrics.completed,
@@ -2093,7 +2137,7 @@ async def benchmark(
             "input_lens": [output.prompt_len for output in outputs],
             "start_times": [output.start_time for output in outputs],
             "output_lens": actual_output_lens,
-            "ttfts": [output.ttft for output in outputs],
+            "ttfts": [measured_ttft(output) for output in outputs],
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
@@ -2184,6 +2228,8 @@ async def benchmark(
         # This function prints and adds statistics of the specified
         # metric.
         if metric_attribute_name not in result_percentile_metrics:
+            return
+        if not has_metric_samples(metrics, metric_attribute_name):
             return
         # No text tokens generated (e.g. pure TTS speech endpoint): per-token
         # latency metrics (ttft/tpot/itl) are undefined, so skip them.

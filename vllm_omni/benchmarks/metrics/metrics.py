@@ -1,5 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import warnings
 from collections import defaultdict
+from collections.abc import Sequence
 from dataclasses import field, make_dataclass
 
 import numpy as np
@@ -15,6 +19,9 @@ _FLOAT_LIST_TYPE = list[float]
 _INT_LIST_TYPE = list[int]
 
 _MULTIMODAL_BENCHMARK_FIELDS = [
+    ("num_ttft_samples", int, field(default=0)),
+    ("num_audio_ttfp_samples", int, field(default=0)),
+    ("num_audio_rtf_samples", int, field(default=0)),
     (defs.MEAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.MEDIAN_AUDIO_TTFP_MS, float, field(default=0.0)),
     (defs.STD_AUDIO_TTFP_MS, float, field(default=0.0)),
@@ -176,6 +183,15 @@ def _stage_modality_flags(
     )
 
 
+def has_metric_samples(metrics: object, metric_name: str) -> bool:
+    sample_count_attr = {
+        "ttft": "num_ttft_samples",
+        defs.AUDIO_TTFP: "num_audio_ttfp_samples",
+        defs.AUDIO_RTF: "num_audio_rtf_samples",
+    }.get(metric_name)
+    return sample_count_attr is None or getattr(metrics, sample_count_attr, 0) > 0
+
+
 def print_metrics(
     task_type,
     selected_percentile_metrics,
@@ -308,6 +324,9 @@ def process_one_metric(
     metric_attribute_name: str,
     metrics: MultiModalsBenchmarkMetrics,
 ):
+    if not has_metric_samples(metrics, metric_attribute_name):
+        return
+
     metric_header_map = {
         "ttft": "Time to First Token",
         "tpot": "Time per Output Token (excl. 1st token)",
@@ -720,8 +739,10 @@ def calculate_metrics(
     tpots: list[float] = []
     all_tpots: list[float] = []
     ttfts: list[float] = []
+    goodput_ttfts: list[float | None] = []
     e2els: list[float] = []
     audio_ttfps: list[float] = []
+    goodput_audio_ttfps: list[float | None] = []
     audio_rtfs: list[float] = []
     audio_duration: list[float] = []
     audio_frames: list[int] = []
@@ -766,9 +787,20 @@ def calculate_metrics(
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
             itls += outputs[i].itl
-            ttfts.append(outputs[i].ttft)
-            audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
-            audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            session_metrics = getattr(outputs[i], "duplex_session_metrics", None)
+            ttft_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_ttft_ms") is not None
+            audio_ttfp_measured = (
+                not isinstance(session_metrics, dict) or session_metrics.get("mean_ttfp_ms") is not None
+            )
+            audio_rtf_measured = not isinstance(session_metrics, dict) or session_metrics.get("mean_rtf") is not None
+            if ttft_measured:
+                ttfts.append(outputs[i].ttft)
+            if audio_ttfp_measured:
+                audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0))
+            if audio_rtf_measured:
+                audio_rtfs.append(getattr(outputs[i], defs.AUDIO_RTF, 0.0))
+            goodput_ttfts.append(outputs[i].ttft if ttft_measured else None)
+            goodput_audio_ttfps.append(getattr(outputs[i], defs.AUDIO_TTFP, 0.0) if audio_ttfp_measured else None)
             audio_duration.append(getattr(outputs[i], defs.AUDIO_DURATION, 0.0))
             audio_frames.append(getattr(outputs[i], defs.AUDIO_FRAMES, 0.0))
             image_count = int(getattr(outputs[i], defs.IMAGE_COUNT, 0) or 0)
@@ -789,14 +821,14 @@ def calculate_metrics(
             actual_output_lens.append(0)
 
     if goodput_config_dict:
-        valid_metrics = []
+        valid_metrics: list[Sequence[float | None]] = []
         slo_values = []
 
         if "ttft" in goodput_config_dict:
-            valid_metrics.append(ttfts)
+            valid_metrics.append(goodput_ttfts)
             slo_values.append(goodput_config_dict["ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "audio_ttft" in goodput_config_dict:
-            valid_metrics.append(audio_ttfps)
+            valid_metrics.append(goodput_audio_ttfps)
             slo_values.append(goodput_config_dict["audio_ttft"] / MILLISECONDS_TO_SECONDS_CONVERSION)
         if "tpot" in goodput_config_dict:
             valid_metrics.append(all_tpots)
@@ -806,7 +838,7 @@ def calculate_metrics(
             slo_values.append(goodput_config_dict["e2el"] / MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
-            is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
+            is_good_req = all(r is not None and s >= r for s, r in zip(slo_values, req_metric))
             if is_good_req:
                 good_completed += 1
 
@@ -881,6 +913,10 @@ def calculate_metrics(
         else:
             print("tip: install termplotlib and gnuplot to plot the metrics")
 
+    duplex_metrics_present = any(
+        isinstance(getattr(output, "duplex_session_metrics", None), dict) for output in outputs
+    )
+    missing_duplex_value = float("nan") if duplex_metrics_present else 0
     metrics = MultiModalsBenchmarkMetrics(
         completed=completed,
         failed=len(failed_outputs),
@@ -890,10 +926,10 @@ def calculate_metrics(
         request_goodput=good_completed / dur_s,
         output_throughput=sum(actual_output_lens) / dur_s,
         total_token_throughput=(total_input + sum(actual_output_lens)) / dur_s,
-        mean_ttft_ms=np.mean(ttfts or 0) * 1000,  # ttfts is empty if streaming is not supported by the endpoint
-        std_ttft_ms=np.std(ttfts or 0) * 1000,
-        median_ttft_ms=np.median(ttfts or 0) * 1000,
-        percentiles_ttft_ms=[(p, np.percentile(ttfts or 0, p) * 1000) for p in selected_percentiles],
+        mean_ttft_ms=np.mean(ttfts or missing_duplex_value) * 1000,
+        std_ttft_ms=np.std(ttfts or missing_duplex_value) * 1000,
+        median_ttft_ms=np.median(ttfts or missing_duplex_value) * 1000,
+        percentiles_ttft_ms=[(p, np.percentile(ttfts or missing_duplex_value, p) * 1000) for p in selected_percentiles],
         mean_tpot_ms=np.mean(tpots or 0) * 1000,
         std_tpot_ms=np.std(tpots or 0) * 1000,
         median_tpot_ms=np.median(tpots or 0) * 1000,
@@ -910,11 +946,14 @@ def calculate_metrics(
         max_concurrent_requests=max_concurrent_requests,
         rtfx=input_audio_duration / dur_s,
         **{
-            defs.MEAN_AUDIO_TTFP_MS: np.mean(audio_ttfps or 0) * 1000,
-            defs.STD_AUDIO_TTFP_MS: np.std(audio_ttfps or 0) * 1000,
-            defs.MEDIAN_AUDIO_TTFP_MS: np.median(audio_ttfps or 0) * 1000,
+            "num_ttft_samples": len(ttfts),
+            "num_audio_ttfp_samples": len(audio_ttfps),
+            "num_audio_rtf_samples": len(audio_rtfs),
+            defs.MEAN_AUDIO_TTFP_MS: np.mean(audio_ttfps or missing_duplex_value) * 1000,
+            defs.STD_AUDIO_TTFP_MS: np.std(audio_ttfps or missing_duplex_value) * 1000,
+            defs.MEDIAN_AUDIO_TTFP_MS: np.median(audio_ttfps or missing_duplex_value) * 1000,
             defs.PERCENTILES_AUDIO_TTFP_MS: [
-                (p, np.percentile(audio_ttfps or 0, p) * 1000) for p in selected_percentiles
+                (p, np.percentile(audio_ttfps or missing_duplex_value, p) * 1000) for p in selected_percentiles
             ],
             defs.MEAN_AUDIO_DURATION_S: np.mean(audio_duration or 0),
             defs.STD_AUDIO_DURATION_S: np.std(audio_duration or 0),
@@ -925,10 +964,12 @@ def calculate_metrics(
             defs.TOTAL_AUDIO_DURATION_S: sum(audio_duration),
             defs.TOTAL_AUDIO_FRAMES: sum(audio_frames),
             defs.AUDIO_THROUGHPUT: sum(audio_duration) / dur_s,
-            defs.MEAN_AUDIO_RTF: np.mean(audio_rtfs or 0),
-            defs.STD_AUDIO_RTF: np.std(audio_rtfs or 0),
-            defs.MEDIAN_AUDIO_RTF: np.median(audio_rtfs or 0),
-            defs.PERCENTILES_AUDIO_RTF: [(p, np.percentile(audio_rtfs or 0, p)) for p in selected_percentiles],
+            defs.MEAN_AUDIO_RTF: np.mean(audio_rtfs or missing_duplex_value),
+            defs.STD_AUDIO_RTF: np.std(audio_rtfs or missing_duplex_value),
+            defs.MEDIAN_AUDIO_RTF: np.median(audio_rtfs or missing_duplex_value),
+            defs.PERCENTILES_AUDIO_RTF: [
+                (p, np.percentile(audio_rtfs or missing_duplex_value, p)) for p in selected_percentiles
+            ],
             defs.TOTAL_IMAGES: total_images,
             defs.IMAGE_THROUGHPUT: total_images / dur_s,
             defs.AVERAGE_PIXELS_PER_IMAGE: (total_image_pixels / total_images) if total_images > 0 else 0.0,

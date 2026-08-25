@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import asyncio
 import base64
 import wave
@@ -121,6 +124,38 @@ async def test_realtime_client_reports_reader_exit_to_event_waiters():
 
     with pytest.raises(ConnectionError, match="closed before"):
         client.raise_if_reader_stopped()
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_configure_reports_reader_failure_immediately():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            async def fail():
+                raise RuntimeError("reader failed")
+
+            self._reader_task = asyncio.create_task(fail())
+            await asyncio.sleep(0)
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="reader failed"):
+        await client.configure("model", timeout_s=10.0)
+
+
+@pytest.mark.asyncio
+async def test_realtime_client_close_reports_reader_cancellation_immediately():
+    class Client(RealtimeDuplexClient):
+        async def send(self, event):
+            async def wait_forever():
+                await asyncio.Future()
+
+            self._reader_task = asyncio.create_task(wait_forever())
+            self._reader_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await self._reader_task
+
+    client = Client("ws://unused")
+    with pytest.raises(ConnectionError, match="reader was cancelled"):
+        await client.close_session(timeout_s=10.0)
 
 
 @pytest.mark.asyncio

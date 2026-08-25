@@ -38,7 +38,10 @@ def _existing_file(value: str) -> str:
 
 
 def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
-    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import OMNIINTERACT_SUBSETS
+    from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+        DEFAULT_MAX_VIDEO_DURATION_S,
+        OMNIINTERACT_SUBSETS,
+    )
 
     group = parser.add_argument_group("OmniInteract Benchmark Options")
     group.add_argument(
@@ -52,6 +55,12 @@ def add_omniinteract_cli_args(parser: argparse.ArgumentParser) -> None:
         type=_positive_finite_float,
         default=600.0,
         help="Per-command media timeout.",
+    )
+    group.add_argument(
+        "--omniinteract-max-video-duration-s",
+        type=_positive_finite_float,
+        default=DEFAULT_MAX_VIDEO_DURATION_S,
+        help="Reject media longer than this safety limit before decoding.",
     )
     group.add_argument(
         "--omniinteract-ref-audio", type=_existing_file, help="Reference WAV for native-duplex audio output."

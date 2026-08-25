@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Reusable Realtime WebSocket, PCM, and event helpers for MiniCPM-o demos."""
 
 from __future__ import annotations
@@ -532,8 +535,15 @@ class RealtimeDuplexClient:
         if idle_timeout_s is not None:
             session["idle_timeout_s"] = idle_timeout_s
         await self.send({"type": "session.update", "session": session})
+
+        def session_created() -> bool:
+            if self.events.count("session.created") > 0:
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: self.events.count("session.created") > 0,
+            session_created,
             timeout_s=timeout_s,
             label="session.created",
         )
@@ -592,8 +602,15 @@ class RealtimeDuplexClient:
     async def close_session(self, *, timeout_s: float = 20.0) -> None:
         from_index = len(self.events.events)
         await self.send({"type": "session.close"})
+
+        def session_closed() -> bool:
+            if any(event.get("type") == "session.closed" for event in self.events.events[from_index:]):
+                return True
+            self.raise_if_reader_stopped()
+            return False
+
         await wait_for(
-            lambda: any(event.get("type") == "session.closed" for event in self.events.events[from_index:]),
+            session_closed,
             timeout_s=timeout_s,
             label="session.closed",
         )

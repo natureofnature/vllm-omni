@@ -23,6 +23,7 @@ from vllm.transformers_utils.repo_utils import hf_fs
 
 OMNIINTERACT_SUBSETS = ("1q1a", "1q1a_math", "1qna")
 DEFAULT_OMNIINTERACT_REPO = "lucky-lance/OmniInteract"
+DEFAULT_MAX_VIDEO_DURATION_S = 3600.0
 logger = logging.getLogger(__name__)
 
 
@@ -42,6 +43,7 @@ class OmniInteractSessionOptions:
     media_timeout_s: float
     ref_audio: str
     require_response: bool = False
+    max_video_duration_s: float = DEFAULT_MAX_VIDEO_DURATION_S
 
 
 @dataclass(frozen=True)

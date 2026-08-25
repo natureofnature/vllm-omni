@@ -28,6 +28,7 @@ from urllib.parse import urljoin, urlsplit
 import pybase64 as base64
 
 from vllm_omni.benchmarks.data_modules.omniinteract_dataset import (
+    DEFAULT_MAX_VIDEO_DURATION_S,
     OmniInteractCase,
     OmniInteractPreparedInput,
     case_manifest,
@@ -63,6 +64,7 @@ class OmniInteractBenchmarkConfig:
     output_root: Path = Path("omniinteract-output")
     timeout_s: float = 900.0
     media_timeout_s: float = 600.0
+    max_video_duration_s: float = DEFAULT_MAX_VIDEO_DURATION_S
     ref_audio: str | None = None
     require_response: bool = False
     extra_headers: dict[str, str] | None = None
@@ -144,23 +146,33 @@ def _run_media_command(
     return result
 
 
-def prepare_media(video: Path, fps: float, *, timeout_s: float) -> tuple[float, bytes, list[str | None]]:
+def prepare_media(
+    video: Path,
+    fps: float,
+    *,
+    timeout_s: float,
+    max_duration_s: float = DEFAULT_MAX_VIDEO_DURATION_S,
+) -> tuple[float, bytes, list[str | None]]:
     probe = [
         "ffprobe",
         *"-v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1".split(),
         str(video),
     ]
     duration = float(_run_media_command(probe, text=True, timeout_s=timeout_s).stdout.strip())
-    if not math.isfinite(duration) or duration <= 0:
+    if not math.isfinite(duration) or duration <= 0 or duration > max_duration_s:
         raise ValueError(f"Invalid video duration for {video}: {duration!r}")
+    target_bytes = math.ceil(duration) * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     audio = [
         "ffmpeg",
         *"-loglevel error -i".split(),
         str(video),
-        *f"-vn -f s16le -ac 1 -ar {PCM16_SAMPLE_RATE} pipe:1".split(),
+        "-t",
+        str(duration),
+        *f"-vn -f s16le -ac 1 -ar {PCM16_SAMPLE_RATE} -fs".split(),
+        str(target_bytes),
+        "pipe:1",
     ]
     pcm = _run_media_command(audio, timeout_s=timeout_s).stdout
-    target_bytes = math.ceil(duration) * PCM16_SAMPLE_RATE * PCM16_BYTES_PER_SAMPLE
     pcm = (pcm + bytes(max(0, target_bytes - len(pcm))))[:target_bytes]
 
     frame_count = math.ceil(duration * fps)
@@ -810,7 +822,11 @@ async def run_omniinteract_case(
 ) -> OmniInteractCaseResult:
     if not config.ref_audio:
         raise ValueError("ref_audio is required for MiniCPM-o native-duplex audio output")
-    for name, value in (("timeout_s", config.timeout_s), ("media_timeout_s", config.media_timeout_s)):
+    for name, value in (
+        ("timeout_s", config.timeout_s),
+        ("media_timeout_s", config.media_timeout_s),
+        ("max_video_duration_s", config.max_video_duration_s),
+    ):
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name} must be finite and positive")
     session_id = f"omniinteract:{case.subset}:{request_index}:{time.monotonic_ns()}"
@@ -829,6 +845,7 @@ async def run_omniinteract_case(
                 case.video_path,
                 VIDEO_FPS,
                 timeout_s=config.media_timeout_s,
+                max_duration_s=config.max_video_duration_s,
             )
         else:
             reference_audio = prepared_input.ref_audio_data_url

@@ -18,10 +18,12 @@ from pathlib import Path
 
 import pytest
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
+from vllm.benchmarks.serve import TaskType
 
 from vllm_omni.benchmarks import omniinteract as oi
 from vllm_omni.benchmarks import serve as benchmark_serve
 from vllm_omni.benchmarks.data_modules import omniinteract_dataset as data
+from vllm_omni.benchmarks.metrics.metrics import calculate_metrics
 from vllm_omni.benchmarks.patch import patch as benchmark_patch
 from vllm_omni.entrypoints.cli.benchmark.cli_args import preprocess_serve_args
 from vllm_omni.entrypoints.cli.benchmark.serve import OmniBenchmarkServingSubcommand
@@ -217,21 +219,39 @@ def test_hub_archive_uses_vllm_filesystem(tmp_path: Path, monkeypatch: pytest.Mo
 
 def test_media_commands_are_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     calls: list[float] = []
+    commands: list[list[str]] = []
     bounded_run = oi._run_media_command
 
     def run(command, *, timeout_s, text=False):
         calls.append(timeout_s)
+        commands.append(command)
         if command[0] == "ffprobe":
             return subprocess.CompletedProcess(command, 0, "1.0", "")
         return subprocess.CompletedProcess(command, 0, b"", b"")
 
     monkeypatch.setattr(oi, "_run_media_command", run)
-    duration, pcm, frames = oi.prepare_media(tmp_path / "video.mp4", 1.0, timeout_s=3.0)
+    duration, pcm, frames = oi.prepare_media(tmp_path / "video.mp4", 1.0, timeout_s=3.0, max_duration_s=1.0)
     assert (duration, len(pcm), frames, calls) == (1.0, 32_000, [None], [3.0, 3.0, 3.0])
+    assert commands[1][commands[1].index("-t") + 1] == "1.0"
+    assert commands[1][commands[1].index("-fs") + 1] == "32000"
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(subprocess.TimeoutExpired("x", 3)))
     with pytest.raises(TimeoutError, match="timed out"):
         bounded_run(["ffmpeg"], timeout_s=3.0)
+
+
+def test_media_duration_is_bounded_before_decode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    calls = 0
+
+    def run(command, *, timeout_s, text=False):
+        nonlocal calls
+        calls += 1
+        return subprocess.CompletedProcess(command, 0, "601.0", "")
+
+    monkeypatch.setattr(oi, "_run_media_command", run)
+    with pytest.raises(ValueError, match="Invalid video duration"):
+        oi.prepare_media(tmp_path / "video.mp4", 1.0, timeout_s=3.0, max_duration_s=600.0)
+    assert calls == 1
 
 
 def test_final_commit_keeps_a_partial_model_unit():
@@ -562,6 +582,60 @@ async def test_adapter_requires_and_forwards_exact_prepared_payload(tmp_path: Pa
     assert seen["capture_artifacts"] is True
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_metrics", "expected_itl", "expected_text_latency"),
+    [
+        (
+            [
+                {"stage0_tokens": {"output_token_count": 3, "itls_ms": [10.0, 20.0]}},
+                {"stage0_tokens": {"output_token_count": 2, "itls_ms": [30.0]}},
+            ],
+            [0.01, 0.02, 0.03],
+            0.16,
+        ),
+        (
+            [
+                {"stage0_tokens": {"output_token_count": 3, "tpot_ms": 10.0}},
+                {"stage0_tokens": {"output_token_count": 2, "tpot_ms": 40.0}},
+            ],
+            [],
+            0.18,
+        ),
+    ],
+)
+async def test_adapter_reports_exact_or_weighted_token_timing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request_metrics: list[dict[str, object]],
+    expected_itl: list[float],
+    expected_text_latency: float,
+):
+    case, options = _case(tmp_path), _session_options(tmp_path)
+    request = _request(case, options)
+    request.omniinteract_prepared_input = data.OmniInteractPreparedInput(
+        1.0, b"pcm", ("frame",), "data:audio/wav;base64,ref"
+    )
+
+    async def run(*args, **kwargs):
+        return oi.OmniInteractCaseResult(
+            case.subset,
+            str(case.video_path),
+            str(options.output_root),
+            success=True,
+            output_tokens=5,
+            duplex_request_metrics=request_metrics,
+            duplex_session_metrics={"mean_ttft_ms": 100.0},
+        )
+
+    monkeypatch.setattr(benchmark_patch, "run_omniinteract_case", run)
+    output = await benchmark_patch.async_request_openai_realtime_duplex(request, session=None)
+
+    assert output.success
+    assert output.itl == expected_itl
+    assert output.text_latency == pytest.approx(expected_text_latency)
+
+
 def test_batch_finalization_publishes_only_measured_results(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     case, options = _case(tmp_path), _session_options(tmp_path)
     options.output_root.mkdir()
@@ -577,6 +651,74 @@ def test_batch_finalization_publishes_only_measured_results(tmp_path: Path, monk
     assert summary and summary["total"] == summary["success"] == summary["eligible_for_official_eval"] == 1
     assert summary["failed"] == summary["successful_but_ineligible"] == summary["audio_clipped_bytes"] == 0
     assert published == [(options.output_root, case, result)]
+
+
+def test_case_artifact_failures_do_not_discard_serving_metrics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    case, options = _case(tmp_path), _session_options(tmp_path)
+    sample = _sample(case, options)
+    result = oi.OmniInteractCaseResult(
+        case.subset, str(case.video_path), str(options.output_root), success=True, eligible_for_official_eval=True
+    )
+    output = benchmark_patch.MixRequestFuncOutput(success=True, error="inference warning")
+    output.omniinteract_case_result = result
+    monkeypatch.setattr(
+        benchmark_patch,
+        "publish_deferred_case_artifacts",
+        lambda *args: (_ for _ in ()).throw(OSError("case disk full")),
+    )
+    monkeypatch.setattr(
+        benchmark_patch,
+        "write_failure_artifacts",
+        lambda *args: (_ for _ in ()).throw(OSError("failure disk full")),
+    )
+    monkeypatch.setattr(benchmark_patch, "write_omniinteract_batch_artifacts", lambda *args: None)
+
+    summary = benchmark_patch._finalize_omniinteract_batch([sample], [output])
+    metrics, _ = calculate_metrics(
+        [],
+        [output],
+        1.0,
+        None,
+        [50.0],
+        {},
+        TaskType.GENERATION,
+        [],
+        None,
+        float("inf"),
+        1.0,
+    )
+
+    assert summary and summary["failed"] == 1
+    assert summary["artifacts_complete"] is False
+    assert len(summary["artifact_errors"]) == 2
+    assert output.success and metrics.completed == 1
+    assert output.error.startswith("inference warning\n")
+    assert "Artifact publication failed: case disk full" in output.error
+
+
+def test_batch_artifact_failure_removes_partial_batch_files(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    case, options = _case(tmp_path), _session_options(tmp_path)
+    sample = _sample(case, options)
+    result = oi.OmniInteractCaseResult(
+        case.subset, str(case.video_path), str(options.output_root), success=True, eligible_for_official_eval=True
+    )
+    output = benchmark_patch.MixRequestFuncOutput(success=True)
+    output.omniinteract_case_result = result
+    monkeypatch.setattr(benchmark_patch, "publish_deferred_case_artifacts", lambda *args: None)
+
+    def fail_batch(root, *args):
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "batch_summary.json").write_text("partial")
+        raise OSError("batch disk full")
+
+    monkeypatch.setattr(benchmark_patch, "write_omniinteract_batch_artifacts", fail_batch)
+
+    summary = benchmark_patch._finalize_omniinteract_batch([sample], [output])
+
+    assert summary and summary["success"] == 1 and summary["artifacts_complete"] is False
+    assert summary["artifact_errors"] == ["Batch artifact publication failed: batch disk full"]
+    assert output.success
+    assert not (options.output_root / "batch_summary.json").exists()
 
 
 @pytest.mark.parametrize(
