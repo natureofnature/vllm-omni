@@ -34,12 +34,15 @@ from tests.helpers.stage_config import get_deploy_config_path, modify_stage_conf
 
 _MODEL = os.environ.get("VLLM_TEST_MINICPMO_4_5_MODEL", "openbmb/MiniCPM-o-4_5")
 _DEPLOY_CONFIG = get_deploy_config_path("minicpmo_4_5.yaml")
-_DUPLEX_BF16_DEPLOY_CONFIG = modify_stage_config(
-    _DUPLEX_DEPLOY_CONFIG,
+_BF16_BASE_DEPLOY_CONFIG = modify_stage_config(
+    _DEPLOY_CONFIG,
     updates={
-        "base_config": _DEPLOY_CONFIG,
         "connectors.connector_of_shared_memory.extra.code2wav_bfloat16_attention_cache": True,
     },
+)
+_DUPLEX_BF16_DEPLOY_CONFIG = modify_stage_config(
+    _DUPLEX_DEPLOY_CONFIG,
+    updates={"base_config": _BF16_BASE_DEPLOY_CONFIG},
 )
 _RESULT_DIR = Path(
     os.environ.get(
