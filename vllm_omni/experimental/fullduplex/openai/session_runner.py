@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -679,6 +682,7 @@ class DuplexSessionRunnerMixin:
             if initial_update_error := self._runtime_session_candidate_update_error(session, session.config):
                 await emit_event(initial_update_error)
                 return
+            active_session: DuplexSession = handshake.session
             if handshake.resumed:
                 native = self._serving_runtime_adapter.session_states[session.session_id]
                 actor.tasks = self._session_tasks[session.session_id]
@@ -913,374 +917,27 @@ class DuplexSessionRunnerMixin:
                     continue
 
                 if event_type in {"input.cancel", "response.cancel", "barge_in", "output_audio_buffer.clear"}:
-                    cancel_reason = (
-                        "output_audio_buffer_clear"
-                        if event_type == "output_audio_buffer.clear"
-                        else "client_cancelled"
-                        if event_type == "response.cancel"
-                        else "barge_in"
+                    await self._handle_cancel_event(
+                        event=event,
+                        event_type=event_type,
+                        session=active_session,
+                        actor=actor,
+                        native=native,
+                        realtime_protocol=realtime_protocol,
+                        emit_event=emit_event,
+                        native_response_in_progress=native_response_in_progress,
                     )
-                    cancelled_fence = DuplexFence(
-                        session.session_id,
-                        epoch=session.epoch,
-                        turn_id=session.turn_id,
-                        incarnation=session.incarnation,
-                    )
-                    if event_type == "response.cancel":
-                        requested_response_id = event.get("response_id")
-                        has_active_response_work = native_response_in_progress()
-                        if (
-                            isinstance(requested_response_id, str)
-                            and session.active_response_id is not None
-                            and requested_response_id != session.active_response_id
-                        ):
-                            await emit_event(
-                                {
-                                    "type": "error",
-                                    "session_id": session.session_id,
-                                    "code": "response_not_active",
-                                    "error": f"Response is not active: {requested_response_id}",
-                                }
-                            )
-                            continue
-                        if not has_active_response_work:
-                            if realtime_protocol is not None and isinstance(requested_response_id, str):
-                                continue
-                            await emit_event(
-                                {
-                                    "type": "error",
-                                    "session_id": session.session_id,
-                                    "code": "response_not_active",
-                                    "error": "response.cancel requires an active response",
-                                }
-                            )
-                            continue
-                    had_native_unbuffered_append = (
-                        self._uses_native_input_append(session)
-                        and native.input_since_commit
-                        and not native.audio_buffer.has_pending()
-                    )
-                    playback_was_active = self._assistant_playback_active(session)
-                    if event_type in {"input.cancel", "barge_in"}:
-                        native.audio_buffer.clear()
-                        session.release_all_input_bytes()
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                        native.clear_committed_audio()
-                    had_native_append = await actor.cancel_append_tasks(
-                        response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
-                    )
-                    if event_type == "response.cancel":
-                        session.release_input_bytes(native.clear_committed_audio())
-                    had_native_stream = native.data_plane_task is not None
-                    cancelled = await self._cancel_active_response(
-                        session,
-                        actor.active_response_task,
-                        emit_event,
-                        reason=cancel_reason,
-                    )
-                    had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
-                    if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
-                        old_epoch = session.epoch
-                        old_response_id = session.active_response_id
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
-                    if not cancelled and playback_was_active:
-                        old_epoch = session.epoch
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, session.last_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": session.last_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
-                    if not cancelled and event_type == "response.cancel":
-                        old_epoch = session.epoch
-                        old_response_id = session.active_response_id
-                        committed_ms = session.playback.committed_ms
-                        self._commit_played_response_history(session, old_response_id, committed_ms)
-                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": old_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": old_epoch,
-                                "epoch": new_epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        cancelled = True
-                    if not cancelled and event_type == "output_audio_buffer.clear":
-                        old_playback = session.playback.as_dict()
-                        committed_ms = session.playback.committed_ms
-                        session.clear_playback_cursor()
-                        await emit_event(
-                            {
-                                "type": "audio.cancelled",
-                                "session_id": session.session_id,
-                                "response_id": session.active_response_id,
-                                "reason": cancel_reason,
-                                "cancelled_epoch": session.epoch,
-                                "epoch": session.epoch,
-                                "committed_ms": committed_ms,
-                                "playback": old_playback,
-                            }
-                        )
-                        actor.active_response_task = None
-                        continue
-                    if not cancelled:
-                        await self._cancel_pending_input(session, emit_event, reason="barge_in")
-                    if not await self._signal_runtime_session(
-                        session,
-                        "barge_in",
-                        emit_event,
-                        fence=cancelled_fence,
-                        next_fence=(
-                            DuplexFence(
-                                session.session_id,
-                                epoch=session.epoch,
-                                turn_id=session.turn_id,
-                                incarnation=session.incarnation,
-                            )
-                            if session.epoch > cancelled_fence.epoch
-                            else None
-                        ),
-                    ):
-                        continue
-                    actor.active_response_task = None
                     continue
 
                 if event_type == "turn.signal":
-                    turn_event = event.get("event")
-                    if isinstance(turn_event, str):
-                        if turn_event == "barge_in" and not session.capabilities.supports_barge_in:
-                            await emit_event(self._barge_in_unsupported_error(session))
-                            continue
-                        if turn_event == "session.update":
-                            realtime_event_id = event.get("realtime_event_id")
-
-                            async def emit_update_event(update_event: dict[str, object]) -> None:
-                                if isinstance(realtime_event_id, str) and realtime_event_id:
-                                    update_event = {**update_event, "realtime_event_id": realtime_event_id}
-                                await emit_event(update_event)
-
-                            def reject_update() -> None:
-                                if realtime_protocol is not None:
-                                    realtime_protocol.reject_realtime_turn_detection_update()
-
-                            payload = event.get("payload")
-                            if not isinstance(payload, dict):
-                                await emit_update_event(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": "bad_event",
-                                        "error": "session.update requires a session payload",
-                                    }
-                                )
-                                reject_update()
-                                continue
-                            if not await wait_for_native_append_tail():
-                                await emit_update_event(
-                                    {
-                                        "type": "error",
-                                        "code": "session_update_aborted",
-                                        "error": "session.update was not applied because the preceding append failed",
-                                    }
-                                )
-                                reject_update()
-                                continue
-                            runtime_update_error = self._runtime_session_update_error(session, payload)
-                            if runtime_update_error is not None:
-                                await emit_update_event(runtime_update_error)
-                                reject_update()
-                                continue
-                            previous_config = session.config
-                            candidate_config = deepcopy(previous_config)
-                            session.replace_config(candidate_config)
-                            try:
-                                update_error = self._apply_session_update(session, payload)
-                            finally:
-                                session.replace_config(previous_config)
-                            if update_error is not None:
-                                await emit_update_event(update_error)
-                                reject_update()
-                                continue
-                            runtime_update_error = self._runtime_session_candidate_update_error(
-                                session,
-                                candidate_config,
-                            )
-                            if runtime_update_error is not None:
-                                await emit_update_event(runtime_update_error)
-                                reject_update()
-                                continue
-                            try:
-                                candidate_runtime_config = self._runtime_config_for_session_update(
-                                    session,
-                                    candidate_config,
-                                )
-                            except ServingRuntimeConfigError as exc:
-                                await emit_update_event(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "code": exc.code,
-                                        "error": str(exc),
-                                    }
-                                )
-                                reject_update()
-                                continue
-                            if not await self._signal_runtime_session(
-                                session,
-                                turn_event,
-                                emit_update_event,
-                                session_config=candidate_config.as_dict(),
-                                runtime_config=candidate_runtime_config,
-                            ):
-                                reject_update()
-                                continue
-                            session.replace_config(candidate_config)
-                            session.replace_runtime_config(candidate_runtime_config)
-                            if realtime_protocol is not None:
-                                realtime_protocol.commit_realtime_turn_detection_update()
-                            await emit_update_event(
-                                {
-                                    "type": "session.updated",
-                                    "session": session.as_public_dict(),
-                                }
-                            )
-                            continue
-                        if turn_event == "conversation.item.create":
-                            payload = event.get("payload")
-                            item = payload.get("item") if isinstance(payload, dict) else None
-                            item_type = item.get("type") if isinstance(item, dict) else None
-                            prepare_function_output = getattr(
-                                self._serving_runtime_adapter,
-                                "runtime_config_for_function_output",
-                                None,
-                            )
-                            if item_type == "function_call_output" and callable(prepare_function_output):
-                                if not await wait_for_native_append_tail():
-                                    continue
-                                try:
-                                    candidate_runtime_config = prepare_function_output(
-                                        item,
-                                        dict(session.runtime_config),
-                                    )
-                                except ServingRuntimeConfigError as exc:
-                                    await emit_event(
-                                        {
-                                            "type": "error",
-                                            "session_id": session.session_id,
-                                            "code": exc.code,
-                                            "error": str(exc),
-                                        }
-                                    )
-                                    continue
-                                if not await self._signal_runtime_session(
-                                    session,
-                                    "session.update",
-                                    emit_event,
-                                    runtime_config=candidate_runtime_config,
-                                ):
-                                    continue
-                                session.replace_runtime_config(candidate_runtime_config)
-                                await emit_event(
-                                    {
-                                        "type": "conversation.item.created",
-                                        "session_id": session.session_id,
-                                        "item": item,
-                                        "created": True,
-                                    }
-                                )
-                                await self._maybe_continue_native_response(
-                                    emit_event,
-                                    session=session,
-                                    expected_epoch=session.epoch,
-                                    expected_model_turn_id=session.turn_id,
-                                )
-                                continue
-                            message = self._realtime_item_to_history_message(item)
-                            item_id = item.get("id") if isinstance(item, dict) else None
-                            if message is not None:
-                                session.append_history_message(message)
-                                session.register_history_item(item_id if isinstance(item_id, str) else None, message)
-                            await emit_event(
-                                {
-                                    "type": "conversation.item.created",
-                                    "session_id": session.session_id,
-                                    "item": item,
-                                    "created": message is not None,
-                                }
-                            )
-                            continue
-                        if turn_event == "conversation.item.delete":
-                            payload = event.get("payload")
-                            item_id = payload.get("item_id") if isinstance(payload, dict) else None
-                            deleted = session.delete_history_item(item_id) if isinstance(item_id, str) else False
-                            await emit_event(
-                                {
-                                    "type": "conversation.item.deleted",
-                                    "session_id": session.session_id,
-                                    "item_id": item_id,
-                                    "deleted": deleted,
-                                }
-                            )
-                            continue
-                        if turn_event == "conversation.item.truncate":
-                            payload = event.get("payload")
-                            item_id = payload.get("item_id") if isinstance(payload, dict) else None
-                            audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
-                            truncated = (
-                                session.truncate_history_item(
-                                    item_id,
-                                    audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else 0,
-                                )
-                                if isinstance(item_id, str)
-                                else False
-                            )
-                            await emit_event(
-                                {
-                                    "type": "conversation.item.truncated",
-                                    "session_id": session.session_id,
-                                    "item_id": item_id,
-                                    "content_index": (
-                                        payload.get("content_index", 0) if isinstance(payload, dict) else 0
-                                    ),
-                                    "audio_end_ms": audio_end_ms,
-                                    "truncated": truncated,
-                                }
-                            )
-                            continue
-                        await emit_event(self._turn_controller.signal(session, turn_event, event))
-                    else:
-                        await emit_event({"type": "error", "error": "turn.signal requires event", "code": "bad_event"})
+                    await self._handle_turn_signal(
+                        event=event,
+                        event_type=event_type,
+                        session=active_session,
+                        emit_event=emit_event,
+                        realtime_protocol=realtime_protocol,
+                        wait_for_native_append_tail=wait_for_native_append_tail,
+                    )
                     continue
 
                 if event_type == "playback.ack":
@@ -1288,702 +945,43 @@ class DuplexSessionRunnerMixin:
                     continue
 
                 if event_type == "input.text.append":
-                    session.mark_user_input_activity()
-                    text = event.get("text")
-                    if not isinstance(text, str):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "input.text.append requires text",
-                                "code": "bad_event",
-                            }
-                        )
-                        continue
-                    if self._uses_native_input_append(session):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "The selected native duplex runtime accepts audio append only",
-                                "code": "native_text_append_unsupported",
-                            }
-                        )
-                        continue
-                    else:
-                        session.append_text(text)
-                    if session.capabilities.supports_input_append:
-                        await start_runtime_append(text, final=False, mode="append_tokens")
+                    await self._handle_text_append(
+                        event=event,
+                        session=active_session,
+                        emit_event=emit_event,
+                        start_runtime_append=start_runtime_append,
+                    )
                     continue
 
                 if event_type == "input_audio_buffer.append":
-                    session.mark_user_input_activity()
-                    audio = event.get("audio") or event.get("data")
-                    if not isinstance(audio, str):
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "input.audio.append requires audio",
-                                "code": "bad_event",
-                            }
-                        )
-                        continue
-                    if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
-                        await emit_event(self._barge_in_unsupported_error(session))
-                        event = dict(event)
-                        event.pop("force_barge_in", None)
-                        for key in ("overlap_action", "overlap"):
-                            value = event.get(key)
-                            if isinstance(value, str) and value.strip().lower() in {
-                                "barge_in",
-                                "interrupt",
-                                "cancel",
-                            }:
-                                event.pop(key, None)
-                    fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
-                    default_sample_rate_hz = 16000
-                    sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
-                    sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
-                    try:
-                        audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
-                            audio,
-                            fmt,
-                            sample_rate_hz=sample_rate_hz,
-                        )
-                    except ValueError as exc:
-                        await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
-                        continue
-                    if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "error": "input_audio_buffer.append pcm16 audio could not be decoded",
-                                "code": "bad_audio",
-                            }
-                        )
-                        continue
-                    force_listen = bool(event.get("force_listen", False))
-                    payload = {
-                        "type": "audio",
-                        "audio": audio,
-                        "format": fmt,
-                        "sample_rate_hz": sample_rate_hz,
-                        "force_listen": force_listen,
-                    }
-                    video_frames = event.get("video_frames")
-                    if isinstance(video_frames, list):
-                        frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
-                        if frames:
-                            payload["video_frames"] = frames
-                    # Speech/silence tag for the Stage0 turn-ended latch.
-                    payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
-                    defer_native_append = False
-                    buffer_overlap_audio = True
-                    if self._uses_native_input_append(session):
-                        mark_pending_silence_superseded()
-                        overlap_active = native_response_in_progress() and (
-                            not self._session_auto_responds(session)
-                            or (
-                                session.capabilities.supports_barge_in
-                                and (
-                                    session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
-                                    or self._event_requests_barge_in(event)
-                                )
-                            )
-                        )
-                        if overlap_active:
-                            decision = self._overlap_decision(session, event, payload)
-                            await self._emit_overlap_decision(emit_event, session, decision)
-                            action = decision.get("action")
-                            if action == "drop":
-                                if realtime_protocol is not None:
-                                    await realtime_protocol.discard_pending_input_audio(
-                                        audio_end_ms=self._input_audio_duration_ms(event, payload)
-                                    )
-                                continue
-                            if action == "listen":
-                                buffer_overlap_audio = bool(decision.get("buffer_audio", True))
-                                defer_native_append = bool(decision.get("defer_runtime_append", True))
-                                if (
-                                    not buffer_overlap_audio
-                                    and realtime_protocol is not None
-                                    and decision.get("preserve_realtime_input") is not True
-                                ):
-                                    await realtime_protocol.discard_pending_input_audio(
-                                        audio_end_ms=self._input_audio_duration_ms(event, payload)
-                                    )
-                                if decision.get("force_listen", True) is True:
-                                    payload["force_listen"] = True
-                            else:
-                                event["force_barge_in"] = True
-                                cancelled_fence = DuplexFence(
-                                    session.session_id,
-                                    epoch=session.epoch,
-                                    turn_id=session.turn_id,
-                                    incarnation=session.incarnation,
-                                )
-                                playback_was_active = self._assistant_playback_active(session)
-                                buffer_overlap_audio = True
-                                defer_native_append = False
-                                native.audio_buffer.clear_force_listen()
-                                session.reset_overlap_speech()
-                                native.input_since_commit = False
-                                native.speech_since_commit = False
-                                await actor.cancel_append_tasks()
-                                had_native_stream = native.data_plane_task is not None
-                                cancel_reason = str(decision.get("cancel_reason") or "barge_in")
-                                cancelled = await self._cancel_active_response(
-                                    session,
-                                    actor.active_response_task,
-                                    emit_event,
-                                    reason=cancel_reason,
-                                )
-                                had_native_stream = (
-                                    await self._cancel_native_data_plane_stream(session) or had_native_stream
-                                )
-                                if not cancelled and had_native_stream:
-                                    old_epoch = session.epoch
-                                    old_response_id = session.active_response_id
-                                    committed_ms = session.playback.committed_ms
-                                    self._commit_played_response_history(session, old_response_id, committed_ms)
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                                    await emit_event(
-                                        {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
-                                            "response_id": old_response_id,
-                                            "reason": cancel_reason,
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
-                                        }
-                                    )
-                                    cancelled = True
-                                if not cancelled and playback_was_active:
-                                    old_epoch = session.epoch
-                                    committed_ms = session.playback.committed_ms
-                                    self._commit_played_response_history(
-                                        session, session.last_response_id, committed_ms
-                                    )
-                                    new_epoch, old_playback = self._advance_barge_in_epoch(session)
-                                    await emit_event(
-                                        {
-                                            "type": "audio.cancelled",
-                                            "session_id": session.session_id,
-                                            "response_id": session.last_response_id,
-                                            "reason": cancel_reason,
-                                            "cancelled_epoch": old_epoch,
-                                            "epoch": new_epoch,
-                                            "committed_ms": committed_ms,
-                                            "playback": old_playback,
-                                        }
-                                    )
-                                    cancelled = True
-                                if session.epoch > cancelled_fence.epoch:
-                                    if not await self._signal_runtime_session(
-                                        session,
-                                        "barge_in",
-                                        emit_event,
-                                        fence=cancelled_fence,
-                                        next_fence=DuplexFence(
-                                            session.session_id,
-                                            epoch=session.epoch,
-                                            turn_id=session.turn_id,
-                                            incarnation=session.incarnation,
-                                        ),
-                                    ):
-                                        continue
-                                actor.active_response_task = None
-                        elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
-                            event, payload, session=session
-                        ):
-                            # Turn-mode only: skip silent chunks so they don't open a
-                            # response. In auto-respond (full-duplex) mode the model owns
-                            # the speak/listen decision and MUST receive silence units --
-                            # the official model typically starts speaking during the
-                            # silence after a question.
-                            await emit_event(
-                                {
-                                    "type": "response.listen",
-                                    "session_id": session.session_id,
-                                    "epoch": session.epoch,
-                                    "reason": "silence_or_noise",
-                                }
-                            )
-                            continue
-                        if self._should_force_listen_for_auto_response_overlap(session, event, payload):
-                            # Auto-response keeps a long-lived native Stage0 stream.
-                            # While assistant audio is still active, silence from the
-                            # browser should advance the model in listen mode rather
-                            # than letting the same stream start another assistant
-                            # segment. Speech/barge-in chunks remain model-owned.
-                            payload["force_listen"] = True
-                        if not buffer_overlap_audio:
-                            continue
-                        session.mark_user_input_activity()
-                        native.input_since_commit = True
-                        native.speech_since_commit = native.speech_since_commit or self._input_looks_like_speech(
-                            event, payload, session=session
-                        )
-                        try:
-                            raw_audio_bytes = self._native_audio_payload_size_bytes(payload)
-                            if not session.reserve_input_bytes(
-                                raw_audio_bytes,
-                                limit=self._duplex_session_config.max_pending_input_bytes_per_session,
-                            ):
-                                await emit_event(
-                                    {
-                                        "type": "error",
-                                        "error": "Duplex session pending input exceeds server limit",
-                                        "code": "input_backpressure",
-                                    }
-                                )
-                                continue
-                            allow_emit = not defer_native_append and (
-                                realtime_protocol is None
-                                or event_type != "input_audio_buffer.append"
-                                # Full-duplex: emit each ~chunk_period of audio so the model
-                                # runs per-chunk generation (speak/listen) without an explicit
-                                # response.create, matching the official duplex_generate loop.
-                                or self._session_auto_responds(session)
-                            )
-                            pcm_reservation = native.audio_buffer.prepare_append(
-                                payload,
-                                operation_id=uuid.uuid4().hex,
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-                                allow_emit=allow_emit,
-                            )
-                        except ValueError as exc:
-                            session.release_input_bytes(raw_audio_bytes)
-                            await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
-                            continue
-                        if pcm_reservation is None:
-                            continue
-                        if pcm_reservation.byte_count == 0:
-                            session.release_input_bytes(raw_audio_bytes)
-                        payload = pcm_reservation.payload
-                    else:
-                        session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
-                    if self._uses_native_input_append(session):
-                        await start_native_append(
-                            payload,
-                            final=False,
-                            pcm_reservation=pcm_reservation,
-                        )
-                        continue
-                    if session.capabilities.supports_input_append:
-                        await start_runtime_append(payload, final=False, mode="append_audio_chunk")
+                    await self._handle_audio_append(
+                        event=event,
+                        event_type=event_type,
+                        session=active_session,
+                        actor=actor,
+                        native=native,
+                        realtime_protocol=realtime_protocol,
+                        emit_event=emit_event,
+                        mark_pending_silence_superseded=mark_pending_silence_superseded,
+                        native_response_in_progress=native_response_in_progress,
+                        start_native_append=start_native_append,
+                        start_runtime_append=start_runtime_append,
+                    )
                     continue
 
                 if event_type in {"input.commit", "input_audio_buffer.commit", "response.create"}:
-                    realtime_item_id = event.get("realtime_item_id")
-                    realtime_validated_audio_commit = (
-                        event_type == "input_audio_buffer.commit"
-                        and isinstance(realtime_item_id, str)
-                        and bool(realtime_item_id)
+                    await self._handle_commit_event(
+                        event=event,
+                        event_type=event_type,
+                        session=active_session,
+                        actor=actor,
+                        native=native,
+                        realtime_protocol=realtime_protocol,
+                        emit_event=emit_event,
+                        native_response_in_progress=native_response_in_progress,
+                        start_native_append=start_native_append,
+                        wait_for_native_append_tail=wait_for_native_append_tail,
                     )
-                    if (
-                        self._uses_native_input_append(session)
-                        and event_type in {"input.commit", "input_audio_buffer.commit"}
-                        and not await wait_for_native_append_tail()
-                    ):
-                        continue
-                    if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                        native.audio_buffer.clear()
-                        session.release_all_input_bytes()
-                        native.clear_committed_audio()
-                        await emit_event(
-                            {
-                                "type": "input.committed",
-                                "session_id": session.session_id,
-                                "turn_id": session.turn_id,
-                                "epoch": session.epoch,
-                                "empty": True,
-                                "is_speech": False,
-                                "no_response": True,
-                            }
-                        )
-                        await emit_event(
-                            {
-                                "type": "response.listen",
-                                "session_id": session.session_id,
-                                "epoch": session.epoch,
-                                "reason": "silence_or_noise",
-                            }
-                        )
-                        continue
-                    should_create_response = (
-                        event_type == "response.create"
-                        or bool(event.get("response_create", event_type == "input.commit"))
-                        or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
-                    )
-                    precreate_response_requested = event_type == "response.create" or bool(
-                        event.get("response_create", event_type == "input.commit")
-                    )
-                    if event_type == "response.create":
-                        response_payload = event.get("response")
-                        if isinstance(response_payload, dict):
-                            response_options_error = self._apply_response_create_options(session, response_payload)
-                            if response_options_error is not None:
-                                error_message = (
-                                    "The selected native duplex runtime does not support generation "
-                                    "overrides for instructions, voice, temperature, max tokens, tools, or "
-                                    "tool_choice."
-                                    if response_options_error == "unsupported_native_response_options"
-                                    else "response.create cannot reserve options while another response is active."
-                                )
-                                await emit_event(
-                                    {
-                                        "type": "error",
-                                        "session_id": session.session_id,
-                                        "epoch": session.epoch,
-                                        "code": response_options_error,
-                                        "error": error_message,
-                                    }
-                                )
-                                continue
-                    if self._uses_native_input_append(session) and event_type == "input_audio_buffer.commit":
-                        has_pending_native_audio = (
-                            native.input_since_commit
-                            or native.audio_buffer.has_pending()
-                            or native.committed_audio_payload is not None
-                            or realtime_validated_audio_commit
-                        )
-                        if (
-                            not has_pending_native_audio
-                            and not actor.native_append_tasks
-                            and native.data_plane_task is None
-                        ):
-                            await emit_event(
-                                {
-                                    "type": "error",
-                                    "session_id": session.session_id,
-                                    "epoch": session.epoch,
-                                    "code": "input_audio_buffer_empty",
-                                    "error": "input_audio_buffer.commit requires a non-empty input audio buffer.",
-                                }
-                            )
-                            continue
-                        commit_action = decide_commit_action(
-                            CommitSnapshot(
-                                auto_responds=self._session_auto_responds(session),
-                                speech_since_commit=native.speech_since_commit,
-                                active_response_id=session.active_response_id,
-                                overlap_speech_ms=session.overlap_speech_ms,
-                                native_response_in_progress=native_response_in_progress(),
-                                playback_active=self._assistant_playback_active(session),
-                            )
-                        )
-                        if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
-                            if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                                native.audio_buffer.clear()
-                                session.release_all_input_bytes()
-                                native.input_since_commit = False
-                                native.speech_since_commit = False
-                                native.clear_committed_audio()
-                                if realtime_protocol is not None:
-                                    await realtime_protocol.discard_pending_input_audio(
-                                        audio_end_ms=session.overlap_speech_ms
-                                    )
-                                await emit_event(
-                                    {
-                                        "type": "input.committed",
-                                        "session_id": session.session_id,
-                                        "turn_id": session.turn_id,
-                                        "epoch": session.epoch,
-                                        "empty": True,
-                                        "is_speech": False,
-                                        "overlap_ack": True,
-                                        "no_response": True,
-                                    }
-                                )
-                                session.reset_overlap_speech()
-                                session.discard_response_options()
-                                continue
-
-                            commit_reservation = native.audio_buffer.prepare_commit(
-                                operation_id=uuid.uuid4().hex,
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-                            )
-                            deferred_payload = commit_reservation.payload
-                            if deferred_payload is None:
-                                commit_reservation.commit()
-                            else:
-                                if native.committed_audio_payload is not None:
-                                    deferred_payload = self._merge_native_audio_payloads(
-                                        native.committed_audio_payload,
-                                        deferred_payload,
-                                    )
-                                native.retain_committed_audio(
-                                    deferred_payload,
-                                    operation_id=commit_reservation.operation_id,
-                                    reserved_bytes=commit_reservation.byte_count,
-                                )
-                                commit_reservation.commit()
-                                native.deferred_response_create = should_create_response
-                                native.deferred_precreate_response = precreate_response_requested
-                                native.input_since_commit = False
-                                native.speech_since_commit = False
-                                committed = self._commit_native_audio_input(
-                                    session,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                                committed_payload = self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                                committed_payload["overlap_deferred"] = True
-                                committed_payload["response_create_deferred"] = should_create_response
-                                await emit_event(committed_payload)
-                                continue
-                        if commit_action is CommitAction.START_AUTO_RESPONSE:
-                            commit_reservation = native.audio_buffer.prepare_commit(
-                                operation_id=uuid.uuid4().hex,
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-                            )
-                            committed_input = commit_reservation.payload
-                            final_payload = committed_input
-                            if native.committed_audio_payload is not None:
-                                if final_payload is not None:
-                                    final_payload = self._merge_native_audio_payloads(
-                                        native.committed_audio_payload,
-                                        final_payload,
-                                    )
-                                else:
-                                    final_payload = native.committed_audio_payload
-                            commit_reservation.commit()
-                            if final_payload is not None:
-                                native.retain_committed_audio(
-                                    final_payload,
-                                    operation_id=commit_reservation.operation_id,
-                                    reserved_bytes=commit_reservation.byte_count,
-                                )
-                            native.deferred_response_create = False
-                            native.input_since_commit = False
-                            native.speech_since_commit = False
-                            data_plane_turn_id = session.turn_id
-                            committed = self._commit_native_audio_input(
-                                session,
-                                realtime_item_id=event.get("realtime_item_id"),
-                                transcript=event.get("transcript"),
-                                turn_id=data_plane_turn_id,
-                            )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                            )
-                            if final_payload is not None:
-                                await start_native_append(
-                                    {
-                                        **final_payload,
-                                        "duplex_turn_id": data_plane_turn_id,
-                                    },
-                                    final=True,
-                                    precreate_response=False,
-                                    operation_id=commit_reservation.operation_id,
-                                    retained_committed_payload=final_payload,
-                                )
-                            continue
-                    if self._uses_native_input_append(session) and event_type == "response.create":
-                        if (
-                            native_response_in_progress()
-                            or actor.native_append_tasks
-                            or native.data_plane_task is not None
-                        ):
-                            if session.active_response_id is None and (
-                                session.active_request_id is not None
-                                or actor.native_append_tasks
-                                or native.data_plane_task is not None
-                            ):
-                                continue
-                            await emit_event(
-                                {
-                                    "type": "error",
-                                    "session_id": session.session_id,
-                                    "epoch": session.epoch,
-                                    "code": "response_already_active",
-                                    "error": "response.create cannot start while another response is active.",
-                                }
-                            )
-                            session.discard_response_options()
-                            continue
-                        if native.committed_audio_payload is not None:
-                            committed_payload = native.committed_audio_payload
-                            operation_id = native.committed_audio_operation_id
-                            if operation_id is None:
-                                operation_id = uuid.uuid4().hex
-                                native.committed_audio_operation_id = operation_id
-                            await start_native_append(
-                                committed_payload,
-                                final=True,
-                                precreate_response=True,
-                                operation_id=operation_id,
-                                retained_committed_payload=committed_payload,
-                            )
-                            continue
-                        await emit_event(
-                            {
-                                "type": "error",
-                                "session_id": session.session_id,
-                                "epoch": session.epoch,
-                                "code": "response_create_without_input",
-                                "error": "Native duplex response.create requires committed audio input.",
-                            }
-                        )
-                        session.discard_response_options()
-                        continue
-                    if self._uses_native_input_append(session) and not native_response_in_progress():
-                        commit_reservation = (
-                            native.audio_buffer.prepare_commit(
-                                operation_id=uuid.uuid4().hex,
-                                chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
-                            )
-                            if event_type in {"input.commit", "input_audio_buffer.commit"}
-                            else None
-                        )
-                        flushed_buffer_reserved_bytes = (
-                            native.audio_buffer.pending_byte_count if commit_reservation is None else 0
-                        )
-                        flushed = (
-                            commit_reservation.payload
-                            if commit_reservation is not None
-                            else native.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
-                        )
-                        if native.committed_audio_payload is not None:
-                            if flushed is not None:
-                                flushed = self._merge_native_audio_payloads(
-                                    native.committed_audio_payload,
-                                    flushed,
-                                )
-                            else:
-                                flushed = native.committed_audio_payload
-                        if commit_reservation is not None:
-                            commit_reservation.commit()
-                        if flushed is not None:
-                            if self._should_force_listen_for_short_commit(session, event, flushed):
-                                flushed = dict(flushed)
-                                flushed["force_listen"] = True
-                            native.input_since_commit = False
-                            committed = self._commit_native_audio_input(
-                                session,
-                                realtime_item_id=event.get("realtime_item_id"),
-                                transcript=event.get("transcript"),
-                            )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                            )
-                            if should_create_response:
-                                native.retain_committed_audio(
-                                    flushed,
-                                    operation_id=(
-                                        commit_reservation.operation_id
-                                        if commit_reservation is not None
-                                        else uuid.uuid4().hex
-                                    ),
-                                    reserved_bytes=(
-                                        commit_reservation.byte_count
-                                        if commit_reservation is not None
-                                        else flushed_buffer_reserved_bytes
-                                    ),
-                                )
-                                await start_native_append(
-                                    flushed,
-                                    final=True,
-                                    precreate_response=True,
-                                    operation_id=native.committed_audio_operation_id,
-                                    retained_committed_payload=flushed,
-                                )
-                            else:
-                                native.retain_committed_audio(
-                                    flushed,
-                                    operation_id=(
-                                        commit_reservation.operation_id
-                                        if commit_reservation is not None
-                                        else uuid.uuid4().hex
-                                    ),
-                                    reserved_bytes=(
-                                        commit_reservation.byte_count
-                                        if commit_reservation is not None
-                                        else flushed_buffer_reserved_bytes
-                                    ),
-                                )
-                                native.deferred_response_create = False
-                            continue
-                    native_had_uncommitted_audio = self._uses_native_input_append(session) and (
-                        native.input_since_commit
-                        or native.audio_buffer.has_pending()
-                        or native.committed_audio_payload is not None
-                        or realtime_validated_audio_commit
-                    )
-                    committed = session.commit_user_input()
-                    if self._uses_native_input_append(session) and event_type in {
-                        "input_audio_buffer.commit",
-                        "input.commit",
-                    }:
-                        native.input_since_commit = False
-                        native.speech_since_commit = False
-                    if committed is None and event_type != "response.create":
-                        if self._uses_native_input_append(session):
-                            committed = (
-                                self._commit_native_audio_input(
-                                    session,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                                if native_had_uncommitted_audio
-                                else None
-                            )
-                            await emit_event(
-                                self._native_audio_committed_payload(
-                                    session,
-                                    committed=committed,
-                                    realtime_item_id=event.get("realtime_item_id"),
-                                    transcript=event.get("transcript"),
-                                )
-                            )
-                        else:
-                            await emit_event(
-                                {
-                                    "type": "input.committed",
-                                    "session_id": session.session_id,
-                                    "empty": True,
-                                }
-                            )
-                        continue
-                    if committed is not None:
-                        realtime_item_id = event.get("realtime_item_id")
-                        if isinstance(realtime_item_id, str):
-                            session.register_history_item(realtime_item_id, committed.message)
-                        await emit_event(
-                            self._input_committed_payload(
-                                session,
-                                committed,
-                                realtime_item_id=realtime_item_id,
-                            )
-                        )
-                    if not should_create_response:
-                        continue
-                    if actor.active_response_task is not None and not actor.active_response_task.done():
-                        await self._cancel_active_response(
-                            session,
-                            actor.active_response_task,
-                            emit_event,
-                            reason="new_response",
-                        )
-                    actor.active_response_task = asyncio.create_task(self._run_response(session, emit_event))
                     continue
 
                 await emit_event(
@@ -2086,3 +1084,1103 @@ class DuplexSessionRunnerMixin:
                 writer_task.cancel()
             with suppress(asyncio.CancelledError):
                 await writer_task
+
+    async def _handle_cancel_event(
+        self,
+        *,
+        event: dict[str, object],
+        event_type: object,
+        session: DuplexSession,
+        actor: DuplexWebSocketActor,
+        native: ServingRuntimeSessionState,
+        realtime_protocol: NativeRealtimeSessionProtocol | None,
+        emit_event,
+        native_response_in_progress,
+    ) -> None:
+        cancel_reason = (
+            "output_audio_buffer_clear"
+            if event_type == "output_audio_buffer.clear"
+            else "client_cancelled"
+            if event_type == "response.cancel"
+            else "barge_in"
+        )
+        cancelled_fence = DuplexFence(
+            session.session_id,
+            epoch=session.epoch,
+            turn_id=session.turn_id,
+            incarnation=session.incarnation,
+        )
+        if event_type == "response.cancel":
+            requested_response_id = event.get("response_id")
+            has_active_response_work = native_response_in_progress()
+            if (
+                isinstance(requested_response_id, str)
+                and session.active_response_id is not None
+                and requested_response_id != session.active_response_id
+            ):
+                await emit_event(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "code": "response_not_active",
+                        "error": f"Response is not active: {requested_response_id}",
+                    }
+                )
+                return
+            if not has_active_response_work:
+                if realtime_protocol is not None and isinstance(requested_response_id, str):
+                    return
+                await emit_event(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "code": "response_not_active",
+                        "error": "response.cancel requires an active response",
+                    }
+                )
+                return
+        had_native_unbuffered_append = (
+            self._uses_native_input_append(session)
+            and native.input_since_commit
+            and not native.audio_buffer.has_pending()
+        )
+        playback_was_active = self._assistant_playback_active(session)
+        if event_type in {"input.cancel", "barge_in"}:
+            native.audio_buffer.clear()
+            session.release_all_input_bytes()
+            native.input_since_commit = False
+            native.speech_since_commit = False
+            native.clear_committed_audio()
+        had_native_append = await actor.cancel_append_tasks(
+            response_bound_only=event_type in {"response.cancel", "output_audio_buffer.clear"},
+        )
+        if event_type == "response.cancel":
+            session.release_input_bytes(native.clear_committed_audio())
+        had_native_stream = native.data_plane_task is not None
+        cancelled = await self._cancel_active_response(
+            session,
+            actor.active_response_task,
+            emit_event,
+            reason=cancel_reason,
+        )
+        had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
+        if not cancelled and (had_native_stream or had_native_append or had_native_unbuffered_append):
+            old_epoch = session.epoch
+            old_response_id = session.active_response_id
+            committed_ms = session.playback.committed_ms
+            self._commit_played_response_history(session, old_response_id, committed_ms)
+            new_epoch, old_playback = self._advance_barge_in_epoch(session)
+            await emit_event(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": old_response_id,
+                    "reason": cancel_reason,
+                    "cancelled_epoch": old_epoch,
+                    "epoch": new_epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            cancelled = True
+        if not cancelled and playback_was_active:
+            old_epoch = session.epoch
+            committed_ms = session.playback.committed_ms
+            self._commit_played_response_history(session, session.last_response_id, committed_ms)
+            new_epoch, old_playback = self._advance_barge_in_epoch(session)
+            await emit_event(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": session.last_response_id,
+                    "reason": cancel_reason,
+                    "cancelled_epoch": old_epoch,
+                    "epoch": new_epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            cancelled = True
+        if not cancelled and event_type == "response.cancel":
+            old_epoch = session.epoch
+            old_response_id = session.active_response_id
+            committed_ms = session.playback.committed_ms
+            self._commit_played_response_history(session, old_response_id, committed_ms)
+            new_epoch, old_playback = self._advance_barge_in_epoch(session)
+            await emit_event(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": old_response_id,
+                    "reason": cancel_reason,
+                    "cancelled_epoch": old_epoch,
+                    "epoch": new_epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            cancelled = True
+        if not cancelled and event_type == "output_audio_buffer.clear":
+            old_playback = session.playback.as_dict()
+            committed_ms = session.playback.committed_ms
+            session.clear_playback_cursor()
+            await emit_event(
+                {
+                    "type": "audio.cancelled",
+                    "session_id": session.session_id,
+                    "response_id": session.active_response_id,
+                    "reason": cancel_reason,
+                    "cancelled_epoch": session.epoch,
+                    "epoch": session.epoch,
+                    "committed_ms": committed_ms,
+                    "playback": old_playback,
+                }
+            )
+            actor.active_response_task = None
+            return
+        if not cancelled:
+            await self._cancel_pending_input(session, emit_event, reason="barge_in")
+        if not await self._signal_runtime_session(
+            session,
+            "barge_in",
+            emit_event,
+            fence=cancelled_fence,
+            next_fence=(
+                DuplexFence(
+                    session.session_id,
+                    epoch=session.epoch,
+                    turn_id=session.turn_id,
+                    incarnation=session.incarnation,
+                )
+                if session.epoch > cancelled_fence.epoch
+                else None
+            ),
+        ):
+            return
+        actor.active_response_task = None
+        return
+
+    async def _handle_turn_signal(
+        self,
+        *,
+        event: dict[str, object],
+        event_type: object,
+        session: DuplexSession,
+        emit_event,
+        realtime_protocol: NativeRealtimeSessionProtocol | None,
+        wait_for_native_append_tail,
+    ) -> None:
+        turn_event = event.get("event")
+        if isinstance(turn_event, str):
+            if turn_event == "barge_in" and not session.capabilities.supports_barge_in:
+                await emit_event(self._barge_in_unsupported_error(session))
+                return
+            if turn_event == "session.update":
+                realtime_event_id = event.get("realtime_event_id")
+
+                async def emit_update_event(update_event: dict[str, object]) -> None:
+                    if isinstance(realtime_event_id, str) and realtime_event_id:
+                        update_event = {**update_event, "realtime_event_id": realtime_event_id}
+                    await emit_event(update_event)
+
+                def reject_update() -> None:
+                    if realtime_protocol is not None:
+                        realtime_protocol.reject_realtime_turn_detection_update()
+
+                payload = event.get("payload")
+                if not isinstance(payload, dict):
+                    await emit_update_event(
+                        {
+                            "type": "error",
+                            "session_id": session.session_id,
+                            "code": "bad_event",
+                            "error": "session.update requires a session payload",
+                        }
+                    )
+                    reject_update()
+                    return
+                if not await wait_for_native_append_tail():
+                    await emit_update_event(
+                        {
+                            "type": "error",
+                            "code": "session_update_aborted",
+                            "error": "session.update was not applied because the preceding append failed",
+                        }
+                    )
+                    reject_update()
+                    return
+                runtime_update_error = self._runtime_session_update_error(session, payload)
+                if runtime_update_error is not None:
+                    await emit_update_event(runtime_update_error)
+                    reject_update()
+                    return
+                previous_config = session.config
+                candidate_config = deepcopy(previous_config)
+                session.replace_config(candidate_config)
+                try:
+                    update_error = self._apply_session_update(session, payload)
+                finally:
+                    session.replace_config(previous_config)
+                if update_error is not None:
+                    await emit_update_event(update_error)
+                    reject_update()
+                    return
+                runtime_update_error = self._runtime_session_candidate_update_error(
+                    session,
+                    candidate_config,
+                )
+                if runtime_update_error is not None:
+                    await emit_update_event(runtime_update_error)
+                    reject_update()
+                    return
+                try:
+                    candidate_runtime_config = self._runtime_config_for_session_update(
+                        session,
+                        candidate_config,
+                    )
+                except ServingRuntimeConfigError as exc:
+                    await emit_update_event(
+                        {
+                            "type": "error",
+                            "session_id": session.session_id,
+                            "code": exc.code,
+                            "error": str(exc),
+                        }
+                    )
+                    reject_update()
+                    return
+                if not await self._signal_runtime_session(
+                    session,
+                    turn_event,
+                    emit_update_event,
+                    session_config=candidate_config.as_dict(),
+                    runtime_config=candidate_runtime_config,
+                ):
+                    reject_update()
+                    return
+                session.replace_config(candidate_config)
+                session.replace_runtime_config(candidate_runtime_config)
+                if realtime_protocol is not None:
+                    realtime_protocol.commit_realtime_turn_detection_update()
+                await emit_update_event(
+                    {
+                        "type": "session.updated",
+                        "session": session.as_public_dict(),
+                    }
+                )
+                return
+            if turn_event == "conversation.item.create":
+                payload = event.get("payload")
+                item = payload.get("item") if isinstance(payload, dict) else None
+                item_type = item.get("type") if isinstance(item, dict) else None
+                prepare_function_output = getattr(
+                    self._serving_runtime_adapter,
+                    "runtime_config_for_function_output",
+                    None,
+                )
+                if item_type == "function_call_output" and callable(prepare_function_output):
+                    if not await wait_for_native_append_tail():
+                        return
+                    try:
+                        candidate_runtime_config = prepare_function_output(
+                            item,
+                            dict(session.runtime_config),
+                        )
+                    except ServingRuntimeConfigError as exc:
+                        await emit_event(
+                            {
+                                "type": "error",
+                                "session_id": session.session_id,
+                                "code": exc.code,
+                                "error": str(exc),
+                            }
+                        )
+                        return
+                    if not await self._signal_runtime_session(
+                        session,
+                        "session.update",
+                        emit_event,
+                        runtime_config=candidate_runtime_config,
+                    ):
+                        return
+                    session.replace_runtime_config(candidate_runtime_config)
+                    await emit_event(
+                        {
+                            "type": "conversation.item.created",
+                            "session_id": session.session_id,
+                            "item": item,
+                            "created": True,
+                        }
+                    )
+                    await self._maybe_continue_native_response(
+                        emit_event,
+                        session=session,
+                        expected_epoch=session.epoch,
+                        expected_model_turn_id=session.turn_id,
+                    )
+                    return
+                message = self._realtime_item_to_history_message(item)
+                item_id = item.get("id") if isinstance(item, dict) else None
+                if message is not None:
+                    session.append_history_message(message)
+                    session.register_history_item(item_id if isinstance(item_id, str) else None, message)
+                await emit_event(
+                    {
+                        "type": "conversation.item.created",
+                        "session_id": session.session_id,
+                        "item": item,
+                        "created": message is not None,
+                    }
+                )
+                return
+            if turn_event == "conversation.item.delete":
+                payload = event.get("payload")
+                item_id = payload.get("item_id") if isinstance(payload, dict) else None
+                deleted = session.delete_history_item(item_id) if isinstance(item_id, str) else False
+                await emit_event(
+                    {
+                        "type": "conversation.item.deleted",
+                        "session_id": session.session_id,
+                        "item_id": item_id,
+                        "deleted": deleted,
+                    }
+                )
+                return
+            if turn_event == "conversation.item.truncate":
+                payload = event.get("payload")
+                item_id = payload.get("item_id") if isinstance(payload, dict) else None
+                audio_end_ms = payload.get("audio_end_ms") if isinstance(payload, dict) else None
+                truncated = (
+                    session.truncate_history_item(
+                        item_id,
+                        audio_end_ms=int(audio_end_ms) if isinstance(audio_end_ms, int | float) else 0,
+                    )
+                    if isinstance(item_id, str)
+                    else False
+                )
+                await emit_event(
+                    {
+                        "type": "conversation.item.truncated",
+                        "session_id": session.session_id,
+                        "item_id": item_id,
+                        "content_index": (payload.get("content_index", 0) if isinstance(payload, dict) else 0),
+                        "audio_end_ms": audio_end_ms,
+                        "truncated": truncated,
+                    }
+                )
+                return
+            await emit_event(self._turn_controller.signal(session, turn_event, event))
+        else:
+            await emit_event({"type": "error", "error": "turn.signal requires event", "code": "bad_event"})
+        return
+
+    async def _handle_text_append(
+        self,
+        *,
+        event: dict[str, object],
+        session: DuplexSession,
+        emit_event,
+        start_runtime_append,
+    ) -> None:
+        session.mark_user_input_activity()
+        text = event.get("text")
+        if not isinstance(text, str):
+            await emit_event(
+                {
+                    "type": "error",
+                    "error": "input.text.append requires text",
+                    "code": "bad_event",
+                }
+            )
+            return
+        if self._uses_native_input_append(session):
+            await emit_event(
+                {
+                    "type": "error",
+                    "error": "The selected native duplex runtime accepts audio append only",
+                    "code": "native_text_append_unsupported",
+                }
+            )
+            return
+        else:
+            session.append_text(text)
+        if session.capabilities.supports_input_append:
+            await start_runtime_append(text, final=False, mode="append_tokens")
+        return
+
+    async def _handle_audio_append(
+        self,
+        *,
+        event: dict[str, object],
+        event_type: object,
+        session: DuplexSession,
+        actor: DuplexWebSocketActor,
+        native: ServingRuntimeSessionState,
+        realtime_protocol: NativeRealtimeSessionProtocol | None,
+        emit_event,
+        mark_pending_silence_superseded,
+        native_response_in_progress,
+        start_native_append,
+        start_runtime_append,
+    ) -> None:
+        session.mark_user_input_activity()
+        audio = event.get("audio") or event.get("data")
+        if not isinstance(audio, str):
+            await emit_event(
+                {
+                    "type": "error",
+                    "error": "input.audio.append requires audio",
+                    "code": "bad_event",
+                }
+            )
+            return
+        if not session.capabilities.supports_barge_in and self._event_requests_barge_in(event):
+            await emit_event(self._barge_in_unsupported_error(session))
+            event = dict(event)
+            event.pop("force_barge_in", None)
+            for key in ("overlap_action", "overlap"):
+                value = event.get(key)
+                if isinstance(value, str) and value.strip().lower() in {
+                    "barge_in",
+                    "interrupt",
+                    "cancel",
+                }:
+                    event.pop(key, None)
+        fmt = event.get("format") if isinstance(event.get("format"), str) else "pcm16"
+        default_sample_rate_hz = 16000
+        sr_raw = event.get("sample_rate_hz") or event.get("sample_rate")
+        sample_rate_hz = sr_raw if isinstance(sr_raw, int | float) else default_sample_rate_hz
+        try:
+            audio, fmt, sample_rate_hz = convert_input_audio_with_rate(
+                audio,
+                fmt,
+                sample_rate_hz=sample_rate_hz,
+            )
+        except ValueError as exc:
+            await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
+            return
+        if isinstance(fmt, str) and fmt.lower() in {"pcm16", "pcm_s16le", "s16le"}:
+            await emit_event(
+                {
+                    "type": "error",
+                    "error": "input_audio_buffer.append pcm16 audio could not be decoded",
+                    "code": "bad_audio",
+                }
+            )
+            return
+        force_listen = bool(event.get("force_listen", False))
+        payload = {
+            "type": "audio",
+            "audio": audio,
+            "format": fmt,
+            "sample_rate_hz": sample_rate_hz,
+            "force_listen": force_listen,
+        }
+        video_frames = event.get("video_frames")
+        if isinstance(video_frames, list):
+            frames = [frame for frame in video_frames if isinstance(frame, str) and frame]
+            if frames:
+                payload["video_frames"] = frames
+        # Speech/silence tag for the Stage0 turn-ended latch.
+        payload["is_speech"] = self._input_looks_like_speech(event, payload, session=session)
+        defer_native_append = False
+        buffer_overlap_audio = True
+        if self._uses_native_input_append(session):
+            mark_pending_silence_superseded()
+            overlap_active = native_response_in_progress() and (
+                not self._session_auto_responds(session)
+                or (
+                    session.capabilities.supports_barge_in
+                    and (
+                        session.config.overlap_policy == DuplexOverlapPolicy.BARGE_IN_ON_SPEECH.value
+                        or self._event_requests_barge_in(event)
+                    )
+                )
+            )
+            if overlap_active:
+                decision = self._overlap_decision(session, event, payload)
+                await self._emit_overlap_decision(emit_event, session, decision)
+                action = decision.get("action")
+                if action == "drop":
+                    if realtime_protocol is not None:
+                        await realtime_protocol.discard_pending_input_audio(
+                            audio_end_ms=self._input_audio_duration_ms(event, payload)
+                        )
+                    return
+                if action == "listen":
+                    buffer_overlap_audio = bool(decision.get("buffer_audio", True))
+                    defer_native_append = bool(decision.get("defer_runtime_append", True))
+                    if (
+                        not buffer_overlap_audio
+                        and realtime_protocol is not None
+                        and decision.get("preserve_realtime_input") is not True
+                    ):
+                        await realtime_protocol.discard_pending_input_audio(
+                            audio_end_ms=self._input_audio_duration_ms(event, payload)
+                        )
+                    if decision.get("force_listen", True) is True:
+                        payload["force_listen"] = True
+                else:
+                    event["force_barge_in"] = True
+                    cancelled_fence = DuplexFence(
+                        session.session_id,
+                        epoch=session.epoch,
+                        turn_id=session.turn_id,
+                        incarnation=session.incarnation,
+                    )
+                    playback_was_active = self._assistant_playback_active(session)
+                    buffer_overlap_audio = True
+                    defer_native_append = False
+                    native.audio_buffer.clear_force_listen()
+                    session.reset_overlap_speech()
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    await actor.cancel_append_tasks()
+                    had_native_stream = native.data_plane_task is not None
+                    cancel_reason = str(decision.get("cancel_reason") or "barge_in")
+                    cancelled = await self._cancel_active_response(
+                        session,
+                        actor.active_response_task,
+                        emit_event,
+                        reason=cancel_reason,
+                    )
+                    had_native_stream = await self._cancel_native_data_plane_stream(session) or had_native_stream
+                    if not cancelled and had_native_stream:
+                        old_epoch = session.epoch
+                        old_response_id = session.active_response_id
+                        committed_ms = session.playback.committed_ms
+                        self._commit_played_response_history(session, old_response_id, committed_ms)
+                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                        await emit_event(
+                            {
+                                "type": "audio.cancelled",
+                                "session_id": session.session_id,
+                                "response_id": old_response_id,
+                                "reason": cancel_reason,
+                                "cancelled_epoch": old_epoch,
+                                "epoch": new_epoch,
+                                "committed_ms": committed_ms,
+                                "playback": old_playback,
+                            }
+                        )
+                        cancelled = True
+                    if not cancelled and playback_was_active:
+                        old_epoch = session.epoch
+                        committed_ms = session.playback.committed_ms
+                        self._commit_played_response_history(session, session.last_response_id, committed_ms)
+                        new_epoch, old_playback = self._advance_barge_in_epoch(session)
+                        await emit_event(
+                            {
+                                "type": "audio.cancelled",
+                                "session_id": session.session_id,
+                                "response_id": session.last_response_id,
+                                "reason": cancel_reason,
+                                "cancelled_epoch": old_epoch,
+                                "epoch": new_epoch,
+                                "committed_ms": committed_ms,
+                                "playback": old_playback,
+                            }
+                        )
+                        cancelled = True
+                    if session.epoch > cancelled_fence.epoch:
+                        if not await self._signal_runtime_session(
+                            session,
+                            "barge_in",
+                            emit_event,
+                            fence=cancelled_fence,
+                            next_fence=DuplexFence(
+                                session.session_id,
+                                epoch=session.epoch,
+                                turn_id=session.turn_id,
+                                incarnation=session.incarnation,
+                            ),
+                        ):
+                            return
+                    actor.active_response_task = None
+            elif not self._session_auto_responds(session) and not self._input_looks_like_speech(
+                event, payload, session=session
+            ):
+                # Turn-mode only: skip silent chunks so they don't open a
+                # response. In auto-respond (full-duplex) mode the model owns
+                # the speak/listen decision and MUST receive silence units --
+                # the official model typically starts speaking during the
+                # silence after a question.
+                await emit_event(
+                    {
+                        "type": "response.listen",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "reason": "silence_or_noise",
+                    }
+                )
+                return
+            if self._should_force_listen_for_auto_response_overlap(session, event, payload):
+                # Auto-response keeps a long-lived native Stage0 stream.
+                # While assistant audio is still active, silence from the
+                # browser should advance the model in listen mode rather
+                # than letting the same stream start another assistant
+                # segment. Speech/barge-in chunks remain model-owned.
+                payload["force_listen"] = True
+            if not buffer_overlap_audio:
+                return
+            session.mark_user_input_activity()
+            native.input_since_commit = True
+            native.speech_since_commit = native.speech_since_commit or self._input_looks_like_speech(
+                event, payload, session=session
+            )
+            try:
+                raw_audio_bytes = self._native_audio_payload_size_bytes(payload)
+                if not session.reserve_input_bytes(
+                    raw_audio_bytes,
+                    limit=self._duplex_session_config.max_pending_input_bytes_per_session,
+                ):
+                    await emit_event(
+                        {
+                            "type": "error",
+                            "error": "Duplex session pending input exceeds server limit",
+                            "code": "input_backpressure",
+                        }
+                    )
+                    return
+                allow_emit = not defer_native_append and (
+                    realtime_protocol is None
+                    or event_type != "input_audio_buffer.append"
+                    # Full-duplex: emit each ~chunk_period of audio so the model
+                    # runs per-chunk generation (speak/listen) without an explicit
+                    # response.create, matching the official duplex_generate loop.
+                    or self._session_auto_responds(session)
+                )
+                pcm_reservation = native.audio_buffer.prepare_append(
+                    payload,
+                    operation_id=uuid.uuid4().hex,
+                    chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                    allow_emit=allow_emit,
+                )
+            except ValueError as exc:
+                session.release_input_bytes(raw_audio_bytes)
+                await emit_event({"type": "error", "error": str(exc), "code": "bad_event"})
+                return
+            if pcm_reservation is None:
+                return
+            if pcm_reservation.byte_count == 0:
+                session.release_input_bytes(raw_audio_bytes)
+            payload = pcm_reservation.payload  # type: ignore[assignment]
+        else:
+            session.append_audio(audio, fmt=fmt, sample_rate_hz=sample_rate_hz)
+        if self._uses_native_input_append(session):
+            await start_native_append(
+                payload,
+                final=False,
+                pcm_reservation=pcm_reservation,
+            )
+            return
+        if session.capabilities.supports_input_append:
+            await start_runtime_append(payload, final=False, mode="append_audio_chunk")
+        return
+
+    async def _handle_commit_event(
+        self,
+        *,
+        event: dict[str, object],
+        event_type: object,
+        session: DuplexSession,
+        actor: DuplexWebSocketActor,
+        native: ServingRuntimeSessionState,
+        realtime_protocol: NativeRealtimeSessionProtocol | None,
+        emit_event,
+        native_response_in_progress,
+        start_native_append,
+        wait_for_native_append_tail,
+    ) -> None:
+        realtime_item_id = event.get("realtime_item_id")
+        realtime_validated_audio_commit = (
+            event_type == "input_audio_buffer.commit" and isinstance(realtime_item_id, str) and bool(realtime_item_id)
+        )
+        if (
+            self._uses_native_input_append(session)
+            and event_type in {"input.commit", "input_audio_buffer.commit"}
+            and not await wait_for_native_append_tail()
+        ):
+            return
+        if event_type == "input_audio_buffer.commit" and event.get("is_speech") is False:
+            native.input_since_commit = False
+            native.speech_since_commit = False
+            native.audio_buffer.clear()
+            session.release_all_input_bytes()
+            native.clear_committed_audio()
+            await emit_event(
+                {
+                    "type": "input.committed",
+                    "session_id": session.session_id,
+                    "turn_id": session.turn_id,
+                    "epoch": session.epoch,
+                    "empty": True,
+                    "is_speech": False,
+                    "no_response": True,
+                }
+            )
+            await emit_event(
+                {
+                    "type": "response.listen",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "reason": "silence_or_noise",
+                }
+            )
+            return
+        should_create_response = (
+            event_type == "response.create"
+            or bool(event.get("response_create", event_type == "input.commit"))
+            or (event_type == "input_audio_buffer.commit" and self._session_auto_responds(session))
+        )
+        precreate_response_requested = event_type == "response.create" or bool(
+            event.get("response_create", event_type == "input.commit")
+        )
+        if event_type == "response.create":
+            response_payload = event.get("response")
+            if isinstance(response_payload, dict):
+                response_options_error = self._apply_response_create_options(session, response_payload)
+                if response_options_error is not None:
+                    error_message = (
+                        "The selected native duplex runtime does not support generation "
+                        "overrides for instructions, voice, temperature, max tokens, tools, or "
+                        "tool_choice."
+                        if response_options_error == "unsupported_native_response_options"
+                        else "response.create cannot reserve options while another response is active."
+                    )
+                    await emit_event(
+                        {
+                            "type": "error",
+                            "session_id": session.session_id,
+                            "epoch": session.epoch,
+                            "code": response_options_error,
+                            "error": error_message,
+                        }
+                    )
+                    return
+        if self._uses_native_input_append(session) and event_type == "input_audio_buffer.commit":
+            has_pending_native_audio = (
+                native.input_since_commit
+                or native.audio_buffer.has_pending()
+                or native.committed_audio_payload is not None
+                or realtime_validated_audio_commit
+            )
+            if not has_pending_native_audio and not actor.native_append_tasks and native.data_plane_task is None:
+                await emit_event(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "input_audio_buffer_empty",
+                        "error": "input_audio_buffer.commit requires a non-empty input audio buffer.",
+                    }
+                )
+                return
+            commit_action = decide_commit_action(
+                CommitSnapshot(
+                    auto_responds=self._session_auto_responds(session),
+                    speech_since_commit=native.speech_since_commit,
+                    active_response_id=session.active_response_id,
+                    overlap_speech_ms=session.overlap_speech_ms,
+                    native_response_in_progress=native_response_in_progress(),
+                    playback_active=self._assistant_playback_active(session),
+                )
+            )
+            if commit_action is CommitAction.DEFER_ACTIVE_RESPONSE:
+                if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
+                    native.audio_buffer.clear()
+                    session.release_all_input_bytes()
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    native.clear_committed_audio()
+                    if realtime_protocol is not None:
+                        await realtime_protocol.discard_pending_input_audio(audio_end_ms=session.overlap_speech_ms)
+                    await emit_event(
+                        {
+                            "type": "input.committed",
+                            "session_id": session.session_id,
+                            "turn_id": session.turn_id,
+                            "epoch": session.epoch,
+                            "empty": True,
+                            "is_speech": False,
+                            "overlap_ack": True,
+                            "no_response": True,
+                        }
+                    )
+                    session.reset_overlap_speech()
+                    session.discard_response_options()
+                    return
+
+                commit_reservation = native.audio_buffer.prepare_commit(
+                    operation_id=uuid.uuid4().hex,
+                    chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                )
+                deferred_payload = commit_reservation.payload
+                if deferred_payload is None:
+                    commit_reservation.commit()
+                else:
+                    if native.committed_audio_payload is not None:
+                        deferred_payload = self._merge_native_audio_payloads(
+                            native.committed_audio_payload,
+                            deferred_payload,
+                        )
+                    native.retain_committed_audio(
+                        deferred_payload,
+                        operation_id=commit_reservation.operation_id,
+                        reserved_bytes=commit_reservation.byte_count,
+                    )
+                    commit_reservation.commit()
+                    native.deferred_response_create = should_create_response
+                    native.deferred_precreate_response = precreate_response_requested
+                    native.input_since_commit = False
+                    native.speech_since_commit = False
+                    committed = self._commit_native_audio_input(
+                        session,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                    committed_payload = self._native_audio_committed_payload(
+                        session,
+                        committed=committed,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                    committed_payload["overlap_deferred"] = True
+                    committed_payload["response_create_deferred"] = should_create_response
+                    await emit_event(committed_payload)
+                    return
+            if commit_action is CommitAction.START_AUTO_RESPONSE:
+                commit_reservation = native.audio_buffer.prepare_commit(
+                    operation_id=uuid.uuid4().hex,
+                    chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                )
+                committed_input = commit_reservation.payload
+                final_payload = committed_input
+                if native.committed_audio_payload is not None:
+                    if final_payload is not None:
+                        final_payload = self._merge_native_audio_payloads(
+                            native.committed_audio_payload,
+                            final_payload,
+                        )
+                    else:
+                        final_payload = native.committed_audio_payload
+                commit_reservation.commit()
+                if final_payload is not None:
+                    native.retain_committed_audio(
+                        final_payload,
+                        operation_id=commit_reservation.operation_id,
+                        reserved_bytes=commit_reservation.byte_count,
+                    )
+                native.deferred_response_create = False
+                native.input_since_commit = False
+                native.speech_since_commit = False
+                data_plane_turn_id = session.turn_id
+                committed = self._commit_native_audio_input(
+                    session,
+                    realtime_item_id=event.get("realtime_item_id"),
+                    transcript=event.get("transcript"),
+                    turn_id=data_plane_turn_id,
+                )
+                await emit_event(
+                    self._native_audio_committed_payload(
+                        session,
+                        committed=committed,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                )
+                if final_payload is not None:
+                    await start_native_append(
+                        {
+                            **final_payload,
+                            "duplex_turn_id": data_plane_turn_id,
+                        },
+                        final=True,
+                        precreate_response=False,
+                        operation_id=commit_reservation.operation_id,
+                        retained_committed_payload=final_payload,
+                    )
+                return
+        if self._uses_native_input_append(session) and event_type == "response.create":
+            if native_response_in_progress() or actor.native_append_tasks or native.data_plane_task is not None:
+                if session.active_response_id is None and (
+                    session.active_request_id is not None
+                    or actor.native_append_tasks
+                    or native.data_plane_task is not None
+                ):
+                    return
+                await emit_event(
+                    {
+                        "type": "error",
+                        "session_id": session.session_id,
+                        "epoch": session.epoch,
+                        "code": "response_already_active",
+                        "error": "response.create cannot start while another response is active.",
+                    }
+                )
+                session.discard_response_options()
+                return
+            if native.committed_audio_payload is not None:
+                committed_payload = native.committed_audio_payload
+                operation_id = native.committed_audio_operation_id
+                if operation_id is None:
+                    operation_id = uuid.uuid4().hex
+                    native.committed_audio_operation_id = operation_id
+                await start_native_append(
+                    committed_payload,
+                    final=True,
+                    precreate_response=True,
+                    operation_id=operation_id,
+                    retained_committed_payload=committed_payload,
+                )
+                return
+            await emit_event(
+                {
+                    "type": "error",
+                    "session_id": session.session_id,
+                    "epoch": session.epoch,
+                    "code": "response_create_without_input",
+                    "error": "Native duplex response.create requires committed audio input.",
+                }
+            )
+            session.discard_response_options()
+            return
+        if self._uses_native_input_append(session) and not native_response_in_progress():
+            commit_reservation = (
+                native.audio_buffer.prepare_commit(
+                    operation_id=uuid.uuid4().hex,
+                    chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
+                )
+                if event_type in {"input.commit", "input_audio_buffer.commit"}
+                else None
+            )
+            flushed_buffer_reserved_bytes = native.audio_buffer.pending_byte_count if commit_reservation is None else 0
+            flushed = (
+                commit_reservation.payload
+                if commit_reservation is not None
+                else native.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
+            )
+            if native.committed_audio_payload is not None:
+                if flushed is not None:
+                    flushed = self._merge_native_audio_payloads(
+                        native.committed_audio_payload,
+                        flushed,
+                    )
+                else:
+                    flushed = native.committed_audio_payload
+            if commit_reservation is not None:
+                commit_reservation.commit()
+            if flushed is not None:
+                if self._should_force_listen_for_short_commit(session, event, flushed):
+                    flushed = dict(flushed)
+                    flushed["force_listen"] = True
+                native.input_since_commit = False
+                committed = self._commit_native_audio_input(
+                    session,
+                    realtime_item_id=event.get("realtime_item_id"),
+                    transcript=event.get("transcript"),
+                )
+                await emit_event(
+                    self._native_audio_committed_payload(
+                        session,
+                        committed=committed,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                )
+                if should_create_response:
+                    native.retain_committed_audio(
+                        flushed,
+                        operation_id=(
+                            commit_reservation.operation_id if commit_reservation is not None else uuid.uuid4().hex
+                        ),
+                        reserved_bytes=(
+                            commit_reservation.byte_count
+                            if commit_reservation is not None
+                            else flushed_buffer_reserved_bytes
+                        ),
+                    )
+                    await start_native_append(
+                        flushed,
+                        final=True,
+                        precreate_response=True,
+                        operation_id=native.committed_audio_operation_id,
+                        retained_committed_payload=flushed,
+                    )
+                else:
+                    native.retain_committed_audio(
+                        flushed,
+                        operation_id=(
+                            commit_reservation.operation_id if commit_reservation is not None else uuid.uuid4().hex
+                        ),
+                        reserved_bytes=(
+                            commit_reservation.byte_count
+                            if commit_reservation is not None
+                            else flushed_buffer_reserved_bytes
+                        ),
+                    )
+                    native.deferred_response_create = False
+                return
+        native_had_uncommitted_audio = self._uses_native_input_append(session) and (
+            native.input_since_commit
+            or native.audio_buffer.has_pending()
+            or native.committed_audio_payload is not None
+            or realtime_validated_audio_commit
+        )
+        committed = session.commit_user_input()
+        if self._uses_native_input_append(session) and event_type in {
+            "input_audio_buffer.commit",
+            "input.commit",
+        }:
+            native.input_since_commit = False
+            native.speech_since_commit = False
+        if committed is None and event_type != "response.create":
+            if self._uses_native_input_append(session):
+                committed = (
+                    self._commit_native_audio_input(
+                        session,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                    if native_had_uncommitted_audio
+                    else None
+                )
+                await emit_event(
+                    self._native_audio_committed_payload(
+                        session,
+                        committed=committed,
+                        realtime_item_id=event.get("realtime_item_id"),
+                        transcript=event.get("transcript"),
+                    )
+                )
+            else:
+                await emit_event(
+                    {
+                        "type": "input.committed",
+                        "session_id": session.session_id,
+                        "empty": True,
+                    }
+                )
+            return
+        if committed is not None:
+            realtime_item_id = event.get("realtime_item_id")
+            if isinstance(realtime_item_id, str):
+                session.register_history_item(realtime_item_id, committed.message)
+            await emit_event(
+                self._input_committed_payload(
+                    session,
+                    committed,
+                    realtime_item_id=realtime_item_id,
+                )
+            )
+        if not should_create_response:
+            return
+        if actor.active_response_task is not None and not actor.active_response_task.done():
+            await self._cancel_active_response(
+                session,
+                actor.active_response_task,
+                emit_event,
+                reason="new_response",
+            )
+        actor.active_response_task = asyncio.create_task(self._run_response(session, emit_event))
+        return
