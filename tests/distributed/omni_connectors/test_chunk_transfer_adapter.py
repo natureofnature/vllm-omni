@@ -65,6 +65,7 @@ def _streaming_request(mocker: MockerFixture, num_computed_tokens: int) -> Simpl
         prompt_token_ids=prompt_token_ids,
         num_computed_tokens=num_computed_tokens,
         num_prompt_tokens=num_computed_tokens,
+        num_output_placeholders=0,
         update_block_hashes=mocker.Mock(),
     )
 
@@ -96,31 +97,31 @@ def test_streaming_payload_can_replace_placeholder_prompt(mocker: MockerFixture)
     request.update_block_hashes.assert_called_once_with()
 
 
-def test_boolean_generation_reserve_does_not_enable_capacity_rollover(mocker: MockerFixture) -> None:
-    request = SimpleNamespace(
-        _all_token_ids=[0, 0, 7, 8],
-        _output_token_ids=[7, 8],
-        prompt_token_ids=[0, 0],
-        num_computed_tokens=4,
-        num_prompt_tokens=2,
-        update_block_hashes=mocker.Mock(),
-    )
+def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4064)
     payload = {
-        "ids": {"prompt": [1, 2, 3]},
+        "ids": {"prompt": [1]},
         "meta": {
-            "next_stage_prompt_len": 3,
-            "next_stage_generation_tokens": True,
+            "replace_streaming_prompt": True,
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
         },
     }
 
-    construct_next_stage_streaming_input_prompt(payload, request, max_model_len=5)
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=7,
+        condition_seq=8,
+        recompute_previous_chunks=1,
+    )
 
-    assert request.prompt_token_ids == [0, 0, 7, 8, 0, 0, 0]
-    assert request._all_token_ids == [0, 0, 7, 8, 0, 0, 0]
-    assert request._output_token_ids == []
-    assert request.num_computed_tokens == 4
-    assert request.num_prompt_tokens == 7
-    request.update_block_hashes.assert_called_once_with()
+    assert replaced is True
+    assert request.prompt_token_ids == [0] * 10
+    assert payload["meta"]["streaming_prompt_recompute"] is False
+    assert "streaming_prompt_previous_codes" not in payload["ids"]
 
 
 def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: MockerFixture) -> None:
@@ -138,6 +139,126 @@ def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: Mocker
     assert replaced is False
     assert request.num_computed_tokens == 4060
     assert request.num_prompt_tokens == 4070
+
+
+def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixture) -> None:
+    previous_condition_len = 10
+    previous_codes = list(range(25))
+    request = SimpleNamespace(
+        _all_token_ids=[0] * 4039 + previous_codes + [999],
+        _output_token_ids=previous_codes + [999],
+        prompt_token_ids=[0] * 4039,
+        num_computed_tokens=4065,
+        num_prompt_tokens=4039,
+        num_output_placeholders=1,
+        update_block_hashes=mocker.Mock(),
+    )
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=previous_condition_len,
+        previous_condition_seq=7,
+        condition_seq=8,
+        recompute_previous_chunks=1,
+    )
+
+    assert replaced is True
+    assert request.prompt_token_ids == [0] * 45
+    assert request.num_prompt_tokens == 45
+    assert request.num_computed_tokens == 0
+    assert payload["ids"]["streaming_prompt_previous_codes"] == previous_codes
+    assert payload["meta"] == {
+        "next_stage_prompt_len": 10,
+        "next_stage_generation_tokens": 26,
+        "streaming_prompt_recompute": True,
+        "streaming_condition_seq": 8,
+    }
+    request.update_block_hashes.assert_called_once_with()
+
+
+def test_streaming_window_recomputes_each_condition_without_accumulating(mocker: MockerFixture) -> None:
+    request = SimpleNamespace(
+        _all_token_ids=[0] * 10 + [101, 102],
+        _output_token_ids=[101, 102],
+        prompt_token_ids=[0] * 10,
+        num_computed_tokens=12,
+        num_prompt_tokens=10,
+        num_output_placeholders=0,
+        update_block_hashes=mocker.Mock(),
+    )
+    second = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 12,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    assert construct_next_stage_streaming_input_prompt(
+        second,
+        request,
+        max_model_len=4096,
+        previous_condition_len=10,
+        previous_condition_seq=0,
+        condition_seq=1,
+        recompute_previous_chunks=1,
+    )
+    assert request.num_prompt_tokens == 24
+    assert second["ids"]["streaming_prompt_previous_codes"] == [101, 102]
+
+    request._all_token_ids.extend([201, 202, 203])
+    request._output_token_ids.extend([201, 202, 203])
+    request.num_computed_tokens = 27
+    third = {
+        "ids": {"prompt": [2]},
+        "meta": {
+            "next_stage_prompt_len": 8,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    assert construct_next_stage_streaming_input_prompt(
+        third,
+        request,
+        max_model_len=4096,
+        previous_condition_len=12,
+        previous_condition_seq=1,
+        condition_seq=2,
+        recompute_previous_chunks=1,
+    )
+    assert request.num_prompt_tokens == 23
+    assert third["ids"]["streaming_prompt_previous_codes"] == [201, 202, 203]
+    assert third["meta"]["streaming_condition_seq"] == 2
+
+
+def test_capacity_rollover_requires_explicit_window_contract(mocker: MockerFixture) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=4064)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    with pytest.raises(ValueError, match="requires window_size=1"):
+        construct_next_stage_streaming_input_prompt(
+            payload,
+            request,
+            max_model_len=4096,
+            previous_condition_len=10,
+            previous_condition_seq=0,
+            condition_seq=1,
+        )
 
 
 @pytest.mark.parametrize("next_stage_prompt_len", [0, -1])
@@ -180,6 +301,7 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         max_num_seqs: int = 2,
         max_model_len: int = 0,
         tts_max_model_len: int = 0,
+        tts_attention_type: str = "full_attention",
         flat_tts_config: bool = False,
         active_stream_window: int = 0,
         connector_extra: dict | None = None,
@@ -215,11 +337,13 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         hf_config = SimpleNamespace(
             model_type="minicpmtts",
             max_position_embeddings=tts_max_model_len,
+            attention_type=tts_attention_type,
         )
         if not flat_tts_config:
             hf_config = SimpleNamespace(
                 tts_config=SimpleNamespace(
                     max_position_embeddings=tts_max_model_len,
+                    attention_type=tts_attention_type,
                 )
             )
         model_config = SimpleNamespace(
@@ -240,6 +364,16 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
         return adapter, connector
 
     return _build
+
+
+@pytest.mark.parametrize(
+    ("attention_type", "expected_previous_chunks"),
+    [("full_attention", 0), ("sliding_recompute", 1)],
+)
+def test_talker_attention_policy_controls_streaming_recompute(build_adapter, attention_type, expected_previous_chunks):
+    adapter, _ = build_adapter(tts_attention_type=attention_type)
+
+    assert adapter._streaming_prompt_previous_chunks == expected_previous_chunks
 
 
 @pytest.mark.parametrize(
@@ -284,9 +418,17 @@ def test_load_poll(build_adapter):
     connector.get.return_value = (payload, 16)
     adapter._poll_single_request(request)
 
+    assert request.additional_information is None
+    assert "req-1" in adapter._finished_load_reqs
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        [request],
+        scheduler_requests={request.request_id: request},
+    )
     assert request.additional_information == payload
     assert adapter.get_req_chunk["req-1"] == 1
-    assert "req-1" in adapter._finished_load_reqs
+    assert "req-1" not in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
 
@@ -317,14 +459,17 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
     )
 
     assert adapter._poll_single_request(request) is True
-    assert request.num_computed_tokens == 0
-    assert request.prompt_token_ids == [0] * 10
-    assert request.request_id in adapter.replaced_streaming_prompt_ids
-
     request.status = RequestStatus.WAITING_FOR_CHUNK
     running_queue = [request]
     waiting_queue = DummyWaitingQueue()
-    adapter.process_pending_chunks(waiting_queue, running_queue)
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+    assert request.num_computed_tokens == 0
+    assert request.prompt_token_ids == [0] * 10
+    assert request.request_id in adapter.replaced_streaming_prompt_ids
     assert running_queue == []
     assert waiting_queue == [request]
     assert request.status == RequestStatus.WAITING
@@ -341,41 +486,99 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
 
 
 @pytest.mark.parametrize("flat_tts_config", [False, True])
-def test_load_poll_ar_rolls_over_native_duplex_prompt_before_context_limit(build_adapter, flat_tts_config):
+def test_load_poll_ar_recomputes_native_duplex_prompt_each_condition(build_adapter, flat_tts_config):
     adapter, connector = build_adapter(
         stage_id=1,
         model_mode="ar",
         max_model_len=8192,
         tts_max_model_len=4096,
+        tts_attention_type="sliding_recompute",
         flat_tts_config=flat_tts_config,
     )
     request = _req("req-rollover", RequestStatus.RUNNING, external_req_id="external-rollover")
     request.resumable = True
-    request.prompt_token_ids = [0] * 4064
-    request._all_token_ids = [0] * 4064
-    request._output_token_ids = []
-    request.num_prompt_tokens = 4064
-    request.num_computed_tokens = 4064
+    previous_codes = list(range(25))
+    request.prompt_token_ids = [0] * 10
+    request._all_token_ids = [0] * 10 + previous_codes
+    request._output_token_ids = previous_codes.copy()
+    request.num_prompt_tokens = 10
+    request.num_computed_tokens = 35
+    request.num_output_placeholders = 0
     request.update_block_hashes = Mock()
     adapter.get_req_chunk[request.request_id] = 1
     adapter.request_ids_mapping[request.request_id] = request.external_req_id
+    adapter._streaming_condition_lengths[request.request_id] = 10
+    adapter._streaming_condition_seqs[request.request_id] = 0
     connector.get.return_value = (
         {
             "ids": {"prompt": [1]},
             "meta": {
                 "next_stage_prompt_len": 10,
                 "next_stage_generation_tokens": 26,
-                "finished": False,
+                "finished": True,
             },
         },
         1,
     )
 
     assert adapter._poll_single_request(request) is True
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    waiting_queue = DummyWaitingQueue()
+    adapter.process_pending_chunks(
+        waiting_queue,
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
+
     assert request.num_computed_tokens == 0
-    assert request.prompt_token_ids == [0] * 10
+    assert request.prompt_token_ids == [0] * 45
+    assert request.additional_information["ids"]["streaming_prompt_previous_codes"] == previous_codes
+    assert request.additional_information["meta"]["streaming_prompt_recompute"] is True
+    assert request.resumable is False
     assert request.request_id in adapter.replaced_streaming_prompt_ids
     assert adapter._max_model_len == 4096
+    assert running_queue == []
+    assert waiting_queue == [request]
+
+
+def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) -> None:
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        tts_attention_type="sliding_recompute",
+    )
+    request = _req("req-condition-seq", RequestStatus.RUNNING)
+
+    def receive(payload):
+        connector.get.return_value = (payload, 1)
+        assert adapter._poll_single_request(request) is True
+        adapter.requests_with_ready_chunks.add(request.request_id)
+        adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+        adapter.requests_with_ready_chunks.discard(request.request_id)
+        return request.additional_information
+
+    first = receive(
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"next_stage_prompt_len": 10},
+        }
+    )
+    assert first["meta"]["streaming_condition_seq"] == 0
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    control = receive({"meta": {"is_segment_finished": True}})
+    assert "streaming_condition_seq" not in control["meta"]
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    second = receive(
+        {
+            "ids": {"prompt": [2]},
+            "meta": {"next_stage_prompt_len": 12},
+        }
+    )
+    assert second["meta"]["streaming_condition_seq"] == 1
+    assert adapter._streaming_condition_lengths[request.request_id] == 12
 
 
 def test_load_poll_ar_reports_invalid_capacity_metadata(build_adapter):
@@ -396,6 +599,13 @@ def test_load_poll_ar_reports_invalid_capacity_metadata(build_adapter):
     )
 
     assert adapter._poll_single_request(request) is True
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    running_queue = [request]
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        running_queue,
+        scheduler_requests={request.request_id: request},
+    )
     assert adapter.collect_failed_receive_request_ids() == {
         request.request_id: "fresh streaming prompt plus generation reserve exceeds max_model_len: "
         "prompt=4096, reserve=26, limit=4096"
@@ -846,6 +1056,78 @@ def test_send_single_request_cleans_up_after_finished_payload(build_adapter, mon
     assert args[1] == "ext-finished"
 
 
+def test_old_turn_terminal_send_preserves_new_turn_state_and_sender(build_adapter):
+    adapter, connector = build_adapter(
+        stage_id=1,
+        model_mode="ar",
+        max_model_len=4096,
+        tts_attention_type="sliding_recompute",
+    )
+    request = _req("req-live", RequestStatus.RUNNING, external_req_id="ext-live")
+    request.resumable = True
+    request._all_token_ids = []
+    request._output_token_ids = []
+    request.update_block_hashes = Mock()
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct(
+        meta=MetaStruct(
+            finished=torch.tensor(True, dtype=torch.bool),
+            codec_streaming=True,
+        )
+    )
+
+    put_started = threading.Event()
+    release_put = threading.Event()
+    put_keys = []
+
+    def blocking_first_put(*_args, **kwargs):
+        put_keys.append(kwargs["put_key"])
+        if len(put_keys) == 1:
+            put_started.set()
+            assert release_put.wait(timeout=5)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_first_put
+    adapter.save_async(multimodal_output=None, request=request)
+    first_task = adapter._pending_save_reqs.popleft()
+    first_sender_token = first_task["sender_token"]
+    send_thread = threading.Thread(target=lambda: adapter._send_single_request(first_task))
+    send_thread.start()
+    assert put_started.wait(timeout=5)
+
+    adapter.load_async(request)
+    assert adapter._pending_load_reqs.popleft() is request
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {
+                "replace_streaming_prompt": True,
+                "next_stage_prompt_len": 10,
+                "next_stage_generation_tokens": 26,
+            },
+        },
+        1,
+    )
+    assert adapter._poll_single_request(request) is True
+    adapter.requests_with_ready_chunks.add(request.request_id)
+    adapter._apply_pending_ar_prompt_updates({request.request_id: request})
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+
+    request.num_computed_tokens = 1
+    adapter.save_async(multimodal_output=None, request=request)
+    second_task = adapter._pending_save_reqs.popleft()
+    assert second_task["sender_token"] is first_sender_token
+
+    release_put.set()
+    send_thread.join(timeout=5)
+    assert not send_thread.is_alive()
+    assert adapter._streaming_condition_seqs[request.request_id] == 0
+    assert adapter._sender_tokens[request.external_req_id] is first_sender_token
+    assert first_sender_token.cancelled is False
+
+    adapter._send_single_request(second_task)
+    assert put_keys == ["ext-live_1_0", "ext-live_1_1"]
+
+
 def test_load_poll_non_ar_merges_into_existing_additional_information(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="diffusion")
     request = _req("req-non-ar", RequestStatus.WAITING, external_req_id="ext-non-ar")
@@ -987,7 +1269,15 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
 
     adapter._poll_single_request(request)
 
-    # AR mode now forwards the latest payload directly.
+    # The recv thread records the latest payload; scheduler-side queue
+    # restoration publishes it onto the Request.
+    assert torch.equal(request.additional_information["hidden_states"]["output"], torch.tensor([[1.0]]))
+    request.status = RequestStatus.WAITING_FOR_CHUNK
+    adapter.process_pending_chunks(
+        DummyWaitingQueue(),
+        [request],
+        scheduler_requests={request.request_id: request},
+    )
     assert request.additional_information == payload
     assert request.additional_information["meta"]["finished"].item() is True
 
@@ -1269,6 +1559,15 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.request_ids_mapping[req_id] = ext_id
     adapter._pending_load_reqs.append(SimpleNamespace(request_id=req_id))
     adapter._finished_load_reqs.add(req_id)
+    adapter._pending_ar_prompt_updates[req_id] = (
+        SimpleNamespace(request_id=req_id),
+        {},
+        False,
+        False,
+        False,
+    )
+    adapter._streaming_condition_lengths[req_id] = 10
+    adapter._streaming_condition_seqs[req_id] = 2
 
     adapter.put_req_chunk[ext_id] = 5
     adapter.request_payload[ext_id] = {"hidden": [1, 2]}
@@ -1290,10 +1589,55 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter.request_ids_mapping
     assert req_id in adapter._cancelled_load_reqs
     assert req_id not in adapter._finished_load_reqs
+    assert req_id not in adapter._pending_ar_prompt_updates
+    assert req_id not in adapter._streaming_condition_lengths
+    assert req_id not in adapter._streaming_condition_seqs
 
     assert ext_id not in adapter.put_req_chunk
     assert ext_id not in adapter.request_payload
     assert ext_id not in adapter.code_prompt_token_ids
+
+
+def test_cleanup_during_connector_get_discards_late_chunk(build_adapter):
+    """A connector get that completes after cleanup cannot restore state."""
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-late", RequestStatus.RUNNING, external_req_id="ext-late")
+    request.resumable = True
+    adapter.load_async(request)
+    assert adapter._pending_load_reqs.popleft() is request
+
+    get_started = threading.Event()
+    release_get = threading.Event()
+
+    def blocking_get(*_args):
+        get_started.set()
+        assert release_get.wait(timeout=5)
+        return (
+            {
+                "ids": {"prompt": [1]},
+                "meta": {
+                    "next_stage_prompt_len": 10,
+                },
+            },
+            1,
+        )
+
+    connector.get.side_effect = blocking_get
+    poll_results = []
+    poll_thread = threading.Thread(target=lambda: poll_results.append(adapter._poll_single_request(request)))
+    poll_thread.start()
+    assert get_started.wait(timeout=5)
+
+    adapter.cleanup_receiver(request.request_id)
+    release_get.set()
+    poll_thread.join(timeout=5)
+
+    assert not poll_thread.is_alive()
+    assert poll_results == [True]
+    assert request.additional_information is None
+    assert request.request_id in adapter._cancelled_load_reqs
+    assert request.request_id not in adapter._pending_ar_prompt_updates
+    assert request.request_id not in adapter._streaming_condition_seqs
 
 
 def test_cleanup_infers_external_id(build_adapter):

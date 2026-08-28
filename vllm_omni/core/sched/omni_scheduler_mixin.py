@@ -258,12 +258,14 @@ class OmniSchedulerMixin:
         self._consume_pending_connector_output(model_mode)
         self._process_pending_input_timeouts()
         if self.chunk_transfer_adapter:
-            self._process_chunk_receive_failures()
             self.chunk_transfer_adapter.process_pending_chunks(
                 self.waiting,
                 self.running,
                 scheduler_requests=self.requests,
             )
+            # Prompt-window contracts are finalized on this scheduler thread
+            # and may surface a permanent receive failure.
+            self._process_chunk_receive_failures()
             self._reset_ready_async_chunk_replacements()
             self._process_pending_chunk_timeouts()
             self._log_failed_chunk_sends()

@@ -59,6 +59,7 @@ class Ids(TypedDict, total=False):
     output: list[int]
     speech_token: list[int]
     prior_image: list[int]
+    streaming_prompt_previous_codes: list[int]
 
 
 class OmniPayloadMeta(TypedDict, total=False):
@@ -80,6 +81,8 @@ class OmniPayloadMeta(TypedDict, total=False):
     next_stage_prompt_len: int
     next_stage_generation_tokens: int
     replace_streaming_prompt: bool
+    streaming_prompt_recompute: bool
+    streaming_condition_seq: int
     replace_runtime_additional_information: bool
     ar_width: int
     eol_token_id: int
@@ -168,6 +171,7 @@ class IdsStruct(_StructBase):
     output: list[int] | None = None
     speech_token: list[int] | None = None
     prior_image: list[int] | None = None
+    streaming_prompt_previous_codes: list[int] | None = None
 
 
 class MetaStruct(_StructBase):
@@ -186,6 +190,8 @@ class MetaStruct(_StructBase):
     next_stage_prompt_len: int | None = None
     next_stage_generation_tokens: int | None = None
     replace_streaming_prompt: bool | None = None
+    streaming_prompt_recompute: bool | None = None
+    streaming_condition_seq: int | None = None
     replace_runtime_additional_information: bool | None = None
     ar_width: int | None = None
     eol_token_id: int | None = None
