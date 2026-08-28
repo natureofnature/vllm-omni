@@ -65,7 +65,13 @@ class DuplexSessionRunnerMixin:
 
 
 class _DuplexSessionRun:
-    """Own the mutable state for one ordered duplex WebSocket mailbox."""
+    """Own the mutable state for one ordered duplex WebSocket mailbox.
+
+    The reader validates and enqueues wire events, while ``run_mailbox``
+    dispatches them in FIFO order. Keeping transport, attachment, runtime, and
+    pending-input state here makes one object responsible for reconciling them
+    when the WebSocket detaches or the session closes.
+    """
 
     def __init__(
         self,
@@ -104,6 +110,7 @@ class _DuplexSessionRun:
         return self.session
 
     async def run(self) -> None:
+        """Open or resume the session, run its mailbox, then reconcile cleanup."""
         self.writer_task = asyncio.create_task(
             self.actor.writer_loop(),
             name="duplex-session-writer",
@@ -192,6 +199,12 @@ class _DuplexSessionRun:
             await self.finalize()
 
     async def run_mailbox(self) -> None:
+        """Await and dispatch one normalized wire event at a time.
+
+        Handlers are awaited directly so event-visible state transitions retain
+        WebSocket FIFO order. Work that may outlive one event is spawned
+        explicitly by the handler and tracked by the actor.
+        """
         assert self.session is not None
         while True:
             event = await self.next_actor_event()
@@ -1505,6 +1518,12 @@ class _DuplexSessionRun:
         return
 
     async def finalize(self) -> None:
+        """Detach a resumable transport or close all session-owned resources.
+
+        A resumable disconnect preserves the runtime and registered session for
+        a replacement attachment. Every other exit cancels outstanding work and
+        removes the session from its registries before stopping the writer.
+        """
         assert self.writer_task is not None
         if self.realtime_protocol is not None:
             self.realtime_protocol.reject_realtime_turn_detection_update()
@@ -1706,6 +1725,11 @@ class _DuplexSessionRun:
             )
 
     async def read_event_loop(self) -> None:
+        """Validate wire events and enqueue them for ordered mailbox dispatch.
+
+        Pending-turn capacity is reserved before enqueue so backpressure counts
+        events waiting in the mailbox. Admission releases that reservation.
+        """
         assert self.session is not None
         try:
             while not self.actor.closing:
@@ -1767,6 +1791,7 @@ class _DuplexSessionRun:
             await self.actor.enqueue_event({"type": "__disconnect__"})
 
     async def next_actor_event(self) -> dict[str, object]:
+        """Admit one FIFO event and release any reader-side turn reservation."""
         event = await self.actor.next_event()
         if event.pop("_duplex_pending_turn_reserved", False) and self.session is not None:
             self.session.release_pending_turn()
@@ -1838,6 +1863,12 @@ class _DuplexSessionRun:
         silence_continuation: bool = False,
         before_append=None,
     ) -> asyncio.Task[bool] | None:
+        """Queue one Stage 0 append behind the preceding wire-order effect.
+
+        Runtime success commits the PCM reservation, while normal failure rolls
+        it back. The returned task stays tracked so later append, cancellation,
+        and shutdown paths preserve the same ordering boundary.
+        """
         if self.session is None:
             return
         if not silence_continuation:
