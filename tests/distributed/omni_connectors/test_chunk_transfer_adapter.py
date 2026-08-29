@@ -366,6 +366,17 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
     return _build
 
 
+def _dequeue_load_entry(adapter, request):
+    """Register and take the entry as the background recv loop would."""
+    adapter.load_async(request)
+    entry = adapter._registered_load_entries[request.request_id]
+    try:
+        adapter._pending_load_reqs.remove(entry)
+    except ValueError:
+        pass
+    return entry
+
+
 @pytest.mark.parametrize(
     ("attention_type", "expected_previous_chunks"),
     [("full_attention", 0), ("sliding_recompute", 1)],
@@ -416,7 +427,7 @@ def test_load_poll(build_adapter):
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
     connector.get.return_value = (payload, 16)
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     assert request.additional_information is None
     assert "req-1" in adapter._finished_load_reqs
@@ -431,6 +442,61 @@ def test_load_poll(build_adapter):
     assert "req-1" not in adapter._finished_load_reqs
     assert "req-1" in adapter.upstream_exhausted_requests
     assert "req-1" not in adapter._pending_load_reqs
+
+
+def test_load_async_does_not_requeue_registered_inflight_request(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-inflight", RequestStatus.RUNNING, external_req_id="ext-inflight")
+
+    entry = _dequeue_load_entry(adapter, request)
+
+    # The recv loop owns the popped request until polling completes. A
+    # scheduler-side duplicate registration must not append a second copy.
+    adapter.load_async(request)
+    assert adapter._pending_load_reqs == deque()
+
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(entry) is True
+
+    # Successful polling releases the registration for the next chunk.
+    adapter.load_async(request)
+    assert [queued.request for queued in adapter._pending_load_reqs] == [request]
+
+
+def test_cleanup_then_reregister_drops_stale_queued_entry(build_adapter):
+    adapter, connector = build_adapter(stage_id=1, model_mode="ar")
+    request = _req("req-resume", RequestStatus.WAITING, external_req_id="ext-resume")
+
+    adapter.load_async(request)
+    stale_entry = adapter._pending_load_reqs[0]
+    adapter.cleanup_receiver(request.request_id)
+    adapter.load_async(request)
+    fresh_entry = adapter._pending_load_reqs[-1]
+    assert len(adapter._pending_load_reqs) == 2
+    assert adapter._pending_load_reqs.popleft() is stale_entry
+    assert adapter._pending_load_reqs.popleft() is fresh_entry
+
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [1]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(stale_entry) is True
+    connector.get.assert_not_called()
+    assert adapter._registered_load_entries[request.request_id] is fresh_entry
+
+    assert adapter._poll_single_request(fresh_entry) is True
+    connector.get.assert_called_once()
+    assert request.request_id not in adapter._registered_load_entries
+    assert adapter.get_req_chunk[request.request_id] == 1
 
 
 def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter):
@@ -458,7 +524,7 @@ def test_load_poll_ar_requeues_explicitly_replaced_running_prompt(build_adapter)
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     request.status = RequestStatus.WAITING_FOR_CHUNK
     running_queue = [request]
     waiting_queue = DummyWaitingQueue()
@@ -521,7 +587,7 @@ def test_load_poll_ar_recomputes_native_duplex_prompt_each_condition(build_adapt
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     request.status = RequestStatus.WAITING_FOR_CHUNK
     running_queue = [request]
     waiting_queue = DummyWaitingQueue()
@@ -552,7 +618,7 @@ def test_window_condition_sequence_ignores_control_only_chunks(build_adapter) ->
 
     def receive(payload):
         connector.get.return_value = (payload, 1)
-        assert adapter._poll_single_request(request) is True
+        assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
         adapter.requests_with_ready_chunks.add(request.request_id)
         adapter._apply_pending_ar_prompt_updates({request.request_id: request})
         adapter.requests_with_ready_chunks.discard(request.request_id)
@@ -598,7 +664,7 @@ def test_load_poll_ar_reports_invalid_capacity_metadata(build_adapter):
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     request.status = RequestStatus.WAITING_FOR_CHUNK
     running_queue = [request]
     adapter.process_pending_chunks(
@@ -627,7 +693,7 @@ def test_load_poll_generation_tensor_codes_use_placeholder_prompt(build_adapter)
     }
     connector.get.return_value = (payload, 16)
 
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     assert request.prompt_token_ids == [0]
     assert request.num_computed_tokens == 0
@@ -657,12 +723,13 @@ def test_load_poll_generation_empty_nonterminal_chunk_keeps_polling(build_adapte
     }
     connector.get.side_effect = [(empty_payload, 16), (ready_payload, 16)]
 
-    assert adapter._poll_single_request(request) is False
+    entry = _dequeue_load_entry(adapter, request)
+    assert adapter._poll_single_request(entry) is False
     assert request.request_id not in adapter._finished_load_reqs
     assert request.request_id not in adapter.requests_with_ready_chunks
     assert adapter.get_req_chunk[request.request_id] == 1
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(entry) is True
     assert request.request_id in adapter._finished_load_reqs
     assert torch.equal(request.additional_information["codes"]["audio"], ready_payload["codes"]["audio"])
     assert adapter.get_req_chunk[request.request_id] == 2
@@ -1094,8 +1161,7 @@ def test_old_turn_terminal_send_preserves_new_turn_state_and_sender(build_adapte
     send_thread.start()
     assert put_started.wait(timeout=5)
 
-    adapter.load_async(request)
-    assert adapter._pending_load_reqs.popleft() is request
+    entry = _dequeue_load_entry(adapter, request)
     connector.get.return_value = (
         {
             "ids": {"prompt": [1]},
@@ -1107,7 +1173,7 @@ def test_old_turn_terminal_send_preserves_new_turn_state_and_sender(build_adapte
         },
         1,
     )
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(entry) is True
     adapter.requests_with_ready_chunks.add(request.request_id)
     adapter._apply_pending_ar_prompt_updates({request.request_id: request})
     assert adapter._streaming_condition_seqs[request.request_id] == 0
@@ -1147,7 +1213,7 @@ def test_load_poll_non_ar_merges_into_existing_additional_information(build_adap
     }
     connector.get.return_value = (payload, 8)
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [7, 8]
     assert request.num_computed_tokens == 0
@@ -1188,7 +1254,7 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [7, 8]
     assert "audio" not in request.additional_information["codes"]
@@ -1217,7 +1283,7 @@ def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter)
         1,
     )
 
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
 
     assert request.prompt_token_ids == [0]
     assert "codes" not in request.additional_information
@@ -1243,7 +1309,7 @@ def test_load_poll_generation_without_snapshot_marker_keeps_incremental_state(bu
         1,
     )
 
-    assert adapter._poll_single_request(request) is False
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is False
 
     assert torch.equal(request.additional_information["codes"]["audio"], torch.tensor([1, 2]))
     assert request.additional_information["meta"]["cache_epoch"] == 3
@@ -1267,7 +1333,7 @@ def test_load_poll_ar_request_additional_information_concats_tensors(build_adapt
     }
     connector.get.return_value = (payload, 8)
 
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     # The recv thread records the latest payload; scheduler-side queue
     # restoration publishes it onto the Request.
@@ -1295,7 +1361,7 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
         },
         8,
     )
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     OmniGenerationScheduler._record_prefill_stats(request)
     first_chunk_stats = request.prefill_stats
     request.prefill_stats = None
@@ -1307,7 +1373,7 @@ def test_non_ar_poll_reinitializes_prefill_stats_for_later_chunks(build_adapter)
         },
         8,
     )
-    assert adapter._poll_single_request(request) is True
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
     assert isinstance(request.prefill_stats, PrefillStats)
     OmniGenerationScheduler._record_prefill_stats(request)
     second_chunk_stats = request.prefill_stats
@@ -1406,7 +1472,7 @@ def test_non_active_waiting_request_is_held_off_scheduler(build_adapter):
     assert waiting_queue == []
     assert active.status == RequestStatus.WAITING_FOR_CHUNK
     assert non_active.status == RequestStatus.WAITING
-    assert list(adapter._pending_load_reqs) == [active]
+    assert [entry.request for entry in adapter._pending_load_reqs] == [active]
     assert list(adapter.waiting_for_chunk_waiting_requests) == [active, non_active]
 
 
@@ -1557,7 +1623,9 @@ def _populate_adapter_state(adapter, req_id="req-1", ext_id="ext-1"):
     adapter.get_req_chunk[req_id] = 3
     adapter.requests_with_ready_chunks.add(req_id)
     adapter.request_ids_mapping[req_id] = ext_id
-    adapter._pending_load_reqs.append(SimpleNamespace(request_id=req_id))
+    entry = SimpleNamespace(request_id=req_id)
+    adapter._pending_load_reqs.append(entry)
+    adapter._registered_load_entries[req_id] = entry
     adapter._finished_load_reqs.add(req_id)
     adapter._pending_ar_prompt_updates[req_id] = (
         SimpleNamespace(request_id=req_id),
@@ -1592,19 +1660,19 @@ def test_cleanup_clears_all_state(build_adapter):
     assert req_id not in adapter._pending_ar_prompt_updates
     assert req_id not in adapter._streaming_condition_lengths
     assert req_id not in adapter._streaming_condition_seqs
+    assert req_id not in adapter._registered_load_entries
 
     assert ext_id not in adapter.put_req_chunk
     assert ext_id not in adapter.request_payload
     assert ext_id not in adapter.code_prompt_token_ids
 
 
-def test_cleanup_during_connector_get_discards_late_chunk(build_adapter):
-    """A connector get that completes after cleanup cannot restore state."""
+def test_cleanup_and_reregister_discards_inflight_old_segment_chunk(build_adapter):
+    """A late old-segment chunk cannot overwrite a resumed registration."""
     adapter, connector = build_adapter(stage_id=1, model_mode="ar")
     request = _req("req-late", RequestStatus.RUNNING, external_req_id="ext-late")
     request.resumable = True
-    adapter.load_async(request)
-    assert adapter._pending_load_reqs.popleft() is request
+    entry = _dequeue_load_entry(adapter, request)
 
     get_started = threading.Event()
     release_get = threading.Event()
@@ -1624,20 +1692,34 @@ def test_cleanup_during_connector_get_discards_late_chunk(build_adapter):
 
     connector.get.side_effect = blocking_get
     poll_results = []
-    poll_thread = threading.Thread(target=lambda: poll_results.append(adapter._poll_single_request(request)))
+    poll_thread = threading.Thread(target=lambda: poll_results.append(adapter._poll_single_request(entry)))
     poll_thread.start()
     assert get_started.wait(timeout=5)
 
     adapter.cleanup_receiver(request.request_id)
+    fresh_entry = _dequeue_load_entry(adapter, request)
     release_get.set()
     poll_thread.join(timeout=5)
 
     assert not poll_thread.is_alive()
     assert poll_results == [True]
     assert request.additional_information is None
-    assert request.request_id in adapter._cancelled_load_reqs
     assert request.request_id not in adapter._pending_ar_prompt_updates
     assert request.request_id not in adapter._streaming_condition_seqs
+    assert adapter.get_req_chunk[request.request_id] == 0
+    assert adapter._registered_load_entries[request.request_id] is fresh_entry
+
+    connector.get.side_effect = None
+    connector.get.return_value = (
+        {
+            "ids": {"prompt": [2]},
+            "meta": {"finished": True},
+        },
+        1,
+    )
+    assert adapter._poll_single_request(fresh_entry) is True
+    assert adapter.get_req_chunk[request.request_id] == 1
+    assert request.request_id not in adapter._registered_load_entries
 
 
 def test_cleanup_infers_external_id(build_adapter):
@@ -1788,7 +1870,7 @@ def test_cleanup_after_poll_flow(build_adapter):
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
     connector.get.return_value = (payload, 8)
-    adapter._poll_single_request(request)
+    adapter._poll_single_request(_dequeue_load_entry(adapter, request))
 
     assert "req-flow" in adapter.upstream_exhausted_requests
     assert adapter.get_req_chunk["req-flow"] == 1

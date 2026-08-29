@@ -34,6 +34,23 @@ class _SenderGeneration:
         self.cancelled = False
 
 
+class _LoadEntry:
+    """Identify one receiver registration across queue and I/O boundaries."""
+
+    __slots__ = ("request",)
+
+    def __init__(self, request: Request) -> None:
+        self.request = request
+
+    @property
+    def request_id(self) -> str:
+        return self.request.request_id
+
+    @property
+    def external_req_id(self) -> str:
+        return self.request.external_req_id
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -63,6 +80,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         # returned by connector.get(). The get itself stays outside the lock so
         # scheduler cleanup never waits for connector I/O.
         self._receiver_state_lock = threading.Lock()
+        # Includes requests queued for polling and the request currently being
+        # polled. Per-registration identity lets the receiver reject an old
+        # segment's queued or in-flight work after the same request id resumes.
+        self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
         self._max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
@@ -249,12 +270,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if not hasattr(request, "additional_information"):
             request.additional_information = None
         with self._receiver_state_lock:
-            # Registration is idempotent for one live internal request id.
-            # Internal ids are UUID-qualified, so cleanup can use the cancelled
-            # tombstone as the commit barrier for an in-flight connector.get().
-            self._discard_from_chunk_deque(self._pending_load_reqs, request.request_id)
-            self._cancelled_load_reqs.discard(request.request_id)
-            self._pending_load_reqs.append(request)
+            request_id = request.request_id
+            if request_id in self._registered_load_entries:
+                return
+            entry = _LoadEntry(request)
+            self._cancelled_load_reqs.discard(request_id)
+            self._registered_load_entries[request_id] = entry
+            self._pending_load_reqs.append(entry)
         with self._recv_cond:
             self._recv_cond.notify()
 
@@ -351,12 +373,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         with self._save_cond:
             self._save_cond.notify()
 
-    def _poll_single_request(self, request: Request):
+    def _poll_single_request(self, entry: _LoadEntry):
+        request = entry.request
         stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id
         with self._receiver_state_lock:
-            if req_id in self._cancelled_load_reqs:
+            if self._registered_load_entries.get(req_id) is not entry:
                 return True
             chunk_id = self.get_req_chunk[req_id]
             external_req_id = self.request_ids_mapping.get(req_id, req_id)
@@ -372,13 +395,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         except Exception as e:
             logger.error(f"SharedMemoryConnector get failed for req {connector_get_key}: {e}")
             with self._receiver_state_lock:
-                if req_id in self._cancelled_load_reqs:
+                if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
 
         if result is None:
             with self._receiver_state_lock:
-                if req_id in self._cancelled_load_reqs:
+                if self._registered_load_entries.get(req_id) is not entry:
                     return True
             return False
 
@@ -386,9 +409,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # cleanup_receiver() can run while connector.get() is in flight.
             # Treat cleanup as a commit barrier: a late chunk must not recreate
             # prompt/window state for the removed request.
-            if req_id in self._cancelled_load_reqs:
+            if self._registered_load_entries.get(req_id) is not entry:
                 return True
-            return self._commit_received_chunk(
+            is_success = self._commit_received_chunk(
                 request,
                 result,
                 stage_id=stage_id,
@@ -396,6 +419,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 chunk_id=chunk_id,
                 connector_get_key=connector_get_key,
             )
+            if is_success:
+                self._registered_load_entries.pop(req_id, None)
+            return is_success
 
     def _commit_received_chunk(
         self,
@@ -742,6 +768,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._pending_ar_prompt_updates.pop(request_id, None)
         self._streaming_condition_lengths.pop(request_id, None)
         self._streaming_condition_seqs.pop(request_id, None)
+        self._registered_load_entries.pop(request_id, None)
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
