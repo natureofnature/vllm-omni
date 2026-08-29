@@ -19,6 +19,9 @@ from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+    OmniChunkTransferAdapter,
+)
 
 # isort: on
 
@@ -58,6 +61,31 @@ def _make_update(prompt_token_ids: list[int] | None = None) -> StreamingUpdate:
         arrival_time=200.0,
         sampling_params=SamplingParams(max_tokens=16),
     )
+
+
+def _make_talker_adapter(*, max_model_len: int = 100) -> OmniChunkTransferAdapter:
+    adapter = OmniChunkTransferAdapter.__new__(OmniChunkTransferAdapter)
+    adapter.receives_chunks = False
+    adapter._max_model_len = max_model_len
+    adapter._streaming_prompt_previous_chunks = 1
+    adapter._streaming_prompt_recompute_on_capacity = True
+    adapter._streaming_condition_lengths = {}
+    adapter._streaming_condition_seqs = {}
+    adapter.segment_finished_requests = set()
+    adapter.requests_num_chunks_sent = {}
+    return adapter
+
+
+def _make_talker_update(condition_len: int, *, reserve: int = 10) -> StreamingUpdate:
+    update = _make_update([0] * condition_len)
+    update.model_intermediate_buffer = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": condition_len,
+            "next_stage_generation_tokens": reserve,
+        },
+    }
+    return update
 
 
 def _run_resumable_segment_stop(
@@ -398,6 +426,97 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     assert sched.chunk_transfer_adapter.requests_num_chunks_sent == {}
     sched._free_request_blocks.assert_called_once_with(session)
     sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+
+def test_talker_capacity_exact_fit_extends_without_recompute() -> None:
+    sched = _make_scheduler(stage_id=1)
+    adapter = _make_talker_adapter(max_model_len=100)
+    sched.chunk_transfer_adapter = adapter
+    session = _make_request()
+    session.external_req_id = "external-capacity-exact-fit"
+    session.prompt_token_ids = [0] * 70
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session._output_token_ids.clear()
+    session.append_output_token_ids([7, 8, 9, 10])
+    session.num_prompt_tokens = 70
+    session.num_computed_tokens = 74
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = 1
+    adapter._streaming_condition_lengths[session.request_id] = 20
+    adapter._streaming_condition_seqs[session.request_id] = 0
+    update = _make_talker_update(16)
+
+    sched._update_request_as_session(session, update)
+
+    assert session.num_computed_tokens == 74
+    assert session.num_prompt_tokens == 90
+    assert list(session._all_token_ids[-20:]) == [7, 8, 9, 10] + [0] * 16
+    assert update.model_intermediate_buffer["meta"] == {
+        "next_stage_prompt_len": 16,
+        "next_stage_generation_tokens": 10,
+        "streaming_condition_seq": 1,
+        "streaming_prompt_recompute": False,
+    }
+    assert adapter._streaming_condition_lengths[session.request_id] == 16
+    assert adapter._streaming_condition_seqs[session.request_id] == 1
+    sched._free_request_blocks.assert_not_called()
+    sched.encoder_cache_manager.free.assert_not_called()
+
+
+def test_talker_capacity_overflow_recomputes_then_resumes_accumulation() -> None:
+    sched = _make_scheduler(stage_id=1)
+    adapter = _make_talker_adapter(max_model_len=100)
+    sched.chunk_transfer_adapter = adapter
+    session = _make_request()
+    session.external_req_id = "external-capacity-rollover"
+    session.prompt_token_ids = [0] * 70
+    session._all_token_ids.clear()
+    session._all_token_ids.extend(session.prompt_token_ids)
+    session._output_token_ids.clear()
+    previous_codes = [7, 8, 9, 10]
+    session.append_output_token_ids(previous_codes)
+    session.num_prompt_tokens = 70
+    session.num_computed_tokens = 74
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = 1
+    adapter._streaming_condition_lengths[session.request_id] = 20
+    adapter._streaming_condition_seqs[session.request_id] = 0
+    adapter.segment_finished_requests.add(session.request_id)
+    adapter.requests_num_chunks_sent[session.external_req_id] = 74
+    overflow_update = _make_talker_update(17)
+
+    sched._update_request_as_session(session, overflow_update)
+
+    assert session.num_computed_tokens == 0
+    assert session.num_prompt_tokens == 41
+    assert session.prompt_token_ids == [0] * 41
+    assert overflow_update.model_intermediate_buffer["ids"]["streaming_prompt_previous_codes"] == previous_codes
+    assert overflow_update.model_intermediate_buffer["meta"]["streaming_condition_seq"] == 1
+    assert overflow_update.model_intermediate_buffer["meta"]["streaming_prompt_recompute"] is True
+    assert adapter.segment_finished_requests == set()
+    assert adapter.requests_num_chunks_sent == {}
+    sched._free_request_blocks.assert_called_once_with(session)
+    sched.encoder_cache_manager.free.assert_called_once_with(session)
+
+    # Once the replacement has been recomputed, later conditions append to
+    # the new full-attention prefix until capacity is approached again.
+    next_codes = [21, 22, 23, 24, 25, 26]
+    session.append_output_token_ids(next_codes)
+    session.num_computed_tokens = 47
+    session.status = RequestStatus.WAITING_FOR_STREAMING_REQ
+    sched.num_waiting_for_streaming_input = 1
+    append_update = _make_talker_update(20)
+
+    sched._update_request_as_session(session, append_update)
+
+    assert session.num_computed_tokens == 47
+    assert session.num_prompt_tokens == 67
+    assert list(session._all_token_ids[-26:]) == next_codes + [0] * 20
+    assert append_update.model_intermediate_buffer["meta"]["streaming_condition_seq"] == 2
+    assert append_update.model_intermediate_buffer["meta"]["streaming_prompt_recompute"] is False
+    assert sched._free_request_blocks.call_count == 1
+    assert sched.encoder_cache_manager.free.call_count == 1
 
 
 def test_ready_async_chunk_prompt_replacement_releases_stale_kv_once() -> None:

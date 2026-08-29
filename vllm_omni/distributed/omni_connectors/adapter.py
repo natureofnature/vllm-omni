@@ -227,6 +227,7 @@ def construct_next_stage_streaming_input_prompt(
     previous_condition_seq: int | None = None,
     condition_seq: int | None = None,
     recompute_previous_chunks: int = 0,
+    recompute_on_capacity: bool = False,
 ) -> bool:
     """Update a downstream streaming request prompt from connector payload ids.
 
@@ -234,7 +235,9 @@ def construct_next_stage_streaming_input_prompt(
     known. When a Thinker payload carries ``ids.prompt``, this helper:
 
     * Preserves ``num_computed_tokens`` while extending a non-window prompt.
-      Explicit replacements and one-condition window recomputes reset it.
+      Explicit replacements and one-condition window recomputes reset it. A
+      full-attention Talker recomputes only when the next condition would
+      exceed its context limit.
     * Moves already-computed output tokens into ``prompt_token_ids``.
     * Appends a new placeholder prompt slice sized from the upstream ids.
     * Refreshes block hashes so the scheduler allocates KV slots for the
@@ -285,12 +288,23 @@ def construct_next_stage_streaming_input_prompt(
     explicit_replacement = meta.get("replace_streaming_prompt") is True
     if isinstance(recompute_previous_chunks, bool) or recompute_previous_chunks not in (0, 1):
         raise ValueError("streaming prompt recompute supports exactly one previous chunk")
+    if not isinstance(recompute_on_capacity, bool):
+        raise ValueError("recompute_on_capacity must be a bool")
     has_window_contract = recompute_previous_chunks == 1
-    window_recompute = not explicit_replacement and has_window_contract and previous_condition_seq is not None
+    if recompute_on_capacity and not has_window_contract:
+        raise ValueError("capacity-triggered streaming prompt recompute requires window_size=1")
+    if recompute_on_capacity and previous_condition_seq is not None and generation_reserve == 0:
+        raise ValueError("capacity-triggered streaming prompt recompute requires a positive generation reserve")
     exceeds_accumulated_capacity = (
         managed_prompt_len is not None
         and capacity_limit is not None
         and request.num_computed_tokens + managed_prompt_len + generation_reserve > capacity_limit
+    )
+    window_recompute = (
+        not explicit_replacement
+        and has_window_contract
+        and previous_condition_seq is not None
+        and (exceeds_accumulated_capacity if recompute_on_capacity else True)
     )
     if not explicit_replacement and exceeds_accumulated_capacity and not window_recompute:
         raise ValueError("capacity-managed streaming prompt rollover requires window_size=1")

@@ -147,16 +147,14 @@ class OmniSchedulerMixin:
         if input_coordinator is not None:
             input_coordinator.free_finished_request(request_id)
 
-    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
-        """Replace a downstream stage's placeholder with its next payload."""
+    def _reset_streaming_session_replacement_state(self, session: Request) -> None:
+        """Fence transport and async state that belongs to an old prompt."""
         adapter = getattr(self, "chunk_transfer_adapter", None)
         if adapter is not None:
             adapter.segment_finished_requests.discard(session.request_id)
             watermark = getattr(adapter, "requests_num_chunks_sent", None)
             if watermark is not None:
                 watermark.pop(session.external_req_id, None)
-        session._output_token_ids.clear()
-        session._all_token_ids.clear()
         # In-flight outputs from the previous segment were optimistically
         # scheduled (async lookahead). Mark them stale so update_from_output
         # drops them instead of underflowing num_output_placeholders
@@ -171,18 +169,15 @@ class OmniSchedulerMixin:
         session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
-        new_prompt = update.prompt_token_ids or ()
-        session._all_token_ids.extend(new_prompt)
-        session.num_computed_tokens = 0
-        session.prompt_token_ids = new_prompt
+
+    def _finish_streaming_session_update(self, session: Request, update: StreamingUpdate) -> None:
+        """Install payload metadata and send an updated session to admission."""
         session.additional_information = update.additional_information or None
         session.model_intermediate_buffer = getattr(
             update,
             "model_intermediate_buffer",
             None,
         )
-        session.update_block_hashes()
-        session.num_prompt_tokens = len(new_prompt)
         session.arrival_time = update.arrival_time
         session.sampling_params = update.sampling_params
         if session.status == RequestStatus.WAITING_FOR_STREAMING_REQ:
@@ -193,6 +188,19 @@ class OmniSchedulerMixin:
             self._enqueue_waiting_request(session)
         if self.log_stats:
             session.record_event(EngineCoreEventType.QUEUED)
+
+    def _replace_streaming_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Replace a downstream stage's placeholder with its next payload."""
+        self._reset_streaming_session_replacement_state(session)
+        session._output_token_ids.clear()
+        session._all_token_ids.clear()
+        new_prompt = update.prompt_token_ids or ()
+        session._all_token_ids.extend(new_prompt)
+        session.num_computed_tokens = 0
+        session.prompt_token_ids = new_prompt
+        session.update_block_hashes()
+        session.num_prompt_tokens = len(new_prompt)
+        self._finish_streaming_session_update(session, update)
 
     def _release_replaced_streaming_prompt_cache(self, session: Request) -> None:
         """Discard cache state that belongs to a replaced prompt."""
