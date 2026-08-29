@@ -124,6 +124,24 @@ def test_turn_start_replacement_ignores_accumulated_prompt_capacity(mocker: Mock
     assert "streaming_prompt_previous_codes" not in payload["ids"]
 
 
+@pytest.mark.parametrize("reserve", [True, 0, -1, 1.5, "26", None])
+def test_streaming_prompt_rejects_invalid_generation_reserve(
+    mocker: MockerFixture,
+    reserve: object,
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=10)
+    payload = {
+        "ids": {"prompt": [1]},
+        "meta": {
+            "next_stage_prompt_len": 10,
+            "next_stage_generation_tokens": reserve,
+        },
+    }
+
+    with pytest.raises(ValueError, match="next_stage_generation_tokens must be a positive integer"):
+        construct_next_stage_streaming_input_prompt(payload, request, max_model_len=4096)
+
+
 def test_capacity_managed_streaming_prompt_at_limit_still_appends(mocker: MockerFixture) -> None:
     request = _streaming_request(mocker, num_computed_tokens=4060)
     payload = {

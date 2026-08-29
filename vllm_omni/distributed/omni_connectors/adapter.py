@@ -252,12 +252,17 @@ def construct_next_stage_streaming_input_prompt(
     # every condition so a prior rollover cannot be replayed by a later append.
     meta["streaming_prompt_recompute"] = False
     next_stage_prompt_len = meta.get("next_stage_prompt_len")
-    next_generation_tokens = meta.get("next_stage_generation_tokens")
-    generation_reserve = (
-        next_generation_tokens
-        if isinstance(next_generation_tokens, int) and not isinstance(next_generation_tokens, bool)
-        else 0
-    )
+    if "next_stage_generation_tokens" in meta:
+        next_generation_tokens = meta["next_stage_generation_tokens"]
+        if (
+            not isinstance(next_generation_tokens, int)
+            or isinstance(next_generation_tokens, bool)
+            or next_generation_tokens <= 0
+        ):
+            raise ValueError("next_stage_generation_tokens must be a positive integer")
+        generation_reserve = next_generation_tokens
+    else:
+        generation_reserve = 0
     capacity_limit = (
         max_model_len
         if isinstance(max_model_len, int) and not isinstance(max_model_len, bool) and max_model_len > 0

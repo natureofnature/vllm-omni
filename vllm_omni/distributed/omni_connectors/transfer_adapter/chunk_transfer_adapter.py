@@ -51,6 +51,33 @@ class _LoadEntry:
         return self.request.external_req_id
 
 
+def _resolve_talker_streaming_prompt_config(model_config: Any) -> tuple[int, int]:
+    """Return the effective Talker context limit and recompute window."""
+    max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
+    hf_config = getattr(model_config, "hf_config", None)
+    tts_config = getattr(hf_config, "tts_config", None)
+    if tts_config is None and getattr(hf_config, "model_type", None) == "minicpmtts":
+        tts_config = hf_config
+    tts_max_model_len = (
+        tts_config.get("max_position_embeddings", 0)
+        if isinstance(tts_config, Mapping)
+        else getattr(tts_config, "max_position_embeddings", 0)
+    )
+    tts_max_model_len = int(tts_max_model_len or 0)
+    if tts_max_model_len > 0:
+        max_model_len = min(max_model_len, tts_max_model_len) if max_model_len else tts_max_model_len
+    attention_type = (
+        tts_config.get("attention_type")
+        if isinstance(tts_config, Mapping)
+        else getattr(tts_config, "attention_type", None)
+    )
+    # Official MiniCPMTTS supports both full_attention and
+    # sliding_recompute. Only an explicit Talker-stage policy enables the
+    # latter; native duplex alone must not override checkpoint semantics.
+    previous_chunks = 1 if attention_type == "sliding_recompute" else 0
+    return max_model_len, previous_chunks
+
+
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
     """Chunk-level transfer adapter for Omni connector pipelines.
 
@@ -86,30 +113,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._registered_load_entries: dict[str, _LoadEntry] = {}
         self._sender_tokens: dict[str, _SenderGeneration] = {}
         self.scheduler_max_num_seqs = vllm_config.scheduler_config.max_num_seqs
-        self._max_model_len = int(getattr(model_config, "max_model_len", 0) or 0)
-        hf_config = getattr(model_config, "hf_config", None)
-        tts_config = getattr(hf_config, "tts_config", None)
-        if tts_config is None and getattr(hf_config, "model_type", None) == "minicpmtts":
-            tts_config = hf_config
-        tts_max_model_len = (
-            tts_config.get("max_position_embeddings", 0)
-            if isinstance(tts_config, Mapping)
-            else getattr(tts_config, "max_position_embeddings", 0)
+        self._max_model_len, self._streaming_prompt_previous_chunks = _resolve_talker_streaming_prompt_config(
+            model_config
         )
-        tts_max_model_len = int(tts_max_model_len or 0)
-        if tts_max_model_len > 0:
-            self._max_model_len = (
-                min(self._max_model_len, tts_max_model_len) if self._max_model_len else tts_max_model_len
-            )
-        attention_type = (
-            tts_config.get("attention_type")
-            if isinstance(tts_config, Mapping)
-            else getattr(tts_config, "attention_type", None)
-        )
-        # Official MiniCPMTTS supports both full_attention and
-        # sliding_recompute. Only an explicit Talker-stage policy enables the
-        # latter; native duplex alone must not override checkpoint semantics.
-        self._streaming_prompt_previous_chunks = 1 if attention_type == "sliding_recompute" else 0
         active_stream_window = int(getattr(model_config, "active_stream_window", 0) or 0)
         model_max_num_seqs = int(getattr(model_config, "max_num_seqs", self.scheduler_max_num_seqs) or 0)
         if model_max_num_seqs <= 0:
