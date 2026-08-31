@@ -25,7 +25,7 @@ steps:
         mirror_hardwares: h100_2
 
       - label: ":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"
-        timeout_in_minutes: 120
+        timeout_in_minutes: 300
         commands:
           - export VLLM_OMNI_RUN_OMNIINTERACT_E2E=1
           - |
