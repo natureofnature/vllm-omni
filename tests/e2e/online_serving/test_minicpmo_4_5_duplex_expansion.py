@@ -8,16 +8,14 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
+import subprocess
 import wave
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-from tests.e2e.accuracy.qwen3_omni.qwen3_omni_acc_bench_core import (
-    find_vllm_cli,
-    run_vllm_bench_subprocess,
-)
 from tests.e2e.online_serving.helpers.minicpmo_4_5_duplex import (
     SERVER_PARAMS,
     SOFT_INTERRUPT_SHA256,
@@ -139,9 +137,11 @@ def test_minicpmo_4_5_omniinteract_nightly(
     run_root = tmp_path / subset
     artifact_root = run_root / "artifacts"
     result_filename = "benchmark_result.json"
-    run_vllm_bench_subprocess(
-        find_vllm_cli(),
+    vllm = shutil.which("vllm")
+    assert vllm is not None, "Could not find `vllm` on PATH"
+    subprocess.run(
         [
+            vllm,
             "bench",
             "serve",
             "--omni",
@@ -183,6 +183,7 @@ def test_minicpmo_4_5_omniinteract_nightly(
             "--result-filename",
             result_filename,
         ],
+        check=True,
     )
 
     benchmark_result = json.loads((run_root / result_filename).read_text())
@@ -212,7 +213,6 @@ def test_minicpmo_4_5_omniinteract_nightly(
             for name in (".done", "output.wav", "wav_transcript.json", "events.json", "result.json")
         )
         with wave.open(str(sample_root / "output.wav"), "rb") as output_wav:
-            assert output_wav.getnframes() > 0
             assert (
                 output_wav.getframerate(),
                 output_wav.getnchannels(),

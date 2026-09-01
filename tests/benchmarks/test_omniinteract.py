@@ -203,18 +203,19 @@ def test_archive_is_safe_and_atomically_shared(tmp_path: Path, monkeypatch: pyte
     assert not list(target.glob(".tmp-*"))
 
 
-def test_hub_archive_uses_vllm_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+@pytest.mark.parametrize("dataset_repo", ["org/repo", "org/repo@revision"])
+def test_hub_archive_uses_vllm_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, dataset_repo: str):
     source = tmp_path / "source.tar"
     _archive(source, "data/1q1a/video_json_map.json")
 
     class FS:
         def get_file(self, remote: str, local: str) -> None:
-            assert remote == "datasets/org/repo/data.tar.gz"
+            assert remote == f"datasets/{dataset_repo}/data.tar.gz"
             Path(local).write_bytes(source.read_bytes())
 
     monkeypatch.setenv("HF_HOME", str(tmp_path / "hf"))
     monkeypatch.setattr(data, "hf_fs", lambda: FS())
-    assert (data.resolve_omniinteract_root(None, "org/repo") / "1q1a").is_dir()
+    assert (data.resolve_omniinteract_root(None, dataset_repo) / "1q1a").is_dir()
 
 
 def test_media_commands_are_bounded(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -285,7 +286,8 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 class _CompletionClient:
     def __init__(self, collector: RealtimeEventCollector):
-        self.events, self.acks = collector, []
+        self.events = collector
+        self.acks: list[tuple[str, int]] = []
 
     def raise_if_reader_stopped(self) -> None:
         return None
@@ -430,8 +432,11 @@ def test_atomic_write_preserves_destination_on_failure(tmp_path: Path, monkeypat
 class _RealtimeClient:
     instances: list[_RealtimeClient] = []
 
-    def __init__(self, url: str, **kwargs):
-        self.url, self.events, self.acks, self.configure_kwargs = url, RealtimeEventCollector(), [], {}
+    def __init__(self, url: str, **kwargs: object):
+        self.url = url
+        self.events = RealtimeEventCollector()
+        self.acks: list[tuple[str, int]] = []
+        self.configure_kwargs: dict[str, object] = {}
         self.instances.append(self)
 
     async def __aenter__(self):
@@ -440,7 +445,7 @@ class _RealtimeClient:
     async def __aexit__(self, *args):
         return None
 
-    async def configure(self, model: str, **kwargs) -> None:
+    async def configure(self, model: str, **kwargs: object) -> None:
         self.configure_kwargs = kwargs
         self.events.add({"type": "session.created", "session": {"capabilities": {"chunk_period_ms": 1000}}})
 
