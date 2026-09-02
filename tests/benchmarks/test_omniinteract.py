@@ -432,7 +432,7 @@ def test_atomic_write_preserves_destination_on_failure(tmp_path: Path, monkeypat
 class _RealtimeClient:
     instances: list[_RealtimeClient] = []
 
-    def __init__(self, url: str, **kwargs: object):
+    def __init__(self, url: str, **kwargs):
         self.url = url
         self.events = RealtimeEventCollector()
         self.acks: list[tuple[str, int]] = []
@@ -445,7 +445,7 @@ class _RealtimeClient:
     async def __aexit__(self, *args):
         return None
 
-    async def configure(self, model: str, **kwargs: object) -> None:
+    async def configure(self, model: str, **kwargs) -> None:
         self.configure_kwargs = kwargs
         self.events.add({"type": "session.created", "session": {"capabilities": {"chunk_period_ms": 1000}}})
 

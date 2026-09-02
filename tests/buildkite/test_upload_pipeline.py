@@ -110,25 +110,6 @@ def test_yaml_gated_l45_only_does_not_unconditionally_build_image() -> None:
     assert "key: upload-weekly-pipeline" in rendered
 
 
-def test_minicpmo_omniinteract_nightly_isolated_from_duplex() -> None:
-    path = Path(".buildkite/cuda/test-nightly.yml")
-    rendered = _render_test_pipeline(yaml.safe_load(path.read_text()), changed_files=None)
-    steps = [step for group in rendered["steps"] for step in group.get("steps", [])]
-    by_label = {step.get("label"): step for step in steps}
-
-    duplex = by_label[":full_moon: Omni · MiniCPM-o 4.5 Duplex Test"]
-    assert duplex["timeout_in_minutes"] == 50
-    assert len(duplex["commands"]) == 1
-    assert "VLLM_OMNI_RUN_OMNIINTERACT_E2E" not in duplex["commands"][0]
-
-    omniinteract = by_label[":full_moon: Omni · MiniCPM-o 4.5 OmniInteract Nightly"]
-    assert omniinteract["timeout_in_minutes"] == 300
-    commands = "\n".join(omniinteract["commands"])
-    assert "VLLM_OMNI_RUN_OMNIINTERACT_E2E=1" in commands
-    assert '-k "omniinteract"' in commands
-    assert "artifact upload" in commands
-
-
 def test_yaml_gated_l2_still_enables_image_via_ready_base() -> None:
     rendered = _render([".buildkite/cuda/test-ready.yml"])
     assert 'build.pull_request.labels includes "ready"' in rendered

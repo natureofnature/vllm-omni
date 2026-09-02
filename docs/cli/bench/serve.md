@@ -307,11 +307,12 @@ omitted from the official manifest; `audio_clipped_bytes` records output beyond 
 TTFT, TTFP, and RTF start at client receipt of `response.created`. TPOT/ITL use engine stage-0 timing; ITL is emitted only when
 every token interval is present.
 
-The dedicated CUDA Nightly benchmark gate runs four deterministic cases from each OmniInteract subset (12 videos total),
-with no warmups and a maximum concurrency of two. It requires every case to commit its input, complete any emitted response
-lifecycles, and publish parseable WAV, transcript, event, and result artifacts. A valid LISTEN-only case may have no response
-audio or transcript chunks. Official-manifest eligibility is reported separately because clipped or cancelled output is a
-benchmark-quality signal, not a transport failure. This gate does not score answer accuracy.
+The dedicated CUDA performance gate in the Nightly pipeline runs four deterministic cases from each OmniInteract subset
+(12 videos total), with no warmups and a maximum concurrency of two. It requires every case to commit its input, complete
+any emitted response lifecycles, and publish the expected WAV, transcript, event, and result artifacts without errors. A
+valid LISTEN-only case may have no response audio or transcript chunks. Official-manifest eligibility is reported separately
+because clipped or cancelled output is a benchmark-quality signal, not a transport failure. This gate does not score answer
+accuracy.
 
 ### Multi-Modal Benchmark
 
