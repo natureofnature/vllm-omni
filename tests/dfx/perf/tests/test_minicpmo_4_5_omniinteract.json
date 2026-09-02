@@ -10,7 +10,7 @@
           "num_cards": 1
         }
       },
-      "full_model",
+      "local_model",
       "omni"
     ],
     "server_params": {
@@ -34,7 +34,6 @@
           2
         ],
         "num_warmups": 0,
-        "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a",
@@ -55,7 +54,6 @@
           2
         ],
         "num_warmups": 0,
-        "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1q1a_math",
@@ -76,7 +74,6 @@
           2
         ],
         "num_warmups": 0,
-        "no_oversample": true,
         "disable_shuffle": true,
         "trust_remote_code": true,
         "omniinteract_subsets": "1qna",

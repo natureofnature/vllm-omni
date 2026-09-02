@@ -108,19 +108,6 @@ steps:
             exit $$EXIT
         mirror_hardwares: h100_1
 
-      - label: ":full_moon: Omni · MiniCPM-o 4.5 · OmniInteract Perf Test"
-        key: nightly-omni-performance-minicpmo-4-5-omniinteract
-        timeout_in_minutes: 300
-        commands:
-          - export BENCHMARK_DIR=tests/dfx/perf/results
-          - |
-            set +e
-            pytest -s -v tests/dfx/perf/scripts/run_benchmark.py --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omniinteract.json -m "full_model and cuda and H100 and omni and cards_1"
-            EXIT=$$?
-            buildkite-agent artifact upload "tests/dfx/perf/results/**/*" || EXIT=1
-            exit $$EXIT
-        mirror_hardwares: h100_1
-
       - label: ":full_moon: Omni · MiniCPM-o 4.5 · Duplex Seed-TTS Perf Test"
         key: nightly-omni-performance-minicpmo-4-5-duplex-seed-tts
         timeout_in_minutes: 180

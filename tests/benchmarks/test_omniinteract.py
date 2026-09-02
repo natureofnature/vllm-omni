@@ -286,8 +286,7 @@ def test_response_ledger_rejects_identity_errors(events, match: str):
 
 class _CompletionClient:
     def __init__(self, collector: RealtimeEventCollector):
-        self.events = collector
-        self.acks: list[tuple[str, int]] = []
+        self.events, self.acks = collector, []
 
     def raise_if_reader_stopped(self) -> None:
         return None
@@ -433,10 +432,7 @@ class _RealtimeClient:
     instances: list[_RealtimeClient] = []
 
     def __init__(self, url: str, **kwargs):
-        self.url = url
-        self.events = RealtimeEventCollector()
-        self.acks: list[tuple[str, int]] = []
-        self.configure_kwargs: dict[str, object] = {}
+        self.url, self.events, self.acks, self.configure_kwargs = url, RealtimeEventCollector(), [], {}
         self.instances.append(self)
 
     async def __aenter__(self):
