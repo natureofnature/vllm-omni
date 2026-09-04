@@ -168,6 +168,37 @@ def test_capacity_managed_streaming_window_at_limit_still_appends(mocker: Mocker
     assert request.num_prompt_tokens == 4070
 
 
+def test_capacity_managed_streaming_prompt_appends_from_declared_length_without_ids_prompt(
+    mocker: MockerFixture,
+) -> None:
+    request = _streaming_request(mocker, num_computed_tokens=20)
+    payload = {
+        "ids": {"tts": [1, 2, 3]},
+        "hidden_states": {"tts": [[0.1], [0.2], [0.3]]},
+        "meta": {
+            "next_stage_prompt_len": 4,
+            "next_stage_generation_tokens": 26,
+        },
+    }
+
+    replaced = construct_next_stage_streaming_input_prompt(
+        payload,
+        request,
+        max_model_len=4096,
+        previous_condition_len=4,
+        previous_condition_seq=0,
+        condition_seq=1,
+        recompute_previous_chunks=1,
+        recompute_on_capacity=True,
+    )
+
+    assert replaced is False
+    assert request.num_computed_tokens == 20
+    assert request.num_prompt_tokens == 24
+    assert request.prompt_token_ids == [0] * 24
+    request.update_block_hashes.assert_called_once_with()
+
+
 def test_streaming_window_builds_one_chunk_recompute_recipe(mocker: MockerFixture) -> None:
     previous_condition_len = 10
     previous_codes = list(range(25))

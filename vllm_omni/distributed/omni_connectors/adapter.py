@@ -229,17 +229,19 @@ def construct_next_stage_streaming_input_prompt(
     recompute_previous_chunks: int = 0,
     recompute_on_capacity: bool = False,
 ) -> bool:
-    """Update a downstream streaming request prompt from connector payload ids.
+    """Update a downstream streaming request prompt from connector payload.
 
     Async-chunk downstream stages are prewarmed before the real Talker prompt is
-    known. When a Thinker payload carries ``ids.prompt``, this helper:
+    known. When a Thinker payload carries ``ids.prompt`` or declares the
+    placeholder length in ``meta.next_stage_prompt_len``, this helper:
 
     * Preserves ``num_computed_tokens`` while extending a non-window prompt.
       Explicit replacements and one-condition window recomputes reset it. A
       full-attention Talker recomputes only when the next condition would
       exceed its context limit.
     * Moves already-computed output tokens into ``prompt_token_ids``.
-    * Appends a new placeholder prompt slice sized from the upstream ids.
+    * Appends a placeholder slice using the declared downstream prompt length,
+      or derives its length from ``ids.prompt`` for legacy producers.
     * Refreshes block hashes so the scheduler allocates KV slots for the
       extended prompt without discarding prior computed state.
     """
@@ -388,7 +390,12 @@ def construct_next_stage_streaming_input_prompt(
         request.update_block_hashes()
         return True
     prompt_token_ids = ids.get("prompt", None)
-    if not prompt_token_ids:
+    has_declared_prompt_len = (
+        isinstance(next_stage_prompt_len, int)
+        and not isinstance(next_stage_prompt_len, bool)
+        and next_stage_prompt_len > 0
+    )
+    if not has_declared_prompt_len and not prompt_token_ids:
         return False
     num_computed_tokens = request.num_computed_tokens
     kept_output_tokens = request._all_token_ids[request.num_prompt_tokens : num_computed_tokens]
@@ -397,7 +404,7 @@ def construct_next_stage_streaming_input_prompt(
     assert request.prompt_token_ids is not None
     # Extend prompt with kept output tokens.
     request.prompt_token_ids.extend(kept_output_tokens)
-    if isinstance(next_stage_prompt_len, int) and next_stage_prompt_len > 0:
+    if has_declared_prompt_len:
         next_prompt_len = next_stage_prompt_len
     else:
         next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))

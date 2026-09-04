@@ -578,7 +578,7 @@ def test_explicit_model_intermediate_prompt_replacement_releases_cache_and_water
     sched.encoder_cache_manager.free.assert_called_once_with(session)
 
 
-def test_talker_capacity_exact_fit_extends_without_recompute() -> None:
+def test_talker_capacity_exact_fit_extends_from_declared_length_without_ids_prompt() -> None:
     sched = _make_scheduler(stage_id=1)
     adapter = _make_talker_adapter(max_model_len=100)
     sched.chunk_transfer_adapter = adapter
@@ -596,6 +596,7 @@ def test_talker_capacity_exact_fit_extends_without_recompute() -> None:
     adapter._streaming_condition_lengths[session.request_id] = 20
     adapter._streaming_condition_seqs[session.request_id] = 0
     update = _make_talker_update(16, condition_seq=1)
+    update.model_intermediate_buffer["ids"] = {"tts": [1, 2, 3]}
 
     sched._update_request_as_session(session, update)
 
@@ -611,6 +612,8 @@ def test_talker_capacity_exact_fit_extends_without_recompute() -> None:
     assert adapter._streaming_condition_lengths[session.request_id] == 16
     assert adapter._streaming_condition_seqs[session.request_id] == 1
     assert session._omni_segment_generation == 1
+    assert session.status == RequestStatus.WAITING
+    assert sched.num_waiting_for_streaming_input == 0
     sched._free_request_blocks.assert_not_called()
     sched.encoder_cache_manager.free.assert_not_called()
 

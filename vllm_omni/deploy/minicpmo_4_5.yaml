@@ -64,8 +64,13 @@ stages:
 
   - stage_id: 1
     max_num_seqs: 4
-    # Preserve the checkpoint's full-attention Talker prompt while it fits;
-    # native duplex rolls over to a one-chunk window at context capacity.
+    # Native duplex uses MiniCPMTTS.generate_with_buffer's supported
+    # sliding_recompute policy: retain one completed condition/codec chunk
+    # when the next condition arrives. Other deploy profiles continue to use
+    # the checkpoint's full_attention policy.
+    hf_overrides:
+      tts_config:
+        attention_type: sliding_recompute
     # Leave device-level headroom for the colocated HiFi-GAN cuDNN workspace.
     gpu_memory_utilization: 0.15
     enforce_eager: false
@@ -113,10 +118,8 @@ platforms:
   cuda:
     stages:
       - stage_id: 1
-        # Full-attention occupancy is bounded by max_num_seqs * max_model_len
-        # (4 * 4096 = 16384 tokens). Keep the reported CUDA KV token capacity
-        # above that bound because physical-preemption replay is unsupported.
-        # The explicit cap leaves device headroom for concurrent Stage 2.
+        # Four Talker streams need much less KV than automatic sizing.
+        # Leave single-GPU headroom for concurrent Stage 2 diffusion batches.
         kv_cache_memory_bytes: 2147483648  # 2 GiB
 
   npu:
