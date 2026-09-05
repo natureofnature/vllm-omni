@@ -47,6 +47,7 @@ from vllm_omni.config.stage_config import (
     build_stage_runtime_overrides,
     load_deploy_config,
     normalize_pipeline_cli_overrides,
+    reconcile_diffusion_attention_overrides,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -319,13 +320,23 @@ def _resolve_scheduler_path(execution_type: StageExecutionType, async_scheduling
     return _scheduler_path(_resolve_scheduler(execution_type, async_scheduling))
 
 
-def _stage_cli_overrides(stage_id: int, cli_overrides: Mapping[str, Any]) -> dict[str, Any]:
+def _stage_cli_overrides(
+    stage_id: int,
+    cli_overrides: Mapping[str, Any],
+    *,
+    execution_type: StageExecutionType | None = None,
+) -> dict[str, Any]:
     runtime_overrides = build_stage_runtime_overrides(stage_id, dict(cli_overrides))
     global_stage_fields = _global_stage_cli_fields()
     result: dict[str, Any] = {}
     for key, value in runtime_overrides.items():
         if key in global_stage_fields or f"stage_{stage_id}_{key}" in cli_overrides:
             result[key] = _copy_value(value)
+
+    # step_execution is a diffusion execution protocol, not an LLM engine
+    # argument. Keep global and stage-scoped CLI values off AR/generation stages.
+    if execution_type is not None and execution_type is not StageExecutionType.DIFFUSION:
+        result.pop("step_execution", None)
     return result
 
 
@@ -1207,6 +1218,9 @@ def _stage_engine_values(
     if topology.omni_kv_config:
         engine["omni_kv_config"] = _copy_value(topology.omni_kv_config)
     if stage_cli_overrides:
+        if topology.execution_type == StageExecutionType.DIFFUSION:
+            # Mirror StageConfig.to_omegaconf so both projections resolve alike.
+            reconcile_diffusion_attention_overrides(engine, stage_cli_overrides)
         engine.update(_copy_value(stage_cli_overrides))
     _validate_stage_engine_override_ownership(
         topology.stage_id,
@@ -1874,7 +1888,11 @@ class VllmOmniConfig:
                 _stage_engine_values(
                     deploy_by_id.get(topology.stage_id),
                     topology,
-                    _stage_cli_overrides(topology.stage_id, cli_overrides),
+                    _stage_cli_overrides(
+                        topology.stage_id,
+                        cli_overrides,
+                        execution_type=topology.execution_type,
+                    ),
                 ),
                 model=model,
             )

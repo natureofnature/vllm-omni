@@ -763,13 +763,14 @@ def prepare_engine_environment() -> None:
         pass
 
 
-def _maybe_set_qwen3_omni_moe_env(engine_args_dict: dict[str, Any]) -> None:
+def _maybe_set_qwen3_omni_moe_backend(engine_args_dict: dict[str, Any]) -> None:
+    """Choose the stable MoE backend when Qwen3-Omni has no explicit choice."""
     if (
         engine_args_dict.get("model_arch") == "Qwen3OmniMoeForConditionalGeneration"
-        and "VLLM_USE_FLASHINFER_MOE_FP16" not in os.environ
+        and engine_args_dict.get("moe_backend", "auto") == "auto"
     ):
-        os.environ["VLLM_USE_FLASHINFER_MOE_FP16"] = "0"
-        logger.info("[stage_init] Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni stage")
+        engine_args_dict["moe_backend"] = "triton"
+        logger.info("[stage_init] Set moe_backend=triton for Qwen3-Omni stage")
 
 
 def split_devices_for_replicas(
@@ -1253,9 +1254,19 @@ def _finalize_engine_args_dict(
     if is_diffusion:
         from vllm_omni.diffusion.data import parse_attention_config
 
-        if engine_args_dict.get("diffusion_attention_config") is not None:
+        # Fold the attention shorthand into the structured config so only one
+        # representation reaches OmniDiffusionConfig.from_kwargs.
+        attention_backend = engine_args_dict.pop("diffusion_attention_backend", None)
+        fastvideo_vsa_topk = engine_args_dict.pop("fastvideo_vsa_topk", None)
+        if (
+            engine_args_dict.get("diffusion_attention_config") is not None
+            or attention_backend is not None
+            or fastvideo_vsa_topk is not None
+        ):
             engine_args_dict["diffusion_attention_config"] = parse_attention_config(
-                engine_args_dict["diffusion_attention_config"],
+                engine_args_dict.get("diffusion_attention_config"),
+                attention_backend=attention_backend,
+                fastvideo_vsa_topk=fastvideo_vsa_topk,
             )
     else:
         resolve_worker_cls(engine_args_dict)
@@ -1270,9 +1281,8 @@ def _finalize_engine_args_dict(
     engine_args_dict["has_sampling_extra_args"] = has_sampling_extra_args
     engine_args_dict["sampling_extra_args_keys"] = sampling_extra_args_keys
 
-    # TODO: Remove this after the performance regression is fixed
-    # Set VLLM_USE_FLASHINFER_MOE_FP16=0 for Qwen3-Omni to avoid performance regression
-    _maybe_set_qwen3_omni_moe_env(engine_args_dict)
+    # Select the typed backend option during stage argument finalization.
+    _maybe_set_qwen3_omni_moe_backend(engine_args_dict)
     return engine_args_dict
 
 
@@ -1283,7 +1293,7 @@ def build_legacy_engine_args_dict(
     cli_tokenizer: str | None = None,
 ) -> dict[str, Any]:
     """Implement engine-argument building for the legacy stage representation."""
-    engine_args_dict = _to_dict(stage_config.engine_args)
+    engine_args_dict = copy.deepcopy(_to_dict(stage_config.engine_args))
     # Legacy configs can materialize an omitted optional TP size as None.
     # Remove it from the detached adapter dict so the backend default applies
     # without mutating stage_config.engine_args.
