@@ -318,7 +318,11 @@ class DuplexSessionConfig:
         ``realtime_*`` keys of ``extra_body`` exactly like the old
         ``_session_create_from_realtime``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.duplex.turn_detection import (
+            normalize_turn_detection_session_payload,
+            validate_realtime_turn_detection,
+        )
+        from vllm_omni.engine.realtime.commands import (
             RealtimeInputDefaults,
             duplex_response_format,
             input_audio_transcription_config,
@@ -326,10 +330,6 @@ class DuplexSessionConfig:
             realtime_max_output_tokens,
             realtime_overlap_fields,
             validate_realtime_session_audio_formats,
-        )
-        from vllm_omni.engine.duplex.turn_detection import (
-            normalize_turn_detection_session_payload,
-            validate_realtime_turn_detection,
         )
 
         payload: dict[str, Any] = dict(session_payload)
@@ -421,7 +421,7 @@ class DuplexSessionConfig:
         ``ref_audio_update_unsupported``) exactly as the old serving path did.
         ``audio_started`` is ``playback.generated_ms > 0 or playback.sent_ms > 0``.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.realtime.commands import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
             duplex_response_format,
             input_audio_transcription_config,
@@ -609,7 +609,7 @@ class ResponseCreateOptions:
         for options a model-native duplex session cannot apply per response.
         Private runtime keys in ``extra_body`` are dropped.
         """
-        from vllm_omni.engine.duplex.realtime_commands import (
+        from vllm_omni.engine.realtime.commands import (
             REALTIME_OUTPUT_AUDIO_FORMATS,
             duplex_response_format,
             parse_realtime_audio_format,
@@ -758,14 +758,14 @@ def realtime_item_to_history_message(item: object) -> dict[str, object] | None:
 
 def realtime_max_output_tokens(value: object) -> int | None:
     """Normalize Realtime max output tokens (``"inf"`` -> ``None``)."""
-    from vllm_omni.engine.duplex.realtime_commands import realtime_max_output_tokens as _impl
+    from vllm_omni.engine.realtime.commands import realtime_max_output_tokens as _impl
 
     return _impl(value)
 
 
 def input_audio_transcription_config(session_payload: Mapping[str, Any]) -> dict[str, object] | None:
     """Return the ``input_audio_transcription`` object of a Realtime session payload."""
-    from vllm_omni.engine.duplex.realtime_commands import input_audio_transcription_config as _impl
+    from vllm_omni.engine.realtime.commands import input_audio_transcription_config as _impl
 
     return _impl(session_payload)
 

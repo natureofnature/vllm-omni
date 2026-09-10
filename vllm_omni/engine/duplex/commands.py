@@ -12,10 +12,11 @@ vocabulary the session runner bodies were written against.
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar
+
+import pybase64 as base64
 
 
 class DuplexCommandError(ValueError):
@@ -276,7 +277,7 @@ def command_from_realtime(payload: Mapping[str, Any]) -> DuplexCommand:
     function only validates and maps the payload shape. Raises
     :class:`DuplexCommandError` for malformed or unsupported payloads.
     """
-    from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
+    from vllm_omni.engine.realtime.commands import translate_realtime_command
 
     return translate_realtime_command(payload)
 

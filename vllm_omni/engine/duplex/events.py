@@ -7,7 +7,7 @@ Every public event is a frozen dataclass with explicit fields. The Realtime
 wire JSON is *derived* from those fields by :meth:`DuplexEvent.to_realtime`,
 which is pure: it never consults session state. The stateful part (response /
 item ids, content-part bookkeeping) lives in
-``vllm_omni.engine.duplex.realtime_events`` on the session runner and is
+``vllm_omni.engine.realtime.projection`` on the session runner and is
 consumed when the events are *constructed*.
 
 ``session_id`` / ``incarnation`` / ``epoch`` are bound by
@@ -17,11 +17,12 @@ consumed when the events are *constructed*.
 
 from __future__ import annotations
 
-import base64
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
 from typing import Any, ClassVar
 from uuid import uuid4
+
+import pybase64 as base64
 
 
 def new_event_id() -> str:

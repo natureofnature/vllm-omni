@@ -75,7 +75,7 @@ from vllm_omni.engine.duplex.events import (
     TranscriptDone,
     error_event,
 )
-from vllm_omni.engine.duplex.realtime_commands import (
+from vllm_omni.engine.realtime.commands import (
     RealtimeInputDefaults,
     apply_realtime_session_defaults,
     build_append_audio,

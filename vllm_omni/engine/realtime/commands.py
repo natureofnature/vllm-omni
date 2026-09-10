@@ -7,13 +7,12 @@ This is the mapping half of the former ``entrypoints/duplex/realtime_input.py``
 translator. Everything that needed per-session state in the old translator
 (input-buffer emptiness for commits, response-id fallbacks for cancels,
 conversation-item lookups, VAD) is resolved by the session runner through the
-helpers on :class:`~vllm_omni.engine.duplex.realtime_events.RealtimeProjectionState`;
+helpers on :class:`~vllm_omni.engine.realtime.projection.RealtimeProjectionState`;
 the commands produced here carry the raw client intent only.
 """
 
 from __future__ import annotations
 
-import base64
 import binascii
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -21,6 +20,7 @@ from typing import Any
 from uuid import uuid4
 
 import numpy as np
+import pybase64 as base64
 
 from vllm_omni.engine.duplex.audio import convert_input_audio_with_rate
 from vllm_omni.engine.duplex.commands import (

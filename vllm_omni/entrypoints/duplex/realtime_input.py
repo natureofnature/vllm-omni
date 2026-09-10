@@ -4,8 +4,8 @@
 """Thin OpenAI Realtime wire envelope for one websocket connection.
 
 Everything that needed session state now lives engine-side
-(``vllm_omni.engine.duplex.realtime_commands`` for the command mapping,
-``vllm_omni.engine.duplex.realtime_events`` for the projection state). What is
+(``vllm_omni.engine.realtime.commands`` for the command mapping,
+``vllm_omni.engine.realtime.projection`` for the projection state). What is
 left here is the per-connection handshake policy (query-param defaults,
 autostart / resume-only rules, ``session.resume`` parsing), the wire defaults
 used to translate appends, and error rendering through the typed
@@ -20,7 +20,7 @@ from typing import Any
 
 from vllm_omni.engine.duplex.commands import DuplexCommand, DuplexCommandError
 from vllm_omni.engine.duplex.events import error_event
-from vllm_omni.engine.duplex.realtime_commands import (
+from vllm_omni.engine.realtime.commands import (
     RealtimeInputDefaults,
     translate_realtime_command,
 )

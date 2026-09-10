@@ -26,7 +26,6 @@ orchestrator loop:
 from __future__ import annotations
 
 import asyncio
-import base64
 import binascii
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -35,6 +34,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import pybase64 as base64
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.audio import convert_input_audio_with_rate
@@ -100,7 +100,16 @@ from vllm_omni.engine.duplex.plugin import (
     coerce_int,
     payload_turn_id,
 )
-from vllm_omni.engine.duplex.realtime_events import (
+from vllm_omni.engine.duplex.session import DuplexEngineSession, DuplexFenceMismatchError
+from vllm_omni.engine.duplex.turn_detection import (
+    PendingTurnDetectionUpdate,
+    ServerTurnDetector,
+    ServerVADUnavailableError,
+    TurnDetectionConfig,
+    TurnDetectionResult,
+    apply_turn_detection_result,
+)
+from vllm_omni.engine.realtime.projection import (
     RealtimeProjectionState,
     discard_pending_input_audio,
     note_input_append,
@@ -112,15 +121,6 @@ from vllm_omni.engine.duplex.realtime_events import (
     resolve_delete_item,
     resolve_truncate_item,
     retrieve_item_events,
-)
-from vllm_omni.engine.duplex.session import DuplexEngineSession, DuplexFenceMismatchError
-from vllm_omni.engine.duplex.turn_detection import (
-    PendingTurnDetectionUpdate,
-    ServerTurnDetector,
-    ServerVADUnavailableError,
-    TurnDetectionConfig,
-    TurnDetectionResult,
-    apply_turn_detection_result,
 )
 from vllm_omni.metrics.stats import OrchestratorAggregator, StageRequestStats
 from vllm_omni.outputs import OmniRequestOutput
@@ -587,7 +587,7 @@ class DuplexSessionRunner:
         session.cancel_pending_input()
         projector = self._projector
         if projector is not None:
-            from vllm_omni.engine.duplex.realtime_events import clear_input_buffer
+            from vllm_omni.engine.realtime.projection import clear_input_buffer
 
             clear_input_buffer(projector)
         self._emit_events([InputCleared()])

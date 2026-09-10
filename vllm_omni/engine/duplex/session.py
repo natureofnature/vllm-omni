@@ -47,7 +47,7 @@ from vllm_omni.engine.duplex.lease import (
 
 if TYPE_CHECKING:
     from vllm_omni.engine.duplex.plugin import DuplexModelSessionState
-    from vllm_omni.engine.duplex.realtime_events import RealtimeProjectionState
+    from vllm_omni.engine.realtime.projection import RealtimeProjectionState
 
 
 def _default_lease() -> DuplexLeaseState:
