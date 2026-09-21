@@ -154,7 +154,6 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         rows: tuple[DuplexSamplingRow, ...],
     ) -> None:
         """Apply MiniCPM duplex policy before the standard model sampler."""
-        del sampling_metadata
         self._minicpmo45_active_duplex_rows = [row.row_idx for row in rows]
         self._minicpmo45_duplex_row_sessions = {
             row.row_idx: row.session_id for row in rows if row.session_id is not None
@@ -174,6 +173,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         token_ids = self._minicpmo45_native_duplex_token_ids()
         listen_id = int(token_ids.get("listen_token_id", -1))
         turn_eos_id = int(token_ids.get("turn_eos_token_id", -1))
+        chunk_eos_id = int(token_ids.get("chunk_eos_token_id", -1))
         if listen_id < 0 or listen_id >= logits.shape[-1]:
             return
 
@@ -187,9 +187,32 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             self._minicpmo45_force_listen_applied_segments = force_listen_segments
         helper = getattr(self, "_minicpmo45_duplex_data_plane_helper", None)
         helper_sessions = getattr(helper, "sessions", None) if helper is not None else None
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         for row in rows:
             row_idx = row.row_idx
             if row_idx < 0 or row_idx >= logits.shape[0]:
+                continue
+            recent_tokens = output_token_ids[row_idx] if row_idx < len(output_token_ids) else []
+            recent_tokens = [token for token in recent_tokens if isinstance(token, int) and token >= 0]
+            if (
+                len(rows) != logits.shape[0]
+                and 0 <= chunk_eos_id < logits.shape[-1]
+                and self._minicpmo45_native_chunk_budget_exhausted(row_idx, recent_tokens)
+            ):
+                # Mixed batches use the standard sampler. Reserve their final
+                # slot too: all preceding text tokens have their own hidden,
+                # and only this control token remains unforwarded at the stop.
+                logits[row_idx, :] = float("-inf")
+                logits[row_idx, chunk_eos_id] = 0.0
+                if not recent_tokens or recent_tokens[-1] not in {
+                    listen_id,
+                    chunk_eos_id,
+                    token_ids.get("chunk_tts_eos_token_id", -1),
+                }:
+                    # Ignore a speculative extra step after the actual stop.
+                    self._record_minicpmo45_duplex_terminator(
+                        row_idx, chunk_eos_id, token_ids, output_token_ids=recent_tokens
+                    )
                 continue
             payload = row.payload
             if not isinstance(payload, dict):
@@ -209,7 +232,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                             state.last_terminator_token = None
                 else:
                     turn_ended = bool(getattr(state, "current_turn_ended", True)) if state is not None else False
-                    if turn_ended and not pending_speech_context:
+                    # turn_eos ends speech, not the current model unit. Let it
+                    # feed back and close naturally with a chunk terminator,
+                    # as in the official decoder. This history resets on the
+                    # next streaming append; explicit force_listen still wins.
+                    closing_unit = turn_eos_id in recent_tokens
+                    if turn_ended and not pending_speech_context and not closing_unit:
                         force_listen = True
 
             if not force_listen:
@@ -346,6 +374,11 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 helper.thinker.audio_past_key_values = None
             helper._configure_streaming_processor(state)
             helper._prepare_session_context(state, session_config, runtime_config=runtime_config)
+            initial_user_text = runtime_config.get("initial_user_text")
+            if duplex.get("epoch", 0) == 0 and isinstance(initial_user_text, str) and initial_user_text:
+                # The initial text turn is pending input even on silent audio.
+                # Context rebuilt in later epochs must not set the pending flag.
+                state.pending_speech_context = True
 
         audio_waveform = helper._decode_audio_payload(payload)
         try:
@@ -688,6 +721,7 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             return None
 
         sampled_ids: list[int] = []
+        output_token_ids = getattr(sampling_metadata, "output_token_ids", None) or []
         for row_idx in range(logits.shape[0]):
             row_logits = logits[row_idx : row_idx + 1].clone()
             sampled = self._sample_minicpmo45_native_duplex_row(
@@ -696,7 +730,12 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
                 row_idx=row_idx,
                 token_ids=token_ids,
             )
-            self._record_minicpmo45_duplex_terminator(row_idx, sampled, token_ids)
+            self._record_minicpmo45_duplex_terminator(
+                row_idx,
+                sampled,
+                token_ids,
+                output_token_ids=output_token_ids[row_idx] if row_idx < len(output_token_ids) else [],
+            )
             sampled_ids.append(sampled)
         return SamplerOutput(
             sampled_token_ids=torch.tensor(sampled_ids, device=logits.device, dtype=torch.int32).unsqueeze(-1),
@@ -721,19 +760,9 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         top_p = float(self._sampling_metadata_value(sampling_metadata, "top_p", row_idx, 0.8))
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if chunk_eos_id >= 0 and chunk_eos_id < logits.shape[-1]:
-            max_speak_tokens = int(
-                getattr(
-                    self,
-                    "max_new_speak_tokens_per_chunk",
-                    MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK,
-                )
-                or MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
-            )
-            request_max_tokens = self._minicpmo45_duplex_row_request_max_tokens(row_idx)
-            effective_max_speak_tokens = max_speak_tokens
-            if request_max_tokens is not None:
-                effective_max_speak_tokens = min(effective_max_speak_tokens, request_max_tokens)
-            if len(recent_tokens) >= max(1, effective_max_speak_tokens - 1):
+            # Keep the early return: even sampling one-hot logits would consume
+            # RNG and change the next unit's output in the native-only path.
+            if self._minicpmo45_native_chunk_budget_exhausted(row_idx, recent_tokens):
                 return int(chunk_eos_id)
 
             # Match the released StreamDecoder: first sample the original
@@ -865,7 +894,25 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
             max_tokens = int(value)
         except (TypeError, ValueError):
             return None
-        return max_tokens if max_tokens > 0 else None
+        return max_tokens if max_tokens >= 0 else None
+
+    def _minicpmo45_native_chunk_budget_exhausted(self, row_idx: int, recent_tokens: list[int]) -> bool:
+        payload = self._minicpmo45_duplex_payload_for_row(row_idx)
+        if not recent_tokens and isinstance(payload, dict) and payload.get("force_listen") is True:
+            # An explicit first-step LISTEN already closes even a one-token unit.
+            return False
+        limit = int(
+            getattr(
+                self,
+                "max_new_speak_tokens_per_chunk",
+                MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK,
+            )
+            or MiniCPMO45DuplexPolicy.DEFAULT_MAX_NEW_SPEAK_TOKENS_PER_CHUNK
+        )
+        request_limit = self._minicpmo45_duplex_row_request_max_tokens(row_idx)
+        if request_limit is not None:
+            limit = min(limit, request_limit)
+        return len(recent_tokens) >= max(0, limit - 1)
 
     def _finalize_minicpmo45_native_duplex_sample(
         self,
@@ -910,14 +957,22 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         history_size = MiniCPMO45DuplexPolicy.REPETITION_HISTORY_SIZE
         del generated_tokens[:-history_size]
 
-    def _record_minicpmo45_duplex_terminator(self, row_idx: int, sampled: int, token_ids: dict[str, int]) -> None:
+    def _record_minicpmo45_duplex_terminator(
+        self,
+        row_idx: int,
+        sampled: int,
+        token_ids: dict[str, int],
+        *,
+        output_token_ids: list[int] | None = None,
+    ) -> None:
         """Remember sampled unit state for the next append.
 
         The scheduler session update discards the final sampled token of a
         segment before the next streaming update, but the official duplex
         format feeds it (terminator + </unit>) into the KV at every unit
         boundary, and the model's listen/speak policy depends on seeing its own
-        past decisions. Non-terminators clear the turn-ended latch."""
+        past decisions. A turn_eos is forwarded inside the current unit; only
+        the later chunk terminator needs re-injection on the next append."""
         state = self._minicpmo45_duplex_state_for_row(row_idx)
         if state is None:
             return
@@ -928,14 +983,34 @@ class MiniCPMO45OmniForConditionalGeneration(nn.Module, SupportsMultiModal, Supp
         chunk_eos_id = token_ids.get("chunk_eos_token_id", -1)
         chunk_tts_eos_id = token_ids.get("chunk_tts_eos_token_id", -1)
         turn_eos_id = token_ids.get("turn_eos_token_id", -1)
-        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id, turn_eos_id}
+        terminators = {listen_id, chunk_eos_id, chunk_tts_eos_id}
+        recent_tokens = output_token_ids or []
+        closing_unit = turn_eos_id >= 0 and turn_eos_id in recent_tokens
+        if closing_unit and any(
+            token in terminators for token in recent_tokens[recent_tokens.index(turn_eos_id) + 1 :]
+        ):
+            # An async extra sample after this unit's closing token is not
+            # another speech turn and must not replace its pending terminator.
+            return
+        if sampled == turn_eos_id:
+            state.pending_terminator_token = None
+            state.last_terminator_token = int(sampled)
+            state.current_turn_ended = True
+            with suppress(Exception):
+                state.pending_speech_response_open = False
+            return
         if sampled in terminators:
             state.pending_terminator_token = int(sampled)
             state.last_terminator_token = int(sampled)
-            if sampled == turn_eos_id or (sampled == listen_id and force_listen):
+            if closing_unit or (sampled == listen_id and force_listen):
                 state.current_turn_ended = True
                 with suppress(Exception):
                     state.pending_speech_response_open = False
+            return
+        if closing_unit:
+            # The official decoder may sample ordinary tokens before its
+            # chunk boundary. They do not reopen speech after turn_eos.
+            state.current_turn_ended = True
             return
         if (
             sampled == tts_bos_id

@@ -2606,6 +2606,8 @@ class _RealtimeTTSProbe:
         Streams in real time for at most ``seconds``, stopping as soon as
         ``until`` holds, and returns the seconds actually appended.
         """
+        from vllm_omni.clients.duplex import wait_for_condition
+
         assert self._client is not None
         input_format = self._client.config.input_audio
         chunk = bytes(max(input_format.byte_count(chunk_ms), input_format.bytes_per_sample))
@@ -2614,7 +2616,18 @@ class _RealtimeTTSProbe:
         while streamed_s < seconds and not (until is not None and until()):
             await self._client.append_audio(chunk, is_speech=False)
             streamed_s += chunk_s
-            await asyncio.sleep(chunk_s)
+            if until is None:
+                await asyncio.sleep(chunk_s)
+            else:
+                # Keep the input cadence while active, but do not wait out the
+                # final interval after the response has already settled. The
+                # outer timeout bounds the helper's 20 ms polling interval.
+                with contextlib.suppress(TimeoutError, asyncio.TimeoutError):
+                    await asyncio.wait_for(
+                        wait_for_condition(until, timeout_s=chunk_s, label="Realtime TTS response settled"),
+                        timeout=chunk_s,
+                    )
+                    break
         return streamed_s
 
     async def close_session(self, *, timeout_s: float = 20.0) -> None:

@@ -431,7 +431,6 @@ def _stage0_stop_token_ids(tokenizer: PreTrainedTokenizerBase | None) -> list[in
         "chunk_eos_token_id",
         "chunk_tts_eos_token_id",
         "listen_token_id",
-        "turn_eos_token_id",
     )
     for field in stop_token_fields:
         token = MiniCPMO45DuplexPolicy.SPECIAL_TOKEN_FIELDS[field]
@@ -677,6 +676,12 @@ class MiniCPMO45DuplexPlugin(DuplexModelPlugin):
         stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
         token_ids = _completion_token_ids(completion) or list(segment_token_ids)
         if _coerce_int(stop_reason) != listen_id and (not token_ids or token_ids[-1] != listen_id):
+            return None
+        cumulative_ids = _coerce_int_list(getattr(completion, "cumulative_token_ids", None))
+        unit_ids = cumulative_ids if len(cumulative_ids) > len(token_ids) else token_ids
+        if MiniCPMO45DuplexPolicy.turn_ends_with_listen(unit_ids, special_token_ids):
+            # turn_eos must reach the Talker with its own hidden state even
+            # when the official decoder closes this speaking unit with LISTEN.
             return None
 
         metadata = dict(output_metadata)

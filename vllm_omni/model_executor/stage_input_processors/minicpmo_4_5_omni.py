@@ -840,6 +840,8 @@ def llm2tts(
         # text would be re-handed to the talker on text-less continuations.
         search_start = max(0, prompt_token_ids_len - 1) if is_native_duplex_handoff else 0
         for idx_t in range(search_start, len(full_token_ids)):
+            if is_native_duplex_handoff and full_token_ids[idx_t] == special_token_ids.get("turn_eos_token_id"):
+                break
             if full_token_ids[idx_t] == tts_bos_id:
                 tts_bos_idx = idx_t + 1
         if tts_bos_idx is None and not is_native_duplex_handoff and llm_output_ids:
@@ -857,14 +859,8 @@ def llm2tts(
 
         tts_token_ids_slice = tts_hidden_slice = None
         native_segment_end = False
-        if tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
+        if not is_native_duplex_handoff and tts_bos_idx is not None and thinker_hidden_states.shape[0] > tts_bos_idx:
             end_idx = tts_eos_idx if tts_eos_idx is not None else thinker_hidden_states.shape[0]
-            if is_native_duplex_handoff and tts_eos_idx is not None:
-                boundary_token = full_token_ids[tts_eos_idx]
-                native_segment_end = boundary_token in {
-                    special_token_ids.get("chunk_eos_token_id"),
-                    special_token_ids.get("chunk_tts_eos_token_id"),
-                }
             tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
             tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         elif is_native_duplex_handoff:
@@ -876,13 +872,18 @@ def llm2tts(
             # hidden states for TTS start after it and stop at the next
             # chunk terminator.
             listen_id = special_token_ids.get("listen_token_id")
-            speak_id = special_token_ids.get("speak_token_id")
             out_ids = llm_output_ids
             j = 0
             while j < len(out_ids) and out_ids[j] == listen_id:
                 j += 1
-            if j < len(out_ids) and out_ids[j] == speak_id:
+            out_start = None
+            if tts_bos_idx is not None:
+                out_start = max(0, tts_bos_idx - prompt_token_ids_len)
+            elif j < len(out_ids) and out_ids[j] not in tts_end_ids:
+                # Like streaming_generate, omit the first unit decision even
+                # when it is ordinary text rather than an explicit SPEAK.
                 out_start = j + 1
+            if out_start is not None:
                 out_end = len(out_ids)
                 turn_eos_id = special_token_ids.get("turn_eos_token_id")
                 for idx_t in range(out_start, len(out_ids)):
@@ -900,48 +901,23 @@ def llm2tts(
                             special_token_ids.get("chunk_tts_eos_token_id"),
                         }
                         break
-                # Map output indices onto hidden rows by END alignment: the
-                # leading decision tokens of the delta may ALSO be folded into
-                # the resumable prompt (they belong to earlier non-forwarded
-                # segments), so prompt_len + delta over-counts them and
-                # front-aligned indexing truncates the slice. The hidden
-                # tensor's last len(out_ids) rows are the delta's rows.
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
-                if hidden_base >= 0 and out_end > out_start:
+                # The final sampled chunk terminator has not been forwarded.
+                # The last N-1 hidden rows therefore belong to out_ids[:-1],
+                # not out_ids[1:]. Earlier LISTENs may also be folded into the
+                # resumable prompt, so use tail alignment rather than prompt P.
+                hidden_rows = int(thinker_hidden_states.shape[0])
+                hidden_base = hidden_rows - len(out_ids) + 1
+                if out_end > out_start:
+                    hidden_start, hidden_end = hidden_base + out_start, hidden_base + out_end
+                    if hidden_start < 0 or hidden_end > hidden_rows:
+                        raise ValueError(
+                            "MiniCPM-o native duplex TTS is missing own-token hidden states: "
+                            f"request_id={llm_output.request_id}, hidden_rows={hidden_rows}, "
+                            f"output_tokens={len(out_ids)}, tts_span=({out_start}, {out_end}). "
+                            "A turn-end token must be forwarded before a chunk terminator stops the unit."
+                        )
                     tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
-                    tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
-            elif j < len(out_ids) and out_ids[j] not in tts_end_ids:
-                # HF streaming_generate does not require an explicit <|speak|>
-                # marker. If a unit starts directly with text, the first token
-                # is fed back into the LLM but is not included in
-                # total_hidden_in_unit; TTS starts from the following token.
-                out_start = j + 1
-                out_end = len(out_ids)
-                turn_eos_id = special_token_ids.get("turn_eos_token_id")
-                for idx_t in range(out_start, len(out_ids)):
-                    token_id = out_ids[idx_t]
-                    if turn_eos_id is not None and token_id == turn_eos_id:
-                        out_end = idx_t + 1
-                        break
-                    if token_id in tts_end_ids:
-                        out_end = idx_t
-                        native_segment_end = token_id in {
-                            special_token_ids.get("chunk_eos_token_id"),
-                            special_token_ids.get("chunk_tts_eos_token_id"),
-                        }
-                        break
-                hidden_base = int(thinker_hidden_states.shape[0]) - len(out_ids)
-                if hidden_base >= 0 and out_end > out_start:
-                    tts_token_ids_slice = torch.tensor(out_ids[out_start:out_end], dtype=torch.long)
-                    tts_hidden_slice = (
-                        thinker_hidden_states[hidden_base + out_start : hidden_base + out_end]
-                        .to(torch.float32)
-                        .contiguous()
-                    )
+                    tts_hidden_slice = thinker_hidden_states[hidden_start:hidden_end].to(torch.float32).contiguous()
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
         if is_native_duplex_handoff and handoff_ids:
             handoff_text = _decode_native_duplex_token_ids(

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -99,6 +100,213 @@ def test_minicpmo_model_hook_turn_end_latch_forces_silence_to_listen():
     assert logits[0, 7].item() == 0.0
     assert torch.isneginf(logits[0, :7]).all()
     assert torch.isneginf(logits[0, 8:]).all()
+
+
+@pytest.fixture
+def native_turn_closure_case():
+    state = SimpleNamespace(current_turn_ended=False, pending_terminator_token=None, pending_speech_context=False)
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    token_ids = model._minicpmo45_native_duplex_token_ids_cache
+    token_ids.update(unit_token_id=1, speak_token_id=6, chunk_eos_token_id=12, chunk_tts_eos_token_id=13)
+    model._minicpmo45_tokenizer_cache = SimpleNamespace(bad_token_ids=[], all_special_ids=list(token_ids.values()))
+    metadata = SimpleNamespace(
+        all_greedy=True,
+        temperature=torch.tensor([0.0]),
+        top_k=torch.tensor([1]),
+        top_p=torch.tensor([1.0]),
+        generators={},
+        output_token_ids=[[6, 10]],
+    )
+    return model, row, state, metadata
+
+
+@pytest.mark.parametrize("next_token", [7, 12, 13, 11])
+def test_native_turn_eos_forwards_before_natural_unit_close(native_turn_closure_case, next_token):
+    model, row, state, metadata = native_turn_closure_case
+    logits = torch.full((1, 16), -100.0)
+    logits[0, 9] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[9]]
+    assert state.current_turn_ended is True
+    assert state.pending_terminator_token is None  # EOS will be fed inside this unit
+
+    metadata.output_token_ids[0].append(9)
+    logits.fill_(-100.0)
+    logits[0, next_token] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[next_token]]
+    assert state.current_turn_ended is True
+    assert state.pending_terminator_token == (None if next_token == 11 else next_token)
+
+    # Streaming append resets the worker's output history. Silence is idle
+    # again; an EOS from the previous unit cannot disable automatic LISTEN.
+    metadata.output_token_ids = [[]]
+    logits.fill_(0.0)
+    logits[0, 11] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (replace(row, seq=row.seq + 1),))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[7]]
+
+
+def test_native_turn_close_preserves_explicit_force_listen(native_turn_closure_case):
+    model, row, state, metadata = native_turn_closure_case
+    state.current_turn_ended = True
+    metadata.output_token_ids = [[6, 10, 9]]
+    logits = torch.zeros((1, 16))
+    logits[0, 11] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (replace(row, payload={"force_listen": True}),))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[7]]
+
+
+def test_native_turn_eos_uses_existing_last_slot_for_chunk_boundary(native_turn_closure_case):
+    model, row, state, metadata = native_turn_closure_case
+    row = replace(row, max_tokens=4)
+    logits = torch.zeros((1, 16))
+    logits[0, 9] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[9]]
+    assert state.pending_terminator_token is None
+
+    metadata.output_token_ids[0].append(9)
+    logits.fill_(0.0)
+    logits[0, 11] = 30.0
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[12]]
+    assert state.pending_terminator_token == 12
+
+    # The closing token is the only unforwarded token re-injected next unit;
+    # an asynchronous extra sample cannot replace it with a second turn EOS.
+    model._record_minicpmo45_duplex_terminator(
+        0, 9, model._minicpmo45_native_duplex_token_ids_cache, output_token_ids=[6, 10, 9, 12]
+    )
+    assert state.pending_terminator_token == 12
+
+
+@pytest.mark.parametrize("req_ids", [["native"], ["native", "plain"], ["plain", "native"]])
+@pytest.mark.parametrize("limit_source", ["request", "context"])
+@pytest.mark.parametrize("history", [[6, 10], [6, 10, 9], []])
+def test_native_budget_closes_before_handoff(native_turn_closure_case, req_ids, limit_source, history):
+    from vllm.v1.sample.logits_processor import LogitsProcessors
+    from vllm.v1.sample.metadata import SamplingMetadata
+    from vllm.v1.sample.sampler import Sampler
+
+    from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
+    from vllm_omni.model_executor.stage_input_processors.minicpmo_4_5_omni import llm2tts
+    from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
+
+    model, row, state, _ = native_turn_closure_case
+    model.prefer_model_sampler = True
+    native_idx = req_ids.index("native")
+    prompt_ids = [1, 2]
+    budget = len(history) + 1
+    histories = [list(history) if req_id == "native" else [] for req_id in req_ids]
+    metadata = SamplingMetadata(
+        temperature=None,
+        all_greedy=True,
+        all_random=False,
+        top_p=None,
+        top_k=None,
+        generators={},
+        max_num_logprobs=None,
+        no_penalties=True,
+        prompt_token_ids=None,
+        frequency_penalties=torch.zeros(len(req_ids)),
+        presence_penalties=torch.zeros(len(req_ids)),
+        repetition_penalties=torch.ones(len(req_ids)),
+        output_token_ids=histories,
+        allowed_token_ids_mask=None,
+        bad_words_token_ids={},
+        logitsprocs=LogitsProcessors([]),
+    )
+    runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.model = model
+    runner.sampler = Sampler()
+    runner.max_model_len = len(prompt_ids) + budget if limit_source == "context" else 128
+    runner.input_batch = SimpleNamespace(
+        req_ids=req_ids,
+        req_output_token_ids=histories,
+        sampling_metadata=metadata,
+        update_async_output_token_ids=lambda: None,
+    )
+    params = SimpleNamespace(max_tokens=budget if limit_source == "request" else 32)
+    runner.requests = {"native": SimpleNamespace(prompt_token_ids=prompt_ids, sampling_params=params)}
+    runner.model_intermediate_buffer = {
+        "native": {
+            "duplex": {
+                "data_plane": True,
+                "session_id": row.session_id,
+                "seq": 0,
+                "payload": {"is_speech": True},
+            }
+        }
+    }
+    runner._duplex_sampling_helper = DuplexSamplingHelper()
+    runner._duplex_sampling_helper.active_request_ids.add("native")
+    logits = torch.zeros((len(req_ids), 16))
+    logits[:, 11] = 30.0
+
+    # Exercise the actual runner, including mixed-batch fallback to the vLLM
+    # sampler. The final sampled boundary has not itself been forwarded.
+    sampled = runner._sample(logits, spec_decode_metadata=None).sampled_token_ids.flatten().tolist()
+    completion = SimpleNamespace(
+        token_ids=[*history, sampled[native_idx]],
+        text="",
+        finish_reason="length",
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "meta": model._minicpmo45_native_duplex_token_ids_cache,
+            "latent": torch.tensor([*prompt_ids, *history], dtype=torch.float32).reshape(-1, 1),
+        },
+    )
+    converted = llm2tts(
+        [SimpleNamespace(request_id="native", prompt_token_ids=prompt_ids, outputs=[completion])],
+        prompt=[{}],
+        _streaming_context=SimpleNamespace(bridge_states={}),
+    )
+
+    assert sampled[native_idx] == 12
+    assert all(token == 11 for idx, token in enumerate(sampled) if idx != native_idx)
+    assert state.pending_terminator_token == 12
+    assert params.max_tokens == (budget if limit_source == "request" else 32)
+    if history:
+        info = converted[0]["model_intermediate_buffer"]
+        assert info["ids"]["tts"] == history[1:]
+        assert torch.tensor(info["hidden_states"]["tts"])[:, 0].tolist() == history[1:]
+    else:
+        assert converted == []
+
+
+def test_native_budget_preserves_rng_and_explicit_single_token_listen(native_turn_closure_case):
+    model, row, state, metadata = native_turn_closure_case
+    row = replace(row, max_tokens=3)
+    metadata.all_greedy = False
+    generator = torch.Generator().manual_seed(17)
+    metadata.generators = {0: generator}
+    before = generator.get_state().clone()
+    logits = torch.zeros((1, 16))
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[12]]
+    assert torch.equal(generator.get_state(), before)
+
+    metadata.all_greedy = True
+    metadata.output_token_ids = [[]]
+    row = replace(row, seq=row.seq + 1, max_tokens=1, payload={"force_listen": True})
+    logits.fill_(0.0)
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert model.sample(logits, metadata).sampled_token_ids.tolist() == [[7]]
+    assert state.pending_terminator_token == 7
+
+
+def test_native_mixed_budget_does_not_overwrite_async_terminal(native_turn_closure_case):
+    model, row, state, metadata = native_turn_closure_case
+    row = replace(row, max_tokens=3)
+    state.pending_terminator_token = 7
+    metadata.output_token_ids = [[6, 10, 7], []]
+    logits = torch.zeros((2, 16))
+    model.prepare_duplex_sampling(logits, metadata, (row,))
+    assert model.sample(logits, metadata) is None
+    assert state.pending_terminator_token == 7
 
 
 def test_minicpmo_model_hook_pending_speech_after_turn_eos_allows_silence_sampling():
@@ -326,11 +534,13 @@ def test_minicpmo_model_hook_ignores_serving_new_user_turn_marker():
     assert torch.equal(logits, original_logits)
 
 
-def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
+@pytest.mark.parametrize(("context_limit", "expected_budget"), [(128, 32), (5, 3), (2, 0), (1, 0)])
+def test_generic_ar_runner_builds_typed_duplex_sampling_rows(context_limit, expected_budget):
     from vllm_omni.model_executor.duplex_sampling import DuplexSamplingHelper
     from vllm_omni.worker.gpu_ar_model_runner import GPUARModelRunner
 
     runner = GPUARModelRunner.__new__(GPUARModelRunner)
+    runner.max_model_len = context_limit
     runner.input_batch = SimpleNamespace(req_ids=["req-duplex", "req-plain"])
     runner.model_intermediate_buffer = {
         "req-duplex": {
@@ -345,6 +555,7 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     runner.requests = {
         "req-duplex": SimpleNamespace(
             sampling_params=SimpleNamespace(max_tokens=32),
+            prompt_token_ids=[1, 2],
         )
     }
     helper = DuplexSamplingHelper()
@@ -358,7 +569,7 @@ def test_generic_ar_runner_builds_typed_duplex_sampling_rows():
     assert rows[0].session_id == "sid-runner-hook"
     assert rows[0].seq == 4
     assert rows[0].payload == {"is_speech": True}
-    assert rows[0].max_tokens == 32
+    assert rows[0].max_tokens == expected_budget
 
 
 def test_generic_ar_runner_skips_duplex_rows_without_model_hook():
@@ -2613,14 +2824,206 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     runtime._require_special_token_ids = lambda: None
     runtime._decode_ref_audio_from_session_config = lambda _config: np.array([0.1, -0.1], dtype=np.float32)
     runtime._encode_text = lambda text: token_map[text]
-    runtime._embed_token = lambda token_id: torch.full((1, 2), float(token_id))
+    embedder = torch.nn.Embedding.from_pretrained(torch.arange(6, dtype=torch.float32).unsqueeze(1).repeat(1, 2))
+    runtime._token_embedder = lambda: embedder
     runtime._stage_ref_audio_embeddings = lambda ref_audio, state=None: torch.tensor([[10.0, 11.0], [12.0, 13.0]])
 
     state = _MiniCPMO45Stage0SessionState(session_id="sid-ref")
     runtime._prepare_session_context(state, {"instructions": "Use speech.", "extra_body": {"ref_audio_data": "x"}})
 
     assert state.context_token_ids == [1, 2, 3, 151683, 151683, 4, 5]
-    assert len(state.context_embeds) == 6
+    assert torch.equal(
+        torch.cat(state.context_embeds),
+        torch.tensor([[1.0, 1.0], [2.0, 2.0], [3.0, 3.0], [10.0, 11.0], [12.0, 13.0], [4.0, 4.0], [5.0, 5.0]]),
+    )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    ("prefix_ids", "suffix_ids", "has_ref", "ref_embeds_present"),
+    [
+        ([1, 2, 1], [3, 4], False, False),
+        ([1, 2, 1], [3, 4], True, True),
+        ([1, 2, 1], [3, 4], True, False),
+        ([], [3, 4], True, True),
+        ([1, 2], [], True, True),
+        ([], [], False, False),
+        ([], [], True, True),
+    ],
+)
+def test_minicpmo_stage0_batches_context_spans_without_changing_values(
+    dtype, prefix_ids, suffix_ids, has_ref, ref_embeds_present
+):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.policy import MiniCPMO45DuplexPolicy
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+        _MiniCPMO45Stage0SessionState,
+    )
+
+    embedder = torch.nn.Embedding.from_pretrained(torch.arange(32, dtype=dtype).reshape(8, 4))
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.thinker = embedder
+    runtime.unit_token_id = 7
+    runtime._stage_runtime_ready = lambda: True
+    runtime._require_special_token_ids = lambda: None
+    reference = np.zeros(4, dtype=np.float32) if has_ref else None
+    runtime._decode_ref_audio_from_session_config = lambda _config: reference
+    texts = MiniCPMO45DuplexPolicy.session_context_texts("Use speech.", has_ref, "Read this.")
+    token_map = dict(zip(texts, (prefix_ids, suffix_ids), strict=True))
+    runtime._encode_text = lambda text: token_map[text]
+    ref_embeds = torch.arange(8, dtype=dtype).reshape(1, 2, 4) if ref_embeds_present else None
+    events = []
+
+    def embed(token_ids):
+        assert token_ids.dtype == torch.long
+        assert token_ids.ndim == 1 and token_ids.numel() > 0
+        events.append(("embed", token_ids.tolist()))
+        return embedder(token_ids)
+
+    state = _MiniCPMO45Stage0SessionState(session_id="context", pending_speech_context=True)
+
+    def embed_reference(audio, *, state):
+        assert audio is reference
+        assert state.session_id == "context"
+        events.append(("ref", None))
+        return ref_embeds
+
+    runtime._token_embedder = lambda: embed
+    runtime._stage_ref_audio_embeddings = embed_reference
+    runtime._prepare_session_context(
+        state, {"instructions": "Use speech."}, runtime_config={"initial_user_text": "Read this."}
+    )
+
+    expected_parts = [embedder(torch.tensor([token_id])) for token_id in prefix_ids]
+    if ref_embeds is not None:
+        expected_parts.append(ref_embeds.squeeze(0))
+    expected_parts.extend(embedder(torch.tensor([token_id])) for token_id in suffix_ids)
+    expected = torch.cat(expected_parts) if expected_parts else embedder.weight.new_empty((0, 4))
+    actual = torch.cat(state.context_embeds) if state.context_embeds else embedder.weight.new_empty((0, 4))
+    assert actual.shape == expected.shape and actual.dtype == dtype
+    assert torch.equal(actual, expected)
+    assert state.context_token_ids == prefix_ids + ([7, 7] if ref_embeds_present else []) + suffix_ids
+    assert events == (
+        ([("embed", prefix_ids)] if prefix_ids else [])
+        + ([("ref", None)] if has_ref else [])
+        + ([("embed", suffix_ids)] if suffix_ids else [])
+    )
+    assert state.pending_speech_context is True
+    assert state.current_turn_ended is True
+    assert state.audio_chunk_idx == 0
+    assert torch.equal(runtime._embed_token(2), embedder(torch.tensor([2])))
+
+
+@pytest.fixture
+def minicpmo_seeded_context_case(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import (
+        MiniCPMO45Stage0DuplexRuntime,
+    )
+
+    runtime = MiniCPMO45Stage0DuplexRuntime.__new__(MiniCPMO45Stage0DuplexRuntime)
+    runtime.sessions = {}
+    runtime.thinker = SimpleNamespace()
+    monkeypatch.setattr(runtime, "_stage_runtime_ready", lambda: True)
+    monkeypatch.setattr(runtime, "_require_special_token_ids", lambda: None)
+    monkeypatch.setattr(runtime, "_decode_ref_audio_from_session_config", lambda _config: None)
+    monkeypatch.setattr(runtime, "_encode_text", lambda text: list(text.encode("utf-8")))
+    embedder = torch.nn.Embedding.from_pretrained(torch.arange(256, dtype=torch.float32).unsqueeze(1).repeat(1, 2))
+    monkeypatch.setattr(runtime, "_token_embedder", lambda: embedder)
+    monkeypatch.setattr(runtime, "_model_device", lambda: "cpu")
+    monkeypatch.setattr(runtime, "_configure_streaming_processor", lambda state: None)
+    monkeypatch.setattr(runtime, "_decode_audio_payload", lambda payload: np.zeros(4, dtype=np.float32))
+    monkeypatch.setattr(runtime, "_decode_video_frames_payload", lambda payload: None)
+    monkeypatch.setattr(runtime, "stage_padding_token_id", lambda: 0)
+    monkeypatch.setattr(
+        runtime,
+        "_stage_prefill_embeddings_only",
+        lambda state, audio_waveform, **kwargs: {
+            "success": True,
+            "inputs_embeds": torch.zeros((1, 2)),
+            "input_token_ids": [1],
+        },
+    )
+    model, row = _minicpmo_duplex_policy_case(SimpleNamespace(), {"is_speech": False})
+    model.model = SimpleNamespace()
+    model._minicpmo45_duplex_data_plane_helper = runtime
+    duplex = {
+        "data_plane": True,
+        "session_id": row.session_id,
+        "epoch": 0,
+        "seq": row.seq,
+        "payload": row.payload,
+        "runtime_config": {"initial_user_text": "Read this sentence."},
+    }
+    return model, row, duplex
+
+
+@pytest.mark.parametrize(
+    ("runtime_config", "force_listen", "epoch", "expect_listen"),
+    [
+        pytest.param({}, False, 0, True, id="missing-seed"),
+        pytest.param({"initial_user_text": None}, False, 0, True, id="null-seed"),
+        pytest.param({"initial_user_text": ""}, False, 0, True, id="empty-seed"),
+        pytest.param({"initial_user_text": "Read this sentence."}, False, 0, False, id="seeded-text"),
+        pytest.param({"initial_user_text": "  "}, False, 0, False, id="whitespace-seed"),
+        pytest.param({"initial_user_text": "Read this sentence."}, True, 0, True, id="explicit-force-listen"),
+        pytest.param({"initial_user_text": "Read this sentence."}, False, 1, True, id="rebuilt-after-cancel"),
+    ],
+)
+def test_minicpmo_stage0_seeded_context_silence_sampling(
+    minicpmo_seeded_context_case, runtime_config, force_listen, epoch, expect_listen
+):
+    model, row, duplex = minicpmo_seeded_context_case
+    duplex.update(runtime_config=runtime_config, epoch=epoch)
+    row.payload["force_listen"] = force_listen
+    _, _, result = model.preprocess(torch.tensor([1]), torch.zeros((1, 2)), duplex=duplex)
+
+    assert result["duplex"]["success"] is True
+    state = model._minicpmo45_duplex_data_plane_helper.sessions[row.session_id]
+    assert state.context_token_ids
+    assert state.current_turn_ended is True
+
+    logits = torch.zeros((1, 16))
+    logits[0, 10] = 20.0
+    original_logits = logits.clone()
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    if expect_listen:
+        assert logits[0, 7].item() == 0.0
+        assert torch.isneginf(logits[0, :7]).all()
+        assert torch.isneginf(logits[0, 8:]).all()
+    else:
+        assert torch.equal(logits, original_logits)
+
+
+def test_minicpmo_stage0_seed_pending_flag_stays_cleared_after_append_and_epoch_reset(minicpmo_seeded_context_case):
+    model, row, duplex = minicpmo_seeded_context_case
+    model.preprocess(torch.tensor([1]), torch.zeros((1, 2)), duplex=duplex)
+    sessions = model._minicpmo45_duplex_data_plane_helper.sessions
+    state = sessions[row.session_id]
+    assert state.pending_speech_context is True
+
+    model.prepare_duplex_sampling(torch.zeros((1, 16)), SimpleNamespace(), (row,))
+    token_ids = model._minicpmo45_native_duplex_token_ids()
+    model._record_minicpmo45_duplex_terminator(0, 10, token_ids)
+    model._record_minicpmo45_duplex_terminator(0, 9, token_ids)
+    assert state.pending_speech_context is False
+
+    duplex["seq"] += 1
+    model.preprocess(torch.tensor([1]), torch.zeros((1, 2)), duplex=duplex)
+    assert sessions[row.session_id] is state
+    assert state.pending_speech_context is False
+
+    model.on_requests_finished({row.request_id})
+    assert row.session_id not in sessions
+    duplex["epoch"] = 1
+    model.preprocess(torch.tensor([1]), torch.zeros((1, 2)), duplex=duplex)
+    assert sessions[row.session_id] is not state
+    assert sessions[row.session_id].pending_speech_context is False
+
+    logits = torch.zeros((1, 16))
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert logits[0, 7].item() == 0.0
+    assert torch.isneginf(logits[0, 10])
 
 
 # ---------------------------------------------------------------------------

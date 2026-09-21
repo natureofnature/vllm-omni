@@ -21,6 +21,7 @@ class DuplexSamplingRow:
     session_id: str | None
     seq: int | None
     payload: dict[str, object] | None
+    # Effective output budget, bounded by the current prompt's context headroom.
     max_tokens: int | None
 
 
@@ -81,10 +82,19 @@ class DuplexSamplingHelper:
                 payload = None
             request = requests.get(req_id) if isinstance(requests, dict) else None
             sampling_params = getattr(request, "sampling_params", None)
+            max_tokens: int | None
             try:
                 max_tokens = int(getattr(sampling_params, "max_tokens", 0) or 0)
             except (TypeError, ValueError):
                 max_tokens = 0
+            max_tokens = max_tokens if max_tokens > 0 else None
+            max_model_len = getattr(runner, "max_model_len", None)
+            prompt_ids = getattr(request, "prompt_token_ids", None)
+            if isinstance(max_model_len, int) and prompt_ids is not None:
+                # Streaming appends replace this prompt with its accumulated
+                # context. Do not subtract output history here as well.
+                context_budget = max(0, max_model_len - len(prompt_ids))
+                max_tokens = context_budget if max_tokens is None else min(max_tokens, context_budget)
             rows.append(
                 DuplexSamplingRow(
                     row_idx=row_idx,
@@ -92,7 +102,7 @@ class DuplexSamplingHelper:
                     session_id=session_id,
                     seq=seq,
                     payload=payload,
-                    max_tokens=max_tokens if max_tokens > 0 else None,
+                    max_tokens=max_tokens,
                 )
             )
         return tuple(rows)

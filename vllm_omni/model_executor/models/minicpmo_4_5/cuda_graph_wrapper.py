@@ -191,6 +191,10 @@ class CFMGraphWrapper:
     as the graph target. The 10-step Euler loop stays in Python, replaying
     the graph 10 times per decode.
 
+    The graph function must fully overwrite cnn_out and att_out without
+    reading their previous contents. They are output-only scratch buffers,
+    not initial cache state; cnn_cache and att_cache carry that state.
+
     Graphs are retired a whole generation at a time rather than one at a time.
     Every capture shares one private memory pool, so a retired graph's blocks
     return to that pool while its live peers still hold those addresses in
@@ -352,8 +356,8 @@ class CFMGraphWrapper:
             self._stats["hits"] += 1
 
         static_inputs, static_output, graph = entry
-        for static, current in zip(static_inputs, inputs, strict=True):
-            if static is not None:
+        for index, (static, current) in enumerate(zip(static_inputs, inputs, strict=True)):
+            if static is not None and index not in (4, 5):
                 static.copy_(current)
         graph.replay()
         return (

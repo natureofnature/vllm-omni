@@ -156,18 +156,20 @@ class MiniCPMO45Stage0DuplexRuntime:
             ref_audio is not None,
             (runtime_config or {}).get("initial_user_text"),
         )
-        for token_id in self._encode_text(prefix):
-            state.context_embeds.append(self._embed_token(token_id))
-            state.context_token_ids.append(token_id)
+        prefix_ids = self._encode_text(prefix)
+        if prefix_ids:
+            state.context_embeds.append(self._embed_tokens(prefix_ids))
+            state.context_token_ids.extend(prefix_ids)
         if ref_audio is not None:
             ref_audio_embeds = self._stage_ref_audio_embeddings(ref_audio, state=state)
             if ref_audio_embeds is not None:
                 ref_audio_embeds = self._as_2d_tensor(ref_audio_embeds)
                 state.context_embeds.append(ref_audio_embeds)
                 state.context_token_ids.extend([self.unit_token_id] * int(ref_audio_embeds.shape[0]))
-        for token_id in self._encode_text(suffix):
-            state.context_embeds.append(self._embed_token(token_id))
-            state.context_token_ids.append(token_id)
+        suffix_ids = self._encode_text(suffix)
+        if suffix_ids:
+            state.context_embeds.append(self._embed_tokens(suffix_ids))
+            state.context_token_ids.extend(suffix_ids)
 
     def _stage_prefill_embeddings_only(
         self,
@@ -364,9 +366,12 @@ class MiniCPMO45Stage0DuplexRuntime:
         return value
 
     def _embed_token(self, token_id: int) -> torch.Tensor:
+        return self._embed_tokens([token_id])
+
+    def _embed_tokens(self, token_ids: list[int]) -> torch.Tensor:
         import torch
 
-        token = torch.tensor([int(token_id)], dtype=torch.long, device=self._model_device())
+        token = torch.tensor([int(token_id) for token_id in token_ids], dtype=torch.long, device=self._model_device())
         embedder = self._token_embedder()
         embeds = embedder(token)
         return self._as_2d_tensor(embeds)

@@ -42,6 +42,23 @@ class MiniCPMO45DuplexPolicy:
     DEFAULT_MIN_NEW_SPEAK_TOKENS_BEFORE_CHUNK_BOUNDARY = 8
     REPETITION_HISTORY_SIZE = 512
 
+    @staticmethod
+    def turn_ends_with_listen(token_ids: list[int], special_token_ids: dict[str, int]) -> bool:
+        """Whether final LISTEN closes speech in this unit, not a listen-only unit."""
+        if not token_ids or token_ids[-1] != special_token_ids.get("listen_token_id"):
+            return False
+        unit_stops = {
+            special_token_ids.get("listen_token_id"),
+            special_token_ids.get("chunk_eos_token_id"),
+            special_token_ids.get("chunk_tts_eos_token_id"),
+        }
+        for token in reversed(token_ids[:-1]):
+            if token == special_token_ids.get("turn_eos_token_id"):
+                return True
+            if token in unit_stops:
+                break
+        return False
+
     @classmethod
     def audio_token_count(cls, sample_count: int) -> int:
         """Audio embedding count for a clip of ``sample_count`` samples.

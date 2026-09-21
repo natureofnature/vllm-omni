@@ -71,6 +71,84 @@ def test_plain_chat_handoff_owns_talker_prompt_contract() -> None:
     assert info["meta"]["next_stage_prompt_len"] == 4
 
 
+@pytest.mark.parametrize(
+    ("prompt_bos", "output_ids", "handoff_ids"),
+    [
+        (False, [4, 21, 22, 8], [21, 22]),
+        (False, [4, 21, 10, 8], [21, 10]),
+        (False, [4, 10, 8], [10]),
+        (False, [3, 3, 4, 21, 10, 8], [21, 10]),
+        (False, [4, 21, 10, 77, 5, 88, 3], [21, 10]),
+        (False, [5, 21, 10, 9], [21, 10]),
+        (False, [99, 21, 10, 8], [21, 10]),
+        (True, [21, 10, 8], [21, 10]),
+    ],
+)
+def test_native_handoff_pairs_each_token_with_its_own_forward(prompt_bos, output_ids, handoff_ids):
+    special_ids = {
+        "listen_token_id": 3,
+        "speak_token_id": 4,
+        "tts_bos_token_id": 5,
+        "tts_eos_token_id": 6,
+        "chunk_eos_token_id": 8,
+        "chunk_tts_eos_token_id": 9,
+        "turn_eos_token_id": 10,
+    }
+    # The resumable prompt can be much longer than this output's hidden
+    # accumulator. Encode actual fed ids as hidden rows, including only N-1
+    # generated tokens: the final sampled unit terminator was never forwarded.
+    prompt_ids = [101] * 100 + ([5] if prompt_bos else [])
+    fed_ids = [101, 5 if prompt_bos else 102, *output_ids[:-1]]
+    latent = torch.tensor(fed_ids, dtype=torch.float32).reshape(-1, 1).repeat(1, 2)
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=latent,
+        multimodal_output={"duplex_prompt_token_ids": prompt_ids, "meta": special_ids},
+    )
+    context = SimpleNamespace(
+        bridge_states={},
+        source_token_decoder=lambda ids, **kwargs: " ".join(str(token) for token in ids if token >= 20),
+    )
+
+    info = llm2tts([source], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == handoff_ids
+    assert torch.tensor(info["hidden_states"]["tts"])[:, 0].tolist() == handoff_ids
+    assert bool(info["meta"].get("turn_end", False)) is (10 in handoff_ids)
+    assert info["meta"]["native_duplex_segment_text"] == " ".join(str(t) for t in handoff_ids if t >= 20)
+
+
+@pytest.mark.parametrize("output_ids", [[4, 21, 10], [4, 10], [4, 21]])
+def test_native_handoff_rejects_missing_terminal_own_hidden(output_ids):
+    prompt_ids = [101, 102]
+    source = _output(
+        prompt_ids=prompt_ids,
+        output_ids=output_ids,
+        latent=torch.tensor([*prompt_ids, *output_ids[:-1]], dtype=torch.float32).reshape(-1, 1),
+        multimodal_output={
+            "duplex_prompt_token_ids": prompt_ids,
+            "meta": {"speak_token_id": 4, "tts_bos_token_id": 5, "chunk_eos_token_id": 8, "turn_eos_token_id": 10},
+        },
+    )
+    source.outputs[0].finish_reason = "length"
+    with pytest.raises(ValueError, match="missing own-token hidden states"):
+        llm2tts([source], prompt=[{}])
+
+
+def test_http_handoff_keeps_absolute_own_hidden_alignment():
+    source = _output(
+        prompt_ids=[101, 151703],
+        output_ids=[21, 22, 151704],
+        latent=torch.tensor([101, 151703, 21, 22], dtype=torch.float32).reshape(-1, 1),
+    )
+
+    info = llm2tts([source], prompt=[{}])[0]["model_intermediate_buffer"]
+
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.tensor(info["hidden_states"]["tts"])[:, 0].tolist() == [21, 22]
+
+
 def test_llm2tts_carries_request_ref_audio() -> None:
     latent = torch.arange(20, dtype=torch.float32).reshape(5, 4)
     source = _output(

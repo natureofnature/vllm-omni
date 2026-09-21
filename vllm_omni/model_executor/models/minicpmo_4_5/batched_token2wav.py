@@ -858,6 +858,19 @@ class BatchedToken2Wav(nn.Module):
         return result
 
     def _stack_flow_cache(self, states: list[BatchedToken2WavState]) -> dict[str, torch.Tensor]:
+        if len(states) == 1:
+            # Request caches already have [conditional, unconditional] order.
+            # Encoder/CFM consumers only read them; splitting the new output
+            # still gives the next state independently owned cache tensors.
+            return {
+                name: states[0].flow_cache[name].contiguous()
+                for name in (
+                    "conformer_cnn_cache",
+                    "conformer_att_cache",
+                    "estimator_cnn_cache",
+                    "estimator_att_cache",
+                )
+            }
         flows = [state.flow_cache for state in states]
         conditional_cnn = [flow["estimator_cnn_cache"][:, :, 0:1] for flow in flows]
         unconditional_cnn = [flow["estimator_cnn_cache"][:, :, 1:2] for flow in flows]

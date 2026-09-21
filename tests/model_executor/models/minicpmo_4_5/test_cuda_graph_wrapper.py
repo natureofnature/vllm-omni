@@ -197,6 +197,10 @@ class _MiniDiT(nn.Module):
             cnn_cache_buffer[b_idx] = x[:, -2:, :].transpose(1, 2).contiguous()
             dt = x.shape[1]
             att_cache_buffer[b_idx][:, :, :dt, :] = x.unsqueeze(1)
+            # Real DiT returns current K/V followed by the full old cache.
+            # Fully initialize the output instead of retaining scratch bytes.
+            if att_b is not None:
+                att_cache_buffer[b_idx][:, :, dt:, :] = att_b
         x = self.final_layer(x)
         x = x.transpose(1, 2)
         return x
@@ -252,6 +256,77 @@ def test_cfm_graph_replay_matches_eager_for_uncached_and_cached_shapes(
             torch.testing.assert_close(graph_att, eager_inputs[5], rtol=1e-4, atol=1e-5)
 
     wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("old_att_len", [0, 5])
+def test_real_cfm_graph_replay_does_not_copy_output_scratch(monkeypatch: pytest.MonkeyPatch, old_att_len: int) -> None:
+    DiT = pytest.importorskip("cosyvoice2.flow.decoder_dit").DiT
+
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    torch.manual_seed(19)
+    estimator = DiT(in_channels=4, out_channels=1, depth=2, num_heads=2, head_dim=2, hidden_size=4).eval().cuda()
+    with torch.no_grad():
+        # Exercise nonzero attention/conv gates and mel outputs, not only the
+        # zero-initialized final layer of an untrained DiT.
+        for parameter in estimator.parameters():
+            parameter.uniform_(-0.2, 0.2)
+    wrapper = CFMGraphWrapper(graph_fn=estimator.blocks_forward_chunk, max_graphs=4)
+    original_copy = torch.Tensor.copy_
+    retained_outputs = []
+    try:
+        with torch.inference_mode():
+            for poison in (float("nan"), float("inf"), -123.0):
+                # Keep every shape fixed but change all inputs, including the
+                # old cache, so a cache hit must copy actual inputs anew.
+                inputs = (
+                    torch.randn(2, 4, 8, device="cuda"),
+                    torch.randn(2, 1, 4, device="cuda"),
+                    torch.randn(2, 2, 8, 2, device="cuda"),
+                    torch.randn(2, 2, 2, old_att_len, 4, device="cuda"),
+                    torch.full((2, 2, 8, 2), poison, device="cuda"),
+                    torch.full((2, 2, 2, old_att_len + 8, 4), poison, device="cuda"),
+                    torch.ones(2, 8, old_att_len + 8, dtype=torch.bool, device="cuda"),
+                )
+                inputs[6][:, :, -1] = False
+                expected_cnn = torch.full_like(inputs[4], float("nan"))
+                expected_att = torch.full_like(inputs[5], float("nan"))
+                expected_mel = estimator.blocks_forward_chunk(
+                    inputs[0], inputs[1], inputs[6], inputs[2], inputs[3], expected_cnn, expected_att
+                )
+                expected = (expected_mel, expected_cnn, expected_att)
+                scratch_ptrs = {inputs[index].data_ptr() for index in (4, 5)}
+                input_ptrs = {inputs[index].data_ptr() for index in (0, 1, 2, 3, 6)}
+                copied_input_ptrs = []
+
+                def checked_copy(destination, source, *args, **kwargs):
+                    assert source.data_ptr() not in scratch_ptrs, "CFM replay copied output-only scratch"
+                    if source.data_ptr() in input_ptrs:
+                        copied_input_ptrs.append(source.data_ptr())
+                    return original_copy(destination, source, *args, **kwargs)
+
+                # Observe real copies around real capture/replay, not a fake
+                # graph: the old replay loop fails on its cnn_out copy here.
+                with monkeypatch.context() as copy_patch:
+                    copy_patch.setattr(torch.Tensor, "copy_", checked_copy)
+                    actual = wrapper.replay(*inputs)
+                assert set(copied_input_ptrs) == input_ptrs
+                assert len(copied_input_ptrs) == len(input_ptrs)
+                for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+                    assert torch.isfinite(expected_tensor).all()
+                    torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-4, atol=1e-5)
+                retained_outputs.append((actual, expected))
+
+            assert wrapper.stats_snapshot()["captures"] == 1
+            assert wrapper.stats_snapshot()["hits"] == 2
+            # Return clones must survive later replays into the same static
+            # output buffers; skipping the input copy does not transfer ownership.
+            for actual, expected in retained_outputs:
+                for actual_tensor, expected_tensor in zip(actual, expected, strict=True):
+                    torch.testing.assert_close(actual_tensor, expected_tensor, rtol=1e-4, atol=1e-5)
+    finally:
+        wrapper._flush()
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")

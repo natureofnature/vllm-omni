@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from vllm_omni.benchmarks.patch import patch as bench_patch
@@ -95,24 +97,22 @@ class _SilenceSink:
     def __init__(self) -> None:
         self.config = duplex_client.SessionConfig()
         self.chunks: list[bytes] = []
+        self.appended_at_s: list[float] = []
 
     async def append_audio(self, pcm: bytes, *, is_speech: bool | None = None, video_frames=None) -> None:
         del video_frames
         assert is_speech is False
         self.chunks.append(pcm)
+        self.appended_at_s.append(asyncio.get_running_loop().time())
 
 
 @pytest.mark.asyncio
-async def test_stream_silence_stops_at_the_turn_end(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stream_silence_stops_at_the_turn_end() -> None:
     """Silence is fed until the turn settles, not for the whole cap."""
     probe = bench_patch._RealtimeTTSProbe("ws://test/v1/realtime?duplex=1")
     sink = _SilenceSink()
     probe._client = sink
 
-    async def no_wait(_: float) -> None:
-        return
-
-    monkeypatch.setattr(bench_patch.asyncio, "sleep", no_wait)
     streamed = await probe.stream_silence(seconds=12.0, chunk_ms=200, until=lambda: len(sink.chunks) >= 3)
     assert len(sink.chunks) == 3
     assert streamed == pytest.approx(0.6)
@@ -120,18 +120,94 @@ async def test_stream_silence_stops_at_the_turn_end(monkeypatch: pytest.MonkeyPa
 
 
 @pytest.mark.asyncio
-async def test_stream_silence_runs_to_the_cap_when_the_turn_never_settles(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_stream_silence_runs_to_the_cap_when_the_turn_never_settles() -> None:
     probe = bench_patch._RealtimeTTSProbe("ws://test/v1/realtime?duplex=1")
     sink = _SilenceSink()
     probe._client = sink
 
-    async def no_wait(_: float) -> None:
-        return
+    streamed = await probe.stream_silence(seconds=0.4, chunk_ms=200, until=lambda: False)
+    assert len(sink.chunks) == 2
+    assert streamed == pytest.approx(0.4)
+    assert sink.appended_at_s[1] - sink.appended_at_s[0] >= 0.2
 
-    monkeypatch.setattr(bench_patch.asyncio, "sleep", no_wait)
-    streamed = await probe.stream_silence(seconds=1.0, chunk_ms=200, until=lambda: False)
+
+@pytest.mark.asyncio
+async def test_stream_silence_without_predicate_keeps_the_original_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = bench_patch._RealtimeTTSProbe("ws://test/v1/realtime?duplex=1")
+    sink = _SilenceSink()
+    probe._client = sink
+    sleeps: list[float] = []
+
+    async def record_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(bench_patch.asyncio, "sleep", record_sleep)
+    streamed = await probe.stream_silence(seconds=1.0, chunk_ms=200)
     assert len(sink.chunks) == 5
     assert streamed == pytest.approx(1.0)
+    assert sleeps == [0.2] * 5
+
+
+@pytest.mark.asyncio
+async def test_stream_silence_settles_during_the_input_interval(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = bench_patch._RealtimeTTSProbe("ws://test/v1/realtime?duplex=1")
+    sink = _SilenceSink()
+    probe._client = sink
+    polling = asyncio.Event()
+    resume_poll = asyncio.Event()
+    settled = asyncio.Event()
+    waiters: list[asyncio.Task] = []
+
+    async def hold_poll(delay: float) -> None:
+        assert delay == 0.02  # The full 200 ms input interval must not be awaited.
+        task = asyncio.current_task()
+        assert task is not None
+        waiters.append(task)
+        polling.set()
+        await resume_poll.wait()
+
+    monkeypatch.setattr(bench_patch.asyncio, "sleep", hold_poll)
+    stream = asyncio.create_task(probe.stream_silence(seconds=1.0, chunk_ms=200, until=settled.is_set))
+    try:
+        await asyncio.wait_for(polling.wait(), timeout=1.0)
+        settled.set()
+        resume_poll.set()
+        assert await asyncio.wait_for(stream, timeout=1.0) == pytest.approx(0.2)
+        assert len(sink.chunks) == 1
+        assert all(waiter.done() for waiter in waiters)
+    finally:
+        stream.cancel()
+        await asyncio.gather(stream, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_stream_silence_cancellation_cleans_up_the_condition_waiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    probe = bench_patch._RealtimeTTSProbe("ws://test/v1/realtime?duplex=1")
+    sink = _SilenceSink()
+    probe._client = sink
+    polling = asyncio.Event()
+    waiters: list[asyncio.Task] = []
+
+    async def hold_poll(delay: float) -> None:
+        assert delay == 0.02
+        task = asyncio.current_task()
+        assert task is not None
+        waiters.append(task)
+        polling.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bench_patch.asyncio, "sleep", hold_poll)
+    stream = asyncio.create_task(probe.stream_silence(seconds=1.0, chunk_ms=200, until=lambda: False))
+    try:
+        await asyncio.wait_for(polling.wait(), timeout=1.0)
+        stream.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await stream
+        assert len(sink.chunks) == 1
+        assert all(waiter.cancelled() for waiter in waiters)
+    finally:
+        stream.cancel()
+        await asyncio.gather(stream, return_exceptions=True)
 
 
 class _TurnEvents:
