@@ -103,7 +103,7 @@ class ResponseState:
     active_response_id: str | None = None
     active_response_turn_id: int | None = None
     active_response_input_commit_seq: int | None = None
-    active_response_awaits_input_commit: bool = False
+    responses_awaiting_input_commit: set[str] = field(default_factory=set)
     last_response_id: str | None = None
     #: Overlapped-input: prior-turn Stage2/3 request ids still draining under
     #: their own ``response_id`` after the next turn opened a new response.
@@ -711,6 +711,7 @@ class DuplexEngineSession:
         cancelled = {"text_chunks": 0, "audio_chunks": 0}
         self._input.reserved_input_bytes = 0
         self._input.pending_turns = 0
+        self._response.responses_awaiting_input_commit.clear()
         self.turn_state = DuplexTurnState.IDLE
         return cancelled
 
@@ -726,7 +727,7 @@ class DuplexEngineSession:
         }
         if transcript:
             input_audio_part["transcript"] = transcript
-        self._bind_active_response_to_input_commit(self._input.commit_seq + 1)
+        self._bind_responses_to_input_commit(self._input.commit_seq + 1)
         self._input.commit_seq += 1
         message = _object_dict(role="user", content=[input_audio_part])
         if transcript:
@@ -747,10 +748,24 @@ class DuplexEngineSession:
             self.turn_id = completed_turn_id + 1
             self.sync_fence()
 
-    def _bind_active_response_to_input_commit(self, input_commit_seq: int) -> None:
-        if self.active_response_id is not None and self._response.active_response_awaits_input_commit:
-            self._response.active_response_input_commit_seq = int(input_commit_seq)
-            self._response.active_response_awaits_input_commit = False
+    def _bind_responses_to_input_commit(self, input_commit_seq: int) -> None:
+        # Duplex responses can finish while their input is still streaming.
+        # Bind their playback snapshots as well as the active response when
+        # that input is committed, without admitting ACKs after a later input.
+        for response_id in self._response.responses_awaiting_input_commit:
+            if response_id == self.active_response_id:
+                self._response.active_response_input_commit_seq = input_commit_seq
+            snapshot = self._conversation.assistant_response_snapshots.get(response_id)
+            if snapshot is not None:
+                self._conversation.assistant_response_snapshots[response_id] = (
+                    snapshot[0],
+                    snapshot[1],
+                    input_commit_seq,
+                )
+            item_id = f"item_{response_id}"
+            if item_id in self._conversation.pending_item_input_commit_seqs:
+                self._conversation.pending_item_input_commit_seqs[item_id] = input_commit_seq
+        self._response.responses_awaiting_input_commit.clear()
 
     def reserve_response_options(self, options: ResponseCreateOptions) -> None:
         if self._response.active_response_id is not None:
@@ -832,7 +847,10 @@ class DuplexEngineSession:
         self._response.active_response_id = response_id
         self._response.active_response_turn_id = self.turn_id if turn_id is None else int(turn_id)
         self._response.active_response_input_commit_seq = self.input_commit_seq
-        self._response.active_response_awaits_input_commit = self.turn_state == DuplexTurnState.USER_SPEAKING
+        # Ending an earlier response changes turn_state, but does not commit
+        # the input that can still produce further responses.
+        if self.turn_state == DuplexTurnState.USER_SPEAKING or self._response.responses_awaiting_input_commit:
+            self._response.responses_awaiting_input_commit.add(response_id)
         self._response.last_response_id = response_id
         self._response.assistant_text_buffer.clear()
         self._response.assistant_audio_text_marks.clear()
@@ -1206,7 +1224,6 @@ class DuplexEngineSession:
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
-        self._response.active_response_awaits_input_commit = False
         # Keep draining bindings for other responses (older TTS may still play).
         self.clear_draining_for_response(response_id)
         self._clear_response_metrics()
@@ -1542,7 +1559,7 @@ class DuplexEngineSession:
         self._response.active_response_id = None
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
-        self._response.active_response_awaits_input_commit = False
+        self._response.responses_awaiting_input_commit.clear()
         self._response.draining_response_by_request.clear()
         self._clear_response_metrics()
         self._restore_response_config()
@@ -1558,7 +1575,7 @@ class DuplexEngineSession:
         self.turn_state = DuplexTurnState.IDLE
         self._response.active_response_turn_id = None
         self._response.active_response_input_commit_seq = None
-        self._response.active_response_awaits_input_commit = False
+        self._response.responses_awaiting_input_commit.clear()
         self._clear_response_metrics()
         self._restore_response_config()
 

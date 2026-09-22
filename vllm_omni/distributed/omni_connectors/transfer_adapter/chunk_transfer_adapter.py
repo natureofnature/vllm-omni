@@ -650,6 +650,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                         continue
                     info[key] = value
                 request.additional_information = info
+                if replace_snapshot:
+                    # New and resumed requests prefer this buffer in the
+                    # runner. Replace the bootstrap payload with the chunk
+                    # metadata, just as for cached requests.
+                    request.model_intermediate_buffer = info
                 request.num_computed_tokens = 0
 
                 # Empty chunk with more data expected: keep polling.

@@ -208,6 +208,53 @@ def test_playback_ack_is_scoped_per_response():
     assert session.playback.played_ms == 0
 
 
+@pytest.mark.parametrize("response_count", [1, 2])
+@pytest.mark.parametrize("later_input", [False, True])
+def test_completed_responses_bind_to_the_input_they_answered(response_count, later_input):
+    from vllm_omni.engine.duplex.events import ErrorEvent
+
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    response_ids = []
+    session.mark_user_input_activity()
+    for _ in range(response_count):
+        response_ids.append(session.begin_response())
+        session.append_assistant_text("hello")
+        session.mark_audio_sent(400, text_chars=5)
+        session.end_response()
+
+    session.commit_audio_input(transcript="the input that triggered these responses")
+    if later_input:
+        session.commit_audio_input(transcript="a genuinely later input")
+
+    for response_id in response_ids:
+        events = apply_playback_ack(
+            session,
+            {
+                "response_id": response_id,
+                "item_id": f"item_{response_id}",
+                "played_ms": 400,
+                "committed_ms": 400,
+            },
+        )
+        errors = [event.code for event in events if isinstance(event, ErrorEvent)]
+        assert errors == (["playback_ack_too_late"] if later_input else [])
+        if not later_input:
+            assert f"item_{response_id}" in session.history_item_ids
+
+
+def test_cancelled_input_does_not_bind_old_responses_to_a_new_commit():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    session.mark_user_input_activity()
+    response_id = session.begin_response()
+    session.append_assistant_text("hello")
+    session.mark_audio_sent(400, text_chars=5)
+    session.end_response()
+    session.cancel_pending_input()
+    session.commit_audio_input(transcript="a replacement input")
+
+    assert session.playback_ack_is_too_late(response_id, f"item_{response_id}")
+
+
 def test_history_commit_uses_audio_text_alignment_marks():
     session = _session()
     session.begin_response()

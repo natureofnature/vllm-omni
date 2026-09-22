@@ -1521,6 +1521,34 @@ def test_load_poll_generation_segment_marker_replaces_previous_chunk(build_adapt
     assert request.request_id in adapter.segment_finished_requests
 
 
+@pytest.mark.parametrize("cache_epoch", [0, 1])
+def test_load_poll_generation_first_chunk_replaces_bootstrap_buffer(build_adapter, cache_epoch):
+    adapter, connector = build_adapter(stage_id=2, model_mode="generation")
+    request = _req("req-first-chunk", RequestStatus.WAITING)
+    request.model_intermediate_buffer = {
+        "request_id": request.request_id,
+        "duplex": {"session_id": "session"},
+    }
+    chunk_meta = {
+        "cache_epoch": cache_epoch,
+        "chunk_seq": 0,
+        "tts_is_last_chunk": True,
+        "replace_runtime_additional_information": True,
+    }
+    connector.get.return_value = (
+        {"codes": {"audio": torch.tensor([7, 8])}, "meta": chunk_meta},
+        1,
+    )
+
+    assert adapter._poll_single_request(_dequeue_load_entry(adapter, request)) is True
+
+    # Newly scheduled and resumed requests prefer this buffer over
+    # additional_information, so both must describe the received chunk.
+    assert request.prompt_token_ids == [7, 8]
+    assert request.model_intermediate_buffer["meta"] == chunk_meta
+    assert request.model_intermediate_buffer == request.additional_information
+
+
 def test_load_poll_generation_empty_replacement_snapshot_is_ready(build_adapter):
     adapter, connector = build_adapter(stage_id=2, model_mode="generation")
     request = _req("req-empty-marker", RequestStatus.WAITING, external_req_id="external-empty-marker")

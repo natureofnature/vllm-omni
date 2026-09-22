@@ -156,8 +156,10 @@ def demo_args(
         realtime_input=True,
         input_video=None,
         stack_frames=1,
-        first_turn_ms=1400,
-        turn_duration_ms=[],
+        # Zero in turn_duration_ms sends the complete utterance. An active
+        # 1.4-second crop can legitimately make the duplex model keep listening.
+        first_turn_ms=0,
+        turn_duration_ms=[0],
         first_turn_transcript="duplex CI speech",
         omit_transcript_hints=False,
         validation_mode="response-required",
@@ -195,7 +197,7 @@ def multi_session_args(
         chunk_ms=200,
         turns=1,
         first_turn_ms=1400,
-        turn_duration_ms=[],
+        turn_duration_ms=[0] if response_required else [],
         response_required=response_required,
         temperature=0.0 if response_required else None,
         disconnect_session_index=0,
