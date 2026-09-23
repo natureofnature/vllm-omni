@@ -341,17 +341,25 @@ def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None
     assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[9:11])
 
 
-def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit() -> None:
+@pytest.mark.parametrize("previous_terminator_forwarded", [False, True])
+@pytest.mark.parametrize("current_terminator_forwarded", [False, True])
+def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit(
+    previous_terminator_forwarded: bool, current_terminator_forwarded: bool
+) -> None:
+    previous_ids = [9304, 21, 22] + ([9308] if previous_terminator_forwarded else [])
+    current_ids = [9304, 21, 22] + ([9308] if current_terminator_forwarded else [])
+    current_start = len(previous_ids) + 1
     source, latent = _native_source(
         prompt_ids=[101, 102],
         output_ids=[9304, 21, 22, 9308],
-        row_ids=[9304, 21, 22, 555, 9304, 21, 22],
-        positions=[0, 1, 2, 3, 10, 11, 12],
+        row_ids=[*previous_ids, 555, *current_ids],
+        positions=[*range(current_start), *range(10, 10 + len(current_ids))],
     )
 
     info = _native_handoff(source)
 
-    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[5:7])
+    assert info["ids"]["tts"] == [21, 22]
+    assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[current_start + 1 : current_start + 3])
 
 
 def test_native_duplex_ledger_rejects_non_contiguous_positions() -> None:

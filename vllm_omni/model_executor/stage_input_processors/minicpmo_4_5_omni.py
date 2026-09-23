@@ -733,14 +733,17 @@ def _native_duplex_forwarded_hidden_rows(
                 return base
         return None
 
-    # Prefer the whole unit (the terminator was forwarded too); otherwise the
-    # unit minus its unforwarded final token. Either must cover the slice.
+    # Compare both widths: an older complete unit must not outrank the current
+    # unit just because its terminator has not been forwarded yet.
+    latest_base: int | None = None
     for width in (len(unit), len(unit) - 1):
         if width < slice_end:
             continue
         base = _latest_block(width)
-        if base is not None:
-            return thinker_hidden_states[base + slice_start : base + slice_end].to(torch.float32).contiguous()
+        if base is not None and (latest_base is None or base > latest_base):
+            latest_base = base
+    if latest_base is not None:
+        return thinker_hidden_states[latest_base + slice_start : latest_base + slice_end].to(torch.float32).contiguous()
     raise ValueError(
         "MiniCPM-o native duplex: missing own-token hidden states for "
         f"{unit[slice_start:slice_end]} (unit={unit}, ledger tail={ids[-32:]}) request_id={request_id}"
