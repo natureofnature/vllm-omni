@@ -140,13 +140,10 @@ def _func_accepts_parameter(func: object | None, parameter_name: str) -> bool:
 
 
 def _resolve_custom_pipeline_cls(custom_pipeline_args: dict[str, Any] | None) -> type | None:
-    if custom_pipeline_args is None:
+    if not custom_pipeline_args or "pipeline_class" not in custom_pipeline_args:
         return None
 
-    try:
-        pipeline_cls = custom_pipeline_args["pipeline_class"]
-    except KeyError as exc:
-        raise ValueError("custom_pipeline_args must include 'pipeline_class'.") from exc
+    pipeline_cls = custom_pipeline_args["pipeline_class"]
 
     if isinstance(pipeline_cls, type):
         return pipeline_cls
@@ -1609,6 +1606,11 @@ class DiffusionEngine:
             raise RuntimeError(f"Diffusion scheduler lost state for request {request_id}.")
 
         if state.status == DiffusionRequestStatus.FINISHED_ABORTED:
+            # An aborted request is never waited on, so a pending async output
+            # would be cached forever by the executor result pump (issue #6413).
+            # Tell the executor to drop it before returning the aborted result.
+            if runner_output is not None and runner_output.async_output_id is not None:
+                self.executor.drop_output(runner_output.async_output_id)
             # Preserve runner-provided abort details when available.
             if runner_output is not None and runner_output.result is not None and runner_output.result.aborted:
                 return runner_output.result
