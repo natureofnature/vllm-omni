@@ -186,11 +186,16 @@ def _setup_diffusion_worker_proc_title_and_log_prefix(
 def _force_cutlass_fp8_linear_kernel(quant_config: object | None) -> Iterator[None]:
     import vllm.model_executor.layers.quantization.modelopt as vllm_modelopt
 
-    linear_method_cls = getattr(quant_config, "LinearMethodCls", None)
-    if linear_method_cls in {
-        vllm_modelopt.ModelOptFp8LinearMethod,
-        vllm_modelopt.ModelOptFp8PcPtLinearMethod,
-    }:
+    # vLLM #49381 replaced the per-format ModelOpt linear methods with the
+    # generic ``ModelOptLinearMethod`` and removed the ``LinearMethodCls``
+    # attributes this used to match on. The same two formats are identified by
+    # the ModelOpt quant-algo string carried on the config
+    # (``ModelOptQuantConfigBase.quant_method``): "FP8" used to select
+    # ``ModelOptFp8LinearMethod`` and "FP8_PER_CHANNEL_PER_TOKEN" used to select
+    # ``ModelOptFp8PcPtLinearMethod``. "FP8_PB_WO" / "NVFP4" / "W4A16_NVFP4"
+    # were never matched here and still are not.
+    quant_algo = getattr(quant_config, "quant_method", None)
+    if quant_algo in ("FP8", "FP8_PER_CHANNEL_PER_TOKEN"):
         from vllm.platforms import current_platform
 
         if current_platform.is_cuda() and current_platform.has_device_capability(89):
@@ -256,6 +261,7 @@ class DiffusionWorker:
         self.init_snapshot: MemorySnapshot | None = None
         self.requested_memory: int | None = None
         self._sleep_saved_buffers: dict[str, torch.Tensor] = {}
+        self._owns_sleep_pool = False
         self.lora_manager: DiffusionLoRAManager | None = None
         # Worker-side cache of (lora_request, lora_scale) per scheduled
         # request id. Used by step mode to recover LoRA identity for cached
@@ -801,6 +807,9 @@ class DiffusionWorker:
         Args:
             level: Sleep level. Level 1 offloads weights, level 2 also saves buffers.
         """
+        progress = getattr(getattr(self, "model_runner", None), "_kv_receive_progress", None)
+        if progress is not None and progress.submitted:
+            raise RuntimeError("Cannot sleep with live native KV prefetch reservations; finish requests first")
         # The config validator rejects sleep for the native paged path. Keep
         # this worker-side guard precise as well: test doubles and legacy
         # configs may expose arbitrary attributes through Mock/getattr.
@@ -1002,6 +1011,7 @@ class DiffusionWorker:
             allocator = CuMemAllocator.get_instance()
             if tag == "weights":
                 assert allocator.get_current_usage() == 0, "Sleep mode can only be used for one instance per process."
+                self._owns_sleep_pool = True
             logger.info(f"[Worker {self.rank}] Activating Diffusion CuMem pool for tag: {tag}")
             return allocator.use_memory_pool(tag=tag)
         return nullcontext()
@@ -1011,25 +1021,36 @@ class DiffusionWorker:
         try:
             if self.model_runner is not None:
                 mgr = getattr(self.model_runner, "kv_transfer_manager", None)
+                if mgr is None:
+                    mgr = getattr(self.model_runner, "_kv_transfer_manager", None)
                 try:
                     offload_backend = getattr(self.model_runner, "offload_backend", None)
                     if offload_backend is not None:
                         offload_backend.disable()
                 finally:
                     if mgr is not None:
-                        mgr.shutdown_prefetch()
+                        mgr.close()
         finally:
+            self.model_runner = None
+            self.lora_manager = None
+            self._sleep_saved_buffers = {}
             try:
-                shutdown_kv_connector()
+                if getattr(self, "_owns_sleep_pool", False):
+                    gc.collect()
+                    _get_cumem_allocator_class().get_instance().release_pools()
+                    self._owns_sleep_pool = False
             finally:
                 try:
-                    a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
-                    if a2a_permute is not None:
-                        a2a_permute.clear_a2a_permute_workspaces()
-                except Exception:
-                    logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    shutdown_kv_connector()
                 finally:
-                    destroy_distributed_env()
+                    try:
+                        a2a_permute = sys.modules.get("vllm_omni.diffusion.distributed.a2a_permute")
+                        if a2a_permute is not None:
+                            a2a_permute.clear_a2a_permute_workspaces()
+                    except Exception:
+                        logger.exception("Failed to release fused Ulysses symmetric-memory workspaces")
+                    finally:
+                        destroy_distributed_env()
 
 
 class CustomPipelineWorkerExtension:
@@ -1634,7 +1655,14 @@ class WorkerWrapperBase:
 
         # Re-initialize pipeline with custom pipeline if provided
         if self.uses_custom_pipeline:
-            self.worker.re_init_pipeline(self.custom_pipeline_args)
+            try:
+                self.worker.re_init_pipeline(self.custom_pipeline_args)
+            except Exception:
+                try:
+                    self.worker.shutdown()
+                except Exception:
+                    logger.exception("Failed to clean up worker after custom pipeline initialization failure")
+                raise
 
     def _prepare_worker_class(self) -> type:
         """
