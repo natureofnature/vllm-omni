@@ -170,10 +170,11 @@ class MiniCPMO45Stage0DuplexRuntime:
         # only present when reference audio is embedded between them. The
         # template is shared with the serving adapter so the first-append
         # scheduler reserve can count these tokens exactly.
+        initial_user_text = (runtime_config or {}).get("initial_user_text")
         prefix, suffix = MiniCPMO45DuplexPolicy.session_context_texts(
             session_config.get("instructions"),
             ref_audio is not None,
-            (runtime_config or {}).get("initial_user_text"),
+            initial_user_text,
         )
         for token_id in self._encode_text(prefix):
             embed = self._embed_token(token_id)
@@ -196,6 +197,10 @@ class MiniCPMO45Stage0DuplexRuntime:
             state.context_token_ids.append(token_id)
             state.context_suffix_embeds.append(embed)
             state.context_suffix_token_ids.append(token_id)
+        if isinstance(initial_user_text, str) and initial_user_text:
+            # Text already in the prompt needs a response even when the
+            # following audio is silence, just like pending speech input.
+            state.pending_speech_context = True
 
     def _stage_prefill_embeddings_only(
         self,

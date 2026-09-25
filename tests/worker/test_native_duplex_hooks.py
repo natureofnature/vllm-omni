@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -2793,6 +2794,75 @@ def test_minicpmo_stage0_session_context_includes_resolved_ref_audio():
     assert len(state.context_embeds) == 6
 
 
+@pytest.mark.parametrize("initial_user_text", [None, "", 123, "Read this sentence aloud."])
+def test_minicpmo_initial_user_text_allows_sampling_during_silence(initial_user_text):
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="initial-text")
+    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": initial_user_text})
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    has_text = isinstance(initial_user_text, str) and bool(initial_user_text)
+    assert state.pending_speech_context is has_text
+    assert state.current_turn_ended is True
+
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False})
+    model._minicpmo45_native_duplex_token_ids_cache = runtime._special_token_ids()
+    logits = torch.zeros((1, 256))
+    logits[0, 200] = 20.0
+    original_logits = logits.clone()
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+
+    if has_text:
+        assert torch.equal(logits, original_logits)
+    else:
+        assert logits[0, runtime.listen_token_id] == 0.0
+        assert torch.isneginf(logits[0, 200])
+
+
+def test_minicpmo_initial_user_text_is_pending_until_response_content():
+    from vllm_omni.model_executor.models.minicpmo_4_5.duplex.stage0 import _MiniCPMO45Stage0SessionState
+
+    runtime = _stage0_vision_runtime()
+    state = _MiniCPMO45Stage0SessionState(session_id="initial-text-lifecycle")
+    runtime._prepare_session_context(state, {}, runtime_config={"initial_user_text": "Read this sentence aloud."})
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=1)
+    model, row = _minicpmo_duplex_policy_case(state, {"is_speech": False, "force_listen": True})
+    row = replace(row, seq=1)
+    token_ids = runtime._special_token_ids()
+    model._minicpmo45_native_duplex_token_ids_cache = token_ids
+    logits = torch.zeros((1, 256))
+    logits[0, 200] = 20.0
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert logits[0, runtime.listen_token_id] == 0.0
+    assert torch.isneginf(logits[0, 200])
+    model._record_minicpmo45_duplex_terminator(0, runtime.listen_token_id, token_ids)
+    assert state.pending_speech_context is True
+
+    # The next silence append must preserve the initial text, while an
+    # actual response consumes it through the existing speech-input lifecycle.
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=2)
+    row = replace(row, seq=2, payload={"is_speech": False})
+    logits = torch.zeros((1, 256))
+    logits[0, 200] = 20.0
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert logits[0, 200] == 20.0
+    model._record_minicpmo45_duplex_terminator(0, runtime.tts_bos_token_id, token_ids)
+    assert state.pending_speech_context is True
+    assert state.pending_speech_response_open is True
+    model._record_minicpmo45_duplex_terminator(0, 200, token_ids)
+    assert state.pending_speech_context is False
+    model._record_minicpmo45_duplex_terminator(0, runtime.turn_eos_token_id, token_ids)
+
+    runtime._stage_prefill_embeddings_only(state, np.zeros(4, dtype=np.float32), seq=3)
+    row = replace(row, seq=3)
+    assert state.pending_speech_context is False
+    logits = torch.zeros((1, 256))
+    logits[0, 200] = 20.0
+    model.prepare_duplex_sampling(logits, SimpleNamespace(), (row,))
+    assert torch.isneginf(logits[0, 200])
+
+
 # ---------------------------------------------------------------------------
 # Cross-platform wiring: every AR model runner must reach the duplex hook.
 #
@@ -2973,7 +3043,8 @@ def _native_duplex_sampling_metadata(output_token_ids: list[int]):
 
 
 @pytest.mark.parametrize("terminator", [151718, 151721, 151705])
-def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(terminator):
+@pytest.mark.parametrize("pending_context", [False, True])
+def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(terminator, pending_context):
     """The frame async scheduling runs after a sampled chunk terminator is
     discarded by the scheduler; it must neither decide anything nor touch the
     session state that the next append re-injects."""
@@ -2981,6 +3052,7 @@ def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(
     state.pending_terminator_token = terminator
     state.last_terminator_token = terminator
     state.generated_tokens = [200, 201]
+    state.pending_speech_context = pending_context
     logits = torch.full((1, 151723), -100.0)
     logits[0, 1234] = 30.0  # what the stale frame would otherwise pick
 
@@ -2992,6 +3064,7 @@ def test_minicpmo_stage0_async_lookahead_frame_after_chunk_terminator_is_frozen(
     assert state.last_terminator_token == terminator
     assert state.generated_tokens == [200, 201]
     assert state.current_turn_ended is False
+    assert state.pending_speech_context is pending_context
 
 
 def test_minicpmo_stage0_turn_eos_is_forwarded_not_pending():
