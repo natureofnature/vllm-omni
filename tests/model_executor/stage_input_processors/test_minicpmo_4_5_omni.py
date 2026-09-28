@@ -362,6 +362,33 @@ def test_native_duplex_handoff_skips_prior_listen_terminated_units(
     assert not info["meta"].get("turn_end", False)
 
 
+def test_native_duplex_listen_trimming_preserves_cumulative_handoff_cursor() -> None:
+    context = SimpleNamespace(bridge_states={"duplex": {"epoch": 3, "model_turn_id": 7}})
+    first_ids = [9304, 9310, 9303, 9304, 21, 22, 9308]
+    first, first_latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=first_ids,
+        row_ids=[101, 102, 9304, 21, 22],
+    )
+    second, second_latent = _native_source(
+        prompt_ids=[101, 102],
+        # Another skipped listen must not reset the current turn's cursor.
+        output_ids=[*first_ids, 9303, 9304, 23, 24, 9308],
+        row_ids=[101, 102, 9304, 23, 24],
+    )
+
+    first_info = llm2tts([first], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert first_info["ids"]["tts"] == [21, 22]
+    torch.testing.assert_close(torch.tensor(first_info["hidden_states"]["tts"]), first_latent[3:5])
+    assert llm2tts([first], prompt=[{}], _streaming_context=context) == []
+
+    second_info = llm2tts([second], prompt=[{}], _streaming_context=context)[0]["model_intermediate_buffer"]
+    assert second_info["ids"]["tts"] == [23, 24]
+    torch.testing.assert_close(torch.tensor(second_info["hidden_states"]["tts"]), second_latent[3:5])
+    assert second_info["meta"]["turn_start"] is False
+    assert llm2tts([second], prompt=[{}], _streaming_context=context) == []
+
+
 @pytest.mark.parametrize("previous_terminator_forwarded", [False, True])
 @pytest.mark.parametrize("current_terminator_forwarded", [False, True])
 def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit(
