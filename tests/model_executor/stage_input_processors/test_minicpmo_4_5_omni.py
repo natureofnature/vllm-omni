@@ -341,6 +341,27 @@ def test_native_duplex_ledger_anchors_on_unit_after_reinjected_listens() -> None
     assert torch.equal(torch.tensor(info["hidden_states"]["tts"]), latent[9:11])
 
 
+@pytest.mark.parametrize("skipped_decision", [9304, 9301], ids=["speak", "tts-bos"])
+@pytest.mark.parametrize("current_decision", [9304, 9301], ids=["speak", "tts-bos"])
+def test_native_duplex_handoff_skips_prior_listen_terminated_units(
+    skipped_decision: int, current_decision: int
+) -> None:
+    # A unit may emit speak/turn_eos before choosing listen. The plugin sends
+    # that unit directly to the session, so it never advances the Talker cursor.
+    skipped_ids = [skipped_decision, 9310, 9303, 9303]
+    source, latent = _native_source(
+        prompt_ids=[101, 102],
+        output_ids=[*skipped_ids, current_decision, 21, 22, 9308],
+        row_ids=[101, 102, 9303, current_decision, 21, 22],
+    )
+
+    info = _native_handoff(source)
+
+    assert info["ids"]["tts"] == [21, 22]
+    torch.testing.assert_close(torch.tensor(info["hidden_states"]["tts"]), latent[4:6])
+    assert not info["meta"].get("turn_end", False)
+
+
 @pytest.mark.parametrize("previous_terminator_forwarded", [False, True])
 @pytest.mark.parametrize("current_terminator_forwarded", [False, True])
 def test_native_duplex_ledger_prefers_latest_repeat_of_the_unit(

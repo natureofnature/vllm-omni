@@ -869,6 +869,15 @@ def llm2tts(
                 _streaming_context,
                 request_id=str(llm_output.request_id),
             )
+            # Listen-terminated units bypass the Talker, so they do not advance
+            # its handoff cursor. They can include speak/turn_eos (or tts_bos),
+            # not just listen tokens. Start at the current unit; earlier units
+            # may no longer have matching rows in the current ledger.
+            listen_id = special_token_ids.get("listen_token_id")
+            for idx in range(len(llm_output_ids) - 1, -1, -1):
+                if llm_output_ids[idx] == listen_id:
+                    llm_output_ids = llm_output_ids[idx + 1 :]
+                    break
         prompt_token_ids_len = len(prompt_token_ids)
 
         is_native_duplex_handoff = _has_native_duplex_prompt_metadata(mm_output)
@@ -932,11 +941,8 @@ def llm2tts(
                 tts_token_ids_slice = torch.tensor(full_token_ids[tts_bos_idx:end_idx], dtype=torch.long)
                 tts_hidden_slice = thinker_hidden_states[tts_bos_idx:end_idx].to(torch.float32).contiguous()
         else:
-            # Mirror the official streaming_generate unit loop. A segment delta
-            # can start with SEVERAL unit decisions (forced/model listens from
-            # chunks that produced no handoff accumulate ahead of the speak),
-            # so skip the leading listen run; the unit's own decisions start
-            # there. The first decision (<|speak|>, a <|tts_bos|> boundary, or
+            # Mirror the official streaming_generate unit loop. The first
+            # decision (<|speak|>, a <|tts_bos|> boundary, or
             # the first text token when no marker is emitted) is fed back but
             # is not part of total_hidden_in_unit; TTS conditions on the
             # tokens after it, up to the chunk terminator. <|turn_eos|> is not
@@ -944,15 +950,11 @@ def llm2tts(
             # handed to the Talker, and anything sampled after it is a stale
             # tail that must not enter TTS.
             out_ids = llm_output_ids
-            listen_id = special_token_ids.get("listen_token_id")
             turn_eos_id = special_token_ids.get("turn_eos_token_id")
-            unit_start = 0
-            while unit_start < len(out_ids) and out_ids[unit_start] == listen_id:
-                unit_start += 1
             if tts_bos_idx is not None:
-                out_start = max(unit_start, tts_bos_idx - prompt_token_ids_len)
-            elif unit_start < len(out_ids) and out_ids[unit_start] not in tts_end_ids:
-                out_start = unit_start + 1
+                out_start = max(0, tts_bos_idx - prompt_token_ids_len)
+            elif out_ids and out_ids[0] not in tts_end_ids:
+                out_start = 1
             else:
                 out_start = None
             if out_start is not None:
@@ -974,9 +976,9 @@ def llm2tts(
                     tts_hidden_slice = _native_duplex_forwarded_hidden_rows(
                         mm_output,
                         thinker_hidden_states,
-                        unit_ids=out_ids[unit_start:],
-                        slice_start=out_start - unit_start,
-                        slice_end=out_end - unit_start,
+                        unit_ids=out_ids,
+                        slice_start=out_start,
+                        slice_end=out_end,
                         request_id=str(llm_output.request_id),
                     )
         handoff_ids = _coerce_token_id_list(tts_token_ids_slice) if tts_token_ids_slice is not None else None
