@@ -6,12 +6,14 @@
 import asyncio
 import json
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
 import pybase64 as base64
 import pytest
 import websockets
+from aiohttp import web
 from vllm.benchmarks.lib.endpoint_request_func import RequestFuncInput
 
 from vllm_omni.benchmarks.duplex import omni_duplex_eval_runner as runner
@@ -197,6 +199,126 @@ def test_invalid_cli_combinations(tmp_path, option, value):
         preprocess_serve_args(_args(tmp_path, option, value))
 
 
+def test_evaluation_requires_a_judge_model(tmp_path):
+    with pytest.raises(ValueError, match="--duplex-eval-judge-model"):
+        preprocess_serve_args(_args(tmp_path, "--duplex-eval-evaluate"))
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("--duplex-eval-judge-timeout-s", "nan"),
+        ("--duplex-eval-judge-fps", "0"),
+        ("--duplex-eval-window-size", "-1"),
+        ("--duplex-eval-eval-workers", "0"),
+    ],
+)
+def test_evaluation_rejects_invalid_options(tmp_path, option, value):
+    with pytest.raises(SystemExit):
+        _args(tmp_path, option, value)
+
+
+def test_evaluation_reuses_selected_samples_and_existing_scores(tmp_path, prepared, monkeypatch):
+    args = _args(
+        tmp_path,
+        "--duplex-eval-evaluate",
+        "--duplex-eval-judge-model",
+        "judge",
+        "--duplex-eval-ids",
+        "1",
+        "--duplex-eval-judge-video-mode",
+        "frame-sample",
+        "--duplex-eval-judge-fps",
+        "3",
+        "--duplex-eval-window-size",
+        "12",
+        "--duplex-eval-judge-timeout-s",
+        "0.5",
+        "--duplex-eval-eval-workers",
+        "2",
+    )
+    preprocess_serve_args(args)
+    samples = patch.get_samples(args, None)
+    assert [request.sample.id for request in samples] == ["1"]
+    observed = []
+    evaluate = adapter.evaluate_sample
+
+    def record(sample, response, score, judge, **kwargs):
+        observed.append((sample.id, judge.timeout, kwargs))
+        return evaluate(sample, response, score, judge, **kwargs)
+
+    monkeypatch.setattr(adapter, "evaluate_sample", record)
+    monkeypatch.setattr(adapter.DuplexJudge, "chat", lambda *args, **kwargs: '{"success_score": 1}')
+    output = patch.MixRequestFuncOutput(success=True)
+    output.duplex_eval_result = _result(samples[0])
+    summary = adapter.finalize_duplex_eval(samples, [output])
+    accuracy = summary["accuracy"]
+    assert observed == [("1", 0.5, {"judge_fps": 3, "judge_video_mode": "frame-sample", "window_size": 12.0})]
+    assert accuracy["status"] == "completed" and accuracy["evaluated"] == accuracy["total"] == 1
+    score_root = Path(accuracy["score_root"])
+    assert not (score_root / "PR_correction/0.json").exists()
+    assert adapter.summarize_scores(score_root)["pr"] == accuracy["pr"]
+    assert accuracy["pr"]["mean_all_success"] == 1
+    assert json.loads((score_root / "evaluation_summary.json").read_text()) == accuracy
+
+
+@pytest.mark.parametrize("failure", ["generation", "publication", "judge", "clock"])
+def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch, failure):
+    samples = [
+        replace(sample, evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge"))
+        for sample in _samples(tmp_path)
+    ]
+    outputs = [patch.MixRequestFuncOutput(success=True) for _ in samples]
+    for sample, output in zip(samples, outputs, strict=True):
+        output.duplex_eval_result = _result(sample)
+    if failure == "generation":
+        outputs[0].success = False
+    if failure == "clock":
+        outputs[0].duplex_eval_result.metadata["clock"] = "invalid"
+    publish = adapter.write_sample_result
+
+    def write(result):
+        if failure == "publication" and result.output.stem == "0":
+            raise OSError("disk full")
+        publish(result)
+
+    calls = 0
+
+    def judge_chat(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if failure == "judge" and calls == 1:
+            raise ConnectionError("judge unavailable")
+        return '{"success_score": 1}'
+
+    monkeypatch.setattr(adapter, "write_sample_result", write)
+    monkeypatch.setattr(adapter.DuplexJudge, "chat", judge_chat)
+    accuracy = adapter.finalize_duplex_eval(samples, outputs)["accuracy"]
+    assert accuracy["status"] == "partial" and accuracy["total"] == 2
+    assert accuracy["evaluated"] == accuracy["samples"] == 1
+    assert accuracy["skipped"] == int(failure in {"generation", "publication"})
+    assert accuracy["failed"] == len(accuracy["errors"]) == int(failure in {"judge", "clock"})
+    assert outputs[1].success
+
+
+def test_evaluation_summary_write_failure_preserves_service_results(tmp_path, prepared, monkeypatch):
+    sample = replace(_samples(tmp_path)[0], evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge"))
+    output = patch.MixRequestFuncOutput(success=True)
+    output.duplex_eval_result = _result(sample)
+    write = Path.write_text
+
+    def fail_summary(path, *args, **kwargs):
+        if path.name == "evaluation_summary.json":
+            raise OSError("disk full")
+        return write(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_summary)
+    monkeypatch.setattr(adapter.DuplexJudge, "chat", lambda *args, **kwargs: '{"success_score": 1}')
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == 1 and output.success
+    assert summary["accuracy"] == {"status": "failed", "error": "disk full"}
+
+
 @pytest.mark.parametrize("sample_id", ["same", "../escape"])
 def test_rejects_colliding_or_unsafe_artifact_paths(tmp_path, prepared, sample_id):
     args = _args(tmp_path)
@@ -379,9 +501,47 @@ def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monke
 
 
 @pytest.mark.asyncio
-async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared):
+@pytest.mark.parametrize("judge_status", [None, 200, 503])
+async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared, monkeypatch, capsys, judge_status):
     samples = _samples(tmp_path)
-    configured = []
+    configured: list[dict] = []
+    judge_calls = []
+
+    class BenchmarkTime:
+        offset = 0.0
+        monotonic = staticmethod(time.monotonic)
+
+        @staticmethod
+        def perf_counter():
+            return time.perf_counter() + BenchmarkTime.offset
+
+    monkeypatch.setattr(patch, "time", BenchmarkTime)
+
+    async def judge_handler(request):
+        # Every readiness, warmup and measured session has finished before judging.
+        assert len(configured) == 5
+        assert request.headers["Authorization"] == "Bearer judge-key"
+        body = await request.json()
+        assert body["model"] == "judge"
+        judge_calls.append(body)
+        # Model an hour of judge work without a real wait. It must not change
+        # the previously captured benchmark duration or throughput denominator.
+        BenchmarkTime.offset = 3600.0
+        return web.json_response(
+            {"choices": [{"message": {"content": json.dumps({"success_score": len(judge_calls) % 2})}}]},
+            status=judge_status,
+        )
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", judge_handler)
+    judge_server = web.AppRunner(app)
+    await judge_server.setup()
+    await web.TCPSite(judge_server, "127.0.0.1", 0).start()
+    if judge_status is not None:
+        options = adapter.DuplexEvalEvaluation(
+            f"http://127.0.0.1:{judge_server.addresses[0][1]}/v1", "judge", api_key="judge-key", timeout_s=2
+        )
+        samples = [replace(sample, evaluation=options) for sample in samples]
 
     async def handler(socket):
         async for raw in socket:
@@ -408,31 +568,34 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared):
 
     async with websockets.serve(handler, "127.0.0.1", 0) as server:
         url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}"
-        result = await patch.benchmark(
-            task_type=patch.TaskType.GENERATION,
-            endpoint_type="openai-realtime-duplex",
-            api_url=f"{url}/v1/realtime",
-            base_url=url,
-            model_id="mock",
-            model_name="mock",
-            tokenizer=None,
-            input_requests=samples,
-            logprobs=None,
-            request_rate=float("inf"),
-            burstiness=1.0,
-            disable_tqdm=True,
-            num_warmups=2,
-            profile=False,
-            selected_percentile_metrics=["ttft", "e2el"],
-            selected_percentiles=[50, 99],
-            ignore_eos=False,
-            goodput_config_dict={},
-            max_concurrency=2,
-            lora_modules=None,
-            extra_headers=None,
-            extra_body={"custom": "test"},
-            ready_check_timeout_sec=10,
-        )
+        try:
+            result = await patch.benchmark(
+                task_type=patch.TaskType.GENERATION,
+                endpoint_type="openai-realtime-duplex",
+                api_url=f"{url}/v1/realtime",
+                base_url=url,
+                model_id="mock",
+                model_name="mock",
+                tokenizer=None,
+                input_requests=samples,
+                logprobs=None,
+                request_rate=float("inf"),
+                burstiness=1.0,
+                disable_tqdm=True,
+                num_warmups=2,
+                profile=False,
+                selected_percentile_metrics=["ttft", "e2el"],
+                selected_percentiles=[50, 99],
+                ignore_eos=False,
+                goodput_config_dict={},
+                max_concurrency=2,
+                lora_modules=None,
+                extra_headers=None,
+                extra_body={"custom": "test"},
+                ready_check_timeout_sec=10,
+            )
+        finally:
+            await judge_server.cleanup()
     assert len(configured) == 5  # one readiness, two warmups, two measured sessions
     assert all(session["extra_body"]["custom"] == "test" for session in configured)
     assert result["completed"] == 2
@@ -446,3 +609,18 @@ async def test_benchmark_socket_lifecycle_excludes_warmups(tmp_path, prepared):
     ]
     report = json.loads((root / "duplex_metrics.json").read_text())
     assert len(report["duplex_session_metrics"]) == 2
+    assert 0 <= result["duration"] < 3600
+    if judge_status is None:
+        assert not judge_calls and "accuracy" not in result["omni_duplex_eval"]
+        assert "Omni-DuplexEval accuracy:" not in capsys.readouterr().out
+    else:
+        assert len(judge_calls) == 2  # no scoring for readiness or warmups
+        accuracy = result["omni_duplex_eval"]["accuracy"]
+        assert accuracy["status"] == ("completed" if judge_status == 200 else "failed")
+        assert accuracy["total"] == 2 and accuracy["skipped"] == 0
+        assert accuracy["evaluated"] == (2 if judge_status == 200 else 0)
+        if judge_status == 200:
+            assert accuracy["pr"]["mean_all_success"] == 0.5
+        else:
+            assert accuracy["failed"] == 2 and "pr" not in accuracy
+        assert "Omni-DuplexEval accuracy:" in capsys.readouterr().out

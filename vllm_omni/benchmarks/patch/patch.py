@@ -3648,7 +3648,7 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    duplex_eval_summary = finalize_duplex_eval(input_requests, outputs)
+    duplex_eval_summary = await asyncio.to_thread(finalize_duplex_eval, input_requests, outputs)
     omniinteract_summary = _finalize_omniinteract_batch(input_requests, outputs)
     omniinteract_evaluation = await _evaluate_omniinteract_batch(input_requests, outputs)
     if omniinteract_summary is not None and omniinteract_evaluation is not None:
@@ -3800,6 +3800,9 @@ async def benchmark(
         result["omniinteract"] = omniinteract_summary
     if duplex_eval_summary is not None:
         result["omni_duplex_eval"] = duplex_eval_summary
+        if (accuracy := duplex_eval_summary.get("accuracy")) is not None:
+            print("\nOmni-DuplexEval accuracy:")
+            print(json.dumps(accuracy, indent=2))
 
     from vllm_omni.benchmarks.data_modules.daily_omni_eval import (
         compute_daily_omni_accuracy_metrics,

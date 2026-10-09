@@ -173,6 +173,23 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
         default=Path("omni-duplex-eval-output"),
         help="Parent directory for artifacts; each invocation creates a new run subdirectory.",
     )
+    group.add_argument(
+        "--duplex-eval-evaluate",
+        action="store_true",
+        help="Run the existing Omni-DuplexEval judge after performance timing and print accuracy scores.",
+    )
+    group.add_argument(
+        "--duplex-eval-judge-base-url",
+        default="http://127.0.0.1:8001/v1",
+        help="Base URL of an already-running OpenAI-compatible judge server.",
+    )
+    group.add_argument("--duplex-eval-judge-model", help="Model name exposed by the judge server.")
+    group.add_argument("--duplex-eval-judge-api-key", default="EMPTY")
+    group.add_argument("--duplex-eval-judge-timeout-s", type=_positive_finite_float, default=600.0)
+    group.add_argument("--duplex-eval-judge-video-mode", choices=("video_url", "frame-sample"), default="video_url")
+    group.add_argument("--duplex-eval-judge-fps", type=_positive_int, default=2)
+    group.add_argument("--duplex-eval-window-size", type=_positive_finite_float, default=10.0)
+    group.add_argument("--duplex-eval-eval-workers", type=_positive_int, default=1)
 
 
 def add_multi_stage_cli_args(parser: argparse.ArgumentParser) -> None:
@@ -518,6 +535,8 @@ def preprocess_serve_args(args: argparse.Namespace) -> None:
             raise ValueError("Omni-DuplexEval requires --backend openai-realtime-duplex --endpoint /v1/realtime")
         if not args.duplex_eval_ref_audio:
             raise ValueError("Omni-DuplexEval requires --duplex-eval-ref-audio")
+        if args.duplex_eval_evaluate and not args.duplex_eval_judge_model:
+            raise ValueError("Omni-DuplexEval evaluation requires --duplex-eval-judge-model")
         for name in ("ignore_eos", "profile", "skip_tokenizer_init", "probe_request_rate"):
             if getattr(args, name, False):
                 raise ValueError(f"Omni-DuplexEval does not support --{name.replace('_', '-')}")

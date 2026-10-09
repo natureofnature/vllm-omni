@@ -331,8 +331,36 @@ and `<id>.meta.json`, using the existing judge format. Publication occurs after 
 `duplex_metrics.json`; artifact errors are recorded in the saved result's
 `omni_duplex_eval` summary without discarding service measurements.
 
-Scoring stays separate and uses the existing commands. After all three samples
-above succeed and their artifacts are published, evaluate the same ordered
+Accuracy scoring is optional. To score immediately after the performance run,
+add these flags to the `vllm bench serve` command above:
+
+```bash
+  --duplex-eval-evaluate \
+  --duplex-eval-judge-base-url http://127.0.0.1:8001/v1 \
+  --duplex-eval-judge-model your-judge-model
+```
+
+The judge must already be running; the benchmark does not launch it. Proactive
+reminder (PR) tasks use a text judge, while real-time description (RTD) tasks
+require a vision-capable judge. The default `--duplex-eval-judge-video-mode video_url`
+requires the judge to support video inputs and access the same local video paths.
+Use `--duplex-eval-judge-video-mode frame-sample` for a remote image-capable judge;
+this changes content evaluation to the existing sampled-frame variant, not full-video judging.
+
+Scoring reuses the standalone evaluator and runs **after performance timing**.
+The terminal and saved benchmark result (`omni_duplex_eval.accuracy`) report scores
+and coverage: total measured sessions, evaluated sessions, skipped failed/unpublished
+sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
+sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
+the evaluated subset, not an accuracy score for all attempted sessions. Warmups
+are never scored. Judge failures do not discard completed performance measurements.
+Per-sample scores and `evaluation_summary.json` are saved under the run's
+`evaluation/` directory. `--duplex-eval-eval-workers` controls scoring concurrency
+(default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).
+
+The independent scoring commands remain available to retry scoring or change
+judges without repeating inference. After all three samples above succeed and
+their artifacts are published, evaluate the same ordered
 selection with `--limit 3`. Replace `run-XXXXXXXX` below with the reported run
 directory:
 
