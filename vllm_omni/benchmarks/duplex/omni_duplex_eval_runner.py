@@ -134,7 +134,11 @@ async def generate_sample(
     if mix != "question":
         raise NotImplementedError("v1 supports mix=question; soundtrack mixing is reserved for P1")
     if prepared is None:
-        prepared = prepare_sample(sample, media_dir=output.parent / ".media", ref_audio=ref_audio, fps=fps)
+        # Standalone generation shares its loop with other live sessions;
+        # decoding a whole clip must not pause their input or playback ACKs.
+        prepared = await asyncio.to_thread(
+            prepare_sample, sample, media_dir=output.parent / ".media", ref_audio=ref_audio, fps=fps
+        )
     realtime = pace == "realtime"
     if pace not in {"realtime", "as-fast-as-possible"}:
         raise ValueError("pace must be realtime or as-fast-as-possible")

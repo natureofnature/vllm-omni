@@ -5,6 +5,7 @@
 
 import asyncio
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -107,8 +108,78 @@ def test_selection_uses_standard_prompt_count(tmp_path, prepared, count, expecte
     assert args.max_concurrency == 1
     assert all(request.prepared is prepared for request in requests)
     assert len({request.request_id for request in requests}) == expected
-    with pytest.raises(FileExistsError):
-        patch.get_samples(args, None)
+
+
+def test_repeated_sweep_runs_keep_artifacts_isolated(tmp_path, prepared):
+    args = _args(tmp_path)
+    preprocess_serve_args(args)
+    parent = args.duplex_eval_response_root
+    roots = []
+    for concurrency in (1, 2):
+        args.max_concurrency = concurrency
+        samples = patch.get_samples(args, None)
+        outputs = []
+        for sample in samples:
+            output = patch.MixRequestFuncOutput(success=True)
+            output.duplex_eval_result = replace(_result(sample), timed_sentences=[{"sentence": str(concurrency)}])
+            outputs.append(output)
+        summary = adapter.finalize_duplex_eval(samples, outputs)
+        root = Path(summary["response_root"])
+        assert summary["published"] == len(samples) and not summary["artifact_errors"]
+        assert all(sample.response_root == root for sample in samples)
+        assert args.duplex_eval_response_root == parent
+        roots.append(root)
+    assert roots[0] != roots[1]
+    assert all(root.parent == parent for root in roots)
+    for concurrency, root in enumerate(roots, start=1):
+        assert json.loads((root / "PR_correction/0.json").read_text()) == [{"sentence": str(concurrency)}]
+
+
+@pytest.mark.asyncio
+async def test_standalone_preparation_keeps_event_loop_responsive(tmp_path, prepared, monkeypatch):
+    sample = _samples(tmp_path)[0]
+    loop = asyncio.get_running_loop()
+    preparing = asyncio.Event()
+    loop_progress = threading.Event()
+
+    def slow_prepare(*args, **kwargs):
+        loop.call_soon_threadsafe(preparing.set)
+        # Only the event-loop coroutine below can release preparation. On the
+        # old synchronous path it cannot run until this bounded wait fails.
+        assert loop_progress.wait(5), "media preparation blocked the event loop"
+        return prepared
+
+    monkeypatch.setattr(runner, "prepare_sample", slow_prepare)
+
+    async def handler(socket):
+        async for raw in socket:
+            event = json.loads(raw)
+            if event["type"] == "session.update":
+                await socket.send(json.dumps({"type": "session.created"}))
+            elif event["type"] == "input_audio_buffer.commit":
+                await socket.send(json.dumps({"type": "response.created", "response": {"id": "r1"}}))
+                await socket.send(json.dumps({"type": "response.done", "response": {"id": "r1"}}))
+            elif event["type"] == "session.close":
+                await socket.send(json.dumps({"type": "session.closed"}))
+                return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        task = asyncio.create_task(
+            runner.generate_sample(
+                sample.sample,
+                url=f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime",
+                model="mock",
+                ref_audio=sample.ref_audio,
+                output_root=sample.response_root,
+            )
+        )
+        try:
+            await asyncio.wait_for(preparing.wait(), timeout=10)
+        finally:
+            loop_progress.set()
+        result = await asyncio.wait_for(task, timeout=10)
+    assert not result.error and result.metadata["response_done"]
+    assert result.output.exists()
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import random
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,11 +66,12 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
     ]
     if len(set(artifact_paths)) != len(artifact_paths):
         raise ValueError("Omni-DuplexEval response and metadata paths must not collide")
-    root = Path(args.duplex_eval_response_root).expanduser()
-    # An exclusive run directory prevents stale responses from being judged
-    # after failures, and prevents concurrent runs from publishing to one root.
-    # Unlike standalone generate, measured requests never resume/skip old files.
-    root.mkdir(parents=True, exist_ok=False)
+    root = Path(args.duplex_eval_response_root).expanduser().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    # Isolate judge inputs for every invocation, including concurrency/QPS
+    # sweeps that reuse the same dataset arguments and parent directory.
+    root = Path(tempfile.mkdtemp(prefix="run-", dir=root))
+    logger.info("Omni-DuplexEval response directory: %s", root)
     requests: list[SampleRequest] = []
     for index, sample in enumerate(samples):
         prepared = prepare_sample(

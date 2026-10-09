@@ -171,7 +171,7 @@ def add_duplex_eval_cli_args(parser: argparse.ArgumentParser) -> None:
         "--duplex-eval-response-root",
         type=Path,
         default=Path("omni-duplex-eval-output"),
-        help="New directory for measured responses and duplex_metrics.json; must not already exist.",
+        help="Parent directory for artifacts; each invocation creates a new run subdirectory.",
     )
 
 

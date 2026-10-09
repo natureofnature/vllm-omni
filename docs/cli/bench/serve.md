@@ -292,7 +292,7 @@ vllm bench serve --omni \
   --model openbmb/MiniCPM-o-4_5 \
   --base-url http://127.0.0.1:8000 --endpoint /v1/realtime \
   --duplex-eval-ref-audio /path/to/reference.wav \
-  --duplex-eval-response-root ./duplex-eval-run-1 \
+  --duplex-eval-response-root ./duplex-eval-runs \
   --duplex-eval-split PR_correction \
   --num-prompts 3 --disable-shuffle --max-concurrency 1 --num-warmups 0 \
   --ready-check-timeout-sec 0 --save-result
@@ -322,21 +322,24 @@ engine token timings and are unavailable when those timings are absent. E2EL
 includes the whole session, including input streaming and drain, so it is not a
 model-only generation latency.
 
-`--duplex-eval-response-root` must be a **new directory**. Serving runs never skip
-existing responses: each invocation measures fresh sessions. Only successful
-measured sessions publish `<split>/<id>.json` and `<id>.meta.json`, using the
-existing judge format. Publication occurs after benchmark timing, alongside
+`--duplex-eval-response-root` is a **parent directory** and may already exist.
+Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
+concurrency/QPS sweeps do not overwrite or reuse earlier responses. The actual
+run path is logged and returned in `omni_duplex_eval.response_root` in the saved
+benchmark result. Only successful measured sessions publish `<split>/<id>.json`
+and `<id>.meta.json`, using the existing judge format. Publication occurs after benchmark timing, alongside
 `duplex_metrics.json`; artifact errors are recorded in the saved result's
 `omni_duplex_eval` summary without discarding service measurements.
 
 Scoring stays separate and uses the existing commands. After all three samples
 above succeed and their artifacts are published, evaluate the same ordered
-selection with `--limit 3`:
+selection with `--limit 3`. Replace `run-XXXXXXXX` below with the reported run
+directory:
 
 ```bash
 vllm bench omni-duplex-eval --omni evaluate \
   --dataset Hothan/Omni-DuplexEval --split PR_correction --limit 3 \
-  --response-root ./duplex-eval-run-1 --score-root ./duplex-eval-scores-1 \
+  --response-root ./duplex-eval-runs/run-XXXXXXXX --score-root ./duplex-eval-scores-1 \
   --judge-base-url http://127.0.0.1:8001/v1 --judge-model your-judge-model
 vllm bench omni-duplex-eval --omni summarize --score-root ./duplex-eval-scores-1
 ```
