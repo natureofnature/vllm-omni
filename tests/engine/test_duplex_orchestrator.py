@@ -37,6 +37,7 @@ from vllm_omni.engine.duplex_orchestrator import DuplexOrchestrator, DuplexOrche
 from vllm_omni.engine.messages import AbortRequestMessage, ShutdownRequestMessage
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.model_executor.models.minicpmo_4_5.duplex.plugin import MiniCPMO45DuplexPlugin
+from vllm_omni.model_executor.models.qwen3_omni.duplex.plugin import Qwen3OmniDuplexPlugin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -445,6 +446,25 @@ async def test_terminal_stage_error_closes_session_before_another_append(mocker,
         # A request-local failure must release admission without evicting the replica.
         result = await _open(orchestrator, rpc_q)
         assert result.ok
+    finally:
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("plugin_type,close_session", [(MiniCPMO45DuplexPlugin, True), (Qwen3OmniDuplexPlugin, False)])
+async def test_terminal_stage_error_preserves_plugin_cleanup_policy(mocker, plugin_type, close_session) -> None:
+    orchestrator, _, _, _ = _build(plugin=plugin_type(_encode_audio))
+    request_state = DuplexOrchestratorRequestState(request_id="failed-request", session_owned=True)
+    output = OmniEngineCoreOutput(
+        request_id=request_state.request_id,
+        finish_reason=FinishReason.ERROR,
+        stop_reason="context_length_exceeded",
+        new_token_ids=[],
+    )
+    cleanup = mocker.patch.object(orchestrator, "_cleanup_request_ids", new_callable=mocker.AsyncMock)
+    try:
+        await orchestrator._report_duplex_session_request_error(0, 0, output, request_state)
+        cleanup.assert_awaited_once_with([request_state.request_id], abort=True, release_owners=close_session)
     finally:
         await orchestrator.session_manager.shutdown()
 

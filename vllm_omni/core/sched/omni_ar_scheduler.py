@@ -161,13 +161,19 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         # update_from_output so the client learns why the session ended.
         self._streaming_context_overflow: dict[str, tuple[int, str]] = {}
         # Keep rejecting in-flight appends after the error output is drained,
-        # until the owning session acknowledges termination with an abort.
+        # until the engine consumes the owner's abort from its ordered input queue.
         self._overflowed_streaming_requests: set[str] = set()
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
             return
         super().add_request(request)
+
+    def release_overflowed_requests(self, request_ids: Iterable[str]) -> None:
+        """Release admission fences after an ordered abort, never an eager one."""
+        overflowed = getattr(self, "_overflowed_streaming_requests", None)
+        if overflowed is not None:
+            overflowed.difference_update(request_ids)
 
     def _get_confirmed_num_computed_tokens(self, request: Request) -> int:
         """num_computed_tokens minus async placeholders (KV actually on GPU)."""
@@ -261,13 +267,6 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
         finished = super().finish_requests(finish_request_ids, finished_status)
         self._clear_kv_wait_starts(cleanup_ids)
-        if finished_status == RequestStatus.FINISHED_ABORTED:
-            overflowed = getattr(self, "_overflowed_streaming_requests", None)
-            if overflowed is not None:
-                if request_ids is None:
-                    overflowed.clear()
-                else:
-                    overflowed.difference_update(cleanup_ids)
         return finished
 
     def _get_kv_transfer_criteria(self) -> dict | None:
