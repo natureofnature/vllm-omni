@@ -846,6 +846,15 @@ class ModelChannel:
             return close_reason, emitted_response
         if isinstance(model_result.get("error_code"), str):
             self._fail_response_from_model_error(model_result)
+            if model_result.get("end_of_turn") is True and not session.capabilities.supports_core_resumable_request:
+                # A failed ephemeral turn owns the same stage resources as a
+                # successful one. Release them before accepting another turn.
+                self._complete_model_turn_without_output(
+                    model_result,
+                    model_turn_id=coerce_int(model_result.get("model_turn_id")),
+                    data_plane_request_id=data_plane_request_id,
+                )
+                await self._release_ephemeral_request(data_plane_request_id, whole_turn=True)
             return close_reason, True
         if model_result.get("function_call") is True:
             self._out.emit(

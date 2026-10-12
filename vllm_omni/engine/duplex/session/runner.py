@@ -1995,15 +1995,30 @@ class DuplexSessionRunner:
         if event_type == "response.create":
             await self._start_response_from_committed_audio()
             return
-        if helpers.next_commit_allowed(
+        next_commit_allowed = helpers.next_commit_allowed(
             self.session,
             self.tasks,
             concurrent_turn_requests_released=self.run.concurrent_turn_requests_released,
-        ) and await self._flush_and_submit_committed_turn(
+        )
+        if next_commit_allowed and await self._flush_and_submit_committed_turn(
             event,
             event_type=event_type,
             realtime_item_id=realtime_item_id,
             should_create_response=should_create_response,
+        ):
+            return
+        # A video-only commit also owns a pending turn, even though it has no
+        # overlapping speech. Keep it for the existing terminal-event promotion
+        # path while an ephemeral request is still running.
+        if (
+            not next_commit_allowed
+            and not session.capabilities.supports_core_resumable_request
+            and self._defer_commit_behind_active_response(
+                event,
+                realtime_item_id=realtime_item_id,
+                should_create_response=should_create_response,
+                precreate_response_requested=precreate_response_requested,
+            )
         ):
             return
         # Nothing flushed (or a response is still in progress without
