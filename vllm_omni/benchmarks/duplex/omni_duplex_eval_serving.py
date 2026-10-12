@@ -26,6 +26,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_eval import evaluate_sample, s
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_judge import DuplexJudge
 from vllm_omni.benchmarks.duplex.omni_duplex_eval_runner import (
     GenerateSampleResult,
+    PreparedReferenceAudio,
     PreparedSample,
     prepare_sample,
     write_sample_result,
@@ -50,9 +51,8 @@ class DuplexEvalEvaluation:
 @dataclass
 class OmniDuplexEvalSampleRequest(SampleRequest):
     sample: DuplexSample | None = None
-    prepared: PreparedSample | None = field(default=None, repr=False)
     response_root: Path = Path("omni-duplex-eval-output")
-    ref_audio: str = ""
+    ref_audio: PreparedReferenceAudio | None = field(default=None, repr=False)
     fps: float = 1.0
     evaluation: DuplexEvalEvaluation | None = field(default=None, repr=False)
 
@@ -101,13 +101,8 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
             workers=args.duplex_eval_eval_workers,
         )
     requests: list[SampleRequest] = []
+    reference = PreparedReferenceAudio.from_path(args.duplex_eval_ref_audio)
     for index, sample in enumerate(samples):
-        prepared = prepare_sample(
-            sample,
-            media_dir=root / sample.split / ".media" / sample.id,
-            ref_audio=args.duplex_eval_ref_audio,
-            fps=args.duplex_eval_fps,
-        )
         requests.append(
             OmniDuplexEvalSampleRequest(
                 prompt="",
@@ -115,15 +110,25 @@ def get_duplex_eval_samples(args: argparse.Namespace) -> list[SampleRequest]:
                 expected_output_len=0,
                 request_id=f"{args.request_id_prefix or ''}{index}",
                 sample=sample,
-                prepared=prepared,
                 response_root=root,
-                ref_audio=args.duplex_eval_ref_audio,
+                ref_audio=reference,
                 fps=args.duplex_eval_fps,
                 evaluation=evaluation,
             )
         )
     args.num_prompts = len(requests)
     return requests
+
+
+def prepare_duplex_eval_sample(request: OmniDuplexEvalSampleRequest) -> PreparedSample:
+    if request.sample is None or request.ref_audio is None:
+        raise ValueError("Omni-DuplexEval requires a dataset sample and reference audio")
+    return prepare_sample(
+        request.sample,
+        media_dir=request.response_root / request.sample.split / ".media" / request.sample.id,
+        ref_audio=request.ref_audio,
+        fps=request.fps,
+    )
 
 
 def attach_duplex_eval(sample: SampleRequest, request: RequestFuncInput) -> None:

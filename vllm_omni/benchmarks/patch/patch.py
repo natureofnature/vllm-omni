@@ -80,6 +80,7 @@ from vllm_omni.benchmarks.duplex.omni_duplex_eval_serving import (
     attach_duplex_eval,
     finalize_duplex_eval,
     get_duplex_eval_samples,
+    prepare_duplex_eval_sample,
 )
 from vllm_omni.benchmarks.omniinteract import (
     VIDEO_FPS,
@@ -2959,8 +2960,13 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
     output.tpot_measured = False
     try:
         sample = getattr(request, "duplex_eval_sample", None)
-        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None or sample.prepared is None:
-            raise ValueError("Omni-DuplexEval requires a prepared dataset sample")
+        if not isinstance(sample, OmniDuplexEvalSampleRequest) or sample.sample is None or sample.ref_audio is None:
+            raise ValueError("Omni-DuplexEval requires a dataset sample and reference audio")
+        # The benchmark's concurrency slot bounds live decoded inputs. Keep
+        # preparation off the event loop and outside this session's latency;
+        # throughput still includes any client preparation stalls.
+        prepared = await asyncio.to_thread(prepare_duplex_eval_sample, sample)
+        output.start_time = time.perf_counter()
         headers = _get_headers()
         _update_headers_common(headers, request)
         result = await asyncio.wait_for(
@@ -2971,7 +2977,7 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
                 ref_audio=sample.ref_audio,
                 output_root=sample.response_root,
                 fps=sample.fps,
-                prepared=sample.prepared,
+                prepared=prepared,
                 defer_artifacts=True,
                 additional_headers=headers or None,
                 extra_body=dict(request.extra_body or {}),
@@ -2982,6 +2988,8 @@ async def _async_request_duplex_eval(request: RequestFuncInput, *, pbar: tqdm | 
         output.output_tokens = result.output_tokens
         output.audio_frames = result.audio_bytes // 2
         output.audio_duration = output.audio_frames / result.audio_sample_rate
+        # calculate_metrics uses duplex_session_metrics to exclude missing
+        # measurements; these typed defaults are not zero-valued samples.
         output.ttft = (metric_mean(result.session_metrics.get("ttft_ms")) or 0.0) / 1000
         output.audio_ttfp = (metric_mean(result.session_metrics.get("ttfp_ms")) or 0.0) / 1000
         output.audio_rtf = metric_mean(result.session_metrics.get("rtf")) or 0.0

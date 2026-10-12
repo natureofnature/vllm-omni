@@ -5,8 +5,10 @@
 
 import asyncio
 import json
+import math
 import threading
 import time
+import weakref
 from dataclasses import replace
 from pathlib import Path
 
@@ -108,7 +110,7 @@ def test_selection_uses_standard_prompt_count(tmp_path, prepared, count, expecte
     requests = patch.get_samples(args, None)
     assert len(requests) == args.num_prompts == expected
     assert args.max_concurrency == 1
-    assert all(request.prepared is prepared for request in requests)
+    assert all(request.ref_audio is requests[0].ref_audio for request in requests)
     assert len({request.request_id for request in requests}) == expected
 
 
@@ -432,6 +434,22 @@ async def test_missing_token_timing_is_not_invented(tmp_path, prepared, monkeypa
     output = await patch.async_request_openai_realtime_duplex(_request(sample), session=None)
     assert output.success and output.itl == [] and not output.tpot_measured
     assert output.duplex_session_metrics == {}
+    metrics, _ = patch.calculate_metrics(
+        input_requests=[sample],
+        outputs=[output],
+        dur_s=1.0,
+        tokenizer=None,
+        selected_percentiles=[50, 99],
+        goodput_config_dict={},
+        task_type=patch.TaskType.GENERATION,
+        selected_percentile_metrics=["ttft"],
+        max_concurrency=1,
+        request_rate=float("inf"),
+        benchmark_duration=1.0,
+    )
+    assert (metrics.num_ttft_samples, metrics.num_audio_ttfp_samples, metrics.num_audio_rtf_samples) == (0, 0, 0)
+    assert math.isnan(metrics.mean_ttft_ms) and math.isnan(metrics.mean_audio_ttfp_ms)
+    assert math.isnan(metrics.mean_audio_rtf)
 
 
 @pytest.mark.asyncio
@@ -482,6 +500,180 @@ async def test_socket_errors_match_omniinteract_policy(tmp_path, prepared, error
         output = await patch.async_request_openai_realtime_duplex(request, session=None)
     assert output.success is success
     assert adapter.finalize_duplex_eval([sample], [output])["published"] == int(success)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["completed", "cancelled", "failed", "incomplete", "timeout", "close_tail"])
+async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, status):
+    sample = _samples(tmp_path)[0]
+    tail_done = asyncio.Event()
+    closed_before_tail = False
+    original_wait = runner.wait_for
+
+    async def bounded_wait(predicate, **kwargs):
+        await original_wait(predicate, timeout_s=0.2, label=kwargs["label"])
+
+    monkeypatch.setattr(runner, "wait_for", bounded_wait)
+
+    async def handler(socket):
+        nonlocal closed_before_tail
+        pending = None
+
+        async def finish_tail():
+            await asyncio.sleep(0.05)
+            await socket.send(json.dumps({"type": "response.output_text.delta", "response_id": "r2", "delta": "Tail."}))
+            await socket.send(json.dumps({"type": "response.done", "response": {"id": "r2", "status": status}}))
+            tail_done.set()
+
+        try:
+            async for raw in socket:
+                event = json.loads(raw)
+                if event["type"] == "session.update":
+                    await socket.send(json.dumps({"type": "session.created"}))
+                elif event["type"] == "input_audio_buffer.append":
+                    for response in [
+                        {"type": "response.created", "response": {"id": "r1"}},
+                        {"type": "response.output_text.delta", "response_id": "r1", "delta": "Earlier."},
+                        {"type": "response.done", "response": {"id": "r1", "status": "completed"}},
+                        *([] if status == "close_tail" else [{"type": "response.created", "response": {"id": "r2"}}]),
+                    ]:
+                        await socket.send(json.dumps(response))
+                elif event["type"] == "input_audio_buffer.commit" and status not in {"timeout", "close_tail"}:
+                    pending = asyncio.create_task(finish_tail())
+                elif event["type"] == "session.close":
+                    closed_before_tail = not tail_done.is_set()
+                    if status == "close_tail":
+                        await socket.send(json.dumps({"type": "response.created", "response": {"id": "r2"}}))
+                    await socket.send(json.dumps({"type": "session.closed"}))
+                    return
+        finally:
+            if pending is not None:
+                pending.cancel()
+                await asyncio.gather(pending, return_exceptions=True)
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        request = _request(sample)
+        request.api_url = f"http://127.0.0.1:{server.sockets[0].getsockname()[1]}/v1/realtime"
+        output = await patch.async_request_openai_realtime_duplex(request, session=None)
+    success = status in {"completed", "cancelled", "close_tail"}
+    assert output.success is success
+    assert closed_before_tail is (status in {"timeout", "close_tail"})
+    if status == "timeout":
+        assert "Timed out" in output.error
+    if status == "close_tail":
+        assert output.duplex_eval_result.metadata["unfinished_response_ids"] == ["r2"]
+    summary = adapter.finalize_duplex_eval([sample], [output])
+    assert summary["published"] == int(success)
+    if success:
+        sentences = json.loads(output.duplex_eval_result.output.read_text())
+        assert sentences[0]["sentence"] == "Earlier."
+        if status != "close_tail":
+            assert sentences[1]["sentence"] == "Tail."
+
+
+@pytest.mark.asyncio
+async def test_lazy_preparation_keeps_loop_responsive_and_excludes_decode_latency(tmp_path, prepared, monkeypatch):
+    sample = _samples(tmp_path)[0]
+    entered = asyncio.Event()
+    loop_progress = threading.Event()
+    loop = asyncio.get_running_loop()
+    clock = 0.0
+
+    def prepare(*args, **kwargs):
+        nonlocal clock
+        loop.call_soon_threadsafe(entered.set)
+        assert loop_progress.wait(5), "media preparation blocked the event loop"
+        clock += 100.0
+        return prepared
+
+    async def generate(*args, **kwargs):
+        nonlocal clock
+        clock += 2.0
+        return _result(sample)
+
+    class Clock:
+        @staticmethod
+        def perf_counter():
+            return clock
+
+    monkeypatch.setattr(adapter, "prepare_sample", prepare)
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    monkeypatch.setattr(patch, "time", Clock)
+    task = asyncio.create_task(patch.async_request_openai_realtime_duplex(_request(sample), session=None))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=5)
+    finally:
+        loop_progress.set()
+    output = await task
+    assert output.success and output.start_time == 100.0 and output.latency == 2.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("concurrency", [1, 2])
+async def test_benchmark_bounds_decoded_media_and_shares_reference(tmp_path, prepared, monkeypatch, concurrency):
+    refs = []
+    references = []
+    reference_reads = 0
+    original_read = Path.read_bytes
+
+    def read_bytes(path):
+        nonlocal reference_reads
+        if path.name == "reference.wav":
+            reference_reads += 1
+        return original_read(path)
+
+    def prepare(*args, **kwargs):
+        value = replace(prepared)
+        refs.append(weakref.ref(value))
+        references.append(kwargs["ref_audio"])
+        assert sum(ref() is not None for ref in refs) <= concurrency
+        return value
+
+    monkeypatch.setattr(Path, "read_bytes", read_bytes)
+    monkeypatch.setattr(adapter, "prepare_sample", prepare)
+    args = _args(tmp_path, "--num-prompts", "0")
+    manifest = Path(args.dataset_path)
+    row = json.loads(manifest.read_text())[0]
+    manifest.write_text(json.dumps([{**row, "id": str(i)} for i in range(6)]))
+    preprocess_serve_args(args)
+    samples = patch.get_samples(args, None)
+    assert not refs and reference_reads == 1
+
+    async def generate(sample, **kwargs):
+        await asyncio.sleep(0.01)
+        if sample.id == "2":
+            raise RuntimeError("synthetic session failure")
+        return _result(next(request for request in samples if request.sample.id == sample.id))
+
+    monkeypatch.setattr(runner, "generate_sample", generate)
+    result = await patch.benchmark(
+        task_type=patch.TaskType.GENERATION,
+        endpoint_type="openai-realtime-duplex",
+        api_url="http://localhost:8000/v1/realtime",
+        base_url="http://localhost:8000",
+        model_id="mock",
+        model_name="mock",
+        tokenizer=None,
+        input_requests=samples,
+        logprobs=None,
+        request_rate=float("inf"),
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=0,
+        profile=False,
+        selected_percentile_metrics=["ttft"],
+        selected_percentiles=[50, 99],
+        ignore_eos=False,
+        goodput_config_dict={},
+        max_concurrency=concurrency,
+        lora_modules=None,
+        extra_headers=None,
+        extra_body=None,
+        ready_check_timeout_sec=0,
+    )
+    assert result["completed"] == 5 and result["omni_duplex_eval"]["published"] == 5
+    assert len(refs) == 6 and all(ref() is None for ref in refs)
+    assert reference_reads == 1 and all(reference is samples[0].ref_audio for reference in references)
 
 
 def test_artifact_io_failure_preserves_service_results(tmp_path, prepared, monkeypatch):

@@ -46,6 +46,19 @@ class GenerateSampleResult:
 
 
 @dataclass(frozen=True)
+class PreparedReferenceAudio:
+    data_url: str = field(repr=False)
+    sha256: str
+
+    @classmethod
+    def from_path(cls, path: str | Path) -> PreparedReferenceAudio:
+        value = Path(path).expanduser().read_bytes()
+        return cls(
+            "data:audio/wav;base64," + base64.b64encode(value).decode("ascii"), hashlib.sha256(value).hexdigest()
+        )
+
+
+@dataclass(frozen=True)
 class PreparedSample:
     """Decoded input, reusable across readiness, warmup and measured sessions."""
 
@@ -56,16 +69,21 @@ class PreparedSample:
     ref_audio_sha256: str
 
 
-def prepare_sample(sample: DuplexSample, *, media_dir: Path, ref_audio: str | Path, fps: float) -> PreparedSample:
+def prepare_sample(
+    sample: DuplexSample, *, media_dir: Path, ref_audio: str | Path | PreparedReferenceAudio, fps: float
+) -> PreparedSample:
     audio_path = materialize_media(sample.question_audio, media_dir, f"{sample.id}_question", ".wav")
     video_path = materialize_media(sample.video, media_dir, sample.id, ".mp4")
     duration = sample.video_duration or video_duration(video_path)
+    reference = (
+        ref_audio if isinstance(ref_audio, PreparedReferenceAudio) else PreparedReferenceAudio.from_path(ref_audio)
+    )
     return PreparedSample(
         pcm=read_audio_pcm16(audio_path),
         frames=tuple(iter_jpegs(video_path, fps=fps, duration=duration)),
         duration=duration,
-        ref_audio=_ref_audio(ref_audio),
-        ref_audio_sha256=hashlib.sha256(Path(ref_audio).read_bytes()).hexdigest(),
+        ref_audio=reference.data_url,
+        ref_audio_sha256=reference.sha256,
     )
 
 
@@ -83,11 +101,6 @@ def write_sample_result(result: GenerateSampleResult) -> None:
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _ref_audio(path: str | Path) -> str:
-    value = Path(path).expanduser().read_bytes()
-    return "data:audio/wav;base64," + base64.b64encode(value).decode("ascii")
 
 
 def _event_collector_from_realtime(source: RealtimeEventCollector) -> EventCollector:
@@ -109,7 +122,7 @@ async def generate_sample(
     *,
     url: str,
     model: str,
-    ref_audio: str | Path,
+    ref_audio: str | Path | PreparedReferenceAudio,
     output_root: str | Path,
     fps: float = 1.0,
     mix: str = "question",
@@ -160,9 +173,18 @@ async def generate_sample(
                 iter_av_units(prepared.pcm, iter(prepared.frames), unit_ms=unit_ms), realtime=realtime
             )
             await client.commit()
+
+            def responses_finished() -> bool:
+                client.raise_if_reader_stopped()
+                # A clip contains multiple turns. An earlier response.done
+                # must not end the drain while a later turn is still active.
+                return client.events.count("response.done") > 0 and all(
+                    client.events.response_is_done(response_id) for response_id in client.events.response_ids
+                )
+
             try:
                 await wait_for(
-                    lambda: client.events.count("response.done") > 0,
+                    responses_finished,
                     timeout_s=max(20.0, prepared.duration + 20.0),
                     label="response.done",
                 )
@@ -213,16 +235,19 @@ async def generate_sample(
         if code != "playback_ack_too_late":
             errors.append(str(event))
     errors.extend(str(error) for error in (drain_timeout, close_timeout) if error)
-    completed = set()
+    finished = set()
     for event in events:
         response = event.get("response")
         if event.get("type") == "response.done" and isinstance(response, dict):
-            if response.get("status", "completed") == "completed":
-                completed.add(response.get("id"))
-            else:
+            finished.add(response.get("id"))
+            # Barge-in cancels an individual turn, not the input clip. Its
+            # preceding responses and already emitted text remain judge input.
+            if response.get("status", "completed") not in {"completed", "cancelled"}:
                 errors.append(f"Response did not complete: {response}")
-    if set(client.events.response_ids) - completed:
-        errors.append("Session closed with unfinished responses")
+    # A turn may be created while closing the continuous session. Record this
+    # boundary in metadata; drain/close timeouts and server errors above still
+    # fail the sample instead of silently publishing a broken session.
+    meta["unfinished_response_ids"] = sorted(set(client.events.response_ids) - finished)
     result = GenerateSampleResult(
         output=output,
         request_metrics=[_with_sample_identity(metric, sample) for metric in bundle.request_metrics],

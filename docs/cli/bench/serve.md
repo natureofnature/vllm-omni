@@ -307,10 +307,14 @@ without repeating it. `--seed` controls shuffling; `--disable-shuffle` preserves
 dataset order.
 
 Inputs retain the standalone runner's real-time pacing, question audio, media
-clock and 1 FPS default (`--duplex-eval-fps`). Selected media is decoded before
-benchmark timing and held in client memory; concurrency does not bound this
-memory, so select a suitable sample count. `--omni-request-timeout-s` bounds each
-complete session (default 900 seconds). Readiness and warmups replay complete
+clock and 1 FPS default (`--duplex-eval-fps`). Each session decodes its media in a
+worker thread after acquiring a concurrency slot, and releases the decoded input
+when the request finishes. `--max-concurrency` therefore bounds the number of
+decoded clips held in memory; the reference audio is encoded once and shared.
+Preparation is excluded from individual session latency, but any preparation
+stalls are included in the total benchmark duration and throughput.
+`--omni-request-timeout-s` bounds each complete session after preparation (default
+900 seconds). Readiness and warmups replay complete
 sessions but do not contribute metrics or judge artifacts; the example disables
 both to avoid that extra runtime.
 
@@ -321,6 +325,12 @@ OmniInteract; stream metrics include concurrent real-time input. TPOT/ITL requir
 engine token timings and are unavailable when those timings are absent. E2EL
 includes the whole session, including input streaming and drain, so it is not a
 model-only generation latency.
+
+A video can produce several responses. Normal barge-in cancellation ends one
+response without failing the sample; its collected text remains available to the
+judge. The runner drains active responses before closing the session. Responses
+created during close are recorded in `unfinished_response_ids` in the metadata;
+server errors, failed responses, and drain/close timeouts still fail the sample.
 
 `--duplex-eval-response-root` is a **parent directory** and may already exist.
 Each invocation creates an exclusive `run-*` subdirectory, so repeated runs and
