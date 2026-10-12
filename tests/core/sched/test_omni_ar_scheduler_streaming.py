@@ -1655,6 +1655,7 @@ def test_context_overflow_emits_an_error_output_with_the_reason() -> None:
     assert output.finish_reason == FinishReason.ERROR
     assert output.stop_reason == "context_length_exceeded: too long"
     assert output.new_token_ids == []
+    assert output.is_segment_finished is False
     assert sched._streaming_context_overflow == {}
 
     sched._emit_streaming_context_overflow_outputs(outputs)

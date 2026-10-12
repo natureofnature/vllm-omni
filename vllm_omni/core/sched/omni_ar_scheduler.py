@@ -166,6 +166,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
     def add_request(self, request: Request) -> None:
         if request.request_id in getattr(self, "_overflowed_streaming_requests", ()):
+            logger.debug("[Omni] Dropping append for overflowed request %s pending ordered abort", request.request_id)
             return
         super().add_request(request)
 

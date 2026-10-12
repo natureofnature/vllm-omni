@@ -200,6 +200,8 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
     ) -> None:
         if not req_state.session_owned or getattr(eco, "finish_reason", None) != FinishReason.ERROR:
             return
+        # Segment boundaries do not terminate a resumable request. Context
+        # overflow emits a separate terminal ERROR with is_segment_finished=False.
         if getattr(eco, "is_segment_finished", False):
             return
         reason = getattr(eco, "stop_reason", None)
