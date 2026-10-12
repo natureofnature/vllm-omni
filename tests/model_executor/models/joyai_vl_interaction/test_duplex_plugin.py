@@ -17,6 +17,7 @@ from vllm_omni.engine.duplex.commands import (
     AckPlayback,
     AppendAudio,
     CancelResponse,
+    ClearInput,
     CloseSession,
     Commit,
     CreateItem,
@@ -390,6 +391,63 @@ async def test_camera_input_during_output_waits_for_previous_turn():
         assert latest.context.request_id != request_id
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
         await h.run(CloseSession())
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_new_camera_commit_supersedes_queued_promotion():
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(Commit(final=True, create_response=True))
+        assert h.runner.model_state.deferred_response_create
+        # Queue C behind A's terminal before processing either. The terminal
+        # appends B's promotion behind C, exercising the real mailbox ordering.
+        h.deliver(tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True)
+        h.submit(AppendAudio(video_frames=(frame("green"),)))
+        h.submit(Commit(final=True, create_response=True))
+        await h.settle()
+        assert len(h.port.submissions) == 2
+        latest = h.port.submissions[-1]
+        assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 128, 0)
+        assert not any(abort for _, abort in h.port.cleanups)
+        assert not h.port.aborts
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(latest.context.request_id, text="</silence>", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        events = [event.to_realtime() for event in h.events]
+        assert any(
+            event["type"] == "response.done"
+            and event["response"]["id"] == response_id
+            and event["response"]["status"] == "completed"
+            for event in events
+        )
+        assert not any(event["type"] == "error" for event in events)
+        assert h.session.active_response_id is None
+        assert h.runner.model_state.committed_audio_payload is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("command", [ClearInput(), CloseSession()], ids=["clear", "close"])
+async def test_invalidated_camera_commit_cannot_be_promoted(command):
+    h = await open_joyai()
+    try:
+        request_id = await observe(h)
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(Commit(final=True, create_response=True))
+        h.deliver(tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True)
+        h.submit(command)
+        await h.settle()
+        assert len(h.port.submissions) == 1
+        assert h.session.active_response_id is None
+        assert h.runner.model_state.committed_audio_payload is None
     finally:
         await h.manager.shutdown()
 

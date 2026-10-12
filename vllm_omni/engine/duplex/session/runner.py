@@ -519,12 +519,17 @@ class DuplexSessionRunner:
             payload = item.payload.get("payload")
             if not isinstance(payload, dict):
                 return
+            # Commands ahead of this queued promotion may replace or clear its
+            # committed input. Only the payload still owned by the session can
+            # start a turn; replaying an old one could abort the newer request.
+            if self.model_state.committed_audio_payload is not payload:
+                return
             await self._start_append(
                 payload,
                 final=True,
                 precreate_response=bool(item.payload.get("precreate_response", False)),
                 operation_id=self.model_state.committed_audio_operation_id,
-                retained_committed_payload=(payload if self.model_state.committed_audio_payload is payload else None),
+                retained_committed_payload=payload,
             )
             return
         if item.kind == "commit":
