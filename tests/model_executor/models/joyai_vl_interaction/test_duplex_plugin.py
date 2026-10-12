@@ -19,6 +19,7 @@ from vllm_omni.engine.duplex.commands import (
     CancelResponse,
     CloseSession,
     Commit,
+    CreateItem,
     CreateResponse,
 )
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
@@ -49,7 +50,7 @@ def frame(color="red"):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-async def open_joyai():
+async def open_joyai(*, modalities=("text", "audio")):
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
@@ -70,7 +71,7 @@ async def open_joyai():
             control_id="open",
             session_id=SESSION_ID,
             session_config=DuplexSessionConfig(
-                model="joyai", instructions="Watch the pot.", modalities=["text", "audio"]
+                model="joyai", instructions="Watch the pot.", modalities=list(modalities)
             ),
             output_buffer=output_buffer,
         )
@@ -240,6 +241,7 @@ async def test_cancel_releases_request_and_late_output_cannot_speak():
         )
         await h.run(CancelResponse())
         assert h.runner.plugin.data_plane.is_terminal(request_id)
+        assert not any(message.get("content") == "Smoke!" for message in h.session.history)
         before = len(h.events)
         await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, epoch=0)
         assert not any(event.to_realtime()["type"] == "response.output_audio.delta" for event in h.events[before:])
@@ -301,6 +303,78 @@ async def test_text_item_uses_same_session_without_audio():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["</silence>", "</response> Repeat", "</delegation> Ask the agent"])
+async def test_intermediate_terminal_allows_text_followup(action):
+    h = await open_joyai()
+    try:
+        h.runner.model_state.last_response_text = "Repeat"
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text=action, finished=True), stage_id=0, segment_finished=True
+        )
+        assert h.session.active_response_id is None
+        assert h.runner.run.stream_request_id is None
+        assert h.port.cleanups[-1][0] == [request_id]
+        await h.run(
+            translate_realtime_command(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": "followup",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "What do you see now?"}],
+                    },
+                }
+            )
+        )
+        await h.run(CreateResponse())
+        assert len(h.port.submissions) == 2
+        assert h.port.submissions[-1].context.request_id != request_id
+        assert "What do you see now?" in h.port.submissions[-1].prompt["prompt"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("modalities", [("text",), ("text", "audio")])
+async def test_response_history_requires_playback_only_for_audio(modalities):
+    h = await open_joyai(modalities=modalities)
+    try:
+        await h.run(
+            CreateItem(
+                item={
+                    "id": "question",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What do you see?"}],
+                }
+            )
+        )
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Smoke!", finished=True), stage_id=0, segment_finished=True
+        )
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
+        assert h.session.active_response_id is None
+        spoken = "audio" in modalities
+        assert any(message.get("content") == "Smoke!" for message in h.session.history) is not spoken
+        assert (h.session.playback.sent_ms > 0) is spoken
+        assert h.session.playback.text_requires_complete_audio is spoken
+        if spoken:
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            assert any(message.get("content") == "Smoke!" for message in h.session.history)
+        else:
+            assert not any(event.to_realtime()["type"] == "response.output_audio.delta" for event in h.events)
+        next_request = await observe(h)
+        assert next_request != request_id
+        assert "</response> Smoke!" in h.port.submissions[-1].prompt["prompt"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_camera_input_during_output_waits_for_previous_turn():
     h = await open_joyai()
     try:
@@ -347,6 +421,48 @@ async def test_cancel_during_prompt_preparation_cannot_submit(monkeypatch):
         await h.manager.shutdown()
 
 
+def test_conversation_images_and_camera_frames_share_input_order():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    state = plugin.create_session_state()
+    conversation: list[dict[str, object]] = []
+    config = {"conversation": conversation}
+    runtime = plugin.runtime_config_for_update(DuplexSessionConfig(), {})
+
+    def prepare(frames=()):
+        payload = {"video_frames": list(frames)}
+        prompt_config = plugin.prepare_prompt_config(config, state=state, payload=payload)
+        plan = plugin.plan_append(
+            request_id="r",
+            fence=DuplexFence("s"),
+            session_config=prompt_config,
+            runtime_config=runtime,
+            seq=1,
+            turn_seq=1,
+            payload=payload,
+            final=True,
+            sampling_params=SamplingParams(max_tokens=64),
+        )
+        return [image.getpixel((0, 0)) for image in plan.prompt["multi_modal_data"]["image"]]
+
+    red, blue, green = (255, 0, 0), (0, 0, 255), (0, 128, 0)
+    assert prepare([frame()] * 4) == [red] * 4
+    image_message: dict[str, object] = {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": frame("blue")}}],
+    }
+    config["conversation"].append(image_message)
+    assert prepare() == [red, red, red, blue]
+    assert prepare([frame("green")]) == [red, red, blue, green]
+    config["conversation"].append({"role": "user", "content": "What changed?"})
+    assert prepare() == [red, red, blue, green]
+    config["conversation"].append(image_message.copy())
+    assert prepare() == [red, blue, green, blue]
+    config["conversation"] = [{"role": "user", "content": "New scene"}]
+    assert prepare([frame("green")]) == [green]
+
+
 def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
@@ -364,7 +480,7 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
         sampling_params=SamplingParams(max_tokens=64),
     )
     session_config = {
-        "joyai_frames": [frame()] * 4,
+        "joyai_frames": [frame()] * 3 + [frame("blue")],
         "conversation": [
             {"role": "user", "content": "old" * 1000},
             {"role": "assistant", "content": "old answer"},
@@ -375,6 +491,7 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     prompt = plan.prompt
     assert "Watch the pot." in prompt["prompt"] and "Any smoke?" in prompt["prompt"]
     assert "old answer" not in prompt["prompt"]
+    assert prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
     assert (
         len(plugin.processor(text=[prompt["prompt"]], images=prompt["multi_modal_data"]["image"])["input_ids"][0])
         <= 1436

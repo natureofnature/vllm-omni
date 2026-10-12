@@ -713,6 +713,8 @@ class ModelChannel:
                 if candidate not in release_ids and not session.is_draining_request(candidate):
                     release_ids.append(candidate)
         session.release_resources_for_request_ids(release_ids)
+        if self._ctx.run.stream_request_id in release_ids:
+            self._ctx.run.stream_request_id = None
         await self._ctx.stage_port.cleanup(release_ids)
 
     async def _on_model_listen(

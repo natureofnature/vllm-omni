@@ -19,6 +19,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import Jo
 class JoyAISessionState(DefaultDuplexModelSessionState):
     audio_buffer: JoyAIFrameBuffer = field(default_factory=JoyAIFrameBuffer)
     frames: list[str] = field(default_factory=list)
+    conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
 
 
@@ -103,6 +104,7 @@ class JoyAIDataPlane(DuplexDataPlane):
                 else:
                     observation.response_text = action.text
                     event["text"] = action.text
+                    event["text_requires_complete_audio"] = "audio" in context.modalities
                 yield event
             elif stage_id == 2:
                 completion = next(iter(output.outputs or ()), None)
@@ -137,9 +139,9 @@ class JoyAIDataPlane(DuplexDataPlane):
                     if samples.size and "audio" in context.modalities
                     else "",
                     sample_rate_hz=rate,
-                    audio_duration_ms=samples.size * 1000 / rate,
+                    audio_duration_ms=samples.size * 1000 / rate if "audio" in context.modalities else 0,
                     audio_complete=bool(output.finished),
-                    text_requires_complete_audio=True,
+                    text_requires_complete_audio="audio" in context.modalities,
                     end_of_turn=bool(output.finished),
                 )
                 yield event

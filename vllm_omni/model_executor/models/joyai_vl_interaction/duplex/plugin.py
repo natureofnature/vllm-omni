@@ -124,9 +124,24 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     ) -> dict[str, object]:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
-        frames = payload.get("video_frames", [])
-        if frames:
-            state.frames = (state.frames + list(frames))[-4:]
+        images = tuple(
+            part["image_url"]["url"]
+            for message in config.get("conversation", [])
+            if message.get("role") == "user" and isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "image_url"
+        )
+        previous = state.conversation_images
+        if images[: len(previous)] == previous:
+            new_images = images[len(previous) :]
+        else:
+            # Rebuild the visual window after conversation images are edited or deleted.
+            state.frames = []
+            new_images = images
+        # Append each conversation image once, alongside newly committed camera
+        # frames, so retained camera history cannot displace a newer user image.
+        state.frames = [*state.frames, *new_images, *payload.get("video_frames", [])][-4:]
+        state.conversation_images = images
         return {**config, "joyai_state": state, "joyai_frames": list(state.frames)}
 
     async def prepare_append_plan(
@@ -185,15 +200,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI video profile requires committed text/image/video input")
         history = []
         query = runtime_config.get("initial_user_text") or ""
-        frame_urls = []
         for message in session_config.get("conversation", []):
             role, content = message.get("role"), message.get("content")
             if role not in {"user", "assistant"}:
                 continue
             if isinstance(content, list):
                 text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
-                if role == "user":
-                    frame_urls.extend(part["image_url"]["url"] for part in content if part.get("type") == "image_url")
             else:
                 text = content if isinstance(content, str) else ""
             if text:
@@ -206,9 +218,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # The active instruction is attached to the latest observation below.
         if history and history[-1]["role"] == "user":
             history.pop()
-        frame_urls.extend(session_config.get("joyai_frames", []))
         images = []
-        for encoded in frame_urls[-4:]:
+        for encoded in session_config.get("joyai_frames", [])[-4:]:
             if encoded.startswith("data:"):
                 encoded = encoded.split(",", 1)[1]
             with Image.open(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
