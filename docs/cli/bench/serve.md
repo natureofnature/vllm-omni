@@ -359,10 +359,10 @@ Per-sample scores and `evaluation_summary.json` are saved under the run's
 (default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).
 
 The independent scoring commands remain available to retry scoring or change
-judges without repeating inference. After all three samples above succeed and
-their artifacts are published, evaluate the same ordered
-selection with `--limit 3`. Replace `run-XXXXXXXX` below with the reported run
-directory:
+judges without repeating inference. The `--limit 3` example below matches the
+serving command above when `--disable-shuffle` is used and all three measured
+samples succeed and publish their artifacts. Replace `run-XXXXXXXX` below with
+the reported run directory:
 
 ```bash
 vllm bench omni-duplex-eval --omni evaluate \
@@ -371,6 +371,12 @@ vllm bench omni-duplex-eval --omni evaluate \
   --judge-base-url http://127.0.0.1:8001/v1 --judge-model your-judge-model
 vllm bench omni-duplex-eval --omni summarize --score-root ./duplex-eval-scores-1
 ```
+
+`evaluate --limit N` selects the first N matching samples in dataset order. It
+does not reproduce the shuffle from `bench serve` or filter out failed or
+unpublished sessions. To automatically score the actual successfully published
+samples, including shuffled or partially successful runs, use
+`--duplex-eval-evaluate` during `bench serve`.
 
 The standalone `generate` command remains available, including its existing
 skip-existing/overwrite behavior. This integration does not change scoring rules

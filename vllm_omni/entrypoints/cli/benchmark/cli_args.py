@@ -481,8 +481,8 @@ def update_omni_help(parser: argparse.ArgumentParser) -> None:
     for action in parser._actions:
         if action.dest == "num_prompts":
             action.help = (
-                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} when this option is omitted; "
-                "0 selects all available cases."
+                f"{action.help} OmniInteract uses {_DEFAULT_OMNIINTERACT_NUM_PROMPTS} and Omni-DuplexEval uses 3 "
+                "when this option is omitted; 0 selects all available cases for either dataset."
             )
         if action.dest == "percentile_metrics":
             action.help = (
