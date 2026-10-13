@@ -585,25 +585,71 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["budget", "submit"])
-async def test_failed_append_preserves_visual_history(failure):
+@pytest.mark.parametrize("failure", ["image", "budget", "submit"])
+async def test_failed_append_preserves_visual_history_and_next_observation_runs(failure):
     h = await open_joyai()
     try:
         state = h.runner.model_state
         state.frames = [frame("red")]
         state.conversation_images = (frame("green"),)
         before = (list(state.frames), state.conversation_images)
-        if failure == "budget":
+        failed_frame = frame("blue")
+        if failure == "image":
+            failed_frame = base64.b64encode(b"not an image").decode()
+        elif failure == "budget":
             h.runner.plugin.max_model_len = 10
         else:
             h.port.fail_submit = RuntimeError("stage unavailable")
-        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(AppendAudio(video_frames=(failed_frame,)))
         await h.run(Commit(final=True, create_response=True))
         assert not h.port.submissions
         assert not h.runner.plugin.data_plane.requests
         assert (state.frames, state.conversation_images) == before
         assert any(event.to_realtime()["type"] == "error" for event in h.events)
+
+        h.runner.plugin.max_model_len = 16384
+        h.port.fail_submit = None
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        events = await h.run(Commit(final=True, create_response=True))
+        assert not any(event.to_realtime()["type"] == "error" for event in events)
+        assert len(h.port.submissions) == 1
+        assert state.frames[-1] == frame("blue")
+        assert len(h.runner.plugin.data_plane.requests) == 1
     finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_buffered_video_keeps_pending_append_failure_until_fresh_input():
+    h = await open_joyai()
+    h.port.submit_gate = asyncio.Event()
+    try:
+        h.submit(AppendAudio(video_frames=(frame(),)))
+        h.submit(Commit(final=True, create_response=True))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=3)
+        pending = h.runner.tasks.append_tail
+        assert pending is not None and not pending.done()
+
+        h.submit(AppendAudio(video_frames=(frame("blue"),)))
+        await h.settle(timeout_s=0.1)
+        assert h.runner.model_state.audio_buffer.frames == [frame("blue")]
+        assert h.runner.tasks.append_tail is pending
+
+        pending.cancel()
+        await h.settle()
+        h.port.submit_gate = None
+        events = await h.run(Commit(final=True, create_response=True))
+        assert any(getattr(event, "code", None) == "commit_aborted" for event in events)
+        assert not h.port.submissions
+
+        await h.run(AppendAudio(video_frames=(frame("green"),)))
+        events = await h.run(Commit(final=True, create_response=True))
+        assert not any(event.to_realtime()["type"] == "error" for event in events)
+        assert len(h.port.submissions) == 1
+        assert h.runner.model_state.frames == [frame("green")]
+    finally:
+        if h.port.submit_gate is not None:
+            h.port.submit_gate.set()
         await h.manager.shutdown()
 
 

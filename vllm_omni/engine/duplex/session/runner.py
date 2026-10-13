@@ -1002,6 +1002,10 @@ class DuplexSessionRunner:
                 return
             if pending_delta < 0:
                 session.release_input_bytes(-pending_delta)
+            # Fresh input for an ephemeral request is an explicit retry even
+            # when the buffer waits until commit to start the append.
+            if not session.capabilities.supports_core_resumable_request:
+                self._reset_failed_append_tail()
             self._maybe_schedule_vad_commit(vad_result)
             return
         if pcm_reservation.byte_count == 0:
@@ -1121,17 +1125,8 @@ class DuplexSessionRunner:
             before_append=before_append,
         )
 
-        predecessor = self.tasks.append_tail
-        if predecessor is not None and predecessor.done():
-            try:
-                predecessor_ok = predecessor.result()
-            except (asyncio.CancelledError, Exception):
-                predecessor_ok = False
-            if not predecessor_ok:
-                # Appends queued behind a failed predecessor stop; a later
-                # command is an explicit retry and starts a new chain.
-                predecessor = None
-        task = asyncio.create_task(attempt.run_in_wire_order(predecessor))
+        self._reset_failed_append_tail()
+        task = asyncio.create_task(attempt.run_in_wire_order(self.tasks.append_tail))
         task.add_done_callback(attempt.release_on_failure)
         self.tasks.append_tail = task
         self.tasks.track_append_task(
@@ -1151,6 +1146,19 @@ class DuplexSessionRunner:
         """An append task died: mark the session closing now, close it out next."""
         self._begin_close(reason)
         self.spawn(self._close_from_runtime(reason), name="duplex-runtime-close")
+
+    def _reset_failed_append_tail(self) -> None:
+        predecessor = self.tasks.append_tail
+        if predecessor is None or not predecessor.done():
+            return
+        try:
+            predecessor_ok = predecessor.result()
+        except (asyncio.CancelledError, Exception):
+            predecessor_ok = False
+        if not predecessor_ok:
+            # Appends queued behind a failed predecessor stop; a later
+            # command is an explicit retry and starts a new chain.
+            self.tasks.append_tail = None
 
     async def _wait_for_append_tail(self) -> bool:
         predecessor = self.tasks.append_tail
