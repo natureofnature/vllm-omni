@@ -364,6 +364,11 @@ sessions, and judge errors. Partial coverage is marked `partial`; no evaluated
 sessions is `failed`, not a zero-error accuracy result. Scores are conditional on
 the evaluated subset, not an accuracy score for all attempted sessions. Warmups
 are never scored. Judge failures do not discard completed performance measurements.
+The saved `omni_duplex_eval.published_with_unfinished_responses` counts published
+samples with non-empty `unfinished_response_ids` in their metadata. A nonzero count
+also emits a warning. These samples remain eligible for scoring using their collected
+text, so interpret accuracy alongside this count. It only covers observed responses;
+zero does not establish that every final input triggered a completed reply.
 Per-sample scores and `evaluation_summary.json` are saved under the run's
 `evaluation/` directory. `--duplex-eval-eval-workers` controls scoring concurrency
 (default 1), and `--duplex-eval-judge-timeout-s` bounds each judge request (default 600).

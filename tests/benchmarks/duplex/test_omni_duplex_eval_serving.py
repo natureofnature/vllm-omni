@@ -303,6 +303,48 @@ def test_evaluation_reports_incomplete_coverage(tmp_path, prepared, monkeypatch,
     assert outputs[1].success
 
 
+@pytest.mark.parametrize("evaluate", [False, True])
+@pytest.mark.parametrize("failure", [None, "generation", "publication"])
+def test_finalization_reports_published_samples_with_unfinished_responses(
+    tmp_path, prepared, monkeypatch, evaluate, failure
+):
+    samples = _samples(tmp_path)
+    if evaluate:
+        samples = [
+            replace(sample, evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge")) for sample in samples
+        ]
+    outputs = [patch.MixRequestFuncOutput(success=True) for _ in samples]
+    for sample, output in zip(samples, outputs, strict=True):
+        output.duplex_eval_result = _result(sample)
+    outputs[0].duplex_eval_result.metadata["unfinished_response_ids"] = ["tail1", "tail2"]
+    if failure == "generation":
+        outputs[0].success = False
+    publish = adapter.write_sample_result
+
+    def write(result):
+        if failure == "publication" and result.output.stem == "0":
+            raise OSError("disk full")
+        publish(result)
+
+    calls = 0
+
+    def judge_chat(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return '{"success_score": 1}'
+
+    monkeypatch.setattr(adapter, "write_sample_result", write)
+    monkeypatch.setattr(adapter.DuplexJudge, "chat", judge_chat)
+    summary = adapter.finalize_duplex_eval(samples, outputs)
+    assert summary["published"] == (2 if failure is None else 1)
+    assert summary["published_with_unfinished_responses"] == int(failure is None)
+    assert len(summary["artifact_errors"]) == int(failure == "publication")
+    assert calls == (summary["published"] if evaluate else 0)
+    if evaluate:
+        assert summary["accuracy"]["evaluated"] == summary["published"]
+        assert summary["accuracy"]["pr"]["mean_all_success"] == 1
+
+
 def test_evaluation_summary_write_failure_preserves_service_results(tmp_path, prepared, monkeypatch):
     sample = replace(_samples(tmp_path)[0], evaluation=adapter.DuplexEvalEvaluation("http://judge", "judge"))
     output = patch.MixRequestFuncOutput(success=True)
@@ -564,6 +606,7 @@ async def test_multiturn_drain_and_clip_end(tmp_path, prepared, monkeypatch, sta
         assert output.duplex_eval_result.metadata["unfinished_response_ids"] == ["r2"]
     summary = adapter.finalize_duplex_eval([sample], [output])
     assert summary["published"] == int(success)
+    assert summary["published_with_unfinished_responses"] == int(status == "close_tail")
     if success:
         sentences = json.loads(output.duplex_eval_result.output.read_text())
         assert sentences[0]["sentence"] == "Earlier."

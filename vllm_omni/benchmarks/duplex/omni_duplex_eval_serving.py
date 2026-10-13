@@ -193,6 +193,7 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
     session_metrics: list[dict[str, object]] = []
     errors: list[str] = []
     published: list[OmniDuplexEvalSampleRequest] = []
+    published_with_unfinished_responses = 0
     for sample, output in rows:
         result = getattr(output, "duplex_eval_result", None)
         if not output.success or not isinstance(result, GenerateSampleResult):
@@ -202,6 +203,8 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
         try:
             write_sample_result(result)
             published.append(sample)
+            if result.metadata.get("unfinished_response_ids"):
+                published_with_unfinished_responses += 1
         except OSError as exc:
             message = f"Cannot publish {result.output}: {exc}"
             errors.append(message)
@@ -213,7 +216,19 @@ def finalize_duplex_eval(samples: list[SampleRequest], outputs: list[RequestFunc
     except OSError as exc:
         errors.append(f"Cannot publish duplex metrics: {exc}")
         logger.exception("Cannot publish duplex metrics")
-    summary: dict[str, object] = {"response_root": str(root), "published": len(published), "artifact_errors": errors}
+    summary: dict[str, object] = {
+        "response_root": str(root),
+        "published": len(published),
+        "published_with_unfinished_responses": published_with_unfinished_responses,
+        "artifact_errors": errors,
+    }
+    if published_with_unfinished_responses:
+        logger.warning(
+            "Published Omni-DuplexEval samples with unfinished responses: %d/%d; "
+            "their collected text remains eligible for scoring.",
+            published_with_unfinished_responses,
+            len(published),
+        )
     if (options := rows[0][0].evaluation) is not None:
         try:
             summary["accuracy"] = _evaluate_published_samples(published, root, options, total=len(rows))
