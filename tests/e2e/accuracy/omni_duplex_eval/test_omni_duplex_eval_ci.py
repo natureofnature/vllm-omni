@@ -114,6 +114,7 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
             "0",
             "--model",
             omni_server.model,
+            "--trust-remote-code",
             "--duplex-eval-ref-audio",
             str(resolve_ref_audio()),
             "--duplex-eval-response-root",

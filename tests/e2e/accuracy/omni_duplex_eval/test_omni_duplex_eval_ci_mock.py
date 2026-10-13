@@ -266,6 +266,7 @@ def test_real_guard_assembles_bench_serve_argv(monkeypatch: pytest.MonkeyPatch, 
     assert args.base_url == "http://127.0.0.1:9999"
     assert args.endpoint == "/v1/realtime"
     assert args.model == "mock-model"
+    assert args.trust_remote_code
     assert args.dataset_name == "omni-duplex-eval"
     assert args.dataset_path == config["dataset"]
     assert args.duplex_eval_split == "all"
