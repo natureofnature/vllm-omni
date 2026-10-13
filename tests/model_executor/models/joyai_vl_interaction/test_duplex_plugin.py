@@ -38,11 +38,28 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 class Processor:
+    merge_size = 2
+    image_token = "<|image_pad|>"
+
+    def __init__(self):
+        self.image_processor = self
+        self.image_size_calls = 0
+        self.vision_calls = 0
+
+    def get_number_of_image_patches(self, height, width, images_kwargs):
+        self.image_size_calls += 1
+        return 256 * self.merge_size**2
+
     def apply_chat_template(self, messages, **kwargs):
-        return repr(messages)
+        return repr(messages).replace("{'type': 'image'}", self.image_token)
+
+    def tokenizer(self, *, text):
+        return {"input_ids": [[0] * len(text[0].replace(self.image_token, "@"))]}
 
     def __call__(self, *, text, images):
-        return {"input_ids": [[0] * (len(text[0]) + 256 * len(images or []))]}
+        self.vision_calls += 1
+        length = len(self.tokenizer(text=text)["input_ids"][0]) + 255 * len(images or [])
+        return {"input_ids": [[0] * length]}
 
 
 def frame(color="red"):
@@ -357,9 +374,10 @@ async def test_response_history_requires_playback_only_for_audio(modalities):
         await h.deliver_and_settle(
             tts_output(request_id, text="</response> Smoke!", finished=True), stage_id=0, segment_finished=True
         )
-        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
-        assert h.session.active_response_id is None
         spoken = "audio" in modalities
+        if spoken:
+            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
+        assert h.session.active_response_id is None
         assert any(message.get("content") == "Smoke!" for message in h.session.history) is not spoken
         assert (h.session.playback.sent_ms > 0) is spoken
         assert h.session.playback.text_requires_complete_audio is spoken
@@ -473,25 +491,28 @@ async def test_cancel_during_prompt_preparation_cannot_submit(monkeypatch):
         await h.settle()
         assert not h.port.submissions
         assert not h.runner.plugin.data_plane.requests
+        assert h.runner.model_state.frames == []
+        assert h.runner.model_state.conversation_images == ()
     finally:
         released.set()
         await h.run(CloseSession())
         await h.manager.shutdown()
 
 
-def test_conversation_images_and_camera_frames_share_input_order():
+@pytest.mark.asyncio
+async def test_conversation_images_and_camera_frames_share_input_order():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
     state = plugin.create_session_state()
     conversation: list[dict[str, object]] = []
-    config = {"conversation": conversation}
+    config = {"conversation": conversation, "modalities": ["text", "audio"]}
     runtime = plugin.runtime_config_for_update(DuplexSessionConfig(), {})
 
-    def prepare(frames=()):
+    async def prepare(frames=()):
         payload = {"video_frames": list(frames)}
         prompt_config = plugin.prepare_prompt_config(config, state=state, payload=payload)
-        plan = plugin.plan_append(
+        plan = await plugin.prepare_append_plan(
             request_id="r",
             fence=DuplexFence("s"),
             session_config=prompt_config,
@@ -502,23 +523,25 @@ def test_conversation_images_and_camera_frames_share_input_order():
             final=True,
             sampling_params=SamplingParams(max_tokens=64),
         )
+        plugin.commit_append_plan("r")
+        plugin.data_plane.close_stream("r")
         return [image.getpixel((0, 0)) for image in plan.prompt["multi_modal_data"]["image"]]
 
     red, blue, green = (255, 0, 0), (0, 0, 255), (0, 128, 0)
-    assert prepare([frame()] * 4) == [red] * 4
+    assert await prepare([frame()] * 4) == [red] * 4
     image_message: dict[str, object] = {
         "role": "user",
         "content": [{"type": "image_url", "image_url": {"url": frame("blue")}}],
     }
-    config["conversation"].append(image_message)
-    assert prepare() == [red, red, red, blue]
-    assert prepare([frame("green")]) == [red, red, blue, green]
-    config["conversation"].append({"role": "user", "content": "What changed?"})
-    assert prepare() == [red, red, blue, green]
-    config["conversation"].append(image_message.copy())
-    assert prepare() == [red, blue, green, blue]
+    conversation.append(image_message)
+    assert await prepare() == [red, red, red, blue]
+    assert await prepare([frame("green")]) == [red, red, blue, green]
+    conversation.append({"role": "user", "content": "What changed?"})
+    assert await prepare() == [red, red, blue, green]
+    conversation.append(image_message.copy())
+    assert await prepare() == [red, blue, green, blue]
     config["conversation"] = [{"role": "user", "content": "New scene"}]
-    assert prepare([frame("green")]) == [green]
+    assert await prepare([frame("green")]) == [green]
 
 
 def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
@@ -546,6 +569,8 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
         ],
     }
     plan = plugin.plan_append(session_config=session_config, **kwargs)
+    assert plugin.processor.vision_calls == 0
+    assert plugin.processor.image_size_calls == 4
     prompt = plan.prompt
     assert "Watch the pot." in prompt["prompt"] and "Any smoke?" in prompt["prompt"]
     assert "old answer" not in prompt["prompt"]
@@ -557,3 +582,154 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin.max_model_len = 10
     with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
         plugin.plan_append(session_config=session_config, **kwargs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["budget", "submit"])
+async def test_failed_append_preserves_visual_history(failure):
+    h = await open_joyai()
+    try:
+        state = h.runner.model_state
+        state.frames = [frame("red")]
+        state.conversation_images = (frame("green"),)
+        before = (list(state.frames), state.conversation_images)
+        if failure == "budget":
+            h.runner.plugin.max_model_len = 10
+        else:
+            h.port.fail_submit = RuntimeError("stage unavailable")
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(Commit(final=True, create_response=True))
+        assert not h.port.submissions
+        assert not h.runner.plugin.data_plane.requests
+        assert (state.frames, state.conversation_images) == before
+        assert any(event.to_realtime()["type"] == "error" for event in h.events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_submission_preserves_visual_history():
+    h = await open_joyai()
+    h.port.submit_gate = asyncio.Event()
+    try:
+        h.submit(AppendAudio(video_frames=(frame(),)))
+        h.submit(Commit(final=True, create_response=True))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=3)
+        assert h.runner.model_state.frames == []
+        await h.run(CancelResponse())
+        h.port.submit_gate.set()
+        await h.settle()
+        assert h.runner.model_state.frames == []
+        assert h.runner.model_state.conversation_images == ()
+        assert not h.runner.plugin.data_plane.requests
+    finally:
+        h.port.submit_gate.set()
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("response_override", [False, True])
+async def test_text_only_response_finishes_without_tts(response_override):
+    h = await open_joyai(modalities=("text", "audio") if response_override else ("text",))
+    try:
+        await h.run(
+            CreateItem(
+                item={
+                    "id": "question",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What do you see?"}],
+                }
+            )
+        )
+        await h.run(CreateResponse(options={"modalities": ["text"]} if response_override else {}))
+        request_id = h.port.submissions[-1].context.request_id
+        consumed = h.deliver(
+            tts_output(request_id, text="</response> Smoke!", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.settle()
+        assert consumed  # DIRECT_RESPONSE prevents Stage 1/2 forwarding.
+        assert h.session.active_response_id is None
+        assert h.runner.model_state.last_response_text == "Smoke!"
+        assert any(message.get("content") == "Smoke!" for message in h.session.history)
+        # A late downstream output cannot turn a completed text response into an error.
+        await h.deliver_and_settle(tts_output(request_id, samples=0, finished=True), stage_id=2)
+        events = [event.to_realtime() for event in h.events]
+        assert sum(event["type"] == "response.done" for event in events) == 1
+        assert not any(event["type"] in {"error", "response.output_audio.delta"} for event in events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("sizes", [[(32, 32)], [(448, 224), (224, 448), (448, 448)]])
+def test_prompt_budget_matches_qwen3_vl_processor(sizes):
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast, Qwen2VLImageProcessor, Qwen3VLProcessor, Qwen3VLVideoProcessor
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    backend.pre_tokenizer = pre_tokenizers.Whitespace()
+    tokenizer = PreTrainedTokenizerFast(
+        tokenizer_object=backend,
+        unk_token="[UNK]",
+        additional_special_tokens=["<|image_pad|>", "<|video_pad|>", "<|vision_start|>", "<|vision_end|>"],
+    )
+    processor = Qwen3VLProcessor(
+        tokenizer=tokenizer,
+        image_processor=Qwen2VLImageProcessor(patch_size=16),
+        video_processor=Qwen3VLVideoProcessor(),
+        chat_template=(
+            "{% for message in messages %}{{message['role']}}: "
+            "{% if message['content'] is string %}{{message['content']}}"
+            "{% else %}{% for part in message['content'] %}"
+            "{% if part['type'] == 'image' %}<|vision_start|><|image_pad|><|vision_end|>"
+            "{% else %}{{part['text']}}{% endif %}{% endfor %}{% endif %}\n"
+            "{% endfor %}assistant: "
+        ),
+    )
+    frames = []
+    for size in sizes:
+        buffer = io.BytesIO()
+        Image.new("RGB", size).save(buffer, format="PNG")
+        frames.append(base64.b64encode(buffer.getvalue()).decode())
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.processor = processor
+    plugin.max_model_len = 16384
+    kwargs = dict(
+        request_id="r",
+        fence=DuplexFence("s"),
+        session_config={"joyai_frames": frames},
+        runtime_config=plugin.runtime_config_for_update(DuplexSessionConfig(), {}),
+        seq=1,
+        turn_seq=1,
+        payload={"video_frames": frames},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=64),
+    )
+    plan = plugin.plan_append(**kwargs)
+    length = len(
+        processor(
+            text=[plan.prompt["prompt"]],
+            images=plan.prompt["multi_modal_data"]["image"],
+        )["input_ids"][0]
+    )
+    # The exact budget fits; one token less must trim an older frame or fail.
+    plugin.max_model_len = length + 64
+    assert len(plugin.plan_append(**kwargs).prompt["multi_modal_data"]["image"]) == len(sizes)
+    plugin.max_model_len -= 1
+    if len(sizes) == 1:
+        with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
+            plugin.plan_append(**kwargs)
+    else:
+        trimmed = plugin.plan_append(**kwargs)
+        assert len(trimmed.prompt["multi_modal_data"]["image"]) == len(sizes) - 1
+        assert (
+            len(
+                processor(
+                    text=[trimmed.prompt["prompt"]],
+                    images=trimmed.prompt["multi_modal_data"]["image"],
+                )["input_ids"][0]
+            )
+            <= plugin.max_model_len - 64
+        )

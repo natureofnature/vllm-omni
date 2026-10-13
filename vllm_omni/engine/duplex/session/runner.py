@@ -1768,6 +1768,7 @@ class DuplexSessionRunner:
         realtime_item_id: object,
         should_create_response: bool,
         precreate_response_requested: bool,
+        video_only: bool = False,
     ) -> bool:
         """Retain a commit that arrived while a response is still running.
 
@@ -1785,6 +1786,9 @@ class DuplexSessionRunner:
         deferred_payload = commit_reservation.payload
         if deferred_payload is None:
             commit_reservation.commit()
+            return False
+        if video_only and (not deferred_payload.get("video_frames") or deferred_payload.get("audio")):
+            commit_reservation.rollback()
             return False
         retained_payload: dict[str, object]
         if model_state.committed_audio_payload is not None:
@@ -2023,6 +2027,7 @@ class DuplexSessionRunner:
                 realtime_item_id=realtime_item_id,
                 should_create_response=should_create_response,
                 precreate_response_requested=precreate_response_requested,
+                video_only=True,
             )
         ):
             return

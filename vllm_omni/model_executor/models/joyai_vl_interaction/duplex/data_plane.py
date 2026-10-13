@@ -26,6 +26,9 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
 @dataclass
 class Observation:
     state: JoyAISessionState | None = None
+    frames: list[str] = field(default_factory=list)
+    conversation_images: tuple[str, ...] = ()
+    modalities: tuple[str, ...] = ("text", "audio")
     previous_response: str = ""
     text_sent: bool = False
     response_text: str = ""
@@ -105,6 +108,10 @@ class JoyAIDataPlane(DuplexDataPlane):
                     observation.response_text = action.text
                     event["text"] = action.text
                     event["text_requires_complete_audio"] = "audio" in context.modalities
+                    if "audio" not in observation.modalities:
+                        event["end_of_turn"] = True
+                        if observation.state is not None:
+                            observation.state.last_response_text = action.text
                 yield event
             elif stage_id == 2:
                 completion = next(iter(output.outputs or ()), None)

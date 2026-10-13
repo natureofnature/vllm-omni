@@ -133,16 +133,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         )
         previous = state.conversation_images
         if images[: len(previous)] == previous:
+            frames = state.frames
             new_images = images[len(previous) :]
         else:
             # Rebuild the visual window after conversation images are edited or deleted.
-            state.frames = []
+            frames = []
             new_images = images
         # Append each conversation image once, alongside newly committed camera
         # frames, so retained camera history cannot displace a newer user image.
-        state.frames = [*state.frames, *new_images, *payload.get("video_frames", [])][-4:]
-        state.conversation_images = images
-        return {**config, "joyai_state": state, "joyai_frames": list(state.frames)}
+        frames = [*frames, *new_images, *payload.get("video_frames", [])][-4:]
+        return {**config, "joyai_state": state, "joyai_frames": frames, "joyai_conversation_images": images}
 
     async def prepare_append_plan(
         self,
@@ -165,6 +165,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.data_plane.begin_request(request_id)
         request = self.data_plane.requests[request_id]
         request.state = state
+        request.frames = config["joyai_frames"]
+        request.conversation_images = config.pop("joyai_conversation_images")
+        request.modalities = tuple(config["modalities"])
         request.previous_response = state.last_response_text
         try:
             return await asyncio.to_thread(
@@ -182,6 +185,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         except BaseException:
             self.data_plane.close_stream(request_id)
             raise
+
+    def commit_append_plan(self, request_id: str) -> None:
+        request = self.data_plane.requests[request_id]
+        request.state.frames = request.frames
+        request.state.conversation_images = request.conversation_images
 
     def plan_append(
         self,
@@ -231,6 +239,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not isinstance(sampling_params, SamplingParams):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
+        # Qwen3-VL expands each image placeholder to this many visual tokens.
+        # Infer the grid from image sizes once; budget trimming needs no pixels.
+        image_processor = self.processor.image_processor
+        image_token_counts = [
+            image_processor.get_number_of_image_patches(image.height, image.width, {}) // image_processor.merge_size**2
+            for image in images
+        ]
         while True:
             content = [{"type": "image"} for _ in images]
             content.append(
@@ -243,10 +258,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             )
             messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
             prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            # Count expanded visual tokens as well as text, using the same image
-            # sizes supplied to the stage. Keep the instruction and current frame.
-            processed = self.processor(text=[prompt], images=images or None)
-            if len(processed["input_ids"][0]) <= budget:
+            text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
+            if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
                 break
             if history:
                 history.pop(0)
@@ -254,6 +267,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     history.pop(0)
             elif len(images) > 1:
                 images.pop(0)
+                image_token_counts.pop(0)
             else:
                 raise DuplexRuntimeConfigError("JoyAI instruction and current observation exceed the context budget")
         return DuplexAppendPlan(
@@ -282,7 +296,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if observation is None:
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
         action = observation.parse(output)
-        if action.action is not Action.RESPONSE or not action.text or observation.is_repeat(action):
+        if (
+            "audio" not in observation.modalities
+            or action.action is not Action.RESPONSE
+            or not action.text
+            or observation.is_repeat(action)
+        ):
             return DuplexOutputDecision(action=DuplexOutputAction.DIRECT_RESPONSE)
         return None
 

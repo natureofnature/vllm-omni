@@ -302,7 +302,11 @@ class ModelChannel:
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
-                    {**request_context.session_config, "conversation": list(session.history)},
+                    {
+                        **request_context.session_config,
+                        "conversation": list(session.history),
+                        "modalities": list(session.response_config.modalities),
+                    },
                     state=self._ctx.model_state,
                     payload=prompt_payload,
                 ),
@@ -333,6 +337,7 @@ class ModelChannel:
                     raise DuplexFenceMismatchError(session.fence, fence)
                 update = session.commit_append(reservation)
                 session.bind_stage_request(stage_id, request_id, fence=fence)
+                self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
                 try:
                     await self._ctx.stage_port.cleanup([request_id])
@@ -370,6 +375,10 @@ class ModelChannel:
                     }
                 ],
             }
+        except BaseException:
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         finally:
             if operation_started and lease_operation_id in session.lease.active_operations:
                 try:
