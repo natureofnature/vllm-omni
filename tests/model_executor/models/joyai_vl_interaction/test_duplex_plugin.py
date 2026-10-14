@@ -5,12 +5,15 @@ import asyncio
 import base64
 import io
 import threading
+from types import SimpleNamespace
 
 import pytest
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import SESSION_ID, Harness, RecordingStagePort, tts_output
+from tests.engine.test_duplex_orchestrator import SESSION_ID as ORCHESTRATOR_SESSION_ID
+from tests.engine.test_duplex_orchestrator import _build, _close, _open, _submit
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.duplex.commands import (
@@ -666,16 +669,106 @@ async def test_cancel_or_close_during_submission_preserves_visual_history(comman
         assert h.runner.model_state.frames == []
         pending = h.runner.tasks.append_tail
         assert pending is not None and not pending.done()
+        request_id = h.port.ensured[-1].request_id
+        submissions_before_cancel = len(h.port.submissions)
         await h.run(command)
-        h.port.submit_gate.set()
         await h.settle()
-        assert pending.done()
+        assert pending.cancelled()
+        assert len(h.port.submissions) == submissions_before_cancel
+        assert any(request_id in ids for ids, _ in h.port.cleanups)
         commit_plan.assert_not_called()
         assert h.session.input_seq == 0
         assert h.runner.model_state.frames == []
         assert h.runner.model_state.conversation_images == ()
         assert not h.runner.plugin.data_plane.requests
         assert not any(event.to_realtime()["type"] == "error" for event in h.events)
+    finally:
+        h.port.submit_gate.set()
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("close_session", [False, True], ids=["cancel", "close"])
+async def test_teardown_aborts_accepted_submission_before_ack(close_session, monkeypatch, mocker):
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
+    accepted, ack = asyncio.Event(), asyncio.Event()
+    add_request = clients[0].add_request_async
+
+    async def build_request(request_id, *args, **kwargs):
+        return SimpleNamespace(request_id=request_id, mm_features=None)
+
+    async def accept_then_wait(*args, **kwargs):
+        await add_request(*args, **kwargs)
+        accepted.set()
+        await ack.wait()
+
+    # Keep the real stage port, pool ownership, and teardown path. Only model
+    # preprocessing and engine IPC are replaced; the engine records acceptance
+    # before the submission acknowledgement is allowed to return.
+    monkeypatch.setattr(orchestrator, "_build_next_stage_request", build_request)
+    monkeypatch.setattr(clients[0], "add_request_async", accept_then_wait)
+    commit_plan = mocker.spy(plugin, "commit_append_plan")
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        runner.submit(AppendAudio(video_frames=(frame(),)))
+        runner.submit(Commit(final=True, create_response=True))
+        await asyncio.wait_for(accepted.wait(), timeout=3)
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        pending = runner.tasks.append_tail
+        assert pending is not None and not pending.done()
+        assert not runner.session.stage_request_submitted(0, request_id)
+        if close_session:
+            assert (await _close(orchestrator, rpc_q)).ok
+        else:
+            await _submit(orchestrator, CancelResponse())
+        assert pending.cancelled()
+        assert len(clients[0].add_request_calls) == 1
+        assert any(request_id in ids for ids in clients[0].abort_calls)
+        assert request_id not in orchestrator.request_states
+        assert not runner.session.resource_request_ids()
+        assert not plugin.data_plane.requests
+        commit_plan.assert_not_called()
+        assert runner.session.input_seq == 0
+        assert runner.model_state.frames == []
+        assert runner.model_state.conversation_images == ()
+    finally:
+        ack.set()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_late_submission_ack_does_not_commit_visual_history(mocker):
+    h = await open_joyai()
+    h.port.submit_gate = asyncio.Event()
+    commit_plan = mocker.spy(h.runner.plugin, "commit_append_plan")
+    cleanup = mocker.spy(h.port, "cleanup")
+    try:
+        h.submit(AppendAudio(video_frames=(frame(),)))
+        h.submit(Commit(final=True, create_response=True))
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=3)
+        request_id = h.port.ensured[-1].request_id
+        pending = h.runner.tasks.append_tail
+        assert pending is not None and not pending.done()
+        # Exercise the post-submit fence check separately from task cancellation.
+        # Retain cancellation's resource cleanup while allowing the ACK to arrive.
+        cancelled_fence = h.session.fence
+        h.session.barge_in()
+        assert await h.runner.model.signal_cancel_fence(cancelled_fence)
+        cleanup.assert_awaited_once_with([request_id], abort=True)
+        h.port.submit_gate.set()
+        await h.settle()
+        assert pending.done() and not pending.cancelled()
+        assert len(h.port.submissions) == 1
+        assert cleanup.await_args_list == [mocker.call([request_id], abort=True), mocker.call([request_id])]
+        commit_plan.assert_not_called()
+        assert h.session.input_seq == 0
+        assert h.runner.model_state.frames == []
+        assert h.runner.model_state.conversation_images == ()
+        assert not h.runner.plugin.data_plane.requests
     finally:
         h.port.submit_gate.set()
         await h.manager.shutdown()
