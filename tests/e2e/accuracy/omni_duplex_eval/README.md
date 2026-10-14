@@ -46,10 +46,11 @@ accuracy results and writes:
 - `<response-root>/run-*/evaluation/evaluation_summary.json`: the accuracy
   summary saved by the benchmark.
 
-The guard copies `bench-result.json`'s `omni_duplex_eval.accuracy` to the
-existing `results/summary.json` artifact path. It does not run a second
+The guard copies `bench-result.json`'s `omni_duplex_eval.accuracy` to
+`results/result_acc_omni_duplex_eval.json`, using the `result_acc_*.json`
+naming convention for dashboard collection. It does not run a second
 evaluation or summarization. Both result files are cleared before each run;
-the compatibility summary is saved before checking the results:
+the accuracy summary is saved before checking the results:
 
 - `results/` is tracked in git via `results/.gitignore` (empty dir, nothing
   committed inside).
@@ -116,10 +117,10 @@ inferred from the split row order and must be re-verified once the dataset
 is reachable). `exclude_ids` has been removed.
 
 All `_MIN_*` thresholds are currently **0.0 (record mode)**: the nightly run
-produces real scores and persists `results/summary.json` without failing the
+produces real scores and persists `results/result_acc_omni_duplex_eval.json` without failing the
 gate. Tighten after the first nightly run:
 
-1. Record `results/summary.json` (mean content / temporal / success).
+1. Record `results/result_acc_omni_duplex_eval.json` (mean content / temporal / success).
 2. Set `_MIN_*` thresholds = `mean - n * std` (start `n=2`) in
    `test_omni_duplex_eval_ci.py`. As a starting point, the paper's
    MiniCPM-o 4.5 scores (100-point scale) map to ≈1.15 content / ≈2.40

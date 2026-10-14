@@ -79,7 +79,7 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
     # Remove previous artifacts so an early CLI failure cannot reuse old results.
     _RESULT_DIR.mkdir(parents=True, exist_ok=True)
     benchmark_path = _RESULT_DIR / "bench-result.json"
-    result_path = _RESULT_DIR / "summary.json"
+    result_path = _RESULT_DIR / "result_acc_omni_duplex_eval.json"
     benchmark_path.unlink(missing_ok=True)
     result_path.unlink(missing_ok=True)
     judge_cfg = config["judge"]
@@ -142,7 +142,7 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
     duplex = benchmark["omni_duplex_eval"]
     summary = duplex["accuracy"]
-    # Preserve the existing artifact path without running another summarizer.
+    # Export the accuracy artifact for dashboard collection without re-summarizing.
     # Save before assertions so partial/failed judging remains inspectable in CI.
     result_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\n[Omni-DuplexEval] summary saved to {result_path}")

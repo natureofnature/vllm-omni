@@ -229,7 +229,7 @@ def _call_real_guard(
     ref = tmp_path / "ref.wav"
     ref.touch()
     monkeypatch.setattr(guard, "resolve_ref_audio", lambda: ref)
-    monkeypatch.setattr(guard, "_RESULT_DIR", tmp_path)  # write summary.json to tmp_path, not real results/
+    monkeypatch.setattr(guard, "_RESULT_DIR", tmp_path)  # write accuracy results to tmp_path, not real results/
     guard.test_omni_duplex_eval_ci(fake_server, tmp_path, judge_url)
     return calls
 
@@ -242,7 +242,10 @@ def test_real_guard_full_flow_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert written == expected, f"test setup: expected {expected} score files, wrote {written}"
     _call_real_guard(monkeypatch, tmp_path)  # must not raise
     result = json.loads((tmp_path / "bench-result.json").read_text())
-    assert json.loads((tmp_path / "summary.json").read_text()) == result["omni_duplex_eval"]["accuracy"]
+    assert (
+        json.loads((tmp_path / "result_acc_omni_duplex_eval.json").read_text())
+        == result["omni_duplex_eval"]["accuracy"]
+    )
 
 
 def test_real_guard_assembles_bench_serve_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -322,7 +325,10 @@ def test_real_guard_rejects_incomplete_benchmark(
         _call_real_guard(monkeypatch, tmp_path, mutate_result=mutate)
     # Both artifacts remain available to Buildkite after a failing assertion.
     result = json.loads((tmp_path / "bench-result.json").read_text())
-    assert json.loads((tmp_path / "summary.json").read_text()) == result["omni_duplex_eval"]["accuracy"]
+    assert (
+        json.loads((tmp_path / "result_acc_omni_duplex_eval.json").read_text())
+        == result["omni_duplex_eval"]["accuracy"]
+    )
 
 
 def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -335,7 +341,7 @@ def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.
     with pytest.raises(AssertionError, match="bench serve exited without writing .*bench-result.json"):
         guard.test_omni_duplex_eval_ci(_FakeServer("127.0.0.1", 9999, "mock-model"), tmp_path, "http://judge:8001")
     assert not (tmp_path / "bench-result.json").exists()
-    assert not (tmp_path / "summary.json").exists()
+    assert not (tmp_path / "result_acc_omni_duplex_eval.json").exists()
 
 
 def test_real_guard_rejects_wrong_sample_with_same_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
