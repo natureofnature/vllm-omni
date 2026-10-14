@@ -420,9 +420,13 @@ async def test_pending_question_comes_from_session_snapshot_and_leaves_after_set
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert "Pending delegated questions" in prompt and "Which pot?" in prompt and call["call_id"] in prompt
         if settlement == "accepted":
-            await h.run(
-                CreateItem(item={"type": "function_call_output", "call_id": call["call_id"], "output": "Blue."})
+            accepted = await h.run(
+                CreateItem(
+                    item={"id": "answer", "type": "function_call_output", "call_id": call["call_id"], "output": "Blue."}
+                )
             )
+            assert not any(event.to_realtime()["type"] == "error" for event in accepted)
+            assert h.session.runtime_config["joyai_delegation_results"][0]["answer"] == "Blue."
             await h.deliver_and_settle(
                 tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True
             )
