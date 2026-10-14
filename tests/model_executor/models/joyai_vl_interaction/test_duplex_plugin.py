@@ -33,6 +33,7 @@ from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDup
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_PIPELINE
@@ -412,6 +413,70 @@ async def test_camera_input_during_output_waits_for_previous_turn():
         assert latest.context.request_id != request_id
         assert latest.prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
         await h.run(CloseSession())
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retained_speech", [False, True])
+async def test_aura_video_commit_keeps_existing_ack_path(retained_speech):
+    h = await open_joyai()
+    try:
+        await observe(h)
+        # Exercise shared dispatch with AURA's actual modality/concurrency contract.
+        h.session.capabilities = aura_duplex_capabilities()
+        previous_payload = {"audio": "PCM", "format": "pcm_f32le"} if retained_speech else None
+        if previous_payload is not None:
+            h.runner.model_state.retain_committed_audio(previous_payload, operation_id="speech")
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        assert not h.runner.model_state.deferred_response_create
+        assert h.runner.model_state.committed_audio_payload is previous_payload
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("early_ack", [False, True])
+async def test_camera_commit_after_done_starts_on_final_playback_ack(early_ack):
+    h = await open_joyai()
+    try:
+        await h.run(
+            CreateItem(
+                item={
+                    "id": "question",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What do you see?"}],
+                }
+            )
+        )
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> The pot is smoking.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.deliver_and_settle(
+            tts_output(request_id, samples=24000, finished=True), stage_id=2, segment_finished=True
+        )
+        assert h.session.active_response_id is None
+        if early_ack:
+            await h.run(AckPlayback(response_id=response_id, played_ms=100))
+        await h.run(AppendAudio(video_frames=(frame("blue"),)))
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        await h.run(AckPlayback(response_id=response_id, played_ms=500))
+        assert len(h.port.submissions) == 1
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert len(h.port.submissions) == 2
+        assert h.port.submissions[-1].prompt["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
+        assert "The pot is smoking." in h.port.submissions[-1].prompt["prompt"]
+        await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+        assert len(h.port.submissions) == 2
+        assert not any(event.to_realtime()["type"] == "error" for event in h.events)
     finally:
         await h.manager.shutdown()
 

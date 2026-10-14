@@ -64,6 +64,7 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
     InputCleared,
+    PlaybackAcknowledged,
     ResponseDone,
     SessionExpired,
     SessionHeartbeatAck,
@@ -622,7 +623,23 @@ class DuplexSessionRunner:
         elif isinstance(command, UpdateSession):
             await self.control.on_session_update(dict(command.patch), realtime_event_id=command.event_id)
         elif isinstance(command, AckPlayback):
-            self._emit_events(playback_ledger.apply_playback_ack(self.session, command.payload()))
+            events = playback_ledger.apply_playback_ack(self.session, command.payload())
+            self._emit_events(events)
+            # A camera commit can arrive after response.done while its audio
+            # is still playing. In that case the final ACK, not another model
+            # terminal event, releases the next observation.
+            if (
+                any(isinstance(event, PlaybackAcknowledged) for event in events)
+                and self.session.capabilities.allows_video_without_audio()
+                and not self.session.capabilities.supports_concurrent_turn_requests
+                and not helpers.response_in_progress(self.session, self.tasks)
+                and self.model_state.deferred_response_create
+                and (pending_observation := self.model_state.committed_audio_payload) is not None
+            ):
+                precreate_response = self.model_state.deferred_precreate_response
+                self.model_state.deferred_response_create = False
+                self.model_state.deferred_precreate_response = False
+                self._promote_deferred_overlap_later(pending_observation, precreate_response)
         elif isinstance(command, Heartbeat):
             self._on_heartbeat(command)
         elif isinstance(command, CreateItem):
@@ -2030,6 +2047,8 @@ class DuplexSessionRunner:
         if (
             not next_commit_allowed
             and not session.capabilities.supports_core_resumable_request
+            and session.capabilities.allows_video_without_audio()
+            and not session.capabilities.supports_concurrent_turn_requests
             and self._defer_commit_behind_active_response(
                 event,
                 realtime_item_id=realtime_item_id,

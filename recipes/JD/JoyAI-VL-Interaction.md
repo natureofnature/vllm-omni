@@ -75,6 +75,23 @@ text, images, and camera frames, and uses the existing CustomVoice
 `tts_speaker`, `tts_language`, and `tts_instruct` fields in `session.extra_body`.
 The default `joyai_vl_interaction.yaml` remains turn-based.
 
+### Browser client
+
+The shared [Realtime Web UI](../../examples/online_serving/realtime_web/README.md#joyai-camera-observations-and-spoken-replies)
+provides text instructions, camera observations, transcript display, and speech
+playback for this profile:
+
+```bash
+python -m examples.online_serving.realtime_web --profile joyai-turn \
+  --ws-backend ws://127.0.0.1:8099 --port 7862
+```
+
+Set the instruction, start the session, and enable Camera. Observations are
+committed once per second while idle; **Send observation** submits the current
+frame manually. The client waits for response completion and playback before
+submitting the latest pending frame. Microphone input is planned with ASR
+integration; generated speech already plays through the shared audio component.
+
 ## Standalone interaction server
 
 From repository root:

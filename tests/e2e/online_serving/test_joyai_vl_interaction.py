@@ -46,6 +46,7 @@ async def run_observations(url, model, output_dir):
                     },
                 }
             )
+            pending_playback = None
             for index, color in enumerate(("red", "blue")):
                 image = io.BytesIO()
                 Image.new("RGB", (224, 224), color).save(image, format="JPEG")
@@ -54,6 +55,11 @@ async def run_observations(url, model, output_dir):
                 try:
                     await client.append_audio(b"", video_frames=[base64.b64encode(image.getvalue()).decode()])
                     await client.commit(create_response=True)
+                    if pending_playback is not None:
+                        # The next observation was committed after response.done
+                        # but before the previous audio finished playing.
+                        played_ms, response_id = pending_playback
+                        await client.ack_playback(played_ms, response_id=response_id)
                     terminal = await done
                 finally:
                     if not done.done():
@@ -67,9 +73,10 @@ async def run_observations(url, model, output_dir):
                     wav.setsampwidth(2)
                     wav.setframerate(collector.output_sample_rate_hz)
                     wav.writeframes(pcm)
-                await client.ack_playback(
-                    len(pcm) * 500 / collector.output_sample_rate_hz, response_id=terminal.response_id
-                )
+                pending_playback = (len(pcm) * 500 / collector.output_sample_rate_hz, terminal.response_id)
+            assert pending_playback is not None
+            played_ms, response_id = pending_playback
+            await client.ack_playback(played_ms, response_id=response_id)
             assert len(set(collector.response_ids)) == 2
             await client.close()
             await consumer
