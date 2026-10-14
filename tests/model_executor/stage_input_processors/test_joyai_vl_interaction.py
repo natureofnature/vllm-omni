@@ -81,15 +81,18 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
 
 def test_asr_handoff_preserves_session_prompt_and_checks_final_budget(monkeypatch):
     monkeypatch.setattr(
-        joyai_bridge, "cached_tokenizer_from_config",
+        joyai_bridge,
+        "cached_tokenizer_from_config",
         lambda config: SimpleNamespace(encode=lambda text, **kwargs: list(text)),
     )
-    prompt = {"additional_information": {
-        "joyai_prompt_parts": ["standing instruction; played history; image; query:", ";assistant:"],
-        "joyai_prompt_budget": 200,
-        "joyai_visual_tokens": 20,
-        "deferred_multi_modal_data": {"image": ["original-frame"]},
-    }}
+    prompt = {
+        "additional_information": {
+            "joyai_prompt_parts": ["standing instruction; played history; image; query:", ";assistant:"],
+            "joyai_prompt_budget": 200,
+            "joyai_visual_tokens": 20,
+            "deferred_multi_modal_data": {"image": ["original-frame"]},
+        }
+    }
     output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>Watch the pot.")])
     (result,) = joyai_bridge.asr_to_joyai([output], prompt)
     assert result["prompt"] == "standing instruction; played history; image; query:Watch the pot.;assistant:"

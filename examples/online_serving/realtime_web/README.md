@@ -11,6 +11,8 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `qwen3-turn --vad` | Server detects trailing silence; speech interrupts replies | Sampled frames with each spoken turn | Yes |
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 | `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
+| `joyai-turn --speech-input` | Hold to talk; release commits speech, then camera observations resume while idle | Latest frame with speech and camera-only observations | Yes |
+| `joyai-turn --speech-input --vad` | Server detects trailing silence and commits speech | Latest frame with each utterance; no automatic camera-only commits | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The

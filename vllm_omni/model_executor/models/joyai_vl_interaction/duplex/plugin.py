@@ -10,8 +10,8 @@ import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 
-import pybase64
 import numpy as np
+import pybase64
 from PIL import Image
 from vllm.config import ModelConfig
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -236,6 +236,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.input_stage_id(payload)
         history = []
         query = runtime_config.get("initial_user_text") or ""
+        if has_audio and query:
+            history.append({"role": "user", "content": query})
         for message in session_config.get("conversation", []):
             role, content = message.get("role"), message.get("content")
             if role not in {"user", "assistant"}:
@@ -309,12 +311,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             else:
                 raise DuplexRuntimeConfigError("JoyAI instruction and current observation exceed the context budget")
         prompt_data = {
-                "prompt": prompt,
-                "multi_modal_data": {"image": images} if images else {},
-                "additional_information": {
-                    key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
-                },
-            }
+            "prompt": prompt,
+            "multi_modal_data": {"image": images} if images else {},
+            "additional_information": {
+                key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
+            },
+        }
         if has_audio:
             if payload.get("format") != "pcm_f32le" or payload.get("sample_rate_hz") != 16000:
                 raise DuplexRuntimeConfigError("JoyAI speech input requires normalized 16 kHz pcm_f32le")
@@ -338,7 +340,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return DuplexAppendPlan(prompt=prompt_data)
 
     def user_transcript(self, *, stage_id: int, output: object, prompt: object, finished: bool) -> str | None:
-        if stage_id != self.asr_stage_id or not finished:
+        if stage_id != self.asr_stage_id or not finished or not getattr(output, "outputs", None):
             return None
         return _clean_qwen3_asr_transcript(_extract_completed_action_text(output)) or None
 

@@ -13,7 +13,12 @@ from PIL import Image
 from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import (
-    SESSION_ID, Harness, RecordingStagePort, _speech_then_stop, append_audio, tts_output,
+    SESSION_ID,
+    Harness,
+    RecordingStagePort,
+    _speech_then_stop,
+    append_audio,
+    tts_output,
 )
 from tests.engine.test_duplex_orchestrator import SESSION_ID as ORCHESTRATOR_SESSION_ID
 from tests.engine.test_duplex_orchestrator import _build, _close, _open, _submit
@@ -173,6 +178,10 @@ def test_asr_profile_and_sampling_keep_joyai_ownership():
     )
     assert params[0].max_tokens == 256 and params[0].temperature == 0.0
     assert params[1].max_tokens == 80 and params[1].temperature == 0.2
+    assert plugin.user_transcript(stage_id=0, output=SimpleNamespace(outputs=[]), prompt={}, finished=True) is None
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>Watch the pot.")])
+    assert plugin.user_transcript(stage_id=0, output=output, prompt={}, finished=True) == "Watch the pot."
+    assert plugin.user_transcript(stage_id=0, output=output, prompt={}, finished=False) is None
     normal = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr.yaml"))
     duplex = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr_duplex.yaml"))
     assert normal.stages == duplex.stages and duplex.session_mode == "duplex"
@@ -204,7 +213,7 @@ def test_speech_buffer_rolls_back_audio_but_keeps_newest_frame():
 async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
     h = await open_joyai(asr=True, modalities=("text",))
     try:
-        pcm = base64.b64encode(struct.pack("<hh", 1000, 2000)).decode()
+        pcm = struct.pack("<hh", 1000, 2000)
         await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000, video_frames=(frame(),)))
         await h.run(Commit(final=True, create_response=True))
         submission = h.port.submissions[-1]
@@ -216,22 +225,30 @@ async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
         request_id = submission.context.request_id
         context = DuplexOutputContext(
             identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
-            final_stage_id=3, segment_finished=True,
+            final_stage_id=3,
+            segment_finished=True,
         )
         if cancel:
             await h.run(CancelResponse())
         transcript = "Tell me when the red light changes."
         for _ in range(2):
-            h.runner.on_stage_output(0, tts_output(request_id, finished=True, text=transcript), None,
-                request_id=request_id, context=context, input_transcript=transcript,
-                input_item_id=info["realtime_item_id"])
+            h.runner.on_stage_output(
+                0,
+                tts_output(request_id, finished=True, text=transcript),
+                None,
+                request_id=request_id,
+                context=context,
+                input_transcript=transcript,
+                input_item_id=info["realtime_item_id"],
+            )
         await h.settle()
         events = [e.to_realtime() for e in h.events]
         transcriptions = [e for e in events if e["type"] == "conversation.item.input_audio_transcription.completed"]
         assert len(transcriptions) == (0 if cancel else 1)
         if not cancel:
-            await h.deliver_and_settle(tts_output(request_id, finished=True, text="</silence>"),
-                stage_id=1, segment_finished=True)
+            await h.deliver_and_settle(
+                tts_output(request_id, finished=True, text="</silence>"), stage_id=1, segment_finished=True
+            )
             assert any(message.get("transcript") == transcript for message in h.session.history)
         await observe(h)
         assert h.port.submissions[-1].context.stage_id == 1

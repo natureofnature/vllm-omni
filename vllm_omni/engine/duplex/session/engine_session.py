@@ -754,7 +754,7 @@ class DuplexEngineSession:
         another user message or overwrite a later conversation edit.
         """
         message = self._conversation.item_ids.get(item_id)
-        if message is None or message.get("role") != "user" or message.get("transcript") == transcript:
+        if message is None or message.get("role") != "user" or "transcript" in message:
             return False
         content = message.get("content")
         if not isinstance(content, list):
@@ -765,6 +765,8 @@ class DuplexEngineSession:
                 and part.get("type") == "audio_url"
                 and part.get("audio_url") == {"url": "native-duplex:input-audio"}
             ):
+                if "transcript" in part:
+                    return False
                 part["transcript"] = transcript
                 message["transcript"] = transcript
                 return True

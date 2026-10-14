@@ -406,6 +406,27 @@ def test_truncate_history_item_uses_response_alignment_marks():
 # ---- turn signals / model turns ----
 
 
+@pytest.mark.parametrize("edit", [None, "delete", "replace", "transcript"])
+def test_input_transcription_is_idempotent_and_does_not_restore_edited_items(edit):
+    session = _session()
+    committed = session.commit_audio_input()
+    session.register_history_item("spoken-input", committed.message)
+    if edit == "delete":
+        session.delete_history_item("spoken-input")
+    elif edit == "replace":
+        session.register_history_item("spoken-input", {"role": "user", "content": "replacement"})
+    elif edit == "transcript":
+        committed.message["content"][0]["transcript"] = "Edited instruction."
+    assert session.update_input_transcript("spoken-input", "Watch the pot.") is (edit is None)
+    assert not session.update_input_transcript("spoken-input", "Watch the pot.")
+    if edit is None:
+        assert session.history[0]["content"][0]["transcript"] == "Watch the pot."
+    elif edit == "replace":
+        assert session.history[0]["content"] == "replacement"
+    elif edit == "transcript":
+        assert session.history[0]["content"][0]["transcript"] == "Edited instruction."
+
+
 @pytest.mark.parametrize(
     ("event_type", "turn_state"),
     [
