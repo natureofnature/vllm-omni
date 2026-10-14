@@ -194,7 +194,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             role, text = history[cutoff]
             if role in {"user", "assistant"} and text:
                 recent += 1
-        end = min(cutoff, covered + SUMMARY_CHUNK_MESSAGES)
+        # Textless observations retain their ledger indices but consume no
+        # summary budget, so a silent camera span cannot stall consolidation.
+        end = covered
+        pending_text = 0
+        while end < cutoff and pending_text < SUMMARY_CHUNK_MESSAGES:
+            role, text = history[end]
+            if role in {"user", "assistant"} and text:
+                pending_text += 1
+            end += 1
         # Preserve the current query and unresolved user turn outside the summary.
         while end > covered and history[end - 1][0] != "assistant":
             end -= 1

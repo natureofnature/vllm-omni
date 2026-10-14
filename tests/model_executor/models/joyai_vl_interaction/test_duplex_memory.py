@@ -210,6 +210,46 @@ async def test_camera_only_commits_do_not_displace_eight_recent_text_messages():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("existing_summary", [False, True])
+@pytest.mark.parametrize("later_turns", [6, 10, 20])
+async def test_summary_advances_past_silent_camera_turns(existing_summary, later_turns):
+    h = await open_joyai(modalities=("text",))
+    try:
+        memory = h.runner.model_state.memory
+        if existing_summary:
+            h.session.append_history_message({"role": "user", "content": "Remember the old cabinet."})
+            h.session.append_history_message({"role": "assistant", "content": "Recorded the old cabinet."})
+            memory.text = "The old cabinet is important."
+            memory.covered_messages = 2
+            memory.covered_digest = duplex_history_digest(duplex_text_history(h.session.history))
+        covered = memory.covered_messages
+        for _ in range(8):
+            request_id = await observe(h)
+            h.deliver(tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True)
+            await h.settle()
+        history = duplex_text_history(h.session.history)
+        assert history[covered:] == (("user", ""),) * 8
+        committed_turns(h.session, count=later_turns)
+        history = duplex_text_history(h.session.history)
+        submissions = len(h.port.submissions)
+        await h.run(Heartbeat())
+        assert len(h.port.submissions) == submissions + 1
+        submission = h.port.submissions[-1]
+        assert "auxiliary-" in submission.context.request_id
+        expected_text = min(8, later_turns * 2 - 8)
+        expected_end = covered + 8 + expected_text
+        assert f"Cabinet {expected_text // 2 - 1} recorded." in submission.prompt["prompt"]
+        assert f"Remember cabinet {expected_text // 2}:" not in submission.prompt["prompt"]
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert memory.covered_messages == expected_end
+        assert memory.covered_digest == duplex_history_digest(history[:expected_end])
+        assert sum(bool(text) for _, text in history[expected_end:]) >= 8
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_text_cutoff_preserves_ledger_indices_and_empty_prefix_fingerprints():
     h = await open_joyai(modalities=("text",))
     try:
