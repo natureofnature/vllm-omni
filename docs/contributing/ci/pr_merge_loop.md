@@ -78,6 +78,18 @@ Keep one record per PR with the fields below. Use timestamps with a timezone; pr
 
 For a PR that needs a conflict fix or missing evidence, the configured loop may send one consolidated, actionable GitHub comment to its author or relevant maintainer. Before commenting, inspect existing comments, reviews, and replies; reuse the existing discussion and avoid duplicate requests or unchanged nudges. State the head, verified blocker, exact missing evidence or next step, and what will trigger recheck. An unchanged head/blocker is not by itself a reason to comment again.
 
+For replies with multiple actions, follow the canonical review skill's
+[consolidated-reply format](https://github.com/vllm-project/vllm-omni/blob/main/.claude/skills/review-pr/references/delivery/maintainer-style-study.md#consolidated-replies-with-multiple-actions):
+a few contributor-owned checkboxes with concrete deliverables and only necessary
+context. Omit routine maintainer/CI status sections and process explanations.
+Keep material testing limitations brief without implying unperformed validation.
+
+Never ask contributors to provide the project's CUDA L2/Buildkite result.
+Maintainers handle admission and inspect matching-head results; record actual
+labels and run state in the review record. Do not require an untriggered result
+before `ready` admission. Justified local evidence and the existing approval/merge
+gates remain intact; this grants no additional label or CI-triggering authority.
+
 This permission is limited to conflict fixes and missing evidence. Other outreach, including generic reminders and stale-approval nudges, remains proposed pending separate authorization. Documenting these operating settings or opening this documentation PR does not establish repository-wide adoption.
 
 ### Action boundaries
@@ -101,6 +113,9 @@ If CUDA merge-test fails after a merge, promptly determine whether the newly mer
 Near-misses are often tip-stale after rebase. Propose a request to the relevant independent reviewer to re-approve tip `SHA`; check the existing discussion first. Stale-approval outreach remains proposed until separately authorized; the conflict/evidence feedback permission does not cover it. A status-only recheck is not a substantive deep review; any substantive re-review counts toward the current run's allowance.
 
 ## LESSONS → code regulation + skills
+
+Record reusable findings in [Review and issue lessons](./lessons.md). Check the
+linked evidence and current code before applying a historical lesson.
 
 | Pattern ≥3 days (or same-area twice on main) | Where it lands |
 |---------------------------------------------|----------------|

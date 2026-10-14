@@ -624,10 +624,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
         # 6. Stop the prefix-cache committer before the CUDA context and the
         # tensors it copies from are torn down.
-        cache = self.omni_prefix_cache
-        if cache is not None:
-            cache.shutdown()
-            self.omni_prefix_cache = None
+        self._shutdown_omni_prefix_cache()
 
         # 7. Delegate to upstream shutdown (model = None, KV caches, workspace).
         super().shutdown()
