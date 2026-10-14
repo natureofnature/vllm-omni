@@ -13,6 +13,7 @@ loaded once by ``DuplexOmniEngine`` and handed to ``DuplexOrchestrator`` /
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -280,6 +281,43 @@ class PartialStageForward:
     queue_close_after: bool = False
 
 
+def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[tuple[str, str], ...]:
+    """Snapshot committed text without retaining images or audio payloads."""
+    entries = []
+    for message in conversation:
+        content = message.get("content")
+        if isinstance(content, list):
+            text = "\n".join(
+                str(part.get("text", ""))
+                for part in content
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+        else:
+            text = content if isinstance(content, str) else ""
+        entries.append((str(message.get("role", "")), text))
+    return tuple(entries)
+
+
+def duplex_history_digest(history: tuple[tuple[str, str], ...]) -> str:
+    return hashlib.sha256(repr(history).encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class DuplexAuxiliaryRequest:
+    """One private, non-resumable request ending at its selected stage.
+
+    The committed prefix identifies the evidence used by the model policy.
+    Later conversation can append while that prefix remains unchanged.
+    """
+
+    stage_id: int
+    prompt: dict[str, object]
+    sampling_params: object
+    history_length: int
+    history_digest: str
+    timeout_s: float = 30.0
+
+
 class DuplexModelPlugin(ABC):
     """Everything vLLM-Omni needs to know about one full-duplex model.
 
@@ -290,6 +328,7 @@ class DuplexModelPlugin(ABC):
     """
 
     projects_intermediate_outputs: bool = False
+    supports_auxiliary_requests: bool = False
     plugin_id: str = ""
     private_runtime_config_keys: frozenset[str] = frozenset()
     #: Samples per silence unit the runner appends to keep a model turn going.
@@ -332,6 +371,21 @@ class DuplexModelPlugin(ABC):
     ) -> dict[str, object]:
         """Add model-owned context before planning an append on the session loop."""
         return config
+
+    async def prepare_auxiliary_request(
+        self,
+        *,
+        history: tuple[tuple[str, str], ...],
+        runtime_config: Mapping[str, object],
+        state: DuplexModelSessionState,
+    ) -> DuplexAuxiliaryRequest | None:
+        """Plan bounded background work from committed text; default opt-out."""
+        return None
+
+    def apply_auxiliary_result(
+        self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
+    ) -> None:
+        """Apply a private result after the runner validates its committed prefix."""
 
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""

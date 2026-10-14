@@ -13,6 +13,7 @@ from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import JoyAISummaryMemory
 
 
 @dataclass
@@ -21,6 +22,7 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     frames: list[str] = field(default_factory=list)
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
+    memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
 
 
 @dataclass

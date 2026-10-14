@@ -31,6 +31,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexStageRequestContext,
     DuplexStageSubmission,
     DuplexStageSubmissionResult,
+    duplex_is_auxiliary_request,
 )
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.engine_session import DuplexFenceMismatchError
@@ -220,7 +221,7 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = self.plugin.capabilities(
+        close_session = not duplex_is_auxiliary_request(req_id) and self.plugin.capabilities(
             max_sessions=self.duplex_session_config.max_sessions
         ).supports_core_resumable_request
         runner = self.session_manager.runner_for_request_id(req_id)

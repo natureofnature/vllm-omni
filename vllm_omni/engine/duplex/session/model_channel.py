@@ -38,6 +38,7 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStageSubmission,
+    duplex_is_auxiliary_request,
     duplex_data_plane_request_info,
     duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
@@ -241,7 +242,7 @@ class ModelChannel:
         if not resumable and session.stage_request_submitted(stage_id, request_id):
             stale_ephemeral_id = request_id
             # Keys are ``(stage_id, request_id)``; values are DuplexRequestResource.
-            stale_keys = list(session.request_resources.keys())
+            stale_keys = [key for key in session.request_resources if not duplex_is_auxiliary_request(key[1])]
             stale_ids = list(dict.fromkeys(rid for _, rid in stale_keys))
             concurrent_turn = session.capabilities.supports_concurrent_turn_requests and (
                 self._ctx.run.concurrent_turn_requests_released
