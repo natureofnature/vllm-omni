@@ -26,6 +26,7 @@ import json
 import os
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -192,6 +193,7 @@ def _call_real_guard(
     judge_url: str = "http://127.0.0.1:8001",
     *,
     mutate_result: Callable[[dict], None] | None = None,
+    model: str = "mock-model",
 ) -> list[list[str]]:
     """Call ``test_omni_duplex_eval_ci()`` with stubbed heavy I/O.
 
@@ -199,7 +201,7 @@ def _call_real_guard(
     """
     from tests.e2e.accuracy.omni_duplex_eval import test_omni_duplex_eval_ci as guard
 
-    fake_server = _FakeServer(host="127.0.0.1", port=9999, model="mock-model")
+    fake_server = _FakeServer(host="127.0.0.1", port=9999, model=model)
     calls: list[list[str]] = []
 
     def spy_run_cli(argv: list[str]) -> None:
@@ -234,18 +236,24 @@ def _call_real_guard(
     return calls
 
 
-def test_real_guard_full_flow_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("model", ["openbmb/MiniCPM-o-4_5", "/models/openbmb/MiniCPM-o-4_5"])
+def test_real_guard_full_flow_passes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path, model: str) -> None:
     """Real guard passes end-to-end with good scores and stubbed CLI."""
     config = _load_config()
     expected = len(_sample_ids(config))
     written = _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
     assert written == expected, f"test setup: expected {expected} score files, wrote {written}"
-    _call_real_guard(monkeypatch, tmp_path)  # must not raise
+    _call_real_guard(monkeypatch, tmp_path, model=model)  # must not raise
     result = json.loads((tmp_path / "bench-result.json").read_text())
-    assert (
-        json.loads((tmp_path / "result_acc_omni_duplex_eval.json").read_text())
-        == result["omni_duplex_eval"]["accuracy"]
-    )
+    accuracy_paths = list(tmp_path.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    accuracy_path = accuracy_paths[0]
+    prefix = "result_acc_MiniCPM-o-4_5_Omni-DuplexEval_"
+    assert accuracy_path.stem.startswith(prefix)
+    timestamp, random_number = accuracy_path.stem.removeprefix(prefix).rsplit("_", 1)
+    datetime.strptime(timestamp, "%Y%m%d-%H%M%S")
+    assert len(random_number) == 8 and random_number.isdecimal()
+    assert json.loads(accuracy_path.read_text()) == result["omni_duplex_eval"]["accuracy"]
 
 
 def test_real_guard_assembles_bench_serve_argv(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -325,10 +333,9 @@ def test_real_guard_rejects_incomplete_benchmark(
         _call_real_guard(monkeypatch, tmp_path, mutate_result=mutate)
     # Both artifacts remain available to Buildkite after a failing assertion.
     result = json.loads((tmp_path / "bench-result.json").read_text())
-    assert (
-        json.loads((tmp_path / "result_acc_omni_duplex_eval.json").read_text())
-        == result["omni_duplex_eval"]["accuracy"]
-    )
+    accuracy_paths = list(tmp_path.glob("result_acc_*.json"))
+    assert len(accuracy_paths) == 1
+    assert json.loads(accuracy_paths[0].read_text()) == result["omni_duplex_eval"]["accuracy"]
 
 
 def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -341,7 +348,7 @@ def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.
     with pytest.raises(AssertionError, match="bench serve exited without writing .*bench-result.json"):
         guard.test_omni_duplex_eval_ci(_FakeServer("127.0.0.1", 9999, "mock-model"), tmp_path, "http://judge:8001")
     assert not (tmp_path / "bench-result.json").exists()
-    assert not (tmp_path / "result_acc_omni_duplex_eval.json").exists()
+    assert not list(tmp_path.glob("result_acc_*.json"))
 
 
 def test_real_guard_rejects_wrong_sample_with_same_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

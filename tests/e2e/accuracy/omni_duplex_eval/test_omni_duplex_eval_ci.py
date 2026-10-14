@@ -8,7 +8,9 @@ Pipeline: bench serve (generate + evaluate + save) -> assert.
 from __future__ import annotations
 
 import json
+import secrets
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -79,9 +81,15 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
     # Remove previous artifacts so an early CLI failure cannot reuse old results.
     _RESULT_DIR.mkdir(parents=True, exist_ok=True)
     benchmark_path = _RESULT_DIR / "bench-result.json"
-    result_path = _RESULT_DIR / "result_acc_omni_duplex_eval.json"
     benchmark_path.unlink(missing_ok=True)
-    result_path.unlink(missing_ok=True)
+    for old_result in _RESULT_DIR.glob("result_acc_*.json"):
+        old_result.unlink()
+    model_name = Path(omni_server.model).name
+    dataset_name = Path(config["dataset"]).name
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    result_path = _RESULT_DIR / (
+        f"result_acc_{model_name}_{dataset_name}_{timestamp}_{secrets.randbelow(10**8):08d}.json"
+    )
     judge_cfg = config["judge"]
     _run_cli(
         [
