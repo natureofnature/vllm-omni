@@ -67,8 +67,11 @@ and newest frame are retained; an oversized instruction is reported as an error.
 These bounds provide a small working context, with summary memory planned in
 [RFC #8803](https://github.com/vllm-project/vllm-omni/issues/8803).
 
-Speech-input ASR and tool delegation are follow-ups in that RFC. The current
-profile accepts text, images, and camera frames, and uses the existing CustomVoice
+The next speech-input integration will reuse the Qwen3-ASR pipeline and audio-free
+bypass added by [#8031](https://github.com/vllm-project/vllm-omni/pull/8031), with
+audio buffering and commit handling in the unified Session. Summary memory and
+tool delegation follow the later steps in that RFC. The current profile accepts
+text, images, and camera frames, and uses the existing CustomVoice
 `tts_speaker`, `tts_language`, and `tts_instruct` fields in `session.extra_body`.
 The default `joyai_vl_interaction.yaml` remains turn-based.
 

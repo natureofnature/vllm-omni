@@ -654,20 +654,28 @@ async def test_buffered_video_keeps_pending_append_failure_until_fresh_input():
 
 
 @pytest.mark.asyncio
-async def test_cancel_during_submission_preserves_visual_history():
+@pytest.mark.parametrize("command", [CancelResponse(), CloseSession()], ids=["cancel", "close"])
+async def test_cancel_or_close_during_submission_preserves_visual_history(command, mocker):
     h = await open_joyai()
     h.port.submit_gate = asyncio.Event()
+    commit_plan = mocker.spy(h.runner.plugin, "commit_append_plan")
     try:
         h.submit(AppendAudio(video_frames=(frame(),)))
         h.submit(Commit(final=True, create_response=True))
         await asyncio.wait_for(h.port.submit_started.wait(), timeout=3)
         assert h.runner.model_state.frames == []
-        await h.run(CancelResponse())
+        pending = h.runner.tasks.append_tail
+        assert pending is not None and not pending.done()
+        await h.run(command)
         h.port.submit_gate.set()
         await h.settle()
+        assert pending.done()
+        commit_plan.assert_not_called()
+        assert h.session.input_seq == 0
         assert h.runner.model_state.frames == []
         assert h.runner.model_state.conversation_images == ()
         assert not h.runner.plugin.data_plane.requests
+        assert not any(event.to_realtime()["type"] == "error" for event in h.events)
     finally:
         h.port.submit_gate.set()
         await h.manager.shutdown()
