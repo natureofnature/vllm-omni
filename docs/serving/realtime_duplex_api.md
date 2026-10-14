@@ -45,10 +45,13 @@ playback acknowledgement or interruption handling.
 
 The JoyAI duplex plugin preserves at least eight recent text messages and consolidates
 older committed conversation into one summary of at most 512 generated tokens.
+Camera-only commits with no text do not count toward that recent-message window.
 Each consolidation handles at most eight more messages and uses JoyAI's own
 deployed stage, with a separate request that ends before speech synthesis.
 There is at most one such request per session and no queue of older snapshots.
 The previous summary remains available if consolidation fails or times out.
+A failed attempt may retry after committed history or session context changes,
+but unchanged heartbeats do not trigger immediate retries.
 Any older unsummarized backlog remains in the normal prompt, subject to the
 existing context budget, while successive bounded requests catch up.
 

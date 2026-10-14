@@ -156,6 +156,91 @@ async def test_failed_summary_keeps_memory_and_does_not_retry_same_prefix(failur
 
 
 @pytest.mark.asyncio
+async def test_failed_full_summary_chunk_retries_after_committed_progress(mocker):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session, count=8)
+        generation = h.session.config_generation
+        submit = mocker.spy(h.port, "submit")
+        h.port.fail_submit = RuntimeError("transient submission failure")
+        await h.run(Heartbeat())
+        assert submit.call_count == 1
+        first_prompt = submit.call_args.args[0].prompt
+        assert "Cabinet 3 recorded." in first_prompt["prompt"]
+        assert "Cabinet 4 recorded." not in first_prompt["prompt"]
+
+        for index in range(8, 11):
+            await h.run(Heartbeat())
+            assert submit.call_count == index - 7
+            assert h.session.resource_request_ids(submitted=True) == []
+            for role, text in (("user", f"New cabinet {index}."), ("assistant", f"Noted cabinet {index}.")):
+                h.session.append_history_message({"role": role, "content": text})
+            if index == 10:
+                h.port.fail_submit = None
+            await h.run(Heartbeat())
+            assert submit.call_count == index - 6
+            assert submit.call_args.args[0].prompt == first_prompt
+
+        assert len(h.port.submissions) == 1
+        retry = h.port.submissions[0]
+        assert h.session.config_generation == generation
+        h.deliver(summary_output(retry.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert h.runner.model_state.memory.covered_messages == 8
+        assert h.runner.model_state.memory.text == "Cabinet 0 has code K731."
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_camera_only_commits_do_not_displace_eight_recent_text_messages():
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session, count=4)
+        for _ in range(8):
+            h.session.commit_audio_input()
+        history = duplex_text_history(h.session.history)
+        assert len(history) == 16
+        assert sum(bool(text) for _, text in history) == 8
+        await h.run(Heartbeat())
+        assert h.port.submissions == []
+        assert h.runner.model_state.memory.covered_messages == 0
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_text_cutoff_preserves_ledger_indices_and_empty_prefix_fingerprints():
+    h = await open_joyai(modalities=("text",))
+    try:
+        for index in range(6):
+            for role, text in (("user", f"Question {index}."), ("assistant", f"Answer {index}.")):
+                h.session.append_history_message({"role": role, "content": text})
+            committed = h.session.commit_audio_input()
+            h.session.register_history_item(f"camera-{index}", committed.message)
+        for _ in range(8):
+            h.session.commit_audio_input()
+        history = duplex_text_history(h.session.history)
+        submission = await start_summary(h)
+        assert "Answer 1." in submission.prompt["prompt"]
+        assert "Question 2." not in submission.prompt["prompt"]
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        memory = h.runner.model_state.memory
+        assert memory.covered_messages == 5
+        assert memory.covered_digest == duplex_history_digest(history[:5])
+        assert sum(role in {"user", "assistant"} and bool(text) for role, text in history[5:]) == 8
+        assert len(h.port.submissions) == 1
+        h.session.register_history_item("camera-0", {"role": "user", "content": "Corrected camera transcript."})
+        config = h.runner.plugin.prepare_prompt_config(
+            {"conversation": list(h.session.history)}, state=h.runner.model_state, payload={}
+        )
+        assert config["joyai_summary"] == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_close_cancels_auxiliary_and_late_result_cannot_write():
     h = await open_joyai(modalities=("text",))
     committed_turns(h.session)

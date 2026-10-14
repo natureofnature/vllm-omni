@@ -196,7 +196,6 @@ class DuplexSessionRunner:
         self._auxiliary_task: asyncio.Task[None] | None = None
         self._auxiliary_output: asyncio.Future[object] | None = None
         self._auxiliary_request_id: str | None = None
-        self._auxiliary_attempt: tuple[int, int, int, str] | None = None
         self._auxiliary_source: tuple[int, int, str] | None = None
         self._auxiliary_completion_pending = False
         self._auxiliary_epoch = session.epoch
@@ -816,6 +815,8 @@ class DuplexSessionRunner:
             return
         history = duplex_text_history(self.session.history)
         source = (self.session.epoch, self.session.config_generation, duplex_history_digest(history))
+        # Failed attempts wait for committed history or context to change.
+        # Successful application clears this marker for the next bounded chunk.
         if source == self._auxiliary_source:
             return
         self._auxiliary_source = source
@@ -843,10 +844,6 @@ class DuplexSessionRunner:
             )
             if request is None or not self._auxiliary_context_matches(request, epoch, generation):
                 return
-            attempt = (epoch, generation, request.history_length, request.history_digest)
-            if attempt == self._auxiliary_attempt:
-                return
-            self._auxiliary_attempt = attempt
             if not 0 <= request.stage_id < self.stage_port.stage_count or request.timeout_s <= 0:
                 raise ValueError("Invalid auxiliary stage or deadline")
             request_id = duplex_resource_request_id(session.fence, f"auxiliary-{uuid.uuid4().hex}")

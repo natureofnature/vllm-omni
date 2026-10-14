@@ -185,7 +185,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         current = state.memory.matches(history)
         covered = state.memory.covered_messages if current else 0
         previous_summary = state.memory.text if current else ""
-        end = min(len(history) - RECENT_MESSAGES, covered + SUMMARY_CHUNK_MESSAGES)
+        # Camera-only commits keep their ledger positions for fingerprints but
+        # must not displace text from the verbatim recent-history window.
+        cutoff = len(history)
+        recent = 0
+        while cutoff and recent < RECENT_MESSAGES:
+            cutoff -= 1
+            role, text = history[cutoff]
+            if role in {"user", "assistant"} and text:
+                recent += 1
+        end = min(cutoff, covered + SUMMARY_CHUNK_MESSAGES)
         # Preserve the current query and unresolved user turn outside the summary.
         while end > covered and history[end - 1][0] != "assistant":
             end -= 1

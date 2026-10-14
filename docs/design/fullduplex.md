@@ -369,6 +369,9 @@ before mailbox writeback. Appending newer history does not invalidate a stable
 prefix; editing or deleting that prefix does. Cancellation and close abort owned
 requests. A failed cleanup retains its resource for teardown retry and prevents
 new auxiliary work from accumulating behind it.
+Failed attempts wait for committed history or session context to change before
+retrying; unchanged heartbeats do not retrigger them. Successful application
+allows the next bounded chunk to catch up without waiting for new input.
 
 ### Experimental output limits
 
