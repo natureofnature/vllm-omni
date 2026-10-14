@@ -185,3 +185,4 @@ class StageOutput:
     decision: DuplexOutputDecision | None
     input_transcript: str | None = None
     input_item_id: str | None = None
+    project_output: bool = True

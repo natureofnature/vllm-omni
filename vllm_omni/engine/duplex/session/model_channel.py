@@ -588,6 +588,10 @@ class ModelChannel:
                 if item.input_item_id is not None:
                     transcript_event["realtime_item_id"] = item.input_item_id
                 self._out.emit(transcript_event)
+        if not item.project_output:
+            # Pass-through ASR belongs to the user, not the assistant output
+            # projector. Its metrics and transcript still use this mailbox.
+            return
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),

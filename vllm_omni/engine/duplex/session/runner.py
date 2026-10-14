@@ -263,7 +263,8 @@ class DuplexSessionRunner:
             self.run.concurrent_turn_requests_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
-        if not consume and not project and not project_intermediate and not input_transcript:
+        project_output = consume or project or project_intermediate
+        if not project_output:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -271,7 +272,8 @@ class DuplexSessionRunner:
             # take. Hand them to the session instead of dropping them, on the
             # mailbox so they stay ordered with this session's other work.
             self._stash_stage_metrics(stage_id, metrics, output)
-            return False
+            if not input_transcript:
+                return False
         if project and not consume:
             # Stage1 thinker text is projected to the client, but that event
             # does not carry engine metrics. Stash them on the same mailbox as
@@ -290,6 +292,7 @@ class DuplexSessionRunner:
                 decision=decision,
                 input_transcript=input_transcript,
                 input_item_id=input_item_id,
+                project_output=project_output,
             )
         )
         # Projection-only must still forward to the next stage (return False).

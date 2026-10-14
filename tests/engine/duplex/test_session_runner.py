@@ -47,6 +47,7 @@ from vllm_omni.engine.duplex.messages import (
     DuplexSessionEventMessage,
     OpenDuplexSessionMessage,
 )
+from vllm_omni.engine.duplex.plugin import DuplexModelPlugin
 from vllm_omni.engine.duplex.session.engine_session import RESPONSE_REQUEST_MEASUREMENT_ORIGIN
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.session.runner import DuplexSessionRunner
@@ -223,8 +224,10 @@ async def open_harness(
     stage_count: int = 2,
     clock: Any = None,
     log_stats: bool = False,
+    plugin: DuplexModelPlugin | None = None,
 ) -> Harness:
-    plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
+    if plugin is None:
+        plugin = MiniCPMO45DuplexPlugin(_fake_encode_audio)
     port = RecordingStagePort(stage_count=stage_count)
     output: asyncio.Queue[Any] = asyncio.Queue()
     results: asyncio.Queue[Any] = asyncio.Queue()
@@ -385,6 +388,65 @@ def b64(data: bytes) -> str:
 # --------------------------------------------------------------------------- #
 # Session lifecycle                                                           #
 # --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> None:
+    from io import BytesIO
+
+    from PIL import Image
+
+    from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
+
+    plugin = AuraDuplexPlugin(_fake_encode_audio)
+    h = await open_harness(plugin=plugin, stage_count=4)
+    try:
+        image = BytesIO()
+        Image.new("RGB", (8, 8), "red").save(image, format="PNG")
+        await h.run(
+            commands.AppendAudio(
+                audio=pcm_f32(1600),
+                format="pcm_f32le",
+                sample_rate_hz=16000,
+                is_speech=True,
+                video_frames=(b64(image.getvalue()),),
+            )
+        )
+        await h.run(commands.Commit(final=True, create_response=True))
+        submission = h.port.submissions[-1]
+        request_id = submission.context.request_id
+        output = SimpleNamespace(
+            request_id=request_id,
+            finished=True,
+            outputs=[SimpleNamespace(text="Watch the red light.", token_ids=[], multimodal_output={})],
+            multimodal_output={},
+        )
+        transcript = plugin.user_transcript(stage_id=0, output=output, prompt=submission.prompt, finished=True)
+        context = DuplexOutputContext(
+            identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+            final_stage_id=3,
+            segment_finished=True,
+        )
+        assert not h.runner.on_stage_output(
+            0,
+            output,
+            stage_stats(stage_id=0, request_id=request_id, num_tokens_out=5),
+            request_id=request_id,
+            context=context,
+            input_transcript=transcript,
+            input_item_id=submission.prompt["additional_information"]["realtime_item_id"],
+        )
+        events = await h.settle()
+        assert find(events, "conversation.item.input_audio_transcription.completed").transcript == transcript
+        assert not any(event.type.startswith("response.output_") for event in events)
+        assert h.session.accumulate_response_stage_metrics(None)["0"]["num_tokens_out"] == 5
+
+        output.outputs[0].text = "I will watch it."
+        assert not h.deliver(output, stage_id=1, segment_finished=True)
+        events = await h.settle()
+        assert find(events, "response.output_text.delta").delta == "I will watch it."
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
