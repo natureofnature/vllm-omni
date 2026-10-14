@@ -467,6 +467,14 @@ policy that used to be two separately configured objects:
 | engine policy | `configure_sampling_params(runtime_config, defaults)`, `plan_append(...) -> DuplexAppendPlan` (the resumable Stage0 prompt for one unit), `decide_output(...) -> DuplexOutputDecision \| None` (e.g. the listen decision on a finished Stage0 segment) |
 | session policy | `capabilities(max_sessions)`, `validate_client_extra_body`, `prepare_runtime_config(config, model_config)` (server-owned runtime keys, reference audio resolution), `runtime_config_for_update`, `runtime_config_for_function_output`, `runtime_config_after_model_output` (consumption acknowledgement), `create_session_state() -> DuplexModelSessionState`, `data_plane: DuplexDataPlane` (projects raw stage outputs into internal events), `data_plane_context(...)` |
 
+JoyAI projects a parsed delegated question through the existing data-plane
+`function_call` event. The application executes it; Session's shared tool
+lifecycle owns admission, cancellation and duplicate/stale-result rejection.
+`runtime_config_for_function_output` formats the accepted result using the
+Session-owned original question. This candidate preparation does not execute
+work or mutate a plugin-local call registry. The next committed JoyAI observation
+includes the result as background context, separate from played assistant speech.
+
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage
 sampling defaults once the stage pools exist. Plugin hooks that may block

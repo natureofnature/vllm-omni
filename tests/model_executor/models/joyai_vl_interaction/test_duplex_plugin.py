@@ -72,7 +72,7 @@ def frame(color="red"):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-async def open_joyai(*, modalities=("text", "audio")):
+async def open_joyai(*, modalities=("text", "audio"), extra_body=None):
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
@@ -93,7 +93,7 @@ async def open_joyai(*, modalities=("text", "audio")):
             control_id="open",
             session_id=SESSION_ID,
             session_config=DuplexSessionConfig(
-                model="joyai", instructions="Watch the pot.", modalities=list(modalities)
+                model="joyai", instructions="Watch the pot.", modalities=list(modalities), extra_body=extra_body or {}
             ),
             output_buffer=output_buffer,
         )

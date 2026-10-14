@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
+from uuid import uuid4
 
 import numpy as np
 
@@ -32,6 +34,7 @@ class Observation:
     previous_response: str = ""
     text_sent: bool = False
     response_text: str = ""
+    delegation_enabled: bool = False
 
     def parse(self, output: object) -> ParsedAction:
         completion = next(iter(output.outputs or ()), None)
@@ -91,12 +94,24 @@ class JoyAIDataPlane(DuplexDataPlane):
                 action = observation.parse(output)
                 observation.text_sent = True
                 if action.action is Action.DELEGATE:
-                    event.update(
-                        error_code="unsupported_tool_call",
-                        error="JoyAI delegation requires the tool adapter",
-                        end_of_turn=True,
-                    )
-                elif action.action is Action.SILENCE or not action.text or observation.is_repeat(action):
+                    if not observation.delegation_enabled or not action.delegated_question:
+                        event.update(
+                            error_code="invalid_function_call",
+                            error="JoyAI delegation requires an enabled delegate tool and a nonempty question",
+                            end_of_turn=True,
+                        )
+                        yield event
+                        continue
+                    yield {
+                        **event,
+                        "function_call": True,
+                        "call_id": f"call_{uuid4().hex}",
+                        "name": "delegate",
+                        "arguments": json.dumps(
+                            {"question": action.delegated_question, "note": action.text}, ensure_ascii=False
+                        ),
+                    }
+                if action.action is Action.SILENCE or not action.text or observation.is_repeat(action):
                     # Match JoyVLPolicy: genuine silence resets deduplication;
                     # suppressing a repeat keeps the last spoken response.
                     if observation.state is not None and not observation.is_repeat(action):

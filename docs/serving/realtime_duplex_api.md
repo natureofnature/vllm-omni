@@ -1051,6 +1051,58 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
+#### JoyAI delegated questions
+
+JoyAI uses the shared Session tool lifecycle from [#8758](https://github.com/vllm-project/vllm-omni/pull/8758).
+Enable its delegated-question adapter with this session tool declaration:
+
+```json
+{
+  "type": "session.update",
+  "session": {
+    "tools": [{
+      "type": "function",
+      "name": "delegate",
+      "description": "Ask the application's background solver a question.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "question": {"type": "string"},
+          "note": {"type": "string"}
+        },
+        "required": ["question"],
+        "additionalProperties": false
+      }
+    }],
+    "tool_choice": "auto"
+  }
+}
+```
+
+The model may return a completed `function_call` named `delegate`, whose JSON
+arguments contain the question and a brief note. The note uses the normal
+text and all-sync speech output path. With no tool declaration or with
+`tool_choice: "none"`, delegation is disabled. Other function names and forced
+tool choices are unsupported.
+
+The application executes the call asynchronously while continuing to send
+camera observations and user input. An application using the existing
+`experimental.fullduplex.joyvl.bridges.delegation.DelegationBridge` can submit
+the question, note and its recent timestamped frames, retain the returned
+backend task ID alongside the Session `call_id`, and poll for the digest.
+The backend task ID is not the `call_id`. Return a completed digest through
+`conversation.item.create` with `type: "function_call_output"`, the original
+`call_id`, and a string `output`. Tool execution and backend task cancellation
+belong to the application.
+
+Session validates ownership before JoyAI associates the result with its original
+question. The client must not supply authoritative call metadata. JoyAI retains
+up to eight recent delegated answers as background context, preserving the
+standing instruction and current user query; older answers may be removed to
+fit the complete input budget. A result does not itself start another inference
+request. Send `response.create`, or commit the next observation, to let JoyAI
+use it. Tool results are not recorded as assistant speech that the user heard.
+
 `C→S conversation.item.delete` / `S→C conversation.item.deleted`
 
 ```json
