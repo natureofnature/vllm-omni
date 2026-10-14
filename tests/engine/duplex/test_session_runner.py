@@ -439,12 +439,16 @@ async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> Non
         events = await h.settle()
         assert find(events, "conversation.item.input_audio_transcription.completed").transcript == transcript
         assert not any(event.type.startswith("response.output_") for event in events)
-        assert h.session.accumulate_response_stage_metrics(None)["0"]["num_tokens_out"] == 5
+        assert h.session.active_response_id is None
 
         output.outputs[0].text = "I will watch it."
         assert not h.deliver(output, stage_id=1, segment_finished=True)
         events = await h.settle()
-        assert find(events, "response.output_text.delta").delta == "I will watch it."
+        delta = find(events, "response.output_audio_transcript.delta")
+        assert delta.delta == "I will watch it."
+        # AURA starts the response on thinker output; earlier ASR metrics are
+        # stashed until then and must appear on the public transcript event.
+        assert _stage_metrics_of(delta)["0"]["num_tokens_out"] == 5
     finally:
         await h.manager.shutdown()
 
