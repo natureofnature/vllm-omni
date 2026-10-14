@@ -463,8 +463,11 @@ enters ASR and carries the original observation context through the handoff.
 
 Completed input transcriptions travel with stage outputs through the runner
 mailbox. After checking the request fence, the runner updates the exact committed
-audio history item and emits its transcription event. Cancellation, item deletion
-or replacement cannot apply a late transcript to a newer turn.
+audio history item and emits its transcription event. The append captures the
+original native audio part before yielding and retains that identity on its
+request resource; a reused public item ID does not confer transcript ownership.
+Cancellation, item deletion or replacement cannot apply a late transcript to a
+newer turn.
 
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.

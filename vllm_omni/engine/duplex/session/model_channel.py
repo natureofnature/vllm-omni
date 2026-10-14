@@ -164,6 +164,7 @@ class ModelChannel:
         operation_id: str | None = None,
         final: bool,
         expected_epoch: int | None = None,
+        input_audio_part: dict[str, object] | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
@@ -180,6 +181,7 @@ class ModelChannel:
                 final=final,
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
+                input_audio_part=input_audio_part,
             )
         except asyncio.CancelledError:
             raise
@@ -225,6 +227,7 @@ class ModelChannel:
         final: bool,
         operation_id: str | None,
         expected_epoch: int | None,
+        input_audio_part: dict[str, object] | None,
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
@@ -295,6 +298,8 @@ class ModelChannel:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
             if request_context.request_id != request_id:
                 request_id = request_context.request_id
+            if not already_submitted:
+                session.request_resources[(stage_id, request_id)].input_audio_part = input_audio_part
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
@@ -579,7 +584,12 @@ class ModelChannel:
         if item.input_transcript:
             # This runs on the same mailbox as conversation edits and cancel,
             # after the request's fence has been checked above.
-            if item.input_item_id is None or session.update_input_transcript(item.input_item_id, item.input_transcript):
+            resource = session.request_resources.get((item.stage_id, item.request_id))
+            if item.input_item_id is None or session.update_input_transcript(
+                item.input_item_id,
+                item.input_transcript,
+                audio_part=resource.input_audio_part if resource is not None else None,
+            ):
                 transcript_event: dict[str, object] = {
                     "type": "input.transcribed",
                     "transcript": item.input_transcript,

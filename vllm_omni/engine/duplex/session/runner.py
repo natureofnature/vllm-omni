@@ -1131,6 +1131,7 @@ class DuplexSessionRunner:
                 session.active_response_id,
                 helpers.audio_payload_size_bytes(payload),
             )
+        input_item_id = payload.get("realtime_item_id")
         attempt = AppendAttempt(
             ctx=self.ctx,
             out=self.out,
@@ -1145,6 +1146,7 @@ class DuplexSessionRunner:
             retained_committed_payload=retained_committed_payload,
             precreated_response_id=session.active_response_id if precreate_response else None,
             owns_request=final or precreate_response,
+            input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
             on_append_accepted=on_append_accepted,
             before_append=before_append,
         )

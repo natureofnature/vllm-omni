@@ -258,6 +258,91 @@ async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
 
 
 @pytest.mark.asyncio
+async def test_late_asr_does_not_transcribe_recreated_audio_item():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        pcm = struct.pack("<h", 1000) * 12800  # 800 ms exceeds the listen-only overlap threshold.
+        await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000, video_frames=(frame(),)))
+        await h.run(Commit(final=True, create_response=True))
+        original = h.port.submissions[-1]
+        item_id = original.prompt["additional_information"]["realtime_item_id"]
+        original_part = h.session.history_item_ids[item_id]["content"][0]
+
+        await h.run(translate_realtime_command({"type": "conversation.item.delete", "item_id": item_id}))
+        await h.run(
+            translate_realtime_command(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": item_id,
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "audio": base64.b64encode(struct.pack("<h", 2000) * 12800).decode(),
+                                "format": "pcm16",
+                                "sample_rate_hz": 16000,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        replacement_part = h.session.history_item_ids[item_id]["content"][0]
+        assert replacement_part == original_part
+        assert replacement_part is not original_part
+        assert h.session.epoch == original.context.fence.epoch
+        assert h.session.active_request_id == original.context.request_id
+        assert len(h.port.submissions) == 1  # The new audio is retained behind the old response.
+
+        def deliver_transcript(submission, text):
+            request_id = submission.context.request_id
+            output = tts_output(request_id, finished=True, text=text)
+            h.runner.on_stage_output(
+                0,
+                output,
+                None,
+                request_id=request_id,
+                context=DuplexOutputContext(
+                    identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+                    final_stage_id=3,
+                    segment_finished=True,
+                ),
+                input_transcript=h.runner.plugin.user_transcript(
+                    stage_id=0, output=output, prompt=submission.prompt, finished=True
+                ),
+                input_item_id=submission.prompt["additional_information"]["realtime_item_id"],
+            )
+
+        deliver_transcript(original, "Old spoken instruction.")
+        events = await h.settle()
+        assert "transcript" not in h.session.history_item_ids[item_id]
+        assert "transcript" not in replacement_part
+        assert not any(event.type == "conversation.item.input_audio_transcription.completed" for event in events)
+
+        await h.deliver_and_settle(
+            tts_output(original.context.request_id, finished=True, text="</silence>"),
+            stage_id=1,
+            segment_finished=True,
+        )
+        await h.run(CreateResponse())
+        replacement = h.port.submissions[-1]
+        assert replacement.context.stage_id == 0
+        assert replacement.context.request_id != original.context.request_id
+        deliver_transcript(replacement, "New spoken instruction.")
+        events = await h.settle()
+        transcriptions = [
+            event for event in events if event.type == "conversation.item.input_audio_transcription.completed"
+        ]
+        assert len(transcriptions) == 1
+        assert transcriptions[0].transcript == "New spoken instruction."
+        assert h.session.history_item_ids[item_id]["transcript"] == "New spoken instruction."
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_shared_vad_commits_joyai_speech_once():
     h = await open_joyai(asr=True)
     try:
