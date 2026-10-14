@@ -10,8 +10,9 @@ from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import tts_output
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import observe, open_joyai
-from vllm_omni.engine.duplex.commands import AckPlayback, Heartbeat
+from vllm_omni.engine.duplex.commands import AckPlayback, CancelInput, Heartbeat
 from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -230,6 +231,72 @@ async def test_failed_auxiliary_cleanup_retains_one_resource_and_blocks_more_job
         assert len(h.port.submissions) == 1
     finally:
         h.port.cleanup = original_cleanup
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_close", [False, True])
+async def test_input_cancel_retains_auxiliary_after_failed_aborts_until_close_retry(fail_close):
+    h = await open_joyai(modalities=("text",))
+    original_cleanup = h.port.cleanup
+    failures_remaining = 2
+
+    async def fail_cleanup(request_ids: list[str], *, abort: bool = False) -> None:
+        nonlocal failures_remaining
+        await original_cleanup(request_ids, abort=abort)
+        if failures_remaining:
+            failures_remaining -= 1
+            raise RuntimeError("synthetic abort failure")
+
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+        request_id = submission.context.request_id
+        cancelled_request_ids = h.session.resource_request_ids()
+        assert h.session.resource_request_ids(submitted=True) == [request_id]
+        old_epoch = h.session.epoch
+        task = h.runner._auxiliary_task
+        h.port.cleanup = fail_cleanup
+
+        events = await h.run(CancelInput())
+        assert any(event.to_realtime()["type"] == "input_audio_buffer.cleared" for event in events)
+        assert h.session.epoch == old_epoch + 1
+        assert task is not None and task.done()
+        # Open reserves the normal stage-0 request without submitting it. The
+        # cancellation batch includes it; the auxiliary's retry contains only
+        # the submitted summary request.
+        assert h.port.cleanups == [(cancelled_request_ids, True), ([request_id], True)]
+        assert failures_remaining == 0
+        assert h.session.resource_request_ids(submitted=True) == [request_id]
+        await h.run(Heartbeat())
+        assert len(h.port.submissions) == 1
+
+        failures_remaining = int(fail_close)
+        await h.manager.close(CloseDuplexSessionMessage(control_id="close-memory", session_id=h.session.session_id))
+        assert [abort for ids, abort in h.port.cleanups if request_id in ids] == [True] * 3
+        if fail_close:
+            assert h.manager._closing[h.session.session_id].submitted_request_ids == (request_id,)
+            assert await h.manager.reap_expired() == 1
+            assert [abort for ids, abort in h.port.cleanups if request_id in ids] == [True] * 4
+        assert h.session.session_id not in h.manager._closing
+    finally:
+        h.port.cleanup = original_cleanup
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_input_cancel_cleans_auxiliary_only_once_when_abort_succeeds():
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+        request_id = submission.context.request_id
+        cancelled_request_ids = h.session.resource_request_ids()
+        await h.run(CancelInput())
+        assert h.port.cleanups == [(cancelled_request_ids, True)]
+        assert request_id not in h.session.resource_request_ids()
+        assert h.runner.model_state.memory.text == ""
+    finally:
         await h.manager.shutdown()
 
 

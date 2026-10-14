@@ -410,11 +410,14 @@ class ModelChannel:
         try:
             next_fence = session.sync_fence()
             if next_fence.epoch > cancelled_fence.epoch:
-                stale_request_ids = session.cancel_fence(cancelled_fence, next_fence)
+                stale_request_ids = session.prepare_cancel_fence(cancelled_fence, next_fence)
             else:
                 stale_request_ids = []
             if stale_request_ids:
                 await self._ctx.stage_port.cleanup(list(stale_request_ids), abort=True)
+                # Keep failed aborts owned for teardown retry. Release only the
+                # captured ids, not resources added while cleanup was awaiting.
+                session.release_resources_for_request_ids(stale_request_ids)
             session.touch_lease(DuplexLeaseActivity.SIGNAL)
         except asyncio.CancelledError:
             raise

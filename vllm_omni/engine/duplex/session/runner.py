@@ -890,7 +890,10 @@ class DuplexSessionRunner:
             if request_id is not None:
                 assert request is not None
                 try:
-                    await self.stage_port.cleanup([request_id], abort=True)
+                    # Cancellation may already have cleaned and released this
+                    # request. A failed cancellation leaves it owned for retry.
+                    if (request.stage_id, request_id) in session.request_resources:
+                        await self.stage_port.cleanup([request_id], abort=True)
                 except Exception as exc:
                     # Keep the reservation for the manager's teardown retry.
                     logger.warning("Duplex auxiliary cleanup failed: %s", type(exc).__name__)
