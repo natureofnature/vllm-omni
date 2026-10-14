@@ -61,6 +61,12 @@
         item_id: `item_${responseId}`, played_ms: playedMs, committed_ms: playedMs };
     },
     mapEvent(event) {
+      // A reply can finish generating while its audio is still queued locally.
+      if (vad && event.type === 'input_audio_buffer.speech_started') return { kind: 'interrupt' };
+      if (vad && (event.type === 'output_audio_buffer.cleared' ||
+          (event.type === 'response.done' && event.response?.status === 'cancelled'))) {
+        return { kind: 'interrupt', responseId: event.response_id || event.response?.id || null };
+      }
       if (event.type === 'playback.acknowledged') return { kind: 'ack', committedMs: (event.event || event).committed_ms || 0 };
       if (event.type === 'response.output_text.delta') {
         return { kind: 'text', role: 'assistant', channel: 'text', text: event.delta || '' };

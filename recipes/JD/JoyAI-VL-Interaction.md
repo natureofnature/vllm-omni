@@ -113,7 +113,9 @@ submitting the latest pending frame. With the ASR duplex deployment, add
 `--speech-input` for **Hold to talk**, releasing to commit a spoken instruction.
 Add `--speech-input --vad` for automatic speech commits with server VAD; camera
 frames accompany utterances, while automatic camera-only observations are paused
-in VAD mode. Use push-to-talk for continuous camera observations between utterances.
+in VAD mode. Starting speech clears queued reply audio immediately, including
+after reply generation has completed. Use push-to-talk for continuous camera
+observations between utterances.
 
 ## Standalone interaction server
 
