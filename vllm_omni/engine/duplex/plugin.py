@@ -287,11 +287,19 @@ def duplex_text_history(conversation: Iterable[Mapping[str, object]]) -> tuple[t
     for message in conversation:
         content = message.get("content")
         if isinstance(content, list):
-            text = "\n".join(
-                str(part.get("text", ""))
-                for part in content
-                if isinstance(part, dict) and part.get("type") == "text"
-            )
+            texts = []
+            has_audio_transcript = False
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") == "text":
+                    texts.append(str(part.get("text", "")))
+                elif part.get("type") == "audio_url" and isinstance(part.get("transcript"), str):
+                    texts.append(part["transcript"])
+                    has_audio_transcript = True
+            if not has_audio_transcript and isinstance(message.get("transcript"), str):
+                texts.append(message["transcript"])
+            text = "\n".join(texts)
         else:
             text = content if isinstance(content, str) else ""
         entries.append((str(message.get("role", "")), text))
@@ -384,8 +392,9 @@ class DuplexModelPlugin(ABC):
 
     def apply_auxiliary_result(
         self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
-    ) -> None:
+    ) -> bool:
         """Apply a private result after the runner validates its committed prefix."""
+        return False
 
     async def prepare_append_plan(self, **kwargs) -> DuplexAppendPlan:
         """Prepare a plan; plugins may offload expensive work on owned snapshots."""

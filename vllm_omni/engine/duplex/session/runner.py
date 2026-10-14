@@ -197,6 +197,8 @@ class DuplexSessionRunner:
         self._auxiliary_output: asyncio.Future[object] | None = None
         self._auxiliary_request_id: str | None = None
         self._auxiliary_attempt: tuple[int, int, int, str] | None = None
+        self._auxiliary_source: tuple[int, int, str] | None = None
+        self._auxiliary_completion_pending = False
         self._auxiliary_epoch = session.epoch
         self._auxiliary_generation = 0
         #: Flags more than one component reads and writes (see session_context).
@@ -263,9 +265,7 @@ class DuplexSessionRunner:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         if duplex_is_auxiliary_request(request_id):
             if request_id == self._auxiliary_request_id and context.segment_finished:
-                self._mailbox.put_nowait(
-                    _Internal("auxiliary_output", {"request_id": request_id, "output": output})
-                )
+                self._mailbox.put_nowait(_Internal("auxiliary_output", {"request_id": request_id, "output": output}))
             return True
         decision: DuplexOutputDecision | None = None
         project = False
@@ -544,6 +544,7 @@ class DuplexSessionRunner:
                     future.set_result(item.payload["output"])
             return
         if item.kind == "auxiliary_result":
+            self._auxiliary_completion_pending = False
             request = item.payload["request"]
             epoch, generation = item.payload["epoch"], item.payload["generation"]
             assert isinstance(request, DuplexAuxiliaryRequest)
@@ -551,7 +552,12 @@ class DuplexSessionRunner:
             if item.payload["operation"] == self._auxiliary_generation and self._auxiliary_context_matches(
                 request, epoch, generation
             ):
-                self.plugin.apply_auxiliary_result(request=request, output=item.payload["output"], state=self.model_state)
+                applied = self.plugin.apply_auxiliary_result(
+                    request=request, output=item.payload["output"], state=self.model_state
+                )
+                if applied:
+                    self._auxiliary_source = None
+            self._maybe_start_auxiliary()
             return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
@@ -796,27 +802,44 @@ class DuplexSessionRunner:
     def _maybe_start_auxiliary(self) -> None:
         if not self.plugin.supports_auxiliary_requests or self.closing:
             return
+        if self._auxiliary_completion_pending:
+            return
         if self._auxiliary_task is not None and not self._auxiliary_task.done():
             if self.session.epoch != self._auxiliary_epoch:
                 self._auxiliary_task.cancel()
             return
+        # A failed abort retains its resource for teardown retry. Do not build
+        # an unbounded collection of abandoned background requests behind it.
+        if any(duplex_is_auxiliary_request(request_id) for _, request_id in self.session.request_resources):
+            return
         if self.session.active_response_id is not None or self.tasks.append_tasks:
             return
+        history = duplex_text_history(self.session.history)
+        source = (self.session.epoch, self.session.config_generation, duplex_history_digest(history))
+        if source == self._auxiliary_source:
+            return
+        self._auxiliary_source = source
         self._auxiliary_epoch = self.session.epoch
         self._auxiliary_generation += 1
-        self._auxiliary_task = asyncio.create_task(self._run_auxiliary(), name="duplex-auxiliary")
+        self._auxiliary_task = asyncio.create_task(self._run_auxiliary(history), name="duplex-auxiliary")
         self._background_tasks.add(self._auxiliary_task)
         self._auxiliary_task.add_done_callback(self._background_tasks.discard)
 
-    async def _run_auxiliary(self) -> None:
+    async def _run_auxiliary(self, history: tuple[tuple[str, str], ...]) -> None:
         session = self.session
         epoch, generation = session.epoch, session.config_generation
         operation = self._auxiliary_generation
         request_id = None
         request = None
+        output = None
         try:
-            request = await self.plugin.prepare_auxiliary_request(
-                history=duplex_text_history(session.history), runtime_config=session.runtime_config, state=self.model_state
+            request = await asyncio.wait_for(
+                self.plugin.prepare_auxiliary_request(
+                    history=history,
+                    runtime_config=session.runtime_config,
+                    state=self.model_state,
+                ),
+                timeout=30.0,
             )
             if request is None or not self._auxiliary_context_matches(request, epoch, generation):
                 return
@@ -859,13 +882,6 @@ class DuplexSessionRunner:
                 return await output_future
 
             output = await asyncio.wait_for(submit_and_wait(), timeout=request.timeout_s)
-            if output is not None:
-                self._mailbox.put_nowait(
-                    _Internal(
-                        "auxiliary_result",
-                        {"request": request, "output": output, "epoch": epoch, "generation": generation, "operation": operation},
-                    )
-                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -887,6 +903,22 @@ class DuplexSessionRunner:
                             self._auxiliary_output.exception()
                     self._auxiliary_request_id = None
                     self._auxiliary_output = None
+        # Queue completion after cleanup, so the mailbox may schedule the next
+        # bounded chunk without racing the previous task's owned resources.
+        if output is not None:
+            self._auxiliary_completion_pending = True
+            self._mailbox.put_nowait(
+                _Internal(
+                    "auxiliary_result",
+                    {
+                        "request": request,
+                        "output": output,
+                        "epoch": epoch,
+                        "generation": generation,
+                        "operation": operation,
+                    },
+                )
+            )
 
     def _session_auto_responds(self) -> bool:
         return self.out.auto_responds()

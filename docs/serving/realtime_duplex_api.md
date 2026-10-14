@@ -41,6 +41,33 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
+## JoyAI conversation memory
+
+The JoyAI duplex plugin preserves at least eight recent text messages and consolidates
+older committed conversation into one summary of at most 512 generated tokens.
+Each consolidation handles at most eight more messages and uses JoyAI's own
+deployed stage, with a separate request that ends before speech synthesis.
+There is at most one such request per session and no queue of older snapshots.
+The previous summary remains available if consolidation fails or times out.
+Any older unsummarized backlog remains in the normal prompt, subject to the
+existing context budget, while successive bounded requests catch up.
+
+Standing instructions and the current user query remain explicit in the normal
+interaction prompt. Summary input contains committed conversation text, not
+unplayed generated speech or retained image/audio payloads. With JoyAI's current
+all-sync audio output, the assistant transcript becomes eligible only after the
+complete audio has been acknowledged. Playback corrections and conversation
+edits invalidate summaries derived from the changed text; newer appended turns
+can coexist with consolidation of an unchanged older prefix.
+
+This bounds the summary and model-input context, not the underlying Session
+conversation ledger. Summaries are lossy and do not preserve visual facts that
+were never represented in committed text. They share compute capacity with
+interactive requests; latency and long-session recall depend on the deployment.
+If instructions and the current observation exhaust the context budget, derived
+memory is omitted. Pending delegated tool calls require the shared tool lifecycle
+adapter and are not synthesized by memory consolidation.
+
 ## Quick Start
 
 ### Start the Server

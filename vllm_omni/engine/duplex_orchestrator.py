@@ -221,9 +221,12 @@ class DuplexOrchestrator(Orchestrator, DuplexStagePort):
             return False
         # Resumable resident Stage0: stage failure closes the session.
         # Ephemeral turn-commit: free this turn's stages without tearing down WS.
-        close_session = not duplex_is_auxiliary_request(req_id) and self.plugin.capabilities(
-            max_sessions=self.duplex_session_config.max_sessions
-        ).supports_core_resumable_request
+        close_session = (
+            not duplex_is_auxiliary_request(req_id)
+            and self.plugin.capabilities(
+                max_sessions=self.duplex_session_config.max_sessions
+            ).supports_core_resumable_request
+        )
         runner = self.session_manager.runner_for_request_id(req_id)
         if runner is not None:
             runner.on_stage_failure(next_stage_id, exc, request_id=req_id)

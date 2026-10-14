@@ -17,12 +17,15 @@ class JoyAISummaryMemory:
     covered_messages: int = 0
     covered_digest: str = ""
 
+    def matches(self, history: tuple[tuple[str, str], ...]) -> bool:
+        return not self.covered_messages or (
+            len(history) >= self.covered_messages
+            and duplex_history_digest(history[: self.covered_messages]) == self.covered_digest
+        )
+
     def validate(self, history: tuple[tuple[str, str], ...]) -> None:
         """A playback correction or conversation edit revokes derived memory."""
-        if self.covered_messages and (
-            len(history) < self.covered_messages
-            or duplex_history_digest(history[: self.covered_messages]) != self.covered_digest
-        ):
+        if not self.matches(history):
             self.text = ""
             self.covered_messages = 0
             self.covered_digest = ""

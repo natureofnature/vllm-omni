@@ -168,6 +168,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "joyai_frames": frames,
             "joyai_conversation_images": images,
             "joyai_summary": state.memory.text,
+            "joyai_summary_messages": state.memory.covered_messages,
         }
 
     async def prepare_auxiliary_request(
@@ -179,15 +180,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     ) -> DuplexAuxiliaryRequest | None:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
-        state.memory.validate(history)
-        covered = state.memory.covered_messages
+        # Snapshot model-owned memory before yielding; preparation never mutates
+        # it. Prompt invalidation and result application stay on the mailbox.
+        current = state.memory.matches(history)
+        covered = state.memory.covered_messages if current else 0
+        previous_summary = state.memory.text if current else ""
         end = min(len(history) - RECENT_MESSAGES, covered + SUMMARY_CHUNK_MESSAGES)
         # Preserve the current query and unresolved user turn outside the summary.
         while end > covered and history[end - 1][0] != "assistant":
             end -= 1
         if end <= covered:
             return None
-        previous_summary = state.memory.text
 
         def prepare() -> DuplexAuxiliaryRequest | None:
             target = end
@@ -199,13 +202,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 )
                 content = LONG_TERM_COMPRESS_PROMPT.format(
                     merged_range=f"conversation turns 1-{target}",
-                    summaries_text=f"Previous committed summary:\n{previous_summary}\n\nCommitted conversation:\n{transcript}",
+                    summaries_text=(
+                        f"Previous committed summary:\n{previous_summary}\n\nCommitted conversation:\n{transcript}"
+                    ),
                     length_instruction=f" (at most {SUMMARY_MAX_TOKENS} tokens) ",
                 )
                 prompt = self.processor.apply_chat_template(
                     [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
                 )
-                if len(self.processor.tokenizer(text=[prompt])["input_ids"][0]) + SUMMARY_MAX_TOKENS <= self.max_model_len:
+                if (
+                    len(self.processor.tokenizer(text=[prompt])["input_ids"][0]) + SUMMARY_MAX_TOKENS
+                    <= self.max_model_len
+                ):
                     return DuplexAuxiliaryRequest(
                         stage_id=self.joyai_stage_id,
                         prompt={"prompt": prompt},
@@ -227,22 +235,23 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def apply_auxiliary_result(
         self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
-    ) -> None:
+    ) -> bool:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
         completion = next(iter(getattr(output, "outputs", ()) or ()), None)
         text = (getattr(completion, "text", "") or "").strip()
         # A truncated or action-only completion is not a usable memory replacement.
         if not text or getattr(completion, "finish_reason", None) == "length":
-            return
+            return False
         if any(marker in text for marker in ("</silence>", "</delegation>")):
-            return
+            return False
         text = text.removeprefix("</response>").strip()
         if not text or len(self.processor.tokenizer(text=[text])["input_ids"][0]) > SUMMARY_MAX_TOKENS:
-            return
+            return False
         state.memory.text = text
         state.memory.covered_messages = request.history_length
         state.memory.covered_digest = request.history_digest
+        return True
 
     async def prepare_append_plan(
         self,
@@ -308,19 +317,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI video profile requires committed text/image/video input")
         history = []
         query = runtime_config.get("initial_user_text") or ""
-        for message in session_config.get("conversation", []):
-            role, content = message.get("role"), message.get("content")
+        for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
             if role not in {"user", "assistant"}:
                 continue
-            if isinstance(content, list):
-                text = "\n".join(part.get("text", "") for part in content if part.get("type") == "text")
-            else:
-                text = content if isinstance(content, str) else ""
             if text:
                 if role == "user":
                     query = text
-                history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
-        history = history[-RECENT_MESSAGES:]
+                if index >= session_config.get("joyai_summary_messages", 0):
+                    history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
         while history and history[0]["role"] == "assistant":
             history.pop(0)
         # The active instruction is attached to the latest observation below.
@@ -336,8 +340,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         system = SILENT_SYSTEM_PROMPT
         if runtime_config.get("instructions"):
             system += "\n\n" + runtime_config["instructions"]
-        if session_config.get("joyai_summary"):
-            system += "\n\n" + QA_HISTORY_HEADER + session_config["joyai_summary"]
+        base_system = system
+        summary = session_config.get("joyai_summary")
+        if summary:
+            system += "\n\n" + QA_HISTORY_HEADER + summary
         if not isinstance(sampling_params, SamplingParams):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
@@ -367,6 +373,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 history.pop(0)
                 while history and history[0]["role"] == "assistant":
                     history.pop(0)
+            elif summary:
+                # Derived memory must not displace standing instructions or
+                # make a previously admissible current observation fail.
+                summary = ""
+                system = base_system
             elif len(images) > 1:
                 images.pop(0)
                 image_token_counts.pop(0)

@@ -359,6 +359,17 @@ for queue updates and the final validity check before delivery.
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
 
+Model plugins may opt into one bounded auxiliary request per Session. The runner
+gives it a separate resource identity, submits and terminates it at the selected
+stage, and intercepts its output and errors before response policy, speech
+routing, playback history or response metrics. The plugin receives immutable
+committed text and owns prompt/result formatting. The runner checks the epoch,
+configuration generation, operation identity and summarized-prefix fingerprint
+before mailbox writeback. Appending newer history does not invalidate a stable
+prefix; editing or deleting that prefix does. Cancellation and close abort owned
+requests. A failed cleanup retains its resource for teardown retry and prevents
+new auxiliary work from accumulating behind it.
+
 ### Experimental output limits
 
 `max_pending_output_bytes_per_session` defaults to 2 MiB and

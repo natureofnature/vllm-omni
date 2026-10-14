@@ -38,8 +38,8 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStageSubmission,
-    duplex_is_auxiliary_request,
     duplex_data_plane_request_info,
+    duplex_is_auxiliary_request,
     duplex_same_turn_request_ids,
     duplex_session_id_from_request_id,
 )

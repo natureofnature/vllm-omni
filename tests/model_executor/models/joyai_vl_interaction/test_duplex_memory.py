@@ -3,12 +3,15 @@
 
 import asyncio
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
+from vllm.outputs import CompletionOutput, RequestOutput
+from vllm.sampling_params import SamplingParams
 
-from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import open_joyai
-from vllm_omni.engine.duplex.commands import Heartbeat
+from tests.engine.duplex.test_session_runner import tts_output
+from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import observe, open_joyai
+from vllm_omni.engine.duplex.commands import AckPlayback, Heartbeat
+from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -34,10 +37,23 @@ async def start_summary(h):
 
 
 def summary_output(request_id, text="Cabinet 0 has code K731.", finish_reason="stop"):
-    return SimpleNamespace(
+    return RequestOutput(
         request_id=request_id,
+        prompt="",
+        prompt_token_ids=[],
+        prompt_logprobs=None,
         finished=True,
-        outputs=[SimpleNamespace(text=text, finish_reason=finish_reason)],
+        outputs=[
+            CompletionOutput(
+                index=0,
+                text=text,
+                token_ids=[],
+                cumulative_logprob=0.0,
+                logprobs=None,
+                finish_reason=finish_reason,
+                stop_reason=None,
+            )
+        ],
     )
 
 
@@ -120,7 +136,11 @@ async def test_failed_summary_keeps_memory_and_does_not_retry_same_prefix(failur
             h.runner.on_stage_failure(0, RuntimeError("synthetic failure"), request_id=request_id)
         elif failure != "timeout":
             h.deliver(
-                summary_output(request_id, text="" if failure == "empty" else "partial", finish_reason="length" if failure == "truncated" else "stop"),
+                summary_output(
+                    request_id,
+                    text="" if failure == "empty" else "partial",
+                    finish_reason="length" if failure == "truncated" else "stop",
+                ),
                 stage_id=0,
                 segment_finished=True,
             )
@@ -148,6 +168,72 @@ async def test_close_cancels_auxiliary_and_late_result_cannot_write():
 
 
 @pytest.mark.asyncio
+async def test_auxiliary_failure_does_not_finish_concurrent_response():
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+        response_id = h.session.begin_response()
+        h.runner.on_stage_failure(0, RuntimeError("synthetic failure"), request_id=submission.context.request_id)
+        events = await h.settle()
+        assert h.session.active_response_id == response_id
+        assert not any(event.to_realtime()["type"] in {"response.done", "error"} for event in events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_summary_excludes_unplayed_speech_and_rejects_late_full_ack():
+    h = await open_joyai()
+    try:
+        h.session.append_history_message({"role": "user", "content": "Observe the cabinet."})
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Unheard secret is Z984.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
+        committed_turns(h.session)
+        # The normal observation is already recorded in the stage-port harness.
+        h.port.submissions.clear()
+        submission = await start_summary(h)
+        assert "Unheard secret" not in submission.prompt["prompt"]
+        h.submit(AckPlayback(response_id=response_id, played_ms=1000))
+        await h.settle(timeout_s=0.1)
+        assert any("Unheard secret" in str(message.get("content")) for message in h.session.history)
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert h.runner.model_state.memory.text == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_auxiliary_cleanup_retains_one_resource_and_blocks_more_jobs():
+    h = await open_joyai(modalities=("text",))
+    original_cleanup = h.port.cleanup
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+
+        async def fail_cleanup(*args, **kwargs):
+            raise RuntimeError("synthetic cleanup failure")
+
+        h.port.cleanup = fail_cleanup
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert submission.context.request_id in h.session.resource_request_ids(submitted=True)
+        committed_turns(h.session, count=2)
+        await h.run(Heartbeat())
+        assert len(h.port.submissions) == 1
+    finally:
+        h.port.cleanup = original_cleanup
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_memory_is_bounded_and_instructions_are_outside_summary():
     h = await open_joyai(modalities=("text",))
     try:
@@ -166,4 +252,119 @@ async def test_memory_is_bounded_and_instructions_are_outside_summary():
         prepared = plugin.prepare_prompt_config({"conversation": list(h.session.history)}, state=state, payload={})
         assert prepared["joyai_summary"] == ""
     finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("part_transcript", [True, False])
+async def test_spoken_instruction_is_summarized_once_and_correction_invalidates(part_transcript):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        part = {"type": "audio_url", "audio_url": {"url": "native-duplex:input-audio"}}
+        if part_transcript:
+            part["transcript"] = "Watch the red cabinet."
+        spoken = {"role": "user", "content": [part], "transcript": "Watch the red cabinet."}
+        h.session.register_history_item("user-0", spoken)
+        submission = await start_summary(h)
+        assert submission.prompt["prompt"].count("Watch the red cabinet.") == 1
+        assert "native-duplex:input-audio" not in submission.prompt["prompt"]
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert h.runner.model_state.memory.text
+        corrected = {"role": "user", "content": [{**part, "transcript": "Watch the blue cabinet."}]}
+        h.session.register_history_item("user-0", corrected)
+        config = h.runner.plugin.prepare_prompt_config(
+            {"conversation": list(h.session.history)}, state=h.runner.model_state, payload={}
+        )
+        assert config["joyai_summary"] == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_imported_history_catches_up_without_omitting_unsummarized_middle():
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session, count=12)
+        first = await start_summary(h)
+        assert "Cabinet 3 recorded." in first.prompt["prompt"]
+        h.deliver(summary_output(first.context.request_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[-1]
+        assert "Cabinet 0 has code K731." in second.prompt["prompt"]
+        assert "Cabinet 7 recorded." in second.prompt["prompt"]
+        config = h.runner.plugin.prepare_prompt_config(
+            {"conversation": list(h.session.history)}, state=h.runner.model_state, payload={}
+        )
+        prompt = h.runner.plugin.plan_append(
+            request_id="normal",
+            fence=DuplexFence("s"),
+            session_config=config,
+            runtime_config=h.session.runtime_config,
+            seq=1,
+            turn_seq=1,
+            payload={},
+            final=True,
+            sampling_params=SamplingParams(max_tokens=64),
+        ).prompt["prompt"]
+        assert "Cabinet 0 has code K731." in prompt
+        assert "Cabinet 4 recorded." in prompt
+        assert "Cabinet 11 recorded." in prompt
+        h.deliver(
+            summary_output(second.context.request_id, "Cabinets 0 through 7 recorded."),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.settle()
+        assert h.runner.model_state.memory.covered_messages == 16
+        assert len(h.port.submissions) == 2
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_unchanged_short_history_does_not_schedule_repeated_preparation(mocker):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session, count=2)
+        prepare = mocker.spy(h.runner.plugin, "prepare_auxiliary_request")
+        await h.run(Heartbeat())
+        first_count = prepare.call_count
+        assert first_count == 1
+        await h.run(Heartbeat())
+        assert prepare.call_count == first_count
+        assert h.port.submissions == []
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queued_completion_keeps_identity_when_earlier_command_appends_tail(monkeypatch):
+    h = await open_joyai(modalities=("text",))
+    release = asyncio.Event()
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+        task = h.runner._auxiliary_task
+        entered = asyncio.Event()
+        original = h.runner._on_command
+
+        async def hold_command(command):
+            entered.set()
+            await release.wait()
+            await original(command)
+
+        monkeypatch.setattr(h.runner, "_on_command", hold_command)
+        h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+        h.submit(Heartbeat())
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        await asyncio.wait_for(task, timeout=2)
+        h.session.append_history_message({"role": "user", "content": "New observation."})
+        release.set()
+        await h.settle()
+        assert h.runner.model_state.memory.text == "Cabinet 0 has code K731."
+    finally:
+        release.set()
         await h.manager.shutdown()
