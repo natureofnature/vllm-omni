@@ -223,9 +223,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return {
             **current,
             "joyai_delegation_results": [
-                {**result, "consumed": True}
-                if result["call_id"] in request.delegation_result_call_ids
-                else result
+                {**result, "consumed": True} if result["call_id"] in request.delegation_result_call_ids else result
                 for result in current.get("joyai_delegation_results", [])
             ],
         }
