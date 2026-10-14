@@ -737,10 +737,21 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
         seen = int(session.get("function_response_generation", 0))
         if generation < seen:
             raise ValueError("Nemotron VoiceChat function-response generation moved backwards")
+        try:
+            floor = int(runtime_config.get("nvc_function_response_floor_generation", 0))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Nemotron VoiceChat function-response floor must be an integer") from exc
+        if floor < 0 or floor > generation:
+            raise ValueError("Nemotron VoiceChat function-response floor is out of range")
+        # Generations at or below the floor have already left the runtime's
+        # queue -- an earlier request's thinker took them, or a cancelled epoch
+        # dropped them -- so this request starts above them. The floor is the
+        # only thing that can move the cursor without a batch.
+        effective_seen = max(seen, floor)
         if generation > seen:
             raw_batches = runtime_config.get("nvc_function_response_batches")
             batches = raw_batches if isinstance(raw_batches, list) else []
-            unseen: list[tuple[int, list[int]]] = []
+            remaining: list[tuple[int, list[int]]] = []
             for raw_batch in batches:
                 if not isinstance(raw_batch, dict):
                     raise ValueError("Nemotron VoiceChat function response batch must be an object")
@@ -748,23 +759,28 @@ class NemotronVoiceChatThinkerForConditionalGeneration(nn.Module, HasInnerState,
                     batch_generation = int(raw_batch["generation"])
                 except (KeyError, TypeError, ValueError) as exc:
                     raise ValueError("Nemotron VoiceChat function response batch requires a generation") from exc
-                if batch_generation <= seen:
+                if batch_generation <= effective_seen:
                     continue
                 raw_tokens = raw_batch.get("token_ids")
                 if not isinstance(raw_tokens, list | tuple) or not raw_tokens:
                     raise ValueError("Nemotron VoiceChat function response requires token ids")
-                unseen.append((batch_generation, [int(token_id) for token_id in raw_tokens]))
-            expected = seen + 1
-            queue = session.setdefault("forced_function_tokens", [])
-            if not isinstance(queue, list):
-                raise ValueError("Nemotron VoiceChat forced function-token queue is invalid")
-            for batch_generation, token_ids in unseen:
+                remaining.append((batch_generation, [int(token_id) for token_id in raw_tokens]))
+            # Everything above the cursor must be accounted for exactly once,
+            # in order: a gap is a lost batch and a repeat would be spoken
+            # twice. Validation finishes *before* the queue is touched, so a
+            # rejected snapshot cannot leave half a result in model state.
+            expected = effective_seen + 1
+            for batch_generation, _ in remaining:
                 if batch_generation != expected:
                     raise ValueError("Nemotron VoiceChat function-response generations are not contiguous")
-                queue.extend(token_ids)
                 expected += 1
             if expected - 1 != generation:
                 raise ValueError("Nemotron VoiceChat function-response batches are incomplete")
+            queue = session.setdefault("forced_function_tokens", [])
+            if not isinstance(queue, list):
+                raise ValueError("Nemotron VoiceChat forced function-token queue is invalid")
+            for _, token_ids in remaining:
+                queue.extend(token_ids)
             session["function_response_generation"] = generation
         queue = session.get("forced_function_tokens")
         if session.get("forced_function_token") is None and isinstance(queue, list) and queue:

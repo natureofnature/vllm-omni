@@ -284,6 +284,72 @@ independent slot. A closure notification exceeding 4 KiB is compacted to
 the event type and identity. One event held by the consumer is outside the
 queued budget; audio already sent still requires the client to stop playback.
 
+### Tool calls: results, deadlines and cancellation
+
+A native-duplex model may emit a function call at any point in its token
+stream. The runtime never executes it: it projects the call to the client as
+`response.function_call_arguments.done` with a `call_id` (plus the projected
+`item_id` / `response_id`) and waits for the client to send the result back as
+a `conversation.item.create` item of type `function_call_output`. Between those
+two events the call is *pending*, and it settles exactly once:
+
+| Terminal state | When |
+| --- | --- |
+| `accepted` | the result was admitted and the item was created |
+| `timed_out` | the deadline passed (only when `tool_result_timeout_s` is set) |
+| `cancelled` | the session's epoch advanced (an effective barge-in or `input.cancel`) |
+
+Admission is authoritative per session, and it is about the *call*, not about
+conversation history: only a call this session exposed can be answered, and only
+while it is still pending. A result for an unknown `call_id`, for a call the
+client imported into history itself, for a call that already settled, or for a
+call left behind by a cancelled epoch is refused with
+`invalid_function_call_output`, carrying the client `event_id` as
+`error.event_id` and `param` `item.call_id` (unusable identity) or
+`item.output` (duplicate or cancelled). Refusals never mutate the call: a plugin
+that rejects a result (for example an over-full tool-result queue) leaves the
+call pending so a corrected or repeated result for the same `call_id` is still
+admissible. A `call_id` is never rebound to a newer call, so a late result
+cannot answer a later one.
+
+Cancelling an epoch (a supported barge-in, or `input.cancel`) refuses any
+pending result and also retires a result the model had already accepted but not
+yet consumed on a frame; the next epoch cannot speak it. Retiring keeps the
+model's monotonic consumption cursor, so a result taken into model state once is
+never applied twice. If a plugin cannot retire its queue, the session closes
+(`tool_result_retirement_failed`) rather than risk speaking a cancelled result.
+
+`tool_result_timeout_s` is optional, per session, and disabled by default. Set it
+in `extra_body` at session open (a top-level session key is accepted too, like
+`idle_timeout_s`); it must be a positive, finite number. It cannot be changed by
+a later `session.update`, because calls may already be pending under the old
+deadline (`tool_result_timeout_update_unsupported`):
+
+```json
+{
+  "type": "session.update",
+  "session": {"extra_body": {"auto_response": true, "tool_result_timeout_s": 30}}
+}
+```
+
+The deadline is measured on the session's monotonic clock from the moment the
+call is exposed. A result that arrives strictly before it is accepted; one that
+arrives at or after it is refused as a timeout (`invalid_function_call_output`,
+`param: "item.call_id"`). The deadline is not a promise that a deadline event
+arrives first: when the expiry timer settles a call, the session emits an
+`error` with `code: "tool_result_timeout"` naming the abandoned `call_id`.
+If result admission observes the deadline first, its correlated
+`invalid_function_call_output` reports the timeout instead. No business result
+is fabricated, and input keeps flowing -- the next call in the same session,
+including one in the same turn, is answered normally. Closing the session
+disarms every pending deadline.
+
+Deployment setting `duplex_session.max_tool_calls_per_session` (default 4096)
+bounds the records one session may track, pending calls and settled tombstones
+together, until it closes; it must be a positive integer. Exceeding it fails the
+session (`resource_exhausted`) rather than evicting a record, because an evicted
+tombstone is exactly the call-id reuse the tombstones prevent.
+
 ### Measure latency
 
 `EventCollector` accumulates events for assertions and metrics:

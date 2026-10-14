@@ -628,6 +628,12 @@ class DuplexSessionRuntimeConfig:
     max_pending_output_bytes_per_session: int = 2 * 1024 * 1024
     max_pending_output_events_per_session: int = 512
     max_sessions: int = 1
+    # Total function-call records one session may track until it closes --
+    # pending calls and terminal tombstones together. Exceeding it fails the
+    # session instead of evicting a record: an evicted tombstone is exactly the
+    # call-id reuse that keeps a late ``function_call_output`` from binding to a
+    # newer call.
+    max_tool_calls_per_session: int = 4096
     # Unread by the plugin framework. It used to bound the per-session
     # completed-append table that made a retried append RPC submit once; the
     # framework carries appends as one-way commands on the runner's ordered
@@ -655,6 +661,7 @@ class DuplexSessionRuntimeConfig:
             "max_pending_output_bytes_per_session": self.max_pending_output_bytes_per_session,
             "max_pending_output_events_per_session": self.max_pending_output_events_per_session,
             "max_sessions": self.max_sessions,
+            "max_tool_calls_per_session": self.max_tool_calls_per_session,
             "completed_append_cache_size": self.completed_append_cache_size,
         }
         if self.idle_ttl_s is not None and self.idle_ttl_s <= 0:
@@ -666,6 +673,14 @@ class DuplexSessionRuntimeConfig:
         for name, value in positive.items():
             if value <= 0:
                 raise ValueError(f"duplex_session.{name} must be positive")
+        # A record budget is a count, not a measurement. ``True <= 0`` is False
+        # and ``0.5 <= 0`` is False, so the positive check alone would let a
+        # bool become a limit of one and a fraction become a silently truncated
+        # one; ``nan`` would pass it too. Rejecting the shape here keeps the
+        # ledger's ``int(max_calls)`` from inventing a budget nobody configured.
+        budget = self.max_tool_calls_per_session
+        if isinstance(budget, bool) or not isinstance(budget, int):
+            raise ValueError("duplex_session.max_tool_calls_per_session must be an integer")
 
 
 @dataclass
