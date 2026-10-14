@@ -233,7 +233,7 @@ class ModelChannel:
         fence = helpers.append_fence(session, payload)
         lease_operation_id = f"append:{operation_id or uuid.uuid4().hex}"
         operation_started = False
-        stage_id = 0
+        stage_id = self._ctx.plugin.input_stage_id(payload)
         resumable = session.capabilities.supports_core_resumable_request
         request_id = self._ctx.manager.stage_request_id(fence, stage_id=stage_id, resumable=resumable)
         # Ephemeral turn-commit cannot submit_update on a finished stage0 id.
@@ -306,6 +306,7 @@ class ModelChannel:
                         **request_context.session_config,
                         "conversation": list(session.history),
                         "modalities": list(session.response_config.modalities),
+                        "stage_sampling_params": request_context.sampling_params,
                     },
                     state=self._ctx.model_state,
                     payload=prompt_payload,
@@ -575,6 +576,18 @@ class ModelChannel:
                     and session.is_draining_request(item.request_id)
                 ):
                     return
+        if item.input_transcript:
+            # This runs on the same mailbox as conversation edits and cancel,
+            # after the request's fence has been checked above.
+            if item.input_item_id is None or session.update_input_transcript(item.input_item_id, item.input_transcript):
+                transcript_event: dict[str, object] = {
+                    "type": "input.transcribed",
+                    "transcript": item.input_transcript,
+                    "epoch": expected_epoch,
+                }
+                if item.input_item_id is not None:
+                    transcript_event["realtime_item_id"] = item.input_item_id
+                self._out.emit(transcript_event)
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),

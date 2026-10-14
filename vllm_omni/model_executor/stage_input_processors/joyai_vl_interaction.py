@@ -49,6 +49,8 @@ def asr_to_joyai(
     source_outputs: list[RequestOutput],
     prompt: object | None = None,
     requires_multimodal_data: bool = True,
+    *,
+    target_model_config: Any = None,
 ) -> list[dict[str, Any]]:
     """Build JoyAI prompts from Qwen3-ASR transcripts and the deferred image/video inputs;
     ``additional_information["joyai_system_prompt"]`` overrides the default system prompt."""
@@ -72,6 +74,17 @@ def asr_to_joyai(
                 "<|im_start|>assistant\n"
             ),
         }
+        prompt_parts = additional_info.get("joyai_prompt_parts")
+        if isinstance(prompt_parts, list) and len(prompt_parts) == 2:
+            # Session policy already rendered and budgeted its instructions,
+            # played history and original visual observation. Only the incoming
+            # utterance was unknown before ASR; do not rebuild a one-turn chat.
+            joyai_input["prompt"] = prompt_parts[0] + transcript + prompt_parts[1]
+            tokenizer = cached_tokenizer_from_config(target_model_config)
+            text_tokens = len(tokenizer.encode(joyai_input["prompt"], add_special_tokens=False))
+            budget = int(additional_info["joyai_prompt_budget"])
+            if text_tokens + int(additional_info["joyai_visual_tokens"]) > budget:
+                raise OmniClientError("JoyAI transcript and observation exceed the context budget")
         if requires_multimodal_data and visual_inputs:
             joyai_input["multi_modal_data"] = visual_inputs
         if request_prompt.get("mm_processor_kwargs") is not None:

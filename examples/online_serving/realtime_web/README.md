@@ -80,9 +80,21 @@ next turn starts after both `response.done` and local playback finish.
 
 Replies appear as text and play through the existing speaker component, which
 sends `playback.ack`. This profile uses camera input and text instructions;
-microphone input will follow the unified Session ASR integration. The browser
-only requests camera permission when **Camera** is enabled. Use localhost or
-HTTPS for browser camera access.
+the default does not request microphone access. The browser only requests camera
+permission when **Camera** is enabled. Use localhost or HTTPS for browser capture.
+
+For spoken instructions, start the `joyai_vl_interaction_asr_duplex.yaml`
+deployment and add `--speech-input` to the UI command. **Hold to talk** captures
+speech with the latest camera frame; releasing it commits the turn. Camera-only
+observations resume after the response and playback finish. Incoming speech may
+be buffered during playback; holding the button does not cancel the response.
+
+Add `--speech-input --vad` to commit speech automatically with shared server VAD
+(Silero must be available on the server). Each utterance includes the latest
+camera frame. In this mode automatic camera-only observations are paused, so
+continuous silent watching uses the default camera mode or push-to-talk mode.
+The three-stage deployment rejects audio input; use the ASR deployment for both
+microphone modes.
 
 ## Qwen3: explicit-turn Realtime
 

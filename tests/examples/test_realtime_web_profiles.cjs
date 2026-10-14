@@ -162,7 +162,7 @@ function shell(profileName, turnMode = 'manual', options = {}) {
       return { getTracks: () => [{ stop() {} }] };
     } } },
     location: { href: 'https://localhost/' },
-    OMNI_REALTIME_CONFIG: { ...config, profile: profileName, turnMode },
+    OMNI_REALTIME_CONFIG: { ...config, profile: profileName, turnMode, speechInput: options.speechInput },
     addEventListener() {},
     setTimeout(fn, ms) { const id = ++timerId; timers.set(id, { fn, ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -241,6 +241,44 @@ test('JoyAI observes without a microphone and waits for both response.done and p
   assert.deepEqual(socket.sent.at(-2).video_frames, ['frame-c'], 'only the latest frame is submitted');
   assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 2);
   assert.equal(socket.sent.some(e => 'audio' in e), false);
+});
+
+test('JoyAI opt-in microphone commits speech and resumes camera observations', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  assert.equal(app.mediaRequests.length, 1);
+  assert.equal(app.elements.get('pttButton').hidden, false);
+  const socket = app.sockets[0];
+  app.ui.setPttHeld(true);
+  app.ui.capture();
+  app.ui.setPendingFrame('speech-frame');
+  app.ui.setPttHeld(false);
+  assert.equal(socket.sent.at(-1).type, 'input_audio_buffer.commit');
+  assert.equal(socket.sent.at(-2).format, 'pcm16');
+  assert.equal(socket.sent.at(-2).sample_rate_hz, 16000);
+  assert.deepEqual(socket.sent.at(-2).video_frames, ['speech-frame']);
+  app.ui.setPendingFrame('pending-frame'); app.ui.flushCapture();
+  assert.equal(socket.sent.filter(e => e.type === 'input_audio_buffer.commit').length, 1);
+  await app.ui.handleEvent({ type: 'response.created', response: { id: 'speech' } });
+  await app.ui.handleEvent({ type: 'response.done', response: { id: 'speech', status: 'completed' } });
+  await app.echo(); app.ui.flushCapture();
+  assert.deepEqual(socket.sent.at(-2), { type: 'input_audio_buffer.append', video_frames: ['pending-frame'] });
+  assert.equal(socket.sent.at(-1).type, 'input_audio_buffer.commit');
+});
+
+test('JoyAI VAD microphone uses shared server commits and carries camera frames', () => {
+  const profile = profiles['joyai-turn']({ speechInput: true, turnMode: 'vad' });
+  assert.equal(profile.clientCommit, false);
+  assert.equal(profile.videoOnly, false);
+  assert.equal(profile.pushToTalk, false);
+  assert.equal(profile.cameraObservations, false);
+  const session = profile.initialMessages({}, 'Watch the pot.')[0].session;
+  assert.equal(session.audio.input.turn_detection.type, 'server_vad');
+  assert.equal(session.audio.input.turn_detection.create_response, true);
+  assert.equal(session.audio.input.turn_detection.interrupt_response, false);
+  assert.deepEqual(plain(profile.append('PCM', 'FRAME')), {
+    type: 'input_audio_buffer.append', audio: 'PCM', format: 'pcm16', sample_rate_hz: 16000, video_frames: ['FRAME'],
+  });
 });
 
 test('JoyAI resumes after a silent decision and supports manual observations', async () => {

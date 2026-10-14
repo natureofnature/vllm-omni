@@ -452,6 +452,20 @@ Frame-based plugins use `engine/duplex/intermediate.py::build_duplex_append_prom
 for the shared request identity, sequencing and config snapshots. Token budgets,
 PCM framing and model-specific worker fields remain in the plugins.
 
+Turn plugins may bind their stage identities in `configure_pipeline` and select
+an append's entry with `input_stage_id(payload)` (default 0). The request context
+and orchestrator retain that entry stage. Session prompt preparation receives
+the request's complete `stage_sampling_params`, so a pipeline with an ASR prefix
+budgets the JoyAI prompt against JoyAI's generation settings. Session model config
+comes from the first tokenizer-owning stage, matching frontend comprehension
+ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
+enters ASR and carries the original observation context through the handoff.
+
+Completed input transcriptions travel with stage outputs through the runner
+mailbox. After checking the request fence, the runner updates the exact committed
+audio history item and emits its transcription event. Cancellation, item deletion
+or replacement cannot apply a late transcript to a newer turn.
+
 See [supported models and deployments](../serving/full_duplex_api.md#enable-full-duplex)
 for the current plugin integrations and deployment configurations.
 

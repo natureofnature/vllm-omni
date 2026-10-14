@@ -747,6 +747,29 @@ class DuplexEngineSession:
             input_commit_seq=self._input.commit_seq,
         )
 
+    def update_input_transcript(self, item_id: str, transcript: str) -> bool:
+        """Attach ASR text to the exact committed audio item on the session loop.
+
+        A deleted/replaced item and a repeated completed output cannot create
+        another user message or overwrite a later conversation edit.
+        """
+        message = self._conversation.item_ids.get(item_id)
+        if message is None or message.get("role") != "user" or message.get("transcript") == transcript:
+            return False
+        content = message.get("content")
+        if not isinstance(content, list):
+            return False
+        for part in content:
+            if (
+                isinstance(part, dict)
+                and part.get("type") == "audio_url"
+                and part.get("audio_url") == {"url": "native-duplex:input-audio"}
+            ):
+                part["transcript"] = transcript
+                message["transcript"] = transcript
+                return True
+        return False
+
     def complete_model_turn(self, turn_id: int) -> None:
         """Advance the model-owned output identity after its terminal signal."""
         completed_turn_id = int(turn_id)

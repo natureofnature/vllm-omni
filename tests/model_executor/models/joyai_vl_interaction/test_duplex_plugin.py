@@ -4,6 +4,7 @@
 import asyncio
 import base64
 import io
+import struct
 import threading
 from types import SimpleNamespace
 
@@ -11,7 +12,9 @@ import pytest
 from PIL import Image
 from vllm.sampling_params import SamplingParams
 
-from tests.engine.duplex.test_session_runner import SESSION_ID, Harness, RecordingStagePort, tts_output
+from tests.engine.duplex.test_session_runner import (
+    SESSION_ID, Harness, RecordingStagePort, _speech_then_stop, append_audio, tts_output,
+)
 from tests.engine.test_duplex_orchestrator import SESSION_ID as ORCHESTRATOR_SESSION_ID
 from tests.engine.test_duplex_orchestrator import _build, _close, _open, _submit
 from tests.helpers.stage_config import get_deploy_config_path
@@ -27,7 +30,7 @@ from vllm_omni.engine.duplex.commands import (
     CreateResponse,
 )
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
-from vllm_omni.engine.duplex.contracts import DuplexFence
+from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputContext, DuplexRequestIdentity
 from vllm_omni.engine.duplex.delivery import DuplexOutputBuffer
 from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
@@ -36,7 +39,10 @@ from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
-from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import JOYAI_VL_INTERACTION_PIPELINE
+from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
+    JOYAI_VL_INTERACTION_ASR_PIPELINE,
+    JOYAI_VL_INTERACTION_PIPELINE,
+)
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -72,11 +78,12 @@ def frame(color="red"):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-async def open_joyai(*, modalities=("text", "audio")):
+async def open_joyai(*, modalities=("text", "audio"), asr=False):
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE if asr else JOYAI_VL_INTERACTION_PIPELINE)
     plugin.processor = Processor()
     plugin.max_model_len = 16384
-    port = RecordingStagePort(stage_count=3)
+    port = RecordingStagePort(stage_count=4 if asr else 3)
     output: asyncio.Queue[object] = asyncio.Queue()
     results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
     output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
@@ -151,6 +158,100 @@ def test_opt_in_profile_preserves_turn_pipeline():
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
+
+
+def test_asr_profile_and_sampling_keep_joyai_ownership():
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    assert plugin.joyai_stage_id == 1 and plugin.audio_stage_id == 3
+    assert plugin.input_stage_id({"audio": "pcm"}) == 0
+    assert plugin.input_stage_id({"video_frames": ["frame"]}) == 1
+    assert plugin.capabilities(max_sessions=1).accepts_input_modality("audio")
+    params = plugin.configure_sampling_params(
+        runtime_config={"max_tokens": 80, "temperature": 0.2},
+        defaults=tuple(SamplingParams(max_tokens=256, temperature=0.0) for _ in range(4)),
+    )
+    assert params[0].max_tokens == 256 and params[0].temperature == 0.0
+    assert params[1].max_tokens == 80 and params[1].temperature == 0.2
+    normal = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr.yaml"))
+    duplex = load_deploy_config(get_deploy_config_path("joyai_vl_interaction_asr_duplex.yaml"))
+    assert normal.stages == duplex.stages and duplex.session_mode == "duplex"
+
+
+def test_speech_buffer_rolls_back_audio_but_keeps_newest_frame():
+    buffer = JoyAIFrameBuffer(accepts_audio=True)
+    raw = struct.pack("<ff", 0.25, 0.5)
+    payload = {"audio": base64.b64encode(raw).decode(), "format": "pcm_f32le", "sample_rate_hz": 16000}
+    buffer.prepare_append({**payload, "video_frames": ["old"]}, operation_id="a", chunk_period_ms=1, allow_emit=True)
+    reservation = buffer.prepare_commit(operation_id="b", chunk_period_ms=1)
+    assert reservation.byte_count == len(raw) + len("old")
+    buffer.prepare_append({**payload, "video_frames": ["new"]}, operation_id="c", chunk_period_ms=1, allow_emit=True)
+    reservation.rollback()
+    assert buffer.frames == ["new"] and buffer.audio == raw + raw
+    reservation = buffer.prepare_commit(operation_id="d", chunk_period_ms=1)
+    assert base64.b64decode(reservation.payload["audio"]) == raw + raw
+    reservation.commit()
+    assert not buffer.has_pending() and not buffer.has_reserved()
+    buffer.prepare_append(payload, operation_id="e", chunk_period_ms=1, allow_emit=True)
+    reservation = buffer.prepare_commit(operation_id="f", chunk_period_ms=1)
+    buffer.clear()
+    reservation.rollback()
+    assert not buffer.has_pending()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        pcm = base64.b64encode(struct.pack("<hh", 1000, 2000)).decode()
+        await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000, video_frames=(frame(),)))
+        await h.run(Commit(final=True, create_response=True))
+        submission = h.port.submissions[-1]
+        assert submission.context.stage_id == 0 and submission.context.final_stage_id == 3
+        info = submission.prompt["additional_information"]
+        assert len(info["deferred_multi_modal_data"]["image"]) == 1
+        assert "Watch the pot." in "".join(info["joyai_prompt_parts"])
+        assert info["joyai_prompt_budget"] == h.runner.plugin.max_model_len - 8
+        request_id = submission.context.request_id
+        context = DuplexOutputContext(
+            identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+            final_stage_id=3, segment_finished=True,
+        )
+        if cancel:
+            await h.run(CancelResponse())
+        transcript = "Tell me when the red light changes."
+        for _ in range(2):
+            h.runner.on_stage_output(0, tts_output(request_id, finished=True, text=transcript), None,
+                request_id=request_id, context=context, input_transcript=transcript,
+                input_item_id=info["realtime_item_id"])
+        await h.settle()
+        events = [e.to_realtime() for e in h.events]
+        transcriptions = [e for e in events if e["type"] == "conversation.item.input_audio_transcription.completed"]
+        assert len(transcriptions) == (0 if cancel else 1)
+        if not cancel:
+            await h.deliver_and_settle(tts_output(request_id, finished=True, text="</silence>"),
+                stage_id=1, segment_finished=True)
+            assert any(message.get("transcript") == transcript for message in h.session.history)
+        await observe(h)
+        assert h.port.submissions[-1].context.stage_id == 1
+        assert (transcript in h.port.submissions[-1].prompt["prompt"]) is (not cancel)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_shared_vad_commits_joyai_speech_once():
+    h = await open_joyai(asr=True)
+    try:
+        h.runner.control._detector = _speech_then_stop()
+        await h.run(append_audio())
+        await h.run(append_audio(is_speech=False, value=0.0))
+        assert len(h.port.submissions) == 1
+        assert h.port.submissions[0].context.stage_id == 0
+        assert "audio" in h.port.submissions[0].prompt["multi_modal_data"]
+    finally:
+        await h.manager.shutdown()
 
 
 def test_capabilities_and_configuration_refuse_audio_and_tools():

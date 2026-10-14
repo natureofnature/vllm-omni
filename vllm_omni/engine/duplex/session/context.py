@@ -183,3 +183,5 @@ class StageOutput:
     request_id: str
     context: DuplexOutputContext
     decision: DuplexOutputDecision | None
+    input_transcript: str | None = None
+    input_item_id: str | None = None

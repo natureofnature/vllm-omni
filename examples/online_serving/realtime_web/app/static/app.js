@@ -54,7 +54,7 @@
     }
   }
   sendTurnButton.hidden = !profile.clientCommit;
-  if (profile.videoOnly) sendTurnButton.textContent = 'Send observation';
+  if (profile.cameraObservations) sendTurnButton.textContent = 'Send observation';
   pttButton.hidden = !profile.pushToTalk;
   promptPreset.replaceChildren();
   for (const name of [...Object.keys(PROMPT_PRESETS), 'custom']) {
@@ -407,6 +407,7 @@
 
     if (profile.pushToTalk && !pttHeld) {
       pendingCapture = [];
+      if (profile.cameraObservations && cameraPendingFrame) submitObservation(cameraPendingFrame);
       return;
     }
 
@@ -454,7 +455,7 @@
     if (!profile.pushToTalk || !running || pttHeld === held) return;
     if (held) {
       pttHeld = true;
-      suppressLocalPlayback();
+      if (!profile.cameraObservations) suppressLocalPlayback();
       pttButton.classList.toggle('is-active', true);
       pttButton.textContent = 'Release to send';
       setModel('Talking');
@@ -464,7 +465,8 @@
     // Flush remaining speech while still held, then commit.
     flushCapture();
     if (socket && socket.readyState === WebSocket.OPEN) {
-      for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+      if (profile.cameraObservations) submitTurn();
+      else for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
     }
     // Lock vision before clearing pttHeld. Stage0/1 are max_num_seqs=1: a
     // vision-follow commit in the gap before response.begin aborts the speech
@@ -1044,7 +1046,7 @@
   });
   sendTurnButton.addEventListener('click', () => {
     if (!running || !connectionReady || !profile.clientCommit || turnSubmitted) return;
-    if (profile.videoOnly) {
+    if (profile.videoOnly || (profile.cameraObservations && !pttHeld)) {
       submitObservation(cameraPendingFrame || cameraLastFrame);
       return;
     }

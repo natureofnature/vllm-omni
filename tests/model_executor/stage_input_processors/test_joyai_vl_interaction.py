@@ -37,6 +37,7 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
     client = object.__new__(StageEngineCoreClient)
     client.custom_process_input_func = joyai_bridge.asr_to_joyai
     client.requires_multimodal_data = True
+    client.vllm_config = SimpleNamespace(model_config=None)
 
     def joyai_prompt(system_prompt: str, user_turn: str) -> str:
         return (
@@ -76,6 +77,26 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
     ]
     for completion, prompt, expected in cases:
         assert client.process_engine_inputs([SimpleNamespace(outputs=[completion])], prompt=prompt) == [expected]
+
+
+def test_asr_handoff_preserves_session_prompt_and_checks_final_budget(monkeypatch):
+    monkeypatch.setattr(
+        joyai_bridge, "cached_tokenizer_from_config",
+        lambda config: SimpleNamespace(encode=lambda text, **kwargs: list(text)),
+    )
+    prompt = {"additional_information": {
+        "joyai_prompt_parts": ["standing instruction; played history; image; query:", ";assistant:"],
+        "joyai_prompt_budget": 200,
+        "joyai_visual_tokens": 20,
+        "deferred_multi_modal_data": {"image": ["original-frame"]},
+    }}
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>Watch the pot.")])
+    (result,) = joyai_bridge.asr_to_joyai([output], prompt)
+    assert result["prompt"] == "standing instruction; played history; image; query:Watch the pot.;assistant:"
+    assert result["multi_modal_data"] == {"image": ["original-frame"]}
+    prompt["additional_information"]["joyai_prompt_budget"] = 30
+    with pytest.raises(joyai_bridge.OmniClientError, match="context budget"):
+        joyai_bridge.asr_to_joyai([output], prompt)
 
 
 def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:

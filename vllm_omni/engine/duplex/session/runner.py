@@ -246,6 +246,8 @@ class DuplexSessionRunner:
         *,
         request_id: str,
         context: DuplexOutputContext,
+        input_transcript: str | None = None,
+        input_item_id: str | None = None,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
         decision: DuplexOutputDecision | None = None
@@ -261,7 +263,7 @@ class DuplexSessionRunner:
             self.run.concurrent_turn_requests_released = True
         consume = decision is not None or stage_id >= context.final_stage_id
         project_intermediate = self.plugin.projects_intermediate_outputs and stage_id == 0
-        if not consume and not project and not project_intermediate:
+        if not consume and not project and not project_intermediate and not input_transcript:
             # Stage0 text without a direct decision feeds the TTS stage as before.
             # Its metrics still have to reach the client: before sessions moved
             # into the engine the orchestrator published them as a standalone
@@ -286,6 +288,8 @@ class DuplexSessionRunner:
                 request_id=request_id,
                 context=context,
                 decision=decision,
+                input_transcript=input_transcript,
+                input_item_id=input_item_id,
             )
         )
         # Projection-only must still forward to the next stage (return False).

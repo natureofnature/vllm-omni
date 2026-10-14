@@ -1,0 +1,5 @@
+# Speech and text/video observations on the shared turn-commit Session.
+base_config: joyai_vl_interaction_asr.yaml
+session_mode: duplex
+duplex_session:
+  max_sessions: 1
