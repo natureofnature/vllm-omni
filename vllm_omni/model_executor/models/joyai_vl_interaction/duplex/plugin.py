@@ -222,8 +222,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return None
         results = current.get("joyai_delegation_results", [])
         if not any(
-            result["call_id"] in request.delegation_result_call_ids and not result.get("consumed")
-            for result in results
+            result["call_id"] in request.delegation_result_call_ids and not result.get("consumed") for result in results
         ):
             return None
         return {
