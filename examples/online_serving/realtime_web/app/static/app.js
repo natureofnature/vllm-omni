@@ -89,6 +89,7 @@
   let visionTurnLocked = false;
   let suppressedPlaybackId = null;
   let pttHeld = false;
+  let pttUploadedInput = false;
   const cameraCanvas = document.createElement('canvas');
   let playbackRate = OUTPUT_RATE;
   let pendingCapture = [];
@@ -101,6 +102,9 @@
   let responseComplete = false;
   let playbackComplete = true;
   let turnSubmitted = false;
+  const pendingCommits = new Set();
+  let pendingCommitsOwnBusy = false;
+  let commitCounter = 0;
   let echoTimer = null;
   let sessionGeneration = 0;
   let audioChain = Promise.resolve();
@@ -156,6 +160,8 @@
       assistantActive = false;
       responseComplete = false;
       turnSubmitted = false;
+      pendingCommits.clear();
+      pendingCommitsOwnBusy = false;
       currentResponseId = null;
       responseHasAudio = false;
       assistantTextChannel = null;
@@ -425,12 +431,14 @@
     }
     pendingCapture = [];
     const pcm = resampleInt16(merged, captureRate, profile.inputSampleRate || INPUT_RATE);
+    if (!pcm.length) return;
     const frame = cameraPendingFrame || (profile.stickyCamera ? cameraLastFrame : null);
     cameraPendingFrame = null;
     const appendEvent = profile.pushToTalk
       ? profile.append(int16ToBase64(pcm), frame, { isSpeech: true })
       : profile.append(int16ToBase64(pcm), frame);
     socket.send(JSON.stringify(appendEvent));
+    if (profile.pushToTalk) pttUploadedInput = true;
   }
 
   function submitObservation(frame) {
@@ -441,7 +449,14 @@
   }
 
   function submitTurn() {
-    for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
+    for (const event of profile.commitMessages()) {
+      if (event.type === 'input_audio_buffer.commit') {
+        event.event_id = `web-commit-${++commitCounter}`;
+        pendingCommits.add(event.event_id);
+        if (!assistantActive && !turnSubmitted) pendingCommitsOwnBusy = true;
+      }
+      socket.send(JSON.stringify(event));
+    }
     turnSubmitted = true;
     responseComplete = false;
     markBusy();
@@ -455,6 +470,7 @@
     if (!profile.pushToTalk || !running || pttHeld === held) return;
     if (held) {
       pttHeld = true;
+      pttUploadedInput = false;
       if (!profile.cameraObservations) suppressLocalPlayback();
       pttButton.classList.toggle('is-active', true);
       pttButton.textContent = 'Release to send';
@@ -464,14 +480,15 @@
     }
     // Flush remaining speech while still held, then commit.
     flushCapture();
-    if (socket && socket.readyState === WebSocket.OPEN) {
+    const committed = pttUploadedInput && socket && socket.readyState === WebSocket.OPEN;
+    if (committed) {
       if (profile.cameraObservations) submitTurn();
       else for (const event of profile.commitMessages()) socket.send(JSON.stringify(event));
     }
     // Lock vision before clearing pttHeld. Stage0/1 are max_num_seqs=1: a
     // vision-follow commit in the gap before response.begin aborts the speech
     // turn (server sees a new ephemeral and kills the prior ASR request).
-    if (profile.visionFollowWhileSpeaking) {
+    if (committed && profile.visionFollowWhileSpeaking) {
       visionTurnLocked = true;
       visionFollowQueue = [];
     }
@@ -479,10 +496,12 @@
     pttButton.classList.toggle('is-active', false);
     pttButton.textContent = 'Hold to talk';
     setModel(profile.waiting);
-    appendLog('PTT up · commit');
+    appendLog(committed ? 'PTT up · commit' : 'PTT up · no input');
   }
 
   function beginAssistant(responseId) {
+    pendingCommits.clear();
+    pendingCommitsOwnBusy = false;
     currentResponseId = responseId || currentResponseId;
     responseHasAudio = false;
     assistantActive = true;
@@ -680,6 +699,19 @@
         break;
       case 'error':
         if (action.fatal) { await failSession(action.message); break; }
+        if (pendingCommits.delete(event.error?.event_id) && pendingCommits.size === 0) {
+          // Release this group's idle-to-busy state only after every commit
+          // is explicitly rejected. An older pending commit may still succeed.
+          if (pendingCommitsOwnBusy && !currentResponseId) {
+            clearTimeout(turnTimeout);
+            turnSubmitted = false;
+            assistantActive = false;
+            responseComplete = false;
+            sendTurnButton.disabled = !profile.clientCommit;
+            if (!pttHeld) setModel(profile.waiting);
+          }
+          pendingCommitsOwnBusy = false;
+        }
         // A rejected frame or a refused update costs one operation, not the
         // call: report it and keep listening.
         appendLog(action.message, true);
@@ -970,11 +1002,14 @@
     responseComplete = false;
     playbackComplete = true;
     turnSubmitted = false;
+    pendingCommits.clear();
+    pendingCommitsOwnBusy = false;
     assistantTextChannel = null;
     assistantRowByResponse.clear();
     lastClosedAssistantText = '';
     sendTurnButton.disabled = true;
     pttHeld = false;
+    pttUploadedInput = false;
     pttButton.disabled = true;
     pttButton.classList.remove('is-active');
     pttButton.textContent = 'Hold to talk';

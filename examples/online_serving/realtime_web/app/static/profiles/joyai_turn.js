@@ -46,7 +46,7 @@
       };
       if (speech) session.audio = { input: { format: { type: 'audio/pcm', rate: 16000 },
         turn_detection: vad ? { type: 'server_vad', threshold: 0.5, prefix_padding_ms: 300,
-          silence_duration_ms: 500, create_response: true, interrupt_response: false } : null } };
+          silence_duration_ms: 500, create_response: true, interrupt_response: true } : null } };
       return [{ type: 'session.update', session }];
     },
     append(audio, frame) {

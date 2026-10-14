@@ -178,9 +178,9 @@ function shell(profileName, turnMode = 'manual', options = {}) {
   const source = fs.readFileSync(path.join(root, 'app.js'), 'utf8').replace(/\}\)\(\);\s*$/, `
     globalThis.testUI = { startSession, stopSession, handleEvent, playbackDrained,
       microphoneUploadEnabled, flushCapture, setPttHeld, awaitQueue: () => audioChain,
-      capture() { pendingCapture.push(new Int16Array([100, 200])); },
+      capture(samples = [100, 200]) { pendingCapture.push(new Int16Array(samples)); },
       setPendingFrame(frame) { cameraPendingFrame = frame; if (profile.stickyCamera) cameraLastFrame = frame; },
-      state() { return { running, connectionReady, assistantActive, pttHeld }; }
+      state() { return { running, connectionReady, assistantActive, pttHeld, turnSubmitted, visionTurnLocked }; }
     };
   })();`);
   vm.runInContext(source, ctx);
@@ -225,7 +225,7 @@ test('JoyAI observes without a microphone and waits for both response.done and p
   app.ui.setPendingFrame('frame-a'); app.ui.flushCapture();
   assert.deepEqual(socket.sent.slice(-2), [
     { type: 'input_audio_buffer.append', video_frames: ['frame-a'] },
-    { type: 'input_audio_buffer.commit', final: true, create_response: true },
+    { type: 'input_audio_buffer.commit', final: true, create_response: true, event_id: 'web-commit-1' },
   ]);
   await app.ui.handleEvent({ type: 'response.created', response: { id: 'r1' } });
   app.ui.setPendingFrame('frame-b'); app.ui.flushCapture();
@@ -275,11 +275,120 @@ test('JoyAI VAD microphone uses shared server commits and carries camera frames'
   const session = profile.initialMessages({}, 'Watch the pot.')[0].session;
   assert.equal(session.audio.input.turn_detection.type, 'server_vad');
   assert.equal(session.audio.input.turn_detection.create_response, true);
-  assert.equal(session.audio.input.turn_detection.interrupt_response, false);
+  assert.equal(session.audio.input.turn_detection.interrupt_response, true);
   assert.deepEqual(plain(profile.append('PCM', 'FRAME')), {
     type: 'input_audio_buffer.append', audio: 'PCM', format: 'pcm16', sample_rate_hz: 16000, video_frames: ['FRAME'],
   });
 });
+
+for (const profileName of ['joyai-turn', 'aura-ptt']) {
+  for (const muted of [false, true]) {
+    test(`${profileName} empty ${muted ? 'muted' : 'zero-sample'} PTT leaves camera turns available`, async () => {
+      const app = shell(profileName, 'manual', { speechInput: true });
+      await app.ui.startSession();
+      if (muted) app.elements.get('muteButton').listeners.click();
+      app.ui.setPttHeld(true);
+      app.ui.capture(muted ? [100, 200] : []); // Captured samples are not an upload while muted.
+      app.ui.setPttHeld(false);
+      assert.equal(app.sockets[0].sent.some(event => event.type === 'input_audio_buffer.commit'), false);
+      assert.equal(app.ui.state().assistantActive, false);
+      assert.equal(app.ui.state().turnSubmitted, false);
+      assert.equal(app.ui.state().visionTurnLocked, false);
+      await app.turnWatchdog();
+      assert.equal(app.ui.state().running, true);
+      for (const frame of ['frame-a', 'frame-b']) {
+        app.ui.setPendingFrame(frame); app.ui.flushCapture();
+      }
+      assert.equal(app.sockets[0].sent.filter(event => event.type === 'input_audio_buffer.commit').length, 1);
+      await app.ui.stopSession({ terminal: false });
+    });
+  }
+}
+
+test('JoyAI rejects only its own pending commit and resumes camera observations without a watchdog', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  app.ui.setPttHeld(true); app.ui.capture(); app.ui.flushCapture(); app.ui.setPttHeld(false);
+  const commit = app.sockets[0].sent.at(-1);
+  assert.equal(commit.type, 'input_audio_buffer.commit', 'a previously flushed hold still commits');
+  const error = { type: 'error', error: { code: 'input_audio_buffer_empty',
+    message: 'Input buffer was empty', event_id: commit.event_id } };
+  await app.ui.handleEvent({ ...error, error: { ...error.error, event_id: 'unrelated-operation' } });
+  assert.equal(app.ui.state().assistantActive, true);
+  await app.ui.handleEvent(error);
+  assert.equal(app.ui.state().assistantActive, false);
+  assert.equal(app.ui.state().turnSubmitted, false);
+  assert.equal(app.elements.get('sendTurnButton').disabled, false);
+  await app.turnWatchdog();
+  assert.equal(app.ui.state().running, true);
+  app.ui.setPendingFrame('after-rejection'); app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-rejection']);
+  assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+  await app.ui.handleEvent(error); // An old rejection must not release the new observation.
+  assert.equal(app.ui.state().assistantActive, true);
+  assert.equal(app.ui.state().turnSubmitted, true);
+  await app.ui.stopSession({ terminal: false });
+});
+
+for (const responseStarted of [false, true]) {
+  test(`JoyAI rejected overlapping PTT preserves an older ${responseStarted ? 'active' : 'pending'} response`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true });
+    await app.ui.startSession();
+    app.ui.setPendingFrame('first'); app.ui.flushCapture();
+    if (responseStarted) await app.ui.handleEvent({ type: 'response.created', response: { id: 'first' } });
+    app.ui.setPttHeld(true); app.ui.capture(); app.ui.setPttHeld(false);
+    const commit = app.sockets[0].sent.at(-1);
+    await app.ui.handleEvent({ type: 'error', error: {
+      code: 'input_audio_buffer_empty', message: 'Input buffer was empty', event_id: commit.event_id,
+    } });
+    assert.equal(app.ui.state().assistantActive, true);
+    assert.equal(app.ui.state().turnSubmitted, true);
+    const count = app.sockets[0].sent.length;
+    app.ui.setPendingFrame('waiting'); app.ui.flushCapture();
+    assert.equal(app.sockets[0].sent.length, count);
+    await app.ui.handleEvent({ type: 'response.done', response: { id: 'first', status: 'completed' } });
+    await app.echo(); app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['waiting']);
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
+for (const reverseOrder of [false, true]) {
+  test(`JoyAI releases busy only after both pending commits are rejected in ${reverseOrder ? 'reverse' : 'send'} order`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true });
+    await app.ui.startSession();
+    for (let index = 0; index < 2; index += 1) {
+      app.ui.setPttHeld(true); app.ui.capture(); app.ui.setPttHeld(false);
+    }
+    const commits = app.sockets[0].sent.filter(event => event.type === 'input_audio_buffer.commit');
+    assert.equal(commits.length, 2);
+    const rejected = reverseOrder ? [...commits].reverse() : commits;
+    const rejection = commit => ({ type: 'error', error: {
+      code: 'commit_aborted', message: 'The preceding append failed', event_id: commit.event_id,
+    } });
+    await app.ui.handleEvent(rejection(rejected[0]));
+    assert.equal(app.ui.state().assistantActive, true, 'the other commit may still succeed');
+    assert.equal(app.ui.state().turnSubmitted, true);
+    const before = app.sockets[0].sent.length;
+    app.ui.setPendingFrame('after-rejections'); app.ui.flushCapture();
+    assert.equal(app.sockets[0].sent.length, before);
+
+    await app.ui.handleEvent(rejection(rejected[1]));
+    assert.equal(app.ui.state().assistantActive, false);
+    assert.equal(app.ui.state().turnSubmitted, false);
+    await app.turnWatchdog();
+    assert.equal(app.ui.state().running, true, 'all rejected commits must disarm their watchdog');
+    app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-rejections']);
+    const newCommit = app.sockets[0].sent.at(-1);
+    for (const commit of commits) await app.ui.handleEvent(rejection(commit));
+    assert.equal(app.ui.state().assistantActive, true, 'late rejections do not release a newer pending commit');
+    await app.ui.handleEvent({ type: 'response.created', response: { id: 'new-response' } });
+    await app.ui.handleEvent(rejection(newCommit));
+    assert.equal(app.ui.state().assistantActive, true, 'a begun response owns its lifecycle');
+    await app.ui.stopSession({ terminal: false });
+  });
+}
 
 test('JoyAI resumes after a silent decision and supports manual observations', async () => {
   const app = shell('joyai-turn');
@@ -320,7 +429,7 @@ test('shared shell sends standard manual turns and keeps the Realtime session op
   assert.equal(append.sample_rate_hz, undefined);
   app.elements.get('sendTurnButton').listeners.click();
   assert.deepEqual(app.sockets[0].sent.slice(-2), [
-    { type: 'input_audio_buffer.commit' },
+    { type: 'input_audio_buffer.commit', event_id: 'web-commit-1' },
     { type: 'response.create' },
   ]);
   assert.equal(app.ui.microphoneUploadEnabled(), false);
@@ -339,7 +448,7 @@ test('shared shell sends standard manual turns and keeps the Realtime session op
   app.ui.capture(); app.ui.flushCapture();
   app.elements.get('sendTurnButton').listeners.click();
   assert.deepEqual(app.sockets[0].sent.slice(-2), [
-    { type: 'input_audio_buffer.commit' },
+    { type: 'input_audio_buffer.commit', event_id: 'web-commit-2' },
     { type: 'response.create' },
   ]);
   assert.equal(app.sockets.length, 1);

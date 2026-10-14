@@ -461,6 +461,11 @@ comes from the first tokenizer-owning stage, matching frontend comprehension
 ownership. JoyAI's audio-free requests enter its `joyvl` stage directly; speech
 enters ASR and carries the original observation context through the handoff.
 
+While idle, JoyAI retains the latest camera frame and one input chunk of audio
+pre-roll. Once speech starts, it keeps the utterance until commit. An idle
+camera commit enters JoyAI directly; reserved-byte accounting includes the
+pre-roll until the commit is consumed or rolled back.
+
 Completed input transcriptions travel with stage outputs through the runner
 mailbox. After checking the request fence, the runner updates the exact committed
 audio history item and emits its transcription event. The append captures the

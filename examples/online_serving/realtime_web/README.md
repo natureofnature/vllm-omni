@@ -12,7 +12,7 @@ This implements [RFC #7222](https://github.com/vllm-project/vllm-omni/issues/722
 | `aura-ptt` | Hold **Hold to talk**; release commits. Hold also stops local playback | Sticky frames with speech; vision-follow every 2 frames only while unlocked (locked from PTT release until text-final / listen) | Yes |
 | `joyai-turn` | Latest observation once per second while idle, or **Send observation**; waits for response completion and playback | Camera frames without audio input | Yes |
 | `joyai-turn --speech-input` | Hold to talk; release commits speech, then camera observations resume while idle | Latest frame with speech and camera-only observations | Yes |
-| `joyai-turn --speech-input --vad` | Server detects trailing silence and commits speech | Latest frame with each utterance; no automatic camera-only commits | Yes |
+| `joyai-turn --speech-input --vad` | Server detects trailing silence; speech interrupts replies | Latest frame with each utterance; no automatic camera-only commits | Yes |
 
 Qwen3 VAD uses an engine-owned duplex plugin: microphone upload continues
 while replies stream, and speech can interrupt generation and playback. The
@@ -87,14 +87,17 @@ permission when **Camera** is enabled. Use localhost or HTTPS for browser captur
 
 For spoken instructions, start the `joyai_vl_interaction_asr_duplex.yaml`
 deployment and add `--speech-input` to the UI command. **Hold to talk** captures
-speech with the latest camera frame; releasing it commits the turn. Camera-only
+speech with the latest camera frame; releasing it commits only when that hold
+uploaded audio. Empty or muted holds do not submit a turn. Camera-only
 observations resume after the response and playback finish. Incoming speech may
 be buffered during playback; holding the button does not cancel the response.
 
 Add `--speech-input --vad` to commit speech automatically with shared server VAD
-(Silero must be available on the server). Each utterance includes the latest
-camera frame. In this mode automatic camera-only observations are paused, so
-continuous silent watching uses the default camera mode or push-to-talk mode.
+(Silero must be available on the server). Speech interrupts an active reply,
+using the server's supported `interrupt_response: true` setting. Each utterance
+includes the latest camera frame. In this mode automatic camera-only observations
+are paused, so continuous silent watching uses the default camera mode or
+push-to-talk mode.
 The three-stage deployment rejects audio input; use the ASR deployment for both
 microphone modes.
 

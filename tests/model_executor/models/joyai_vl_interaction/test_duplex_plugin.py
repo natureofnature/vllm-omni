@@ -16,6 +16,7 @@ from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
     Harness,
     RecordingStagePort,
+    _ScriptedDetector,
     _speech_then_stop,
     append_audio,
     tts_output,
@@ -41,6 +42,7 @@ from vllm_omni.engine.duplex.messages import DuplexControlResultMessage, OpenDup
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
+from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
@@ -206,6 +208,102 @@ def test_speech_buffer_rolls_back_audio_but_keeps_newest_frame():
     buffer.clear()
     reservation.rollback()
     assert not buffer.has_pending()
+
+
+@pytest.mark.parametrize("chunk_period_ms", [250, 1000])
+def test_speech_buffer_bounds_idle_preroll_and_preserves_speech(chunk_period_ms):
+    buffer = JoyAIFrameBuffer(accepts_audio=True)
+    samples = 16000 * chunk_period_ms // 1000
+    idle = struct.pack("<f", 0.01) * samples
+    speech = struct.pack("<f", 0.25) * (samples * 2)
+
+    def append(raw, is_speech, frame_name):
+        buffer.prepare_append(
+            {
+                "audio": base64.b64encode(raw).decode(),
+                "format": "pcm_f32le",
+                "sample_rate_hz": 16000,
+                "is_speech": is_speech,
+                "video_frames": [frame_name],
+            },
+            operation_id="append",
+            chunk_period_ms=chunk_period_ms,
+            allow_emit=False,
+        )
+
+    for i in range(10):
+        append(idle, False, str(i))
+    assert buffer.audio == idle
+    assert buffer.frames == ["9"]
+    assert buffer.pending_byte_count == len(idle) + 1
+    append(speech, True, "speech")
+    append(idle, False, "tail")
+    expected = idle + speech + idle
+    assert buffer.audio == expected
+    reservation = buffer.prepare_commit(operation_id="commit", chunk_period_ms=chunk_period_ms)
+    assert base64.b64decode(reservation.payload["audio"]) == expected
+    assert reservation.byte_count == len(expected) + len("tail")
+    reservation.rollback()
+    append(idle, False, "new")
+    assert buffer.audio == expected + idle  # A failed speech commit still owns the full utterance.
+    buffer.clear()
+    append(idle, False, "camera")
+    reservation = buffer.prepare_commit(operation_id="camera", chunk_period_ms=chunk_period_ms)
+    assert reservation.payload == {"video_frames": ["camera"], "is_speech": False}
+    assert reservation.byte_count == len(idle) + len("camera")
+    reservation.commit()
+    assert not buffer.has_pending() and not buffer.has_reserved()
+
+
+@pytest.mark.asyncio
+async def test_idle_vad_camera_stream_stays_bounded_and_accepts_speech():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        h.manager.runtime_config = DuplexSessionRuntimeConfig(max_pending_input_bytes_per_session=256 * 1024)
+        idle_turns = 10
+        h.runner.control._detector = _ScriptedDetector(
+            [TurnDetectionResult(is_speech=False, speech_active=False)] * idle_turns
+            + [
+                TurnDetectionResult(is_speech=True, speech_active=True, speech_started=True),
+                TurnDetectionResult(is_speech=False, speech_active=False, speech_stopped=True, should_commit=True),
+            ]
+        )
+        silent_pcm = bytes(16000 * 2)
+        red, blue = frame("red"), frame("blue")
+        for i in range(idle_turns):
+            latest = blue if i == idle_turns - 1 else red
+            events = await h.run(
+                AppendAudio(audio=silent_pcm, format="pcm16", sample_rate_hz=16000, video_frames=(latest,))
+            )
+            assert not any(getattr(event, "code", None) == "input_backpressure" for event in events)
+        buffer = h.runner.model_state.audio_buffer
+        assert buffer.frames == [blue]
+        assert len(buffer.audio) <= 16000 * 4
+        assert h.session.pending_input_bytes == buffer.pending_byte_count
+        assert not h.port.submissions
+        await h.run(AppendAudio(audio=struct.pack("<h", 1000) * 16000, format="pcm16", sample_rate_hz=16000))
+        await h.run(AppendAudio(audio=silent_pcm, format="pcm16", sample_rate_hz=16000, video_frames=(blue,)))
+        assert len(h.port.submissions) == 1
+        assert h.port.submissions[0].context.stage_id == 0
+        assert "audio" in h.port.submissions[0].prompt["multi_modal_data"]
+        assert h.session.pending_input_bytes == 0
+        assert not buffer.has_pending()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_silent_audio_camera_commit_uses_visual_entry_and_releases_bytes():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        await h.run(AppendAudio(audio=bytes(16000 * 2), format="pcm16", sample_rate_hz=16000, video_frames=(frame(),)))
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        assert h.port.submissions[0].context.stage_id == 1
+        assert "audio" not in h.port.submissions[0].prompt["multi_modal_data"]
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio

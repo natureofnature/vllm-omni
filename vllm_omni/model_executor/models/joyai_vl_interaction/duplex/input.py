@@ -10,14 +10,23 @@ from vllm_omni.engine.duplex.plugin import PcmAppendBuffer, PcmAppendReservation
 
 
 class FrameReservation(PcmAppendReservation):
-    def __init__(self, owner: JoyAIFrameBuffer, operation_id: str, frames: list[str], audio: bytes = b"") -> None:
+    def __init__(
+        self,
+        owner: JoyAIFrameBuffer,
+        operation_id: str,
+        frames: list[str],
+        audio: bytes = b"",
+        *,
+        had_speech: bool = True,
+    ) -> None:
         self.owner = owner
         self.operation_id = operation_id
         self.frames = frames
         self.audio = audio
+        self.had_speech = had_speech
         self.version = owner.version
         self.payload = {"video_frames": frames, "is_speech": False} if frames else None
-        if audio:
+        if audio and had_speech:
             self.payload = {
                 **(self.payload or {}),
                 "audio": pybase64.b64encode(audio).decode("ascii"),
@@ -43,6 +52,7 @@ class FrameReservation(PcmAppendReservation):
     def rollback(self) -> None:
         if self._active:
             self.owner.audio[:0] = self.audio
+            self.owner._had_speech = self.owner._had_speech or self.had_speech
             # A newer camera update supersedes an observation that failed to submit.
             if not self.owner.frames and self.owner.version == self.version:
                 self.owner.frames = self.frames
@@ -55,6 +65,7 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
     def __init__(self, *, accepts_audio: bool = False) -> None:
         self.accepts_audio = accepts_audio
         self.audio = bytearray()
+        self._had_speech = False
         self.frames: list[str] = []
         self.reservations: list[FrameReservation] = []
         self.version = 0
@@ -66,6 +77,7 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
     def clear(self) -> None:
         self.frames = []
         self.audio.clear()
+        self._had_speech = False
         self.version += 1
         for reservation in self.reservations:
             reservation._active = False
@@ -92,6 +104,12 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
             if len(raw) % 4:
                 raise ValueError("Invalid float32 PCM length")
             self.audio.extend(raw)
+            self._had_speech = self._had_speech or payload.get("is_speech") is not False
+            if not self._had_speech:
+                # Keep one input chunk of pre-roll while watching an idle scene.
+                # Once speech begins, retain the whole utterance until commit.
+                preroll_bytes = 16000 * 4 * chunk_period_ms // 1000
+                del self.audio[: max(0, len(self.audio) - preroll_bytes)]
         frames = payload.get("video_frames")
         if isinstance(frames, list) and frames:
             self.version += 1
@@ -102,7 +120,8 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
         frames, self.frames = self.frames, []
         audio = bytes(self.audio)
         self.audio.clear()
-        reservation = FrameReservation(self, operation_id, frames, audio)
+        reservation = FrameReservation(self, operation_id, frames, audio, had_speech=self._had_speech)
+        self._had_speech = False
         self.reservations.append(reservation)
         return reservation
 
