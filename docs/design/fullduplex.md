@@ -479,6 +479,11 @@ Session supplies reserved request, stage and completion facts to
 actually rendered answer IDs to acknowledge consumption only after completed
 JoyAI output. Epoch cancellation retires unconsumed answers through the common
 retirement hook; previously consumed answers remain background context.
+Prompt preparation also receives `pending_tool_calls`, an immutable tuple of
+current-epoch, nonexpired pending origins from the Session ledger. Reading this
+snapshot does not settle calls or expose mutable records. JoyAI renders the
+owned questions separately from played history and accepted answers, so context
+compression cannot silently turn an outstanding task into a new delegation.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage

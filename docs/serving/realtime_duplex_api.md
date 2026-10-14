@@ -1110,6 +1110,9 @@ Cancellation retires answers not yet used by a completed JoyAI observation;
 already-used answers remain background context. Submitting a prompt alone does
 not establish consumption, and a later result cannot be consumed by an earlier
 observation's output.
+Pending questions are supplied separately by Session's authoritative call
+snapshot and remain explicit in later observations until settlement. They are
+not inferred from editable conversation items or stored in a second registry.
 
 `C→S conversation.item.delete` / `S→C conversation.item.deleted`
 

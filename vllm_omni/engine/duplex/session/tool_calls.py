@@ -227,6 +227,17 @@ class ToolCallLedger:
         """Immutable identities for final plugin disposal when the session closes."""
         return tuple(call.origin for call in self._calls.values())
 
+    def pending_origins(self, *, epoch: int) -> tuple[ToolCallOrigin, ...]:
+        """Snapshot live calls for model context without settling or exposing records."""
+        now = self._clock()
+        return tuple(
+            call.origin
+            for call in self._calls.values()
+            if call.is_pending
+            and call.origin.epoch == epoch
+            and (call.deadline is None or now < call.deadline)
+        )
+
     # -- exposure ------------------------------------------------------- #
 
     def register(self, origin: ToolCallOrigin) -> ToolCall:

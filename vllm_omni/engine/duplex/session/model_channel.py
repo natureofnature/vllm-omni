@@ -308,6 +308,7 @@ class ModelChannel:
                         **request_context.session_config,
                         "conversation": list(session.history),
                         "modalities": list(session.response_config.modalities),
+                        "pending_tool_calls": self._ctx.tool_calls.pending_origins(epoch=session.epoch),
                     },
                     state=self._ctx.model_state,
                     payload=prompt_payload,

@@ -167,6 +167,26 @@ def test_terminal_records_are_tombstones_until_close(ledger: ToolCallLedger):
     assert ledger.record("call_a").state in TERMINAL_TOOL_CALL_STATES
 
 
+def test_pending_snapshot_contains_only_live_current_epoch_origins(ledger: ToolCallLedger, clock: FakeClock):
+    ledger.register(_origin("older_epoch", epoch=0))
+    ledger.register(_origin("expired", epoch=1))
+    ledger.register(_origin("accepted", epoch=1))
+    acceptance = ledger.begin_accept("accepted")
+    assert isinstance(acceptance, ToolCallAcceptance)
+    assert ledger.commit_accept(acceptance, epoch=1)
+    clock.advance(5.0)
+    live = _origin("live", epoch=1)
+    ledger.register(live)
+    snapshot = ledger.pending_origins(epoch=1)
+    assert snapshot == (live,)
+    # Reading prompt context does not settle overdue records or own their timers.
+    assert ledger.record("expired").state is ToolCallState.PENDING
+    assert ledger.record("accepted").state is ToolCallState.ACCEPTED
+    ledger.invalidate_epoch(2)
+    assert ledger.pending_origins(epoch=2) == ()
+    assert snapshot == (live,)
+
+
 # --------------------------------------------------------------------------- #
 # Deadline                                                                    #
 # --------------------------------------------------------------------------- #

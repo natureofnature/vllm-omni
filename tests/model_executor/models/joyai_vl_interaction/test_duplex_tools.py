@@ -393,3 +393,40 @@ async def test_cancelled_delegation_cannot_enter_joyai_context():
         assert h.session.runtime_config["joyai_delegation_results"] == []
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["accepted", "cancelled"])
+async def test_pending_question_comes_from_session_snapshot_and_leaves_after_settlement(settlement):
+    h = await open_joyai(extra_body=TOOLS, modalities=("text",))
+    try:
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> </delegation> Which pot?", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        call = next(
+            event.to_realtime()["item"]
+            for event in h.events
+            if event.to_realtime()["type"] == "response.output_item.done"
+            and event.to_realtime()["item"]["type"] == "function_call"
+        )
+        request_id = await observe(h)
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "Pending delegated questions" in prompt and "Which pot?" in prompt and call["call_id"] in prompt
+        if settlement == "accepted":
+            await h.run(
+                CreateItem(item={"type": "function_call_output", "call_id": call["call_id"], "output": "Blue."})
+            )
+            await h.deliver_and_settle(
+                tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True
+            )
+        else:
+            await h.run(CancelResponse())
+        await observe(h)
+        prompt = h.port.submissions[-1].prompt["prompt"]
+        assert "Pending delegated questions" not in prompt
+        assert ("Blue." in prompt) is (settlement == "accepted")
+    finally:
+        await h.manager.shutdown()

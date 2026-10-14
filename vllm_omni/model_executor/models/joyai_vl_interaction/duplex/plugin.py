@@ -250,11 +250,20 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         query: str,
         image_count: int,
         delegation_results: list[dict[str, object]],
+        pending_questions: tuple[dict[str, str], ...] = (),
     ) -> str:
         system = DEFAULT_SYSTEM_PROMPT if runtime_config.get("joyai_delegation_enabled") else SILENT_SYSTEM_PROMPT
         if runtime_config.get("instructions"):
             system += "\n\n" + runtime_config["instructions"]
         content = [{"type": "image"} for _ in range(image_count)]
+        if pending_questions:
+            content.append(
+                {
+                    "type": "text",
+                    "text": "[Pending delegated questions — already running; do not delegate again]\n"
+                    + json.dumps(pending_questions, ensure_ascii=False),
+                }
+            )
         if delegation_results:
             content.append(
                 {
@@ -422,6 +431,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             for image in images
         ]
         delegation_results = list(runtime_config.get("joyai_delegation_results", []))
+        pending_questions = tuple(
+            {"call_id": origin.call_id, "question": json.loads(origin.arguments)["question"]}
+            for origin in session_config.get("pending_tool_calls", ())
+            if origin.name == "delegate"
+        )
         while True:
             prompt = self._render_prompt(
                 runtime_config,
@@ -429,6 +443,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 query=query,
                 image_count=len(images),
                 delegation_results=delegation_results,
+                pending_questions=pending_questions,
             )
             text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
             if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
@@ -444,7 +459,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 image_token_counts.pop(0)
             else:
                 raise DuplexRuntimeConfigError(
-                    "JoyAI instruction, latest delegated answer and current observation exceed the context budget"
+                    "JoyAI instruction, pending questions, latest answer and observation exceed the context budget"
                 )
         return JoyAIAppendPlan(
             prompt={
