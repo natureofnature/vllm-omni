@@ -580,7 +580,13 @@ class ModelChannel:
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
-            item.context.segment_output_metadata,
+            {
+                **item.context.segment_output_metadata,
+                # Reserved owner facts: worker metadata cannot override them.
+                "_duplex_request_id": item.request_id,
+                "_duplex_stage_id": item.stage_id,
+                "_duplex_segment_finished": item.context.segment_finished,
+            },
         )
         if runtime_config is not None:
             session.replace_runtime_config(runtime_config)

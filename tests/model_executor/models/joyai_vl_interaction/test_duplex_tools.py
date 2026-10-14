@@ -3,6 +3,7 @@
 
 """JoyAI formatting on the shared Session tool lifecycle (PR #8758)."""
 
+import importlib.util
 import json
 import sys
 
@@ -17,7 +18,14 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
 
-pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+pytestmark = [
+    pytest.mark.core_model,
+    pytest.mark.cpu,
+    pytest.mark.skipif(
+        importlib.util.find_spec("vllm_omni.engine.duplex.session.tool_calls") is None,
+        reason="JoyAI delegated tools require the Session-owned lifecycle from PR #8758",
+    ),
+]
 
 DELEGATE = {
     "type": "function",
@@ -129,8 +137,8 @@ def test_prompt_budget_keeps_latest_answer_and_rejects_an_oversized_one():
     config = DuplexSessionConfig(instructions="Watch the pot.", extra_body=TOOLS)
     runtime = plugin.runtime_config_for_update(config, {})
     runtime["joyai_delegation_results"] = [
-        {"question": "Old question", "answer": "old detail " * 1000},
-        {"question": "Which pot?", "answer": "Blue."},
+        {"call_id": "old", "question": "Old question", "answer": "old detail " * 1000},
+        {"call_id": "latest", "question": "Which pot?", "answer": "Blue."},
     ]
     kwargs = dict(
         request_id="r",
@@ -143,11 +151,15 @@ def test_prompt_budget_keeps_latest_answer_and_rejects_an_oversized_one():
         final=True,
         sampling_params=SamplingParams(max_tokens=64),
     )
-    prompt = plugin.plan_append(**kwargs).prompt["prompt"]
+    plan = plugin.plan_append(**kwargs)
+    prompt = plan.prompt["prompt"]
+    assert plan.delegation_result_call_ids == ("latest",)
     assert "Old question" not in prompt and "Which pot?" in prompt and "Blue." in prompt
     assert "Watch the pot." in prompt and len(prompt) <= 1936
     assert len(runtime["joyai_delegation_results"]) == 2
-    runtime["joyai_delegation_results"] = [{"question": "Which pot?", "answer": "large answer " * 1000}]
+    runtime["joyai_delegation_results"] = [
+        {"call_id": "large", "question": "Which pot?", "answer": "large answer " * 1000}
+    ]
     with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
         plugin.plan_append(**kwargs)
 
@@ -261,13 +273,93 @@ async def test_oversized_answer_is_rejected_before_settlement_and_can_be_correct
         corrected = await h.run(CreateItem(item={**output, "output": "Blue."}))
         assert not any(event.to_realtime()["type"] == "error" for event in corrected)
         assert h.session.runtime_config["joyai_delegation_results"] == [
-            {"call_id": call["call_id"], "question": "Which pot?", "answer": "Blue."}
+            {"call_id": call["call_id"], "question": "Which pot?", "answer": "Blue.", "consumed": False}
         ]
         await observe(h)
         prompt = h.port.submissions[-1].prompt["prompt"]
         assert "Which pot?" in prompt and "Blue." in prompt
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_at", ["queued", "submitted", "completed_joyai"])
+async def test_cancel_retires_only_answers_used_by_no_completed_observation(cancel_at):
+    h = await open_joyai(extra_body=TOOLS)
+    try:
+        request_id = await observe(h)
+        response_id = h.session.active_response_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> I will check. </delegation> Which pot?", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        call = next(
+            event.to_realtime()["item"]
+            for event in h.events
+            if event.to_realtime()["type"] == "response.output_item.done"
+            and event.to_realtime()["item"]["type"] == "function_call"
+        )
+        await h.run(
+            CreateItem(item={"type": "function_call_output", "call_id": call["call_id"], "output": "Blue."})
+        )
+        if cancel_at != "queued":
+            await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
+            await h.run(AckPlayback(response_id=response_id, played_ms=1000))
+            request_id = await observe(h)
+            assert "Blue." in h.port.submissions[-1].prompt["prompt"]
+        if cancel_at == "completed_joyai":
+            await h.deliver_and_settle(
+                tts_output(request_id, text="</response> I am watching it.", finished=True),
+                stage_id=0,
+                segment_finished=True,
+                segment_output_metadata={
+                    "_duplex_request_id": "untrusted",
+                    "_duplex_stage_id": 2,
+                    "_duplex_segment_finished": False,
+                },
+            )
+        old_epoch = h.session.epoch
+        await h.run(CancelResponse())
+        assert h.session.epoch > old_epoch
+        retained = h.session.runtime_config["joyai_delegation_results"]
+        assert bool(retained) is (cancel_at == "completed_joyai")
+        # A late output from a cancelled request cannot consume its old snapshot.
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> Late output.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+            epoch=old_epoch,
+        )
+        await observe(h)
+        assert ("Blue." in h.port.submissions[-1].prompt["prompt"]) is (cancel_at == "completed_joyai")
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("stage_id, finished", [(0, False), (1, True), (2, True), (0, True)])
+def test_consumption_uses_only_the_rendered_request_snapshot(stage_id, finished):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.data_plane.begin_request("observed")
+    plugin.data_plane.requests["observed"].delegation_result_call_ids = ("included",)
+    original = {
+        "joyai_delegation_results": [
+            {"call_id": call_id, "question": "Which pot?", "answer": "Blue.", "consumed": False}
+            for call_id in ("evicted", "included", "arrived_later")
+        ]
+    }
+    updated = plugin.runtime_config_after_model_output(
+        original,
+        {"_duplex_request_id": "observed", "_duplex_stage_id": stage_id, "_duplex_segment_finished": finished},
+    )
+    if stage_id == 0 and finished:
+        consumed = [result["call_id"] for result in updated["joyai_delegation_results"] if result["consumed"]]
+        assert consumed == ["included"]
+        retained = plugin.retire_pending_function_output(DuplexSessionConfig(), updated)
+        assert [result["call_id"] for result in retained["joyai_delegation_results"]] == ["included"]
+    else:
+        assert updated is None
+    assert not any(result["consumed"] for result in original["joyai_delegation_results"])
 
 
 @pytest.mark.asyncio

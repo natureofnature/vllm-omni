@@ -587,7 +587,10 @@ class DuplexModelPlugin(ABC):
 
         Plugins may use model-owned output metadata to retire server-side
         runtime state that has been consumed by the worker. The default keeps
-        the framework unaware of model-specific metadata.
+        the framework unaware of model-specific metadata. Reserved keys
+        ``_duplex_request_id``, ``_duplex_stage_id`` and
+        ``_duplex_segment_finished`` are supplied by Session after fencing;
+        worker metadata cannot override these request-ownership facts.
         """
         del current, output_metadata
         return None

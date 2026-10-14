@@ -474,6 +474,11 @@ lifecycle owns admission, cancellation and duplicate/stale-result rejection.
 Session-owned original question. This candidate preparation does not execute
 work or mutate a plugin-local call registry. The next committed JoyAI observation
 includes the result as background context, separate from played assistant speech.
+Session supplies reserved request, stage and completion facts to
+`runtime_config_after_model_output` after fencing. JoyAI uses its observation's
+actually rendered answer IDs to acknowledge consumption only after completed
+JoyAI output. Epoch cancellation retires unconsumed answers through the common
+retirement hook; previously consumed answers remain background context.
 
 `DuplexOmniEngine._validate_deployment` loads the plugin before any stage
 starts; `DuplexSessionManager.__init__` validates it against the stage

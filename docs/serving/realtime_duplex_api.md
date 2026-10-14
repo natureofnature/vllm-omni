@@ -1106,6 +1106,10 @@ rejected before settlement; retry a shorter digest with the same `call_id`.
 The later complete prompt is also checked with its current query and images.
 Send `response.create`, or commit the next observation, to let JoyAI
 use it. Tool results are not recorded as assistant speech that the user heard.
+Cancellation retires answers not yet used by a completed JoyAI observation;
+already-used answers remain background context. Submitting a prompt alone does
+not establish consumption, and a later result cannot be consumed by an earlier
+observation's output.
 
 `C→S conversation.item.delete` / `S→C conversation.item.deleted`
 

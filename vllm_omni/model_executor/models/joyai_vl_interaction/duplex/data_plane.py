@@ -35,6 +35,7 @@ class Observation:
     text_sent: bool = False
     response_text: str = ""
     delegation_enabled: bool = False
+    delegation_result_call_ids: tuple[str, ...] = ()
 
     def parse(self, output: object) -> ParsedAction:
         completion = next(iter(output.outputs or ()), None)
