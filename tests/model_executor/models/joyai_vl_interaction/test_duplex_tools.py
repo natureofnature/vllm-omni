@@ -300,9 +300,13 @@ async def test_cancel_retires_only_answers_used_by_no_completed_observation(canc
             if event.to_realtime()["type"] == "response.output_item.done"
             and event.to_realtime()["item"]["type"] == "function_call"
         )
-        await h.run(
-            CreateItem(item={"type": "function_call_output", "call_id": call["call_id"], "output": "Blue."})
+        accepted = await h.run(
+            CreateItem(
+                item={"id": "answer", "type": "function_call_output", "call_id": call["call_id"], "output": "Blue."}
+            )
         )
+        assert not any(event.to_realtime()["type"] == "error" for event in accepted)
+        assert h.session.runtime_config["joyai_delegation_results"][0]["answer"] == "Blue."
         if cancel_at != "queued":
             await h.deliver_and_settle(tts_output(request_id, finished=True), stage_id=2, segment_finished=True)
             await h.run(AckPlayback(response_id=response_id, played_ms=1000))
