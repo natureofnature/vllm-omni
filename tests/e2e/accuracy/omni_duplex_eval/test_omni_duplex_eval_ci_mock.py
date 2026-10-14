@@ -332,7 +332,7 @@ def test_real_guard_removes_stale_results_on_early_cli_exit(monkeypatch: pytest.
     _write_scores_from_config(tmp_path / "responses" / "run-ci" / "evaluation", config)
     _call_real_guard(monkeypatch, tmp_path)
     monkeypatch.setattr(guard, "_run_cli", lambda argv: None)
-    with pytest.raises(FileNotFoundError, match="bench-result.json"):
+    with pytest.raises(AssertionError, match="bench serve exited without writing .*bench-result.json"):
         guard.test_omni_duplex_eval_ci(_FakeServer("127.0.0.1", 9999, "mock-model"), tmp_path, "http://judge:8001")
     assert not (tmp_path / "bench-result.json").exists()
     assert not (tmp_path / "summary.json").exists()

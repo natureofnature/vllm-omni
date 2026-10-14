@@ -138,6 +138,7 @@ def test_omni_duplex_eval_ci(omni_server, tmp_path: Path, judge_server: str) -> 
         ]
     )
 
+    assert benchmark_path.exists(), f"bench serve exited without writing {benchmark_path}"
     benchmark = json.loads(benchmark_path.read_text(encoding="utf-8"))
     duplex = benchmark["omni_duplex_eval"]
     summary = duplex["accuracy"]
