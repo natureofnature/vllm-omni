@@ -361,6 +361,19 @@ def test_consumption_uses_only_the_rendered_request_snapshot(stage_id, finished)
         assert consumed == ["included"]
         retained = plugin.retire_pending_function_output(DuplexSessionConfig(), updated)
         assert [result["call_id"] for result in retained["joyai_delegation_results"]] == ["included"]
+        plugin.data_plane.begin_request("next_observation")
+        plugin.data_plane.requests["next_observation"].delegation_result_call_ids = ("included",)
+        assert (
+            plugin.runtime_config_after_model_output(
+                updated,
+                {
+                    "_duplex_request_id": "next_observation",
+                    "_duplex_stage_id": 0,
+                    "_duplex_segment_finished": True,
+                },
+            )
+            is None
+        )
     else:
         assert updated is None
     assert not any(result["consumed"] for result in original["joyai_delegation_results"])

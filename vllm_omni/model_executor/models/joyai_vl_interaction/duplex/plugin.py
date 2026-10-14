@@ -220,11 +220,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request = self.data_plane.requests.get(request_id)
         if request is None or not request.delegation_result_call_ids:
             return None
+        results = current.get("joyai_delegation_results", [])
+        if not any(
+            result["call_id"] in request.delegation_result_call_ids and not result.get("consumed")
+            for result in results
+        ):
+            return None
         return {
             **current,
             "joyai_delegation_results": [
                 {**result, "consumed": True} if result["call_id"] in request.delegation_result_call_ids else result
-                for result in current.get("joyai_delegation_results", [])
+                for result in results
             ],
         }
 
