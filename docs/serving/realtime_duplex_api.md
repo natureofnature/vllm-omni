@@ -1051,9 +1051,10 @@ deferred commit during an active response (`event.response_create_deferred`)
 }
 ```
 
-#### JoyAI delegated questions
+**JoyAI delegated questions.**
 
 JoyAI uses the shared Session tool lifecycle from [#8758](https://github.com/vllm-project/vllm-omni/pull/8758).
+Tool configuration is rejected when that prerequisite is absent.
 Enable its delegated-question adapter with this session tool declaration:
 
 ```json
@@ -1100,7 +1101,10 @@ question. The client must not supply authoritative call metadata. JoyAI retains
 up to eight recent delegated answers as background context, preserving the
 standing instruction and current user query; older answers may be removed to
 fit the complete input budget. A result does not itself start another inference
-request. Send `response.create`, or commit the next observation, to let JoyAI
+request. An answer that cannot fit even the instruction-only prompt budget is
+rejected before settlement; retry a shorter digest with the same `call_id`.
+The later complete prompt is also checked with its current query and images.
+Send `response.create`, or commit the next observation, to let JoyAI
 use it. Tool results are not recorded as assistant speech that the user heard.
 
 `C→S conversation.item.delete` / `S→C conversation.item.deleted`
