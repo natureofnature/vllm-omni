@@ -233,9 +233,7 @@ class ToolCallLedger:
         return tuple(
             call.origin
             for call in self._calls.values()
-            if call.is_pending
-            and call.origin.epoch == epoch
-            and (call.deadline is None or now < call.deadline)
+            if call.is_pending and call.origin.epoch == epoch and (call.deadline is None or now < call.deadline)
         )
 
     # -- exposure ------------------------------------------------------- #
