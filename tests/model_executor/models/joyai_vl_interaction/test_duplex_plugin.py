@@ -518,6 +518,7 @@ async def test_camera_commit_preserves_retained_speech_and_transcript_owner(defe
                     "audio": base64.b64encode(pcm).decode(),
                     "format": "pcm16",
                     "sample_rate_hz": 16000,
+                    "video_frames": [frame("green")],
                 }
             )
         )
@@ -546,7 +547,8 @@ async def test_camera_commit_preserves_retained_speech_and_transcript_owner(defe
         assert audio.tobytes() == struct.pack("<ff", 1000 / 32768, 2000 / 32768) * 4000
         info = submission.prompt["additional_information"]
         assert info["realtime_item_id"] == speech_item_id
-        assert info["deferred_multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
+        expected_colors = ([(255, 0, 0)] if deferred else []) + [(0, 128, 0), (0, 0, 255)]
+        assert [image.getpixel((0, 0)) for image in info["deferred_multi_modal_data"]["image"]] == expected_colors
         transcript = "Describe the blue scene."
         h.runner.on_stage_output(
             0,

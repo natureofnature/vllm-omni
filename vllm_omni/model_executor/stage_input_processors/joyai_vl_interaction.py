@@ -114,7 +114,35 @@ def asr_to_joyai(
             ),
         }
         context = additional_info.get("joyai_prompt_context")
-        if isinstance(context, dict):
+        if "joyai_prompt_context" in additional_info:
+            # Chat clients can also supply this metadata. Reject malformed
+            # session context as a request error before invoking the processor.
+            if (
+                not isinstance(context, dict)
+                or not isinstance(context.get("system"), str)
+                or not isinstance(context.get("history"), list)
+                or any(
+                    not isinstance(message, dict)
+                    or message.get("role") not in ("user", "assistant")
+                    or not isinstance(message.get("content"), str)
+                    for message in context["history"]
+                )
+            ):
+                raise OmniClientError(
+                    "joyai_prompt_context requires a string system and a history of user/assistant text messages"
+                )
+            budget = additional_info.get("joyai_prompt_budget")
+            if type(budget) is not int or budget <= 0:
+                raise OmniClientError("joyai_prompt_budget must be a positive integer")
+            image_token_counts = additional_info.get("joyai_image_token_counts")
+            images = visual_inputs.get("image", [])
+            if (
+                not isinstance(image_token_counts, list)
+                or not isinstance(images, list)
+                or len(image_token_counts) != len(images)
+                or any(type(count) is not int or count < 0 for count in image_token_counts)
+            ):
+                raise OmniClientError("joyai_image_token_counts must contain one non-negative integer per image")
             # ASR determines the query length. Apply the same history/visual
             # eviction policy as direct observations only once it is known.
             joyai_input["prompt"], images = render_joyai_session_prompt(
@@ -122,9 +150,9 @@ def asr_to_joyai(
                 system=context["system"],
                 history=context["history"],
                 query=transcript,
-                images=visual_inputs.get("image", []),
-                image_token_counts=additional_info["joyai_image_token_counts"],
-                budget=int(additional_info["joyai_prompt_budget"]),
+                images=images,
+                image_token_counts=image_token_counts,
+                budget=budget,
             )
             visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:

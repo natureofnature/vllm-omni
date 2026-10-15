@@ -391,7 +391,8 @@ def b64(data: bytes) -> str:
 
 
 @pytest.mark.asyncio
-async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> None:
+@pytest.mark.parametrize("camera_update", [False, True])
+async def test_aura_asr_transcript_does_not_project_as_assistant_output(camera_update: bool) -> None:
     from io import BytesIO
 
     from PIL import Image
@@ -399,7 +400,7 @@ async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> Non
     from vllm_omni.model_executor.models.aura_omni.duplex.plugin import AuraDuplexPlugin
 
     plugin = AuraDuplexPlugin(_fake_encode_audio)
-    h = await open_harness(plugin=plugin, stage_count=4)
+    h = await open_harness(plugin=plugin, stage_count=4, auto_response=not camera_update)
     try:
         image = BytesIO()
         Image.new("RGB", (8, 8), "red").save(image, format="PNG")
@@ -412,8 +413,22 @@ async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> Non
                 video_frames=(b64(image.getvalue()),),
             )
         )
+        if camera_update:
+            events = await h.run(commands.Commit(final=True, create_response=False))
+            speech_item_id = find(events, "input_audio_buffer.committed").to_realtime()["item_id"]
+            assert not h.port.submissions
+            image = BytesIO()
+            Image.new("RGB", (8, 8), "blue").save(image, format="PNG")
+            await h.run(commands.AppendAudio(video_frames=(b64(image.getvalue()),)))
         await h.run(commands.Commit(final=True, create_response=True))
         submission = h.port.submissions[-1]
+        if camera_update:
+            info = submission.prompt["additional_information"]
+            assert info["realtime_item_id"] == speech_item_id
+            audio, rate = submission.prompt["multi_modal_data"]["audio"]
+            assert rate == 16000 and audio.tobytes() == pcm_f32(1600)
+            video = info["deferred_multi_modal_data"]["video"][0][0]
+            assert [tuple(frame[0, 0]) for frame in video] == [(255, 0, 0), (0, 0, 255)]
         request_id = submission.context.request_id
         output = SimpleNamespace(
             request_id=request_id,
@@ -437,9 +452,13 @@ async def test_aura_asr_transcript_does_not_project_as_assistant_output() -> Non
             input_item_id=submission.prompt["additional_information"]["realtime_item_id"],
         )
         events = await h.settle()
-        assert find(events, "conversation.item.input_audio_transcription.completed").transcript == transcript
+        transcription = find(events, "conversation.item.input_audio_transcription.completed")
+        assert transcription.transcript == transcript
+        if camera_update:
+            assert transcription.to_realtime()["item_id"] == speech_item_id
+            assert h.session.pending_input_bytes == 0
         assert not any(event.type.startswith("response.output_") for event in events)
-        assert h.session.active_response_id is None
+        assert (h.session.active_response_id is not None) == camera_update
 
         output.outputs[0].text = "I will watch it."
         assert not h.deliver(output, stage_id=1, segment_finished=True)
@@ -1624,7 +1643,7 @@ async def test_duplex_stage_request_stamps_wall_clock_request_timestamp() -> Non
         await orchestrator.session_manager.shutdown()
 
 
-def _response_request_metrics_of(event: object) -> dict[str, object]:
+def _response_request_metrics_of(event: DuplexEvent) -> dict[str, object]:
     """Server request-start clocks as the client reads them off one wire event."""
     payload = event.to_realtime()
     metadata = payload.get("metadata")
