@@ -664,6 +664,9 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   const player = new Playback();
   player.handleMessage({ type: 'audio', responseId: 'old', pcm: new Int16Array(24000), initialBufferMs: 0 });
   player.process([], [[new Float32Array(2400)]]);
+  player.handleMessage({ type: 'drain', responseId: 'old' });
+  player.handleMessage({ type: 'audio', responseId: 'unplayed', pcm: new Int16Array(24000) });
+  player.handleMessage({ type: 'drain', responseId: 'unplayed' });
   player.handleMessage({ type: 'clear' });
   const report = messages.find(m => m.type === 'playback-stopped');
   assert.equal(report.responseId, 'old');
@@ -672,6 +675,11 @@ test('interrupted playback reports its cursor before clear resets it', () => {
   assert.equal(player.bufferedFrames(), 0);
   player.handleMessage({ type: 'clear' });
   assert.equal(messages.filter(m => m.type === 'playback-stopped').length, 1);
+  player.handleMessage({ type: 'audio', responseId: 'fresh', pcm: new Int16Array(4800), initialBufferMs: 0 });
+  player.handleMessage({ type: 'drain', responseId: 'fresh' });
+  player.process([], [[new Float32Array(4800)]]);
+  assert.deepEqual(messages.filter(m => m.type === 'playback-drained').map(m => [m.responseId, m.playedMs]),
+    [['fresh', 200]], 'clear must discard unplayed queued responses and reset the next cursor');
 });
 
 test('late interruption cursor acknowledges old response without finishing the new response', async () => {
@@ -880,6 +888,42 @@ function renderPlayback(player) {
   const output = new Float32Array(128);
   player.process([], [[output]]);
   return output;
+}
+
+for (const queueNextAudio of [false, true]) {
+  test(`JoyAI overlapping PTT acknowledges each response with next audio ${queueNextAudio ? 'queued' : 'pending'}`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true, realPlayback: true });
+    await app.ui.startSession();
+    receive(app, { type: 'response.created', response: { id: 'old' } });
+    receive(app, audioChunk('old'));
+    await app.ui.awaitQueue();
+    app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+    assert.equal(app.sockets[0].sent.at(-1).type, 'input_audio_buffer.commit');
+    receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+    receive(app, { type: 'response.created', response: { id: 'new' } });
+    if (queueNextAudio) {
+      receive(app, audioChunk('new'));
+      receive(app, { type: 'response.done', response: { id: 'new', status: 'completed' } });
+    }
+    await app.ui.awaitQueue();
+    const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+    for (let i = 0; i < 188; i += 1) renderPlayback(player);
+    await Promise.resolve();
+    const acks = () => app.sockets[0].sent.filter(message => message.type === 'playback.ack');
+    assert.deepEqual(acks().map(message => [message.response_id, message.played_ms]), [['old', 1000]]);
+    assert.equal(app.ui.state().assistantActive, true, 'draining old audio must not finish the new turn');
+    if (!queueNextAudio) {
+      receive(app, audioChunk('new'));
+      receive(app, { type: 'response.done', response: { id: 'new', status: 'completed' } });
+      await app.ui.awaitQueue();
+    }
+    for (let i = 0; i < 188; i += 1) renderPlayback(player);
+    await Promise.resolve();
+    assert.deepEqual(acks().map(message => [message.response_id, message.played_ms]), [['old', 1000], ['new', 1000]]);
+    await app.echo();
+    assert.equal(app.ui.state().assistantActive, false);
+    await app.ui.stopSession({ terminal: false });
+  });
 }
 
 for (const outcome of ['rejected', 'silent']) for (const settleBeforeDrain of [false, true]) {

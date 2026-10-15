@@ -565,8 +565,10 @@
 
   function playbackDrained(message) {
     const responseId = message.responseId || currentResponseId;
-    if (currentResponseId && responseId !== currentResponseId) return;
     if (profile.playbackAck) sendPlaybackAck(responseId, Number(message.playedMs) || 0);
+    // Generation may advance before the previous response finishes playing.
+    // ACK that response's own cursor without completing the newer UI turn.
+    if (currentResponseId && responseId !== currentResponseId) return;
     setPlayback('Idle');
     playbackComplete = true;
     if (message.underrunMs > 0) appendLog(`playback underrun ${message.underrunMs} ms`);
