@@ -37,6 +37,7 @@ from vllm_omni.engine.duplex.commands import (
     Commit,
     CreateItem,
     CreateResponse,
+    DeleteItem,
 )
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence, DuplexOutputContext, DuplexRequestIdentity
@@ -570,6 +571,243 @@ async def test_camera_commit_preserves_retained_speech_and_transcript_owner(defe
         assert [(e["item_id"], e["transcript"]) for e in transcriptions] == [(speech_item_id, transcript)]
         assert h.session.pending_input_bytes == 0
     finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("first_transcript", ["Remember the red cup.", ""])
+@pytest.mark.parametrize("interleave", [False, True])
+@pytest.mark.parametrize("count", [2, 3])
+async def test_batched_commits_keep_separate_audio_and_transcript_owners(cancel, first_transcript, interleave, count):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        item_ids = []
+        for sample in range(1000, (count + 1) * 1000, 1000):
+            await h.run(
+                translate_realtime_command(
+                    {
+                        "type": "input_audio_buffer.append",
+                        "audio": base64.b64encode(struct.pack("<h", sample) * 8000).decode(),
+                        "format": "pcm16",
+                        "sample_rate_hz": 16000,
+                        "video_frames": [frame("red" if sample == 1000 else "blue")],
+                    }
+                )
+            )
+            events = await h.run(
+                translate_realtime_command({"type": "input_audio_buffer.commit", "create_response": False})
+            )
+            item_ids.append(
+                next(e.to_realtime()["item_id"] for e in events if e.type == "input_audio_buffer.committed")
+            )
+        assert not h.port.submissions
+        h.submit(CreateResponse())
+        await h.settle(timeout_s=0.2)
+        if interleave:
+            events = await h.run(
+                translate_realtime_command({"type": "session.update", "session": {"temperature": 0.2}})
+            )
+            assert any(e.type == "session.updated" for e in events)
+            await h.run(AppendAudio(audio=struct.pack("<h", 4000) * 8000, format="pcm16", sample_rate_hz=16000))
+            events = await h.run(
+                translate_realtime_command({"type": "input_audio_buffer.commit", "create_response": False})
+            )
+            assert any(e.type == "input_audio_buffer.committed" for e in events)
+            retained = h.runner.model_state.committed_audio_payload
+            assert base64.b64decode(retained["audio"]) == struct.pack("<f", 4000 / 32768) * 8000
+        expected_transcripts = (first_transcript, "Now describe the blue plate.", "Keep the answer short.")[:count]
+        for index, transcript in enumerate(expected_transcripts):
+            assert len(h.port.submissions) == index + 1
+            submission = h.port.submissions[index]
+            info = submission.prompt["additional_information"]
+            assert info["realtime_item_id"] == item_ids[index]
+            audio, rate = submission.prompt["multi_modal_data"]["audio"]
+            assert rate == 16000
+            assert audio.tobytes() == struct.pack("<f", (index + 1) * 1000 / 32768) * 8000
+            if index < count - 1:
+                assert submission.context.final_stage_id == 0
+            else:
+                assert submission.context.final_stage_id == 3
+                images = info["deferred_multi_modal_data"]["image"]
+                assert [image.getpixel((0, 0)) for image in images] == [(255, 0, 0)] + [(0, 0, 255)] * (count - 1)
+                history = info["joyai_prompt_context"]["history"]
+                for previous in expected_transcripts[:-1]:
+                    assert ({"role": "user", "content": previous} in history) is bool(previous)
+            if cancel:
+                await h.run(CancelResponse())
+            h.runner.on_stage_output(
+                0,
+                tts_output(submission.context.request_id, finished=True, text=transcript),
+                None,
+                request_id=submission.context.request_id,
+                context=DuplexOutputContext(
+                    identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+                    final_stage_id=submission.context.final_stage_id,
+                    segment_finished=True,
+                ),
+                input_transcript=transcript,
+                input_item_id=item_ids[index],
+            )
+            await h.settle(timeout_s=0.2)
+            if cancel:
+                assert len(h.port.submissions) == 1
+                assert not h.runner.model._input_transcriptions
+                assert not any(e.type == "conversation.item.input_audio_transcription.completed" for e in h.events)
+                assert h.session.pending_input_bytes == 0
+                return
+        transcripts = [
+            e.to_realtime() for e in h.events if e.type == "conversation.item.input_audio_transcription.completed"
+        ]
+        assert [(e["item_id"], e["transcript"]) for e in transcripts] == [
+            (item_id, transcript) for item_id, transcript in zip(item_ids, expected_transcripts) if transcript
+        ]
+        created = [e.to_realtime()["response"]["id"] for e in h.events if e.type == "response.created"]
+        assert len(created) == 1
+        events = await h.deliver_and_settle(
+            tts_output(submission.context.request_id, finished=True, text="</response> Both noted."),
+            stage_id=1,
+            segment_finished=True,
+        )
+        done = [e.to_realtime()["response"] for e in events if e.type == "response.done"]
+        assert [(response["id"], response["status"]) for response in done] == [(created[0], "completed")]
+        assert len(h.port.submissions) == count
+        assert not any(e.type == "error" for e in h.events)
+        await h.run(DeleteItem(item_id=item_ids[-1]))
+        assert h.session.history_item_ids[item_ids[0]].get("transcript", "") == first_transcript
+        assert item_ids[-1] not in h.session.history_item_ids
+        assert (h.session.pending_input_bytes > 0) is interleave
+        if interleave:
+            assert h.runner.model_state.committed_audio_payload is retained
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batched_commits_do_not_transcribe_recreated_pending_item():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        item_ids = []
+        for sample in (1000, 2000):
+            await h.run(AppendAudio(audio=struct.pack("<h", sample) * 8000, format="pcm16", sample_rate_hz=16000))
+            events = await h.run(Commit(final=True, create_response=False))
+            item_ids.append(
+                next(e.to_realtime()["item_id"] for e in events if e.type == "input_audio_buffer.committed")
+            )
+        await h.run(CreateResponse())
+        original_part = h.session.input_audio_part(item_ids[1])
+        await h.run(DeleteItem(item_id=item_ids[1]))
+        await h.run(
+            translate_realtime_command(
+                {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "id": item_ids[1],
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_audio",
+                                "audio": base64.b64encode(struct.pack("<h", 3000) * 8000).decode(),
+                                "format": "pcm16",
+                                "sample_rate_hz": 16000,
+                            }
+                        ],
+                    },
+                }
+            )
+        )
+        replacement_part = h.session.input_audio_part(item_ids[1])
+        assert replacement_part == original_part and replacement_part is not original_part
+        for index, transcript in enumerate(("First original audio.", "Second original audio.")):
+            submission = h.port.submissions[index]
+            h.runner.on_stage_output(
+                0,
+                tts_output(submission.context.request_id, finished=True, text=transcript),
+                None,
+                request_id=submission.context.request_id,
+                context=DuplexOutputContext(
+                    identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+                    final_stage_id=submission.context.final_stage_id,
+                    segment_finished=True,
+                ),
+                input_transcript=transcript,
+                input_item_id=item_ids[index],
+            )
+            await h.settle()
+        transcripts = [
+            e.to_realtime() for e in h.events if e.type == "conversation.item.input_audio_transcription.completed"
+        ]
+        assert [(e["item_id"], e["transcript"]) for e in transcripts] == [(item_ids[0], "First original audio.")]
+        assert "transcript" not in replacement_part
+        assert "transcript" not in h.session.history_item_ids[item_ids[1]]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batched_commits_release_continuation_on_asr_submission_failure():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        for sample in (1000, 2000):
+            await h.run(AppendAudio(audio=struct.pack("<h", sample) * 8000, format="pcm16", sample_rate_hz=16000))
+            await h.run(Commit(final=True, create_response=False))
+        h.port.fail_submit = RuntimeError("ASR submission failed")
+        events = await h.run(CreateResponse())
+        assert not h.port.submissions
+        assert not h.runner.model._input_transcriptions
+        assert not h.runner.plugin.data_plane.requests
+        assert h.session.pending_input_bytes == 0
+        done = [e.to_realtime() for e in events if e.type == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "failed"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batched_commits_wait_for_submission_acceptance_before_continuing():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        for sample in (1000, 2000):
+            await h.run(AppendAudio(audio=struct.pack("<h", sample) * 8000, format="pcm16", sample_rate_hz=16000))
+            await h.run(Commit(final=True, create_response=False))
+        gate = asyncio.Event()
+        h.port.submit_gate = gate
+        h.submit(CreateResponse())
+        await asyncio.wait_for(h.port.submit_started.wait(), timeout=2)
+        context = h.port.ensured[-1]
+        first_item_id = next(iter(h.session.history_item_ids))
+        h.runner.on_stage_output(
+            0,
+            tts_output(context.request_id, finished=True, text="Remember the red cup."),
+            None,
+            request_id=context.request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=context.fence),
+                final_stage_id=0,
+                segment_finished=True,
+            ),
+            input_transcript="Remember the red cup.",
+            input_item_id=first_item_id,
+        )
+        await h.settle(timeout_s=0.05)
+        assert not h.port.submissions
+        assert not h.port.cleanups
+        gate.set()
+        await h.settle()
+        assert len(h.port.submissions) == 2
+        first, second = h.port.submissions
+        assert first.context.final_stage_id == 0
+        assert second.context.final_stage_id == 3
+        assert first.context.request_id != second.context.request_id
+        assert not h.runner.model._input_transcriptions
+        assert (0, first.context.request_id) not in h.session.request_resources
+        assert first.context.request_id not in h.runner.plugin.data_plane.requests
+        assert sum(e.type == "response.created" for e in h.events) == 1
+        assert not any(e.type in {"error", "response.done"} for e in h.events)
+    finally:
+        if h.port.submit_gate is not None:
+            h.port.submit_gate.set()
         await h.manager.shutdown()
 
 

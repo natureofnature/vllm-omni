@@ -48,7 +48,7 @@ from vllm_omni.engine.duplex.plugin import (
     payload_turn_id,
 )
 from vllm_omni.engine.duplex.session import helpers
-from vllm_omni.engine.duplex.session.context import DuplexSessionContext, StageOutput
+from vllm_omni.engine.duplex.session.context import CommittedInputContinuation, DuplexSessionContext, StageOutput
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession, DuplexFenceMismatchError
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
@@ -99,6 +99,10 @@ class ModelChannel:
         self._close_from_runtime = close_from_runtime
         self._schedule_silence_continuation = schedule_silence_continuation
         self._abort_request = abort_request
+        self._input_transcriptions: dict[str, CommittedInputContinuation] = {}
+
+    def is_input_transcription(self, request_id: str) -> bool:
+        return request_id in self._input_transcriptions
 
     def _draining_stage_ids(self) -> frozenset[int]:
         """Stages the plugin keeps across a concurrent turn. Empty if undeclared."""
@@ -165,6 +169,7 @@ class ModelChannel:
         final: bool,
         expected_epoch: int | None = None,
         input_audio_part: dict[str, object] | None = None,
+        input_audio_parts: dict[str, dict[str, object] | None] | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
@@ -176,12 +181,21 @@ class ModelChannel:
         # commits timing state only if the append actually submitted.
         submit_time = time.monotonic()
         try:
+            payload, remaining_input = self._ctx.plugin.split_transcription_input(payload)
+            if input_audio_parts is not None:
+                item_id = payload.get("realtime_item_id") if isinstance(payload, Mapping) else None
+                input_audio_part = input_audio_parts.get(item_id) if isinstance(item_id, str) else None
             result = await self._append_via_data_plane(
                 payload,
                 final=final,
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
                 input_audio_part=input_audio_part,
+                remaining_transcription_input=(
+                    CommittedInputContinuation(remaining_input, input_audio_parts or {})
+                    if remaining_input is not None
+                    else None
+                ),
             )
         except asyncio.CancelledError:
             raise
@@ -228,6 +242,7 @@ class ModelChannel:
         operation_id: str | None,
         expected_epoch: int | None,
         input_audio_part: dict[str, object] | None,
+        remaining_transcription_input: CommittedInputContinuation | None = None,
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
@@ -293,7 +308,12 @@ class ModelChannel:
             operation_started = True
             reservation = session.prepare_append(fence)
             already_submitted = False if not resumable else session.stage_request_submitted(stage_id, request_id)
-            request_context = self._ctx.manager.ensure_stage_request(session, stage_id=stage_id, fence=fence)
+            request_context = self._ctx.manager.ensure_stage_request(
+                session,
+                stage_id=stage_id,
+                fence=fence,
+                final_stage_id=stage_id if remaining_transcription_input is not None else None,
+            )
             if request_context is None:
                 raise RuntimeError("duplex_data_plane_has_no_stage")
             if request_context.request_id != request_id:
@@ -335,6 +355,8 @@ class ModelChannel:
                 already_submitted=already_submitted,
                 resumable=resumable,
             )
+            if remaining_transcription_input is not None:
+                self._input_transcriptions[request_id] = remaining_transcription_input
             submission_result = await self._ctx.stage_port.submit(submission)
             try:
                 if submission_result.request_id != request_id or submission_result.stage_id != stage_id:
@@ -382,6 +404,7 @@ class ModelChannel:
                 ],
             }
         except BaseException:
+            self._input_transcriptions.pop(request_id, None)
             if not resumable:
                 self._ctx.plugin.data_plane.close_stream(request_id)
             raise
@@ -406,6 +429,7 @@ class ModelChannel:
 
     def cancel_data_plane_stream(self) -> bool:
         had_stream = self._ctx.run.stream_request_id is not None
+        self._input_transcriptions.clear()
         self._ctx.run.stream_request_id = None
         return had_stream
 
@@ -560,19 +584,19 @@ class ModelChannel:
             engine_output.metrics = {**existing, "stage_metrics": merged_stage_metrics}
         return engine_output
 
-    async def on_stage_output_item(self, item: StageOutput) -> None:
+    async def on_stage_output_item(self, item: StageOutput) -> CommittedInputContinuation | None:
         session = self._ctx.session
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
-            return
+            return None
         expected_epoch = item.context.identity.fence.epoch
         if session.epoch != expected_epoch:
-            return
+            return None
         if session.lease.terminal_reason is not None:
             # Lease already closed/expired: the output belongs to a dead session.
-            return
+            return None
         session.touch_lease(DuplexLeaseActivity.MODEL_OUTPUT)
         if self._ctx.plugin.data_plane.is_terminal(item.request_id):
-            return
+            return None
         if self._out.auto_responds():
             active_request_id = session.active_request_id
             if active_request_id is not None and active_request_id != item.request_id:
@@ -580,7 +604,7 @@ class ModelChannel:
                     session.capabilities.supports_concurrent_turn_requests
                     and session.is_draining_request(item.request_id)
                 ):
-                    return
+                    return None
         if item.input_transcript:
             # This runs on the same mailbox as conversation edits and cancel,
             # after the request's fence has been checked above.
@@ -598,10 +622,28 @@ class ModelChannel:
                 if item.input_item_id is not None:
                     transcript_event["realtime_item_id"] = item.input_item_id
                 self._out.emit(transcript_event)
+        pending_transcription = self._input_transcriptions.get(item.request_id)
+        if pending_transcription is not None:
+            if not item.context.segment_finished:
+                return None
+            self._input_transcriptions.pop(item.request_id)
+            self._ctx.plugin.data_plane.close_stream(item.request_id)
+            await self._ctx.stage_port.cleanup([item.request_id])
+            if session.epoch != expected_epoch or session.state != DuplexSessionState.OPEN or self._ctx.run.closing:
+                return None
+            session.request_resources.pop((item.stage_id, item.request_id), None)
+            session.clear_request(item.request_id)
+            session.complete_model_turn(item.context.identity.fence.turn_id)
+            if self._ctx.run.stream_request_id == item.request_id:
+                self._ctx.run.stream_request_id = None
+            return replace(
+                pending_transcription,
+                payload={**pending_transcription.payload, "duplex_turn_id": session.turn_id},
+            )
         if not item.project_output:
             # Pass-through ASR belongs to the user, not the assistant output
             # projector. Its metrics and transcript still use this mailbox.
-            return
+            return None
         engine_output = self._build_stage_output(item)
         runtime_config = self._ctx.plugin.runtime_config_after_model_output(
             dict(session.runtime_config),
@@ -614,10 +656,10 @@ class ModelChannel:
             drain_result, expected_epoch=expected_epoch
         )
         if self._ctx.run.closing:
-            return
+            return None
         if close_reason is not None:
             await self._close_from_runtime(close_reason)
-            return
+            return None
         finished = self._data_plane_outputs_finished(drain_result)
         # Intermediate-stage projection finishing means text is done, not the duplex turn.
         # Closing the stream here drops later Code2Wav chunks / next-turn bind.
@@ -642,6 +684,7 @@ class ModelChannel:
                     self.maybe_continue_response(expected_epoch=expected_epoch, expected_response_id=response_id),
                     name="duplex-continue",
                 )
+        return None
 
     async def _send_model_output_events(
         self,

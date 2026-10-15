@@ -312,6 +312,15 @@ class DuplexModelPlugin(ABC):
         """Select the entry stage for one append before reserving its request."""
         return 0
 
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        """Separate the next ASR-only input from a batched response input.
+
+        The remaining committed payload resumes after this item's transcript
+        has reached conversation history. Models without an ASR entry stage
+        consume their input normally.
+        """
+        return payload, None
+
     def silence_unit_payload(self) -> dict[str, object]:
         """One silence unit as an append payload (``pcm_f32le`` zeros).
 

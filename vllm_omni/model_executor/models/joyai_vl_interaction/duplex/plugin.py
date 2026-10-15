@@ -58,6 +58,24 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return self.asr_stage_id
         return self.joyai_stage_id
 
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        if not isinstance(payload, Mapping):
+            return payload, None
+        segments = payload.get("committed_audio_segments")
+        if not isinstance(segments, list) or len(segments) < 2:
+            return payload, None
+        raw = pybase64.b64decode(payload["audio"], validate=True)
+        if sum(segment["byte_count"] for segment in segments) != len(raw):
+            raise DuplexRuntimeConfigError("Committed audio boundaries do not match the retained PCM")
+        boundary = segments[0]["byte_count"]
+        first = {**payload, "audio": pybase64.b64encode(raw[:boundary]).decode("ascii")}
+        first["realtime_item_id"] = segments[0]["item_id"]
+        first.pop("committed_audio_segments", None)
+        first.pop("video_frames", None)
+        remaining = {**payload, "audio": pybase64.b64encode(raw[boundary:]).decode("ascii")}
+        remaining["committed_audio_segments"] = segments[1:]
+        return first, remaining
+
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return DuplexCapabilities(
             supports_input_append=True,

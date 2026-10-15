@@ -250,6 +250,21 @@ class DuplexSessionRunner:
         input_item_id: str | None = None,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
+        if self.model.is_input_transcription(request_id):
+            self._mailbox.put_nowait(
+                StageOutput(
+                    stage_id=stage_id,
+                    output=output,
+                    metrics=metrics,
+                    request_id=request_id,
+                    context=context,
+                    decision=None,
+                    input_transcript=input_transcript,
+                    input_item_id=input_item_id,
+                    project_output=False,
+                )
+            )
+            return True
         decision: DuplexOutputDecision | None = None
         project = False
         if stage_id < context.final_stage_id:
@@ -501,7 +516,16 @@ class DuplexSessionRunner:
     async def _handle_item(self, item: DuplexCommand | StageOutput | _Internal) -> None:
         session = self.session
         if isinstance(item, StageOutput):
-            await self.model.on_stage_output_item(item)
+            if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
+                return
+            remaining_input = await self.model.on_stage_output_item(item)
+            if remaining_input is not None:
+                await self._start_append(
+                    remaining_input.payload,
+                    final=True,
+                    precreate_response=True,
+                    input_audio_parts=remaining_input.audio_parts,
+                )
             return
         if isinstance(item, _Internal):
             await self._on_internal(item)
@@ -752,7 +776,7 @@ class DuplexSessionRunner:
     def _cleanup_duplex_session_state(self) -> None:
         session = self.session
         self.plugin.data_plane.close_session(session.session_id, active_request_id=session.active_request_id)
-        self.run.stream_request_id = None
+        self.model.cancel_data_plane_stream()
 
     # ------------------------------------------------------------------ #
     # Append path (was the audio-append branch + start_native_append)    #
@@ -1096,6 +1120,7 @@ class DuplexSessionRunner:
         silence_continuation: bool = False,
         on_append_accepted: Callable[[float], None] | None = None,
         before_append: Callable[[], bool] | None = None,
+        input_audio_parts: dict[str, dict[str, object] | None] | None = None,
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
@@ -1134,6 +1159,13 @@ class DuplexSessionRunner:
                 helpers.audio_payload_size_bytes(payload),
             )
         input_item_id = payload.get("realtime_item_id")
+        segments = payload.get("committed_audio_segments")
+        if input_audio_parts is None and isinstance(segments, list):
+            input_audio_parts = {
+                segment["item_id"]: session.input_audio_part(segment["item_id"])
+                for segment in segments
+                if isinstance(segment, dict) and isinstance(segment.get("item_id"), str)
+            }
         attempt = AppendAttempt(
             ctx=self.ctx,
             out=self.out,
@@ -1149,6 +1181,7 @@ class DuplexSessionRunner:
             precreated_response_id=session.active_response_id if precreate_response else None,
             owns_request=final or precreate_response,
             input_audio_part=session.input_audio_part(input_item_id) if isinstance(input_item_id, str) else None,
+            input_audio_parts=input_audio_parts,
             on_append_accepted=on_append_accepted,
             before_append=before_append,
         )

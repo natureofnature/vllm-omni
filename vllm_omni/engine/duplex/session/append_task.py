@@ -66,6 +66,8 @@ class AppendAttempt:
     owns_request: bool = False
     #: Exact committed audio part, captured before this task can wait or yield.
     input_audio_part: dict[str, object] | None = None
+    #: Original item identities for a batch, never accepted from client payloads.
+    input_audio_parts: dict[str, dict[str, object] | None] | None = None
     #: Commits timing state once the runtime accepts the append (before any
     #: returned output event can clear the continuation chain).
     on_append_accepted: Callable[[float], None] | None = None
@@ -195,6 +197,7 @@ class AppendAttempt:
                 final=self.final,
                 expected_epoch=self.epoch,
                 input_audio_part=self.input_audio_part,
+                input_audio_parts=self.input_audio_parts,
                 on_append_accepted=self.on_append_accepted,
             )
             if append_ok:

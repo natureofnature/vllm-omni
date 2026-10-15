@@ -174,6 +174,14 @@ class DuplexSessionTasks:
 
 
 @dataclass(frozen=True, slots=True)
+class CommittedInputContinuation:
+    """Server-owned remainder of a batch, fenced to its original audio parts."""
+
+    payload: dict[str, object]
+    audio_parts: dict[str, dict[str, object] | None]
+
+
+@dataclass(frozen=True, slots=True)
 class StageOutput:
     """One stage result, queued for the session that owns the request."""
 
