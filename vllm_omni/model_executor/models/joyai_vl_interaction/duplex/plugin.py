@@ -294,7 +294,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             if not audio.size or not np.isfinite(audio).all() or not np.any(audio):
                 raise DuplexRuntimeConfigError("JoyAI speech commit requires non-silent finite PCM")
             prompt_data["additional_information"].update(
-                joyai_prompt_context={"system": system, "history": history, "query": query},
+                joyai_prompt_context={"system": system, "history": history},
                 joyai_prompt_budget=budget,
                 joyai_image_token_counts=image_token_counts,
                 deferred_multi_modal_data={"image": images} if images else {},

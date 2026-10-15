@@ -505,6 +505,73 @@ async def test_silent_audio_camera_commit_uses_visual_entry_and_releases_bytes()
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("deferred", [False, True])
+async def test_camera_commit_preserves_retained_speech_and_transcript_owner(deferred):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        active_request = await observe(h) if deferred else None
+        pcm = struct.pack("<hh", 1000, 2000) * 4000
+        await h.run(
+            translate_realtime_command(
+                {
+                    "type": "input_audio_buffer.append",
+                    "audio": base64.b64encode(pcm).decode(),
+                    "format": "pcm16",
+                    "sample_rate_hz": 16000,
+                }
+            )
+        )
+        events = await h.run(
+            translate_realtime_command({"type": "input_audio_buffer.commit", "final": True, "create_response": False})
+        )
+        speech_item_id = next(e.to_realtime()["item_id"] for e in events if e.type == "input_audio_buffer.committed")
+        assert len(h.port.submissions) == int(deferred)
+        assert h.runner.model_state.committed_audio_payload["audio"]
+        await h.run(translate_realtime_command({"type": "input_audio_buffer.append", "video_frames": [frame("blue")]}))
+        events = await h.run(
+            translate_realtime_command({"type": "input_audio_buffer.commit", "final": True, "create_response": True})
+        )
+        camera_item_id = next(e.to_realtime()["item_id"] for e in events if e.type == "input_audio_buffer.committed")
+        assert camera_item_id != speech_item_id
+        if deferred:
+            assert len(h.port.submissions) == 1
+            await h.deliver_and_settle(
+                tts_output(active_request, finished=True, text="</silence>"), stage_id=1, segment_finished=True
+            )
+        assert len(h.port.submissions) == int(deferred) + 1
+        submission = h.port.submissions[-1]
+        assert submission.context.stage_id == 0
+        audio, sample_rate = submission.prompt["multi_modal_data"]["audio"]
+        assert sample_rate == 16000
+        assert audio.tobytes() == struct.pack("<ff", 1000 / 32768, 2000 / 32768) * 4000
+        info = submission.prompt["additional_information"]
+        assert info["realtime_item_id"] == speech_item_id
+        assert info["deferred_multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
+        transcript = "Describe the blue scene."
+        h.runner.on_stage_output(
+            0,
+            tts_output(submission.context.request_id, finished=True, text=transcript),
+            None,
+            request_id=submission.context.request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=submission.context.fence),
+                final_stage_id=3,
+                segment_finished=True,
+            ),
+            input_transcript=transcript,
+            input_item_id=info["realtime_item_id"],
+        )
+        await h.settle()
+        transcriptions = [
+            e.to_realtime() for e in h.events if e.type == "conversation.item.input_audio_transcription.completed"
+        ]
+        assert [(e["item_id"], e["transcript"]) for e in transcriptions] == [(speech_item_id, transcript)]
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
     h = await open_joyai(asr=True, modalities=("text",))
@@ -1212,15 +1279,21 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
             {"role": "assistant", "content": "old answer"},
         ]
         if transcript
-        else []
+        else [
+            {"role": "user", "content": "What color is the car?"},
+            {"role": "assistant", "content": "The car is red."},
+        ]
     )
+    runtime = plugin.runtime_config_for_update(DuplexSessionConfig(instructions="Watch the pot."), {})
+    if not transcript:
+        runtime["initial_user_text"] = "Describe what you see."
     plan = plugin.plan_append(
         request_id="r",
         fence=DuplexFence("s"),
         seq=1,
         turn_seq=1,
         final=True,
-        runtime_config=plugin.runtime_config_for_update(DuplexSessionConfig(instructions="Watch the pot."), {}),
+        runtime_config=runtime,
         session_config={"joyai_frames": [frame("blue")], "conversation": history},
         payload={
             "audio": base64.b64encode(struct.pack("<ff", 0.1, 0.2)).decode(),
@@ -1239,6 +1312,8 @@ def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch,
     else:
         assert "Observe the current scene and choose whether to speak or stay silent." in result["prompt"]
         assert "[User Query" not in result["prompt"]
+        assert result["prompt"].count("What color is the car?") == 1
+        assert result["prompt"].count("Describe what you see.") == 1
     assert (
         len(plugin.processor(text=[result["prompt"]], images=result["multi_modal_data"]["image"])["input_ids"][0])
         <= 2536

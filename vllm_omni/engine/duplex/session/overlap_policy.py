@@ -306,6 +306,15 @@ def input_audio_duration_ms(event: dict[str, object], payload: dict[str, object]
 
 
 def merge_audio_payloads(first: dict[str, object], second: dict[str, object]) -> dict[str, object]:
+    if (
+        first.get("format") == "pcm_f32le"
+        and first.get("audio")
+        and not second.get("audio")
+        and second.get("video_frames")
+    ):
+        # A camera update replaces the observation, not retained speech or the
+        # item that owns its eventual transcript.
+        return {**first, "video_frames": second["video_frames"]}
     if first.get("format") != "pcm_f32le" or second.get("format") != "pcm_f32le":
         return second
     first_rate = first.get("sample_rate_hz")

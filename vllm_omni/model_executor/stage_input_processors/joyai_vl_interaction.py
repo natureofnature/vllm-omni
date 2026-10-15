@@ -121,7 +121,7 @@ def asr_to_joyai(
                 cached_processor_from_config(target_model_config),
                 system=context["system"],
                 history=context["history"],
-                query=transcript or context["query"],
+                query=transcript,
                 images=visual_inputs.get("image", []),
                 image_token_counts=additional_info["joyai_image_token_counts"],
                 budget=int(additional_info["joyai_prompt_budget"]),

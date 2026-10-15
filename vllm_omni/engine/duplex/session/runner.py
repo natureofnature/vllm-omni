@@ -1638,6 +1638,8 @@ class DuplexSessionRunner:
             if commit_reservation is not None
             else model_state.audio_buffer.flush(chunk_period_ms=session.capabilities.chunk_period_ms or 1000)
         )
+        if flushed is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            flushed = {**flushed, "realtime_item_id": realtime_item_id}
         if model_state.committed_audio_payload is not None:
             if flushed is not None:
                 flushed = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, flushed)
@@ -1659,9 +1661,6 @@ class DuplexSessionRunner:
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
-        if isinstance(realtime_item_id, str) and realtime_item_id:
-            flushed = dict(flushed)
-            flushed["realtime_item_id"] = realtime_item_id
         model_state.input_since_commit = False
         committed = helpers.commit_audio_input(
             session,
@@ -1828,6 +1827,8 @@ class DuplexSessionRunner:
         if video_only and (not deferred_payload.get("video_frames") or deferred_payload.get("audio")):
             commit_reservation.rollback()
             return False
+        if isinstance(realtime_item_id, str) and realtime_item_id:
+            deferred_payload = {**deferred_payload, "realtime_item_id": realtime_item_id}
         retained_payload: dict[str, object]
         if model_state.committed_audio_payload is not None:
             retained_payload = overlap_policy.merge_audio_payloads(
@@ -1836,9 +1837,6 @@ class DuplexSessionRunner:
             )
         else:
             retained_payload = deferred_payload
-        if isinstance(realtime_item_id, str) and realtime_item_id:
-            retained_payload = dict(retained_payload)
-            retained_payload["realtime_item_id"] = realtime_item_id
         model_state.retain_committed_audio(
             retained_payload,
             operation_id=commit_reservation.operation_id,
@@ -1876,6 +1874,8 @@ class DuplexSessionRunner:
             chunk_period_ms=session.capabilities.chunk_period_ms or 1000,
         )
         final_payload = commit_reservation.payload
+        if final_payload is not None and isinstance(realtime_item_id, str) and realtime_item_id:
+            final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
         if model_state.committed_audio_payload is not None:
             if final_payload is not None:
                 final_payload = overlap_policy.merge_audio_payloads(model_state.committed_audio_payload, final_payload)
@@ -1907,8 +1907,6 @@ class DuplexSessionRunner:
             )
         )
         if final_payload is not None:
-            if isinstance(realtime_item_id, str) and realtime_item_id:
-                final_payload = {**final_payload, "realtime_item_id": realtime_item_id}
             await self._start_append(
                 {**final_payload, "duplex_turn_id": data_plane_turn_id},
                 final=True,
