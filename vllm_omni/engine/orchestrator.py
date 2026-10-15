@@ -2079,8 +2079,14 @@ class OrchestratorBase:
                 raw_prompt_embeds = raw_prompt.get("prompt_embeds")
                 if isinstance(raw_prompt_embeds, torch.Tensor):
                     prompt_embeds = raw_prompt_embeds
+            raw_info = raw_prompt.get("additional_information")
+            if isinstance(raw_info, dict):
+                # Deferred visuals belong to the raw prompt used for stage
+                # handoff, not to the current stage's EngineCore wire payload.
+                raw_info = dict(raw_info)
+                raw_info.pop("deferred_multi_modal_data", None)
             additional_information = serialize_additional_information(
-                raw_prompt.get("additional_information"),
+                raw_info,
                 log_prefix="Orchestrator stage input",
             )
 

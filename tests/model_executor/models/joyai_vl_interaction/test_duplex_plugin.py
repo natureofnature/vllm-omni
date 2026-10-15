@@ -11,6 +11,7 @@ from types import SimpleNamespace
 import pytest
 from PIL import Image
 from vllm.sampling_params import SamplingParams
+from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 
 from tests.engine.duplex.test_session_runner import (
     SESSION_ID,
@@ -23,6 +24,7 @@ from tests.engine.duplex.test_session_runner import (
 )
 from tests.engine.test_duplex_orchestrator import SESSION_ID as ORCHESTRATOR_SESSION_ID
 from tests.engine.test_duplex_orchestrator import _build, _close, _open, _submit
+from tests.engine.test_orchestrator import _processed_request
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.config.stage_config import DuplexSessionRuntimeConfig, load_deploy_config, merge_pipeline_deploy
 from vllm_omni.engine.duplex.commands import (
@@ -43,6 +45,7 @@ from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.engine.duplex.session.manager import DuplexSessionManager
 from vllm_omni.engine.duplex.turn_detection import TurnDetectionResult
+from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.models.aura_omni.duplex.capabilities import aura_duplex_capabilities
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.plugin import JoyAIDuplexPlugin
@@ -50,6 +53,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.pipeline import (
     JOYAI_VL_INTERACTION_ASR_PIPELINE,
     JOYAI_VL_INTERACTION_PIPELINE,
 )
+from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import asr_to_joyai
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -387,6 +391,45 @@ async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
         assert (transcript in h.port.submissions[-1].prompt["prompt"]) is (not cancel)
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeypatch):
+    monkeypatch.setenv("VLLM_ALLOW_INSECURE_SERIALIZATION", "0")
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
+
+    async def process_inputs(stage_id, *, request_id, params, **kwargs):
+        return _processed_request(request_id, params)
+
+    mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
+    mocker.patch(
+        "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_tokenizer_from_config",
+        return_value=SimpleNamespace(encode=lambda text, **kwargs: [1]),
+    )
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        await _submit(orchestrator, AppendAudio(audio=struct.pack("<hh", 1000, 2000), video_frames=(frame(),)))
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        request = clients[0].add_request_calls[-1][0]
+        restored = MsgpackDecoder(type(request)).decode(MsgpackEncoder().encode(request))
+        info = deserialize_additional_information(restored.additional_information)
+        assert "deferred_multi_modal_data" not in info
+        raw_prompt = orchestrator.request_states[request.request_id].prompt
+        raw_info = raw_prompt["additional_information"]
+        assert info["joyai_prompt_parts"] == raw_info["joyai_prompt_parts"]
+        assert info["tts_language"] == raw_info["tts_language"]
+        image = raw_info["deferred_multi_modal_data"]["image"][0]
+        assert isinstance(image, Image.Image) and image.getpixel((0, 0)) == (255, 0, 0)
+        output = SimpleNamespace(outputs=[SimpleNamespace(text="Describe this image.")])
+        (joyai_prompt,) = asr_to_joyai([output], raw_prompt)
+        assert joyai_prompt["multi_modal_data"]["image"][0] is image
+        assert "Describe this image." in joyai_prompt["prompt"]
+    finally:
+        await orchestrator.session_manager.shutdown()
 
 
 @pytest.mark.asyncio

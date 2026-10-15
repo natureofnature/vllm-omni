@@ -42,7 +42,7 @@ from vllm_omni.engine.orchestrator import (
     StreamingSegmentState,
     _build_terminal_empty_output,
 )
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool, StageUnavailableError
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.metrics.stats import StageRequestStats, StageStats
@@ -640,6 +640,16 @@ def _processed_request(request_id: str, params) -> EngineCoreRequest:
         cache_salt=None,
         data_parallel_rank=None,
     )
+
+
+@pytest.mark.parametrize("metadata_kind", ["dict", "serialized", "none"])
+def test_processed_stage_request_preserves_metadata_forms(metadata_kind):
+    orchestrator = object.__new__(Orchestrator)
+    info = {"tts_language": "English"} if metadata_kind != "none" else None
+    raw_info = serialize_additional_information(info) if metadata_kind == "serialized" else info
+    request = _processed_request("metadata-forms", _sampling_params())
+    upgraded = orchestrator._upgrade_processed_stage_request(request, {"additional_information": raw_info})
+    assert deserialize_additional_information(getattr(upgraded, "additional_information", None)) == (info or {})
 
 
 @pytest.mark.asyncio
