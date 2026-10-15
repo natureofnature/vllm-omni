@@ -9,7 +9,7 @@ from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import tts_output
-from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import observe, open_joyai
+from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import frame, observe, open_joyai
 from vllm_omni.engine.duplex.commands import AckPlayback, CancelInput, Heartbeat
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
@@ -443,6 +443,66 @@ async def test_memory_is_bounded_and_instructions_are_outside_summary():
         h.session.delete_history_item("user-0")
         prepared = plugin.prepare_prompt_config({"conversation": list(h.session.history)}, state=state, payload={})
         assert prepared["joyai_summary"] == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_count", [0, 4])
+@pytest.mark.parametrize("extra_query_tokens", [0, 150])
+async def test_dropped_summary_rebudgets_recent_history(image_count, extra_query_tokens):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        plugin, state = h.runner.plugin, h.runner.model_state
+        request = await plugin.prepare_auxiliary_request(
+            history=duplex_text_history(h.session.history), runtime_config=h.session.runtime_config, state=state
+        )
+        plugin.apply_auxiliary_result(request=request, output=summary_output("private", "S" * 479), state=state)
+        assert state.memory.covered_messages == 4
+        saved_memory = replace(state.memory)
+        conversation = [dict(message) for message in h.session.history]
+        for index, message in enumerate(conversation[4:]):
+            message["content"] = f"tail-{index}"
+        conversation.append({"role": "user", "content": "Q"})
+        prepared = plugin.prepare_prompt_config(
+            {"conversation": conversation}, state=state, payload={"video_frames": [frame()] * image_count}
+        )
+        kwargs = dict(
+            request_id="budget-test",
+            fence=DuplexFence("s"),
+            runtime_config=h.session.runtime_config,
+            seq=1,
+            turn_seq=1,
+            payload={},
+            final=True,
+            sampling_params=SamplingParams(max_tokens=256),
+        )
+
+        def plan(config):
+            return plugin.plan_append(session_config=config, **kwargs).prompt
+
+        def token_count(prompt):
+            inputs = plugin.processor(text=[prompt["prompt"]], images=prompt["multi_modal_data"].get("image"))
+            return len(inputs["input_ids"][0])
+
+        assert saved_memory.text in plan(prepared)["prompt"]  # Short queries still use the accepted summary.
+        short_prompt = plan({**prepared, "joyai_summary": ""})
+        budget = plugin.max_model_len - 256
+        conversation[-1]["content"] = "Q" * (budget - token_count(short_prompt) + 1 + extra_query_tokens)
+        expected = plan({**prepared, "joyai_summary": ""})
+        actual = plan(prepared)
+        assert actual["prompt"] == expected["prompt"]
+        assert actual["prompt"].count("tail-") == (8 if extra_query_tokens == 0 else 4)
+        assert actual["prompt"].count(conversation[-1]["content"]) == 1
+        assert "Remember cabinet" not in actual["prompt"]  # Covered history stays covered.
+        assert saved_memory.text not in actual["prompt"]
+        assert "Watch the pot." in actual["prompt"]
+        assert len(actual["multi_modal_data"].get("image", [])) == image_count
+        assert token_count(actual) <= budget
+        assert state.memory == saved_memory
+        conversation[-1]["content"] = "Q"
+        assert saved_memory.text in plan(prepared)["prompt"]
     finally:
         await h.manager.shutdown()
 

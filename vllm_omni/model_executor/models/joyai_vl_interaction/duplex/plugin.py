@@ -347,6 +347,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # The active instruction is attached to the latest observation below.
         if history and history[-1]["role"] == "user":
             history.pop()
+        unsummarized_history = history.copy()
         images = []
         for encoded in session_config.get("joyai_frames", [])[-4:]:
             if encoded.startswith("data:"):
@@ -395,6 +396,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 # make a previously admissible current observation fail.
                 summary = ""
                 system = base_system
+                # Rebudget the recent turns now that the summary no longer
+                # consumes their space. Covered history remains summarized.
+                history = unsummarized_history
             elif len(images) > 1:
                 images.pop(0)
                 image_token_counts.pop(0)
