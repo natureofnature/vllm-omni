@@ -633,10 +633,15 @@ class ModelChannel:
             self._ctx.plugin.data_plane.close_stream(item.request_id)
             if self._ctx.run.stream_request_id == item.request_id:
                 self._ctx.run.stream_request_id = None
-            self._ctx.services.spawn(
-                self.maybe_continue_response(expected_epoch=expected_epoch),
-                name="duplex-continue",
-            )
+            # A terminal projection may already have ended this response and
+            # queued the next committed turn. Its continuation must not close
+            # that newer response when the background task gets to run.
+            response_id = session.active_response_id
+            if response_id is not None:
+                self._ctx.services.spawn(
+                    self.maybe_continue_response(expected_epoch=expected_epoch, expected_response_id=response_id),
+                    name="duplex-continue",
+                )
 
     async def _send_model_output_events(
         self,
@@ -1358,10 +1363,13 @@ class ModelChannel:
         *,
         expected_epoch: int | None,
         expected_model_turn_id: int | None = None,
+        expected_response_id: str | None = None,
     ) -> None:
         session = self._ctx.session
         model_state = self._ctx.model_state
         response_id = session.active_response_id
+        if expected_response_id is not None and response_id != expected_response_id:
+            return
         auto_response = self._out.auto_responds()
         if session.state == DuplexSessionState.CLOSED or self._ctx.run.closing:
             model_state.clear_continuation()

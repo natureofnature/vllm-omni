@@ -6,6 +6,7 @@ import base64
 import io
 import struct
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -89,7 +90,7 @@ def frame(color="red"):
     return base64.b64encode(buffer.getvalue()).decode()
 
 
-async def open_joyai(*, modalities=("text", "audio"), asr=False):
+async def open_joyai(*, modalities=("text", "audio"), asr=False, runtime_config=None):
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE if asr else JOYAI_VL_INTERACTION_PIPELINE)
     plugin.processor = Processor()
@@ -97,13 +98,17 @@ async def open_joyai(*, modalities=("text", "audio"), asr=False):
     port = RecordingStagePort(stage_count=4 if asr else 3)
     output: asyncio.Queue[object] = asyncio.Queue()
     results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
-    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    runtime_config = runtime_config or DuplexSessionRuntimeConfig()
+    output_buffer = DuplexOutputBuffer(
+        max_bytes=runtime_config.max_pending_output_bytes_per_session,
+        max_events=runtime_config.max_pending_output_events_per_session,
+    )
     manager = DuplexSessionManager(
         plugin=plugin,
         stage_port=port,
         output_sink=output,
         result_sink=results,
-        runtime_config=DuplexSessionRuntimeConfig(),
+        runtime_config=runtime_config,
         model_config=None,
     )
     await manager.handle(
@@ -160,6 +165,114 @@ async def test_quiet_pcm_commit_keeps_client_identity_without_creating_response(
         assert not h.port.submissions
         assert not any(event.type in {"error", "response.created"} for event in events)
         await observe(h)  # A later camera observation still opens a response.
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("policy", ["listen_only", "barge_in_on_speech"])
+async def test_short_overlap_commit_keeps_identity_and_listen_only_speech(policy):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        h.session.config.overlap_policy = policy
+        await h.run(append_audio(samples=8000))
+        await h.run(Commit(final=True, create_response=True, event_id="first-commit"))
+        original = h.port.submissions[-1]
+        item_id = original.prompt["additional_information"]["realtime_item_id"]
+        h.runner.on_stage_output(
+            0,
+            tts_output(original.context.request_id, finished=True, text="Hello."),
+            None,
+            request_id=original.context.request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=SESSION_ID, fence=original.context.fence),
+                final_stage_id=3,
+                segment_finished=True,
+            ),
+            input_transcript="Hello.",
+            input_item_id=item_id,
+        )
+        await h.settle()
+        # An in-progress VAD utterance defers barge-in until commit.
+        await h.run(replace(append_audio(samples=8000), hints={"vad": {"speech_started": False}}))
+        events = await h.run(Commit(final=True, create_response=True, event_id="second-commit"))
+        committed = next(e.to_realtime() for e in events if e.type == "input_audio_buffer.committed")
+        assert committed["item_id"] != item_id
+        assert not any(e.type == "conversation.item.input_audio_transcription.completed" for e in events)
+        assert not h.runner._require_projector().pending_commit_item_ids
+        assert len(h.port.submissions) == 1
+        if policy == "listen_only":
+            assert committed["event"].get("overlap_deferred") is True
+            await h.deliver_and_settle(
+                tts_output(original.context.request_id, finished=True, text="</silence>"),
+                stage_id=1,
+                segment_finished=True,
+            )
+            assert len(h.port.submissions) == 2
+            assert h.port.submissions[-1].prompt["additional_information"]["realtime_item_id"] == committed["item_id"]
+        else:
+            assert committed["event"].get("no_response") is True
+            assert committed["event"]["realtime_event_id"] == "second-commit"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("asr", [False, True])
+async def test_full_tts_waveform_fits_joyai_deployment_output_budget(asr):
+    from vllm_omni.entrypoints.duplex.audio_encoding import encode_audio
+
+    filename = "joyai_vl_interaction_asr_duplex.yaml" if asr else "joyai_vl_interaction_duplex.yaml"
+    deploy = load_deploy_config(get_deploy_config_path(filename))
+    h = await open_joyai(asr=asr, runtime_config=deploy.duplex_session)
+    h.runner.plugin.data_plane.encode_audio = encode_audio
+    try:
+        await h.run(translate_realtime_command({"type": "session.update", "session": {"output_audio_format": "pcm16"}}))
+        request_id = await observe(h)
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> A long spoken answer.", finished=True),
+            stage_id=int(asr),
+            segment_finished=True,
+        )
+        # One complete waveform, conservatively covering 4096 codec frames at 12 Hz.
+        events = await h.deliver_and_settle(
+            tts_output(request_id, samples=4096 * 2000, finished=True),
+            stage_id=2 + int(asr),
+            segment_finished=True,
+        )
+        assert not [e.to_realtime() for e in events if e.type in {"error", "session.closed"}]
+        audio = [e.to_realtime()["delta"] for e in events if e.type == "response.output_audio.delta"]
+        assert sum(len(base64.b64decode(part)) for part in audio) == 4096 * 2000 * 2
+        assert any(e.type == "response.done" and e.to_realtime()["response"]["status"] == "completed" for e in events)
+        assert all("audio" not in e.to_realtime()["response"]["metadata"] for e in events if e.type == "response.done")
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_deferred_speech_reply_survives_previous_response_continuation():
+    h = await open_joyai(asr=True)
+    try:
+        await h.run(append_audio(samples=8000))
+        await h.run(Commit(final=True, create_response=True))
+        first = h.port.submissions[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(first, text="</response> First reply.", finished=True), stage_id=1, segment_finished=True
+        )
+        await h.run(append_audio(samples=8000))
+        await h.run(Commit(final=True, create_response=True))
+        await h.deliver_and_settle(tts_output(first, finished=True), stage_id=3, segment_finished=True)
+        assert len(h.port.submissions) == 2
+        second = h.port.submissions[-1].context.request_id
+        assert first != second
+        assert h.session.active_response_id is not None
+        assert sum(e.type == "response.done" for e in h.events) == 1
+        await h.deliver_and_settle(
+            tts_output(second, text="</response> Second reply.", finished=True), stage_id=1, segment_finished=True
+        )
+        await h.deliver_and_settle(tts_output(second, finished=True), stage_id=3, segment_finished=True)
+        assert sum(e.type == "response.done" for e in h.events) == 2
+        assert sum(e.type == "response.output_audio.delta" for e in h.events) == 2
     finally:
         await h.manager.shutdown()
 
@@ -330,6 +443,53 @@ async def test_idle_vad_camera_stream_stays_bounded_and_accepts_speech():
         await h.manager.shutdown()
 
 
+def test_rejected_idle_append_restores_preroll_and_latest_frame():
+    buffer = JoyAIFrameBuffer(accepts_audio=True)
+    idle = struct.pack("<f", 0.00001) * 16000
+    payload = {
+        "audio": base64.b64encode(idle).decode(),
+        "format": "pcm_f32le",
+        "sample_rate_hz": 16000,
+        "is_speech": False,
+        "video_frames": ["red"],
+    }
+    buffer.prepare_append(payload, operation_id="first", chunk_period_ms=1000, allow_emit=False).commit()
+    before = (bytes(buffer.audio), buffer.frames, buffer.version, buffer._had_speech)
+    payload.update(audio=base64.b64encode(bytes(8000 * 4)).decode(), video_frames=["blue"])
+    reservation = buffer.prepare_append(payload, operation_id="rejected", chunk_period_ms=1000, allow_emit=False)
+    assert buffer.frames == ["blue"] and len(buffer.audio) == len(idle)
+    reservation.rollback()
+    assert (bytes(buffer.audio), buffer.frames, buffer.version, buffer._had_speech) == before
+    assert not reservation.active
+
+
+@pytest.mark.asyncio
+async def test_rejected_mixed_append_preserves_buffer_and_byte_accounting():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        image = frame()
+        h.manager.runtime_config = DuplexSessionRuntimeConfig(
+            max_pending_input_bytes_per_session=8000 + len(image) // 2
+        )
+        pcm = struct.pack("<h", 1000) * 1000
+        h.runner.control._detector = _ScriptedDetector([TurnDetectionResult(is_speech=True, speech_active=True)] * 4)
+        await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000))
+        buffer = h.runner.model_state.audio_buffer
+        before = (bytes(buffer.audio), list(buffer.frames), buffer.version, buffer._had_speech)
+        for _ in range(2):
+            events = await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000, video_frames=(image,)))
+            assert any(getattr(event, "code", None) == "input_backpressure" for event in events)
+            assert (bytes(buffer.audio), buffer.frames, buffer.version, buffer._had_speech) == before
+            assert h.session.pending_input_bytes == buffer.pending_byte_count == 4000
+        await h.run(AppendAudio(audio=pcm, format="pcm16", sample_rate_hz=16000))
+        assert h.session.pending_input_bytes == buffer.pending_byte_count == 8000
+        await h.run(Commit(final=True, create_response=True))
+        assert len(h.port.submissions) == 1
+        assert h.session.pending_input_bytes == 0
+    finally:
+        await h.manager.shutdown()
+
+
 @pytest.mark.asyncio
 async def test_silent_audio_camera_commit_uses_visual_entry_and_releases_bytes():
     h = await open_joyai(asr=True, modalities=("text",))
@@ -356,7 +516,7 @@ async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
         assert submission.context.stage_id == 0 and submission.context.final_stage_id == 3
         info = submission.prompt["additional_information"]
         assert len(info["deferred_multi_modal_data"]["image"]) == 1
-        assert "Watch the pot." in "".join(info["joyai_prompt_parts"])
+        assert "Watch the pot." in info["joyai_prompt_context"]["system"]
         assert info["joyai_prompt_budget"] == h.runner.plugin.max_model_len - 8
         request_id = submission.context.request_id
         context = DuplexOutputContext(
@@ -407,8 +567,8 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
 
     mocker.patch.object(orchestrator, "_process_stage_inputs", side_effect=process_inputs)
     mocker.patch(
-        "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_tokenizer_from_config",
-        return_value=SimpleNamespace(encode=lambda text, **kwargs: [1]),
+        "vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction.cached_processor_from_config",
+        return_value=plugin.processor,
     )
     try:
         assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
@@ -420,7 +580,7 @@ async def test_asr_visuals_stay_on_raw_prompt_across_engine_wire(mocker, monkeyp
         assert "deferred_multi_modal_data" not in info
         raw_prompt = orchestrator.request_states[request.request_id].prompt
         raw_info = raw_prompt["additional_information"]
-        assert info["joyai_prompt_parts"] == raw_info["joyai_prompt_parts"]
+        assert info["joyai_prompt_context"] == raw_info["joyai_prompt_context"]
         assert info["tts_language"] == raw_info["tts_language"]
         image = raw_info["deferred_multi_modal_data"]["image"][0]
         assert isinstance(image, Image.Image) and image.getpixel((0, 0)) == (255, 0, 0)
@@ -1028,6 +1188,61 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin.max_model_len = 10
     with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
         plugin.plan_append(session_config=session_config, **kwargs)
+
+
+@pytest.mark.parametrize("transcript", ["current question " * 50, ""], ids=["long-transcript", "empty-transcript"])
+def test_asr_handoff_rebudgets_history_and_handles_empty_transcript(monkeypatch, transcript):
+    from vllm_omni.model_executor.stage_input_processors import joyai_vl_interaction as bridge
+
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    plugin.processor = Processor()
+    plugin.max_model_len = 2600
+    monkeypatch.setattr(bridge, "cached_processor_from_config", lambda config: plugin.processor, raising=False)
+    monkeypatch.setattr(
+        bridge,
+        "cached_tokenizer_from_config",
+        lambda config: SimpleNamespace(
+            encode=lambda text, **kwargs: plugin.processor.tokenizer(text=[text])["input_ids"][0]
+        ),
+    )
+    history = (
+        [
+            {"role": "user", "content": "outdated " * 130},
+            {"role": "assistant", "content": "old answer"},
+        ]
+        if transcript
+        else []
+    )
+    plan = plugin.plan_append(
+        request_id="r",
+        fence=DuplexFence("s"),
+        seq=1,
+        turn_seq=1,
+        final=True,
+        runtime_config=plugin.runtime_config_for_update(DuplexSessionConfig(instructions="Watch the pot."), {}),
+        session_config={"joyai_frames": [frame("blue")], "conversation": history},
+        payload={
+            "audio": base64.b64encode(struct.pack("<ff", 0.1, 0.2)).decode(),
+            "format": "pcm_f32le",
+            "sample_rate_hz": 16000,
+        },
+        sampling_params=SamplingParams(max_tokens=64),
+    )
+    output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>" + transcript)])
+    (result,) = bridge.asr_to_joyai([output], plan.prompt)
+    assert "Watch the pot." in result["prompt"]
+    assert result["multi_modal_data"]["image"][-1].getpixel((0, 0)) == (0, 0, 255)
+    if transcript:
+        assert transcript.strip() in result["prompt"]
+        assert "outdated" not in result["prompt"]
+    else:
+        assert "Observe the current scene and choose whether to speak or stay silent." in result["prompt"]
+        assert "[User Query" not in result["prompt"]
+    assert (
+        len(plugin.processor(text=[result["prompt"]], images=result["multi_modal_data"]["image"])["input_ids"][0])
+        <= 2536
+    )
 
 
 @pytest.mark.asyncio

@@ -82,20 +82,27 @@ def test_asr_to_joyai_combines_transcript_with_deferred_visuals() -> None:
 def test_asr_handoff_preserves_session_prompt_and_checks_final_budget(monkeypatch):
     monkeypatch.setattr(
         joyai_bridge,
-        "cached_tokenizer_from_config",
-        lambda config: SimpleNamespace(encode=lambda text, **kwargs: list(text)),
+        "cached_processor_from_config",
+        lambda config: SimpleNamespace(
+            apply_chat_template=lambda messages, **kwargs: repr(messages),
+            tokenizer=lambda **kwargs: {"input_ids": [list(kwargs["text"][0])]},
+        ),
     )
     prompt = {
         "additional_information": {
-            "joyai_prompt_parts": ["standing instruction; played history; image; query:", ";assistant:"],
-            "joyai_prompt_budget": 200,
-            "joyai_visual_tokens": 20,
+            "joyai_prompt_context": {
+                "system": "standing instruction",
+                "history": [{"role": "assistant", "content": "played history"}],
+                "query": "",
+            },
+            "joyai_prompt_budget": 500,
+            "joyai_image_token_counts": [21],
             "deferred_multi_modal_data": {"image": ["original-frame"]},
         }
     }
     output = SimpleNamespace(outputs=[SimpleNamespace(text="language English<asr_text>Watch the pot.")])
     (result,) = joyai_bridge.asr_to_joyai([output], prompt)
-    assert result["prompt"] == "standing instruction; played history; image; query:Watch the pot.;assistant:"
+    assert all(text in result["prompt"] for text in ("standing instruction", "played history", "Watch the pot."))
     assert result["multi_modal_data"] == {"image": ["original-frame"]}
     prompt["additional_information"]["joyai_prompt_budget"] = 30
     with pytest.raises(joyai_bridge.OmniClientError, match="context budget"):
@@ -111,6 +118,7 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     prompt_lengths = {
         "Colored squares are visible.": 12,
         "I am checking this request now.": 18,
+        "Why don't scientists trust atoms? Because they make up everything!": 24,
     }
 
     def compute_prompt_length(metadata, model_config):
@@ -129,6 +137,12 @@ def test_joyai_action_to_tts_bridge(monkeypatch: pytest.MonkeyPatch) -> None:
     client.vllm_config = SimpleNamespace(model_config=target_model_config)
 
     cases = [
+        (
+            "</response> Why don't scientists trust atoms?\n\nBecause they make up everything!",
+            None,
+            {},
+            ("Why don't scientists trust atoms? Because they make up everything!", "Auto", "Vivian"),
+        ),
         (
             "</response> Colored squares are visible.",
             None,

@@ -882,6 +882,39 @@ function renderPlayback(player) {
   return output;
 }
 
+for (const outcome of ['rejected', 'silent']) for (const settleBeforeDrain of [false, true]) {
+  test(`JoyAI ${outcome} PTT after response.done settles ${settleBeforeDrain ? 'before' : 'after'} playback drains`, async () => {
+    const app = shell('joyai-turn', 'manual', { speechInput: true, realPlayback: true });
+    await app.ui.startSession();
+    receive(app, { type: 'response.created', response: { id: 'old' } });
+    receive(app, audioChunk('old'));
+    receive(app, { type: 'response.done', response: { id: 'old', status: 'completed' } });
+    await app.ui.awaitQueue();
+    const player = app.nodes.find(node => node.name === 'fullduplex-pcm-playback').player;
+    assert.ok(player.bufferedFrames() > 0);
+    app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+    const commit = app.sockets[0].sent.at(-1);
+    if (settleBeforeDrain) await app.ui.handleEvent(settledCommit(outcome, commit));
+    while (player.bufferedFrames()) renderPlayback(player);
+    renderPlayback(player);
+    await Promise.resolve(); // Deliver the worklet's playback-drained message.
+    if (!settleBeforeDrain) {
+      await app.echo();
+      assert.equal(app.ui.state().turnSubmitted, true, 'the pending hold must remain owned');
+      await app.ui.handleEvent(settledCommit(outcome, commit));
+    }
+    await app.echo();
+    assert.equal(app.ui.state().assistantActive, false);
+    assert.equal(app.ui.state().turnSubmitted, false);
+    assert.ok(app.sockets[0].sent.some(event => event.type === 'playback.ack' && event.response_id === 'old'));
+    await app.turnWatchdog();
+    assert.equal(app.ui.state().running, true);
+    app.ui.setPendingFrame('next'); app.ui.flushCapture();
+    assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['next']);
+    await app.ui.stopSession({ terminal: false });
+  });
+}
+
 async function playingVad(options = {}) {
   const app = shell(options.profile || 'qwen3-turn', 'vad', { realPlayback: true, speechInput: true, ...options });
   await app.ui.startSession();

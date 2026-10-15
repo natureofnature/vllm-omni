@@ -6,7 +6,6 @@ from __future__ import annotations
 
 import asyncio
 import io
-import uuid
 from collections.abc import Callable, Mapping
 from copy import deepcopy
 
@@ -20,13 +19,15 @@ from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
 from vllm_omni.engine.duplex.plugin import DuplexModelPlugin, DuplexModelSessionState, DuplexRuntimeConfigError
+from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
-from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SILENT_SYSTEM_PROMPT, USER_QUERY_HEADER
+from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import SILENT_SYSTEM_PROMPT
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, JoyAISessionState
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
     _extract_completed_action_text,
+    render_joyai_session_prompt,
 )
 
 
@@ -99,13 +100,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             if self.processor is None:
                 if model_config is None:
                     raise DuplexRuntimeConfigError("JoyAI requires its comprehension-stage model configuration")
-                from transformers import AutoProcessor
+                from vllm.transformers_utils.processor import cached_processor_from_config
 
                 self.processor = await asyncio.to_thread(
-                    AutoProcessor.from_pretrained,
-                    model_config.model,
-                    trust_remote_code=model_config.trust_remote_code,
-                    revision=getattr(model_config, "revision", None),
+                    cached_processor_from_config,
+                    model_config,
                 )
                 self.max_model_len = model_config.max_model_len
         return self.runtime_config_for_update(config, {})
@@ -260,9 +259,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # The active instruction is attached to the latest observation below.
         if not has_audio and history and history[-1]["role"] == "user":
             history.pop()
-        transcript_marker = f"joyai_transcript_{uuid.uuid4().hex}" if has_audio else ""
-        if has_audio:
-            query = transcript_marker
         images = []
         for encoded in session_config.get("joyai_frames", [])[-4:]:
             if encoded.startswith("data:"):
@@ -286,33 +282,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             image_processor.get_number_of_image_patches(image.height, image.width, {}) // image_processor.merge_size**2
             for image in images
         ]
-        while True:
-            content = [{"type": "image"} for _ in images]
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"{USER_QUERY_HEADER}\n{query}"
-                    if query
-                    else "Observe the current scene and choose whether to speak or stay silent.",
-                }
-            )
-            messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
-            prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-            text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
-            if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
-                break
-            if history:
-                history.pop(0)
-                while history and history[0]["role"] == "assistant":
-                    history.pop(0)
-            elif len(images) > 1:
-                images.pop(0)
-                image_token_counts.pop(0)
-            else:
-                raise DuplexRuntimeConfigError("JoyAI instruction and current observation exceed the context budget")
         prompt_data = {
-            "prompt": prompt,
-            "multi_modal_data": {"image": images} if images else {},
             "additional_information": {
                 key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
             },
@@ -323,12 +293,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             audio = np.frombuffer(pybase64.b64decode(payload["audio"], validate=True), dtype="<f4")
             if not audio.size or not np.isfinite(audio).all() or not np.any(audio):
                 raise DuplexRuntimeConfigError("JoyAI speech commit requires non-silent finite PCM")
-            prefix, suffix = prompt.split(transcript_marker, 1)
             prompt_data["additional_information"].update(
-                joyai_prompt_parts=[prefix, suffix],
+                joyai_prompt_context={"system": system, "history": history, "query": query},
                 joyai_prompt_budget=budget,
-                joyai_visual_tokens=sum(image_token_counts) - len(images),
-                deferred_multi_modal_data=prompt_data["multi_modal_data"],
+                joyai_image_token_counts=image_token_counts,
+                deferred_multi_modal_data={"image": images} if images else {},
             )
             if payload.get("realtime_item_id"):
                 prompt_data["additional_information"]["realtime_item_id"] = payload["realtime_item_id"]
@@ -337,6 +306,20 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 "Please transcribe this speech.<|im_end|>\n<|im_start|>assistant\n"
             )
             prompt_data["multi_modal_data"] = {"audio": (audio, 16000)}
+        else:
+            try:
+                prompt_data["prompt"], images = render_joyai_session_prompt(
+                    self.processor,
+                    system=system,
+                    history=history,
+                    query=query,
+                    images=images,
+                    image_token_counts=image_token_counts,
+                    budget=budget,
+                )
+            except OmniClientError as exc:
+                raise DuplexRuntimeConfigError(str(exc)) from exc
+            prompt_data["multi_modal_data"] = {"image": images} if images else {}
         return DuplexAppendPlan(prompt=prompt_data)
 
     def user_transcript(self, *, stage_id: int, output: object, prompt: object, finished: bool) -> str | None:

@@ -6,6 +6,7 @@ from typing import Any
 
 from vllm.outputs import RequestOutput
 from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.transformers_utils.processor import cached_processor_from_config
 
 from vllm_omni.errors import OmniClientError
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import (
@@ -45,6 +46,44 @@ def _clean_qwen3_asr_transcript(raw_text: str) -> str:
     return " ".join(raw_text.rsplit(_ASR_TEXT_TAG, 1)[-1].replace("</asr_text>", "").split())
 
 
+def render_joyai_session_prompt(
+    processor: Any,
+    *,
+    system: str,
+    history: list[dict[str, Any]],
+    query: str,
+    images: list[Any],
+    image_token_counts: list[int],
+    budget: int,
+) -> tuple[str, list[Any]]:
+    """Fit the actual query, keeping system policy and the latest observation."""
+    history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    while True:
+        content = [{"type": "image"} for _ in images]
+        content.append(
+            {
+                "type": "text",
+                "text": f"{USER_QUERY_HEADER}\n{query}"
+                if query
+                else "Observe the current scene and choose whether to speak or stay silent.",
+            }
+        )
+        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
+        if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+            return rendered, images
+        if history:
+            history.pop(0)
+            while history and history[0]["role"] == "assistant":
+                history.pop(0)
+        elif len(images) > 1:
+            images.pop(0)
+            image_token_counts.pop(0)
+        else:
+            raise OmniClientError("JoyAI instruction and current observation exceed the context budget")
+
+
 def asr_to_joyai(
     source_outputs: list[RequestOutput],
     prompt: object | None = None,
@@ -74,17 +113,20 @@ def asr_to_joyai(
                 "<|im_start|>assistant\n"
             ),
         }
-        prompt_parts = additional_info.get("joyai_prompt_parts")
-        if isinstance(prompt_parts, list) and len(prompt_parts) == 2:
-            # Session policy already rendered and budgeted its instructions,
-            # played history and original visual observation. Only the incoming
-            # utterance was unknown before ASR; do not rebuild a one-turn chat.
-            joyai_input["prompt"] = prompt_parts[0] + transcript + prompt_parts[1]
-            tokenizer = cached_tokenizer_from_config(target_model_config)
-            text_tokens = len(tokenizer.encode(joyai_input["prompt"], add_special_tokens=False))
-            budget = int(additional_info["joyai_prompt_budget"])
-            if text_tokens + int(additional_info["joyai_visual_tokens"]) > budget:
-                raise OmniClientError("JoyAI transcript and observation exceed the context budget")
+        context = additional_info.get("joyai_prompt_context")
+        if isinstance(context, dict):
+            # ASR determines the query length. Apply the same history/visual
+            # eviction policy as direct observations only once it is known.
+            joyai_input["prompt"], images = render_joyai_session_prompt(
+                cached_processor_from_config(target_model_config),
+                system=context["system"],
+                history=context["history"],
+                query=transcript or context["query"],
+                images=visual_inputs.get("image", []),
+                image_token_counts=additional_info["joyai_image_token_counts"],
+                budget=int(additional_info["joyai_prompt_budget"]),
+            )
+            visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:
             joyai_input["multi_modal_data"] = visual_inputs
         if request_prompt.get("mm_processor_kwargs") is not None:

@@ -1012,8 +1012,9 @@ class DuplexSessionRunner:
             session.release_input_bytes(raw_audio_bytes)
             self._emit_error("bad_event", str(exc))
             return
-        if pcm_reservation is None:
-            # Commit-only buffers (AURA) accumulate in place and return None.
+        if pcm_reservation is None or pcm_reservation.payload is None:
+            # Buffered appends emit no payload. Transactional buffers also
+            # return a reservation so a rejected mutation can be rolled back.
             # Undo the speculative audio reserve and re-apply the exact pending
             # delta so retained video frames are counted (and later released).
             session.release_input_bytes(raw_audio_bytes)
@@ -1022,10 +1023,14 @@ class DuplexSessionRunner:
                 pending_delta,
                 limit=int(self.manager.runtime_config.max_pending_input_bytes_per_session),
             ):
+                if pcm_reservation is not None:
+                    pcm_reservation.rollback()
                 self._emit_error("input_backpressure", "Duplex session pending input exceeds server limit")
                 return
             if pending_delta < 0:
                 session.release_input_bytes(-pending_delta)
+            if pcm_reservation is not None:
+                pcm_reservation.commit()
             # Fresh input for an ephemeral request is an explicit retry even
             # when the buffer waits until commit to start the append.
             if not session.capabilities.supports_core_resumable_request:
@@ -1035,9 +1040,6 @@ class DuplexSessionRunner:
         if pcm_reservation.byte_count == 0:
             session.release_input_bytes(raw_audio_bytes)
         append_payload = pcm_reservation.payload
-        if append_payload is None:
-            self._maybe_schedule_vad_commit(vad_result)
-            return
         await self._start_append(append_payload, final=False, pcm_reservation=pcm_reservation)
         self._maybe_schedule_vad_commit(vad_result)
 
@@ -1765,7 +1767,7 @@ class DuplexSessionRunner:
         )
         session.discard_response_options()
 
-    def _discard_short_overlap_ack(self) -> None:
+    def _discard_short_overlap_ack(self, *, realtime_item_id: object, event_id: object) -> None:
         """Drop a sub-threshold interjection made while the model is speaking.
 
         Too short to be a turn, so it neither interrupts the response nor
@@ -1790,6 +1792,8 @@ class DuplexSessionRunner:
                 "is_speech": False,
                 "overlap_ack": True,
                 "no_response": True,
+                "realtime_item_id": realtime_item_id,
+                "realtime_event_id": event_id,
             }
         )
         session.reset_overlap_speech()
@@ -1858,6 +1862,8 @@ class DuplexSessionRunner:
         )
         committed_payload["overlap_deferred"] = True
         committed_payload["response_create_deferred"] = should_create_response
+        if isinstance(event.get("realtime_event_id"), str):
+            committed_payload["realtime_event_id"] = event["realtime_event_id"]
         self.emit(committed_payload)
         return True
 
@@ -1975,7 +1981,8 @@ class DuplexSessionRunner:
                 or model_state.committed_audio_payload is not None
             )
             if not has_pending_turn:
-                self._commit_silent_input(event_id=event.get("realtime_event_id"))
+                event_id = event.get("realtime_event_id")
+                self._commit_silent_input(event_id=event_id if isinstance(event_id, str) else None)
                 return
         precreate_response_requested = event_type == "response.create" or bool(
             event.get("response_create", event_type == "input.commit")
@@ -2022,8 +2029,13 @@ class DuplexSessionRunner:
                     self.tasks,
                     concurrent_turn_requests_released=self.run.concurrent_turn_requests_released,
                 ):
-                    if session.overlap_speech_ms <= session.config.overlap_short_ack_ms:
-                        self._discard_short_overlap_ack()
+                    if (
+                        session.config.overlap_policy != DuplexOverlapPolicy.LISTEN_ONLY.value
+                        and session.overlap_speech_ms <= session.config.overlap_short_ack_ms
+                    ):
+                        self._discard_short_overlap_ack(
+                            realtime_item_id=realtime_item_id, event_id=event.get("realtime_event_id")
+                        )
                         return
 
                     if self._defer_commit_behind_active_response(

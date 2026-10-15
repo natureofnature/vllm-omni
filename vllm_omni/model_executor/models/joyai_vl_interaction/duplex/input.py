@@ -59,6 +59,43 @@ class FrameReservation(PcmAppendReservation):
             self.commit()
 
 
+class FrameAppendReservation(PcmAppendReservation):
+    """Undo a buffered append if exact retained-byte accounting rejects it."""
+
+    payload = None
+
+    def __init__(self, owner: JoyAIFrameBuffer, operation_id: str) -> None:
+        self.owner = owner
+        self.operation_id = operation_id
+        self.audio_size = len(owner.audio)
+        self.dropped_audio = b""
+        self.frames = owner.frames
+        self.version = owner.version
+        self.had_speech = owner._had_speech
+        self._active = True
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    @property
+    def byte_count(self) -> int:
+        # All bytes remain pending in the owner; none are submitted yet.
+        return 0
+
+    def commit(self) -> None:
+        self._active = False
+
+    def rollback(self) -> None:
+        if self._active:
+            self.owner.audio[:0] = self.dropped_audio
+            del self.owner.audio[self.audio_size :]
+            self.owner.frames = self.frames
+            self.owner.version = self.version
+            self.owner._had_speech = self.had_speech
+            self.commit()
+
+
 class JoyAIFrameBuffer(PcmAppendBuffer):
     """Retain the latest camera frame until commit, with exact wire-byte accounting."""
 
@@ -94,7 +131,8 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
 
     def prepare_append(
         self, payload: dict[str, object], *, operation_id: str, chunk_period_ms: int, allow_emit: bool
-    ) -> None:
+    ) -> FrameAppendReservation:
+        reservation = FrameAppendReservation(self, operation_id)
         if payload.get("audio"):
             if not self.accepts_audio:
                 raise ValueError("JoyAI video profile accepts text and video; speech input requires the ASR profile")
@@ -109,12 +147,14 @@ class JoyAIFrameBuffer(PcmAppendBuffer):
                 # Keep one input chunk of pre-roll while watching an idle scene.
                 # Once speech begins, retain the whole utterance until commit.
                 preroll_bytes = 16000 * 4 * chunk_period_ms // 1000
-                del self.audio[: max(0, len(self.audio) - preroll_bytes)]
+                dropped_bytes = max(0, len(self.audio) - preroll_bytes)
+                reservation.dropped_audio = bytes(self.audio[:dropped_bytes])
+                del self.audio[:dropped_bytes]
         frames = payload.get("video_frames")
         if isinstance(frames, list) and frames:
             self.version += 1
             self.frames = [frames[-1]]
-        return None
+        return reservation
 
     def prepare_commit(self, *, operation_id: str, chunk_period_ms: int) -> FrameReservation:
         frames, self.frames = self.frames, []

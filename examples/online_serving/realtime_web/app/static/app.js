@@ -141,6 +141,10 @@
       if (!pttHeld) setModel(profile.waiting);
     }
     pendingCommitsOwnBusy = false;
+    if (responseComplete) {
+      clearTimeout(turnTimeout);
+      finishResponseIfReady();
+    }
   }
 
   function armTurnTimeout() {
@@ -158,11 +162,11 @@
   }
 
   function finishResponseIfReady() {
-    if (!responseComplete || !playbackComplete || echoTimer !== null) return;
+    if (!responseComplete || !playbackComplete || pendingCommits.size || echoTimer !== null) return;
     const generation = sessionGeneration;
     echoTimer = window.setTimeout(async () => {
       echoTimer = null;
-      if (!running || generation !== sessionGeneration) return;
+      if (!running || generation !== sessionGeneration || pendingCommits.size) return;
       if (profile.reconnectEachTurn) {
         connectionReady = false;
         const previous = socket;
@@ -473,7 +477,9 @@
       socket.send(JSON.stringify(event));
     }
     turnSubmitted = true;
-    responseComplete = false;
+    // A new hold can be rejected while the previous reply is still playing.
+    // Its terminal state belongs to that reply until a new response begins.
+    if (!currentResponseId) responseComplete = false;
     markBusy();
     armTurnTimeout();
     sendTurnButton.disabled = true;
@@ -692,7 +698,11 @@
         if (action.kind === 'text-final' && action.role === 'assistant') releaseVisionTurn(responseId);
         break;
       case 'done':
-        clearTimeout(turnTimeout);
+        if (!currentResponseId) {
+          pendingCommits.clear();
+          pendingCommitsOwnBusy = false;
+        }
+        if (!pendingCommits.size) clearTimeout(turnTimeout);
         responseComplete = true;
         finishTranscript('assistant');
         releaseVisionTurn(responseId);
