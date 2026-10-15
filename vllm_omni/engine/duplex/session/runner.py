@@ -1175,6 +1175,7 @@ class DuplexSessionRunner:
             precreated_response_id=session.active_response_id if precreate_response else None,
             owns_request=final or precreate_response,
             on_append_accepted=on_append_accepted,
+            on_append_prepared=self.memory.preempt_for_submission if interactive else None,
             before_append=before_append,
         )
 

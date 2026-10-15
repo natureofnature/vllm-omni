@@ -4,6 +4,7 @@
 
 from collections.abc import Sequence
 from dataclasses import dataclass, field
+from io import BytesIO
 from time import monotonic
 from typing import Literal
 
@@ -14,7 +15,7 @@ from vllm_omni.engine.duplex.plugin import duplex_history_digest
 RECENT_MESSAGES = 8
 SUMMARY_MAX_TOKENS = 512
 SUMMARY_CHUNK_MESSAGES = 8
-VisualClosureReason = Literal["count", "context", "image_limit"]
+VisualClosureReason = Literal["count", "context", "image_limit", "capacity"]
 
 
 @dataclass
@@ -38,12 +39,37 @@ class JoyAISummaryMemory:
 
 
 @dataclass(frozen=True)
+class EncodedVisualImage:
+    """Lossless retained pixels; encode/decode in prompt-preparation workers."""
+
+    data: bytes
+    width: int
+    height: int
+
+    @classmethod
+    def from_image(cls, image: Image.Image) -> "EncodedVisualImage":
+        if image.mode != "RGB":
+            raise ValueError("Visual memory requires normalized RGB images")
+        with BytesIO() as buffer:
+            image.save(buffer, format="PNG")
+            return cls(buffer.getvalue(), image.width, image.height)
+
+    def decode(self) -> Image.Image:
+        with Image.open(BytesIO(self.data)) as image:
+            return image.convert("RGB")
+
+
+@dataclass(frozen=True)
 class VisualFrame:
     id: int
     source_id: str
     time_s: float
-    image: Image.Image
+    encoded_image: EncodedVisualImage
     token_count: int
+
+    @property
+    def image(self) -> Image.Image:
+        return self.encoded_image.decode()
 
 
 @dataclass(frozen=True)
@@ -75,8 +101,8 @@ class VisualMemoryCapacityError(ValueError):
 class JoyAIVisualMemory:
     """Model-owned visual evidence; only successful summaries retire sources.
 
-    Images are normalized RGB objects shared with prompt preparation. Callers
-    must treat them as immutable; freezing a frame does not freeze PIL pixels.
+    Frames retain lossless encoded pixels, decoded only for model requests.
+    The encoded-byte and frame limits bound retained memory per Session.
     Mutation belongs to the Session mailbox, after observation acceptance.
     """
 
@@ -90,6 +116,7 @@ class JoyAIVisualMemory:
     chunk_frames: int = 100
     max_pending: int = 200
     max_pixel_bytes: int = 200 * 262144 * 3
+    max_encoded_bytes: int = 32 * 1024 * 1024
     mid_group: int = 5
     max_long: int = 15
     mid_max_tokens: int = 4000
@@ -97,18 +124,29 @@ class JoyAIVisualMemory:
 
     @property
     def pixel_bytes(self) -> int:
-        return sum(frame.image.width * frame.image.height * 3 for frame in self.pending)
+        return sum(frame.encoded_image.width * frame.encoded_image.height * 3 for frame in self.pending)
 
-    def check_capacity(self, images: Sequence[Image.Image]) -> None:
-        if any(image.mode != "RGB" for image in images):
-            raise ValueError("Visual memory requires normalized RGB images")
+    @property
+    def encoded_bytes(self) -> int:
+        return sum(len(frame.encoded_image.data) for frame in self.pending)
+
+    def check_capacity(self, images: Sequence[EncodedVisualImage | Image.Image]) -> None:
+        encoded = [
+            EncodedVisualImage.from_image(image) if isinstance(image, Image.Image) else image for image in images
+        ]
         added_bytes = sum(image.width * image.height * 3 for image in images)
-        if len(self.pending) + len(images) > self.max_pending or self.pixel_bytes + added_bytes > self.max_pixel_bytes:
+        if (
+            len(self.pending) + len(images) > self.max_pending
+            or self.pixel_bytes + added_bytes > self.max_pixel_bytes
+            or self.encoded_bytes + sum(len(image.data) for image in encoded) > self.max_encoded_bytes
+        ):
             raise VisualMemoryCapacityError("Visual memory is full; retry after pending observations are summarized")
 
     def append(
-        self, *, source_id: str, image: Image.Image, token_count: int, time_s: float | None = None
+        self, *, source_id: str, image: EncodedVisualImage | Image.Image, token_count: int, time_s: float | None = None
     ) -> VisualFrame:
+        if isinstance(image, Image.Image):
+            image = EncodedVisualImage.from_image(image)
         self.check_capacity([image])
         frame = VisualFrame(
             self.next_id, source_id, monotonic() - self.start_time if time_s is None else time_s, image, token_count

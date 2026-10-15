@@ -167,6 +167,7 @@ class ModelChannel:
         final: bool,
         expected_epoch: int | None = None,
         on_append_accepted: Callable[[float], None] | None = None,
+        on_append_prepared: Callable[[], None] | None = None,
     ) -> tuple[bool, bool]:
         session = self._ctx.session
         if not session.capabilities.supports_input_append:
@@ -182,6 +183,7 @@ class ModelChannel:
                 final=final,
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
+                on_append_prepared=on_append_prepared,
             )
         except (asyncio.CancelledError, DuplexInputCapacityError):
             raise
@@ -227,6 +229,7 @@ class ModelChannel:
         final: bool,
         operation_id: str | None,
         expected_epoch: int | None,
+        on_append_prepared: Callable[[], None] | None = None,
     ) -> dict[str, object] | None:
         """Submit one planned append to the stage port and bind the resulting stage request."""
         session = self._ctx.session
@@ -300,13 +303,15 @@ class ModelChannel:
             prompt_payload: dict[str, object] = (
                 {str(key): value for key, value in payload.items()} if isinstance(payload, Mapping) else {}
             )
+            conversation, conversation_item_ids = session.history_snapshot()
             append_plan = await self._ctx.plugin.prepare_append_plan(
                 request_id=request_id,
                 fence=fence,
                 session_config=self._ctx.plugin.prepare_prompt_config(
                     {
                         **request_context.session_config,
-                        "conversation": list(session.history),
+                        "conversation": list(conversation),
+                        "conversation_item_ids": conversation_item_ids,
                         "modalities": list(session.response_config.modalities),
                     },
                     state=self._ctx.model_state,
@@ -325,6 +330,8 @@ class ModelChannel:
                 raise DuplexFenceMismatchError(session.fence, fence)
             if not isinstance(append_plan, DuplexAppendPlan):
                 raise TypeError("duplex plugin plan_append() must return DuplexAppendPlan")
+            if on_append_prepared is not None:
+                on_append_prepared()
             submission = DuplexStageSubmission(
                 context=request_context,
                 prompt=append_plan.prompt,

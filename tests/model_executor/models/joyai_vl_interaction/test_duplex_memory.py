@@ -450,8 +450,8 @@ async def test_memory_is_bounded_and_instructions_are_outside_summary():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("image_count", [0, 4])
-@pytest.mark.parametrize("extra_query_tokens", [0, 150])
-async def test_dropped_summary_rebudgets_recent_history(image_count, extra_query_tokens):
+@pytest.mark.parametrize("dropped_pairs", [0, 1])
+async def test_dropped_summary_rebudgets_recent_history(image_count, dropped_pairs):
     h = await open_joyai(modalities=("text",))
     try:
         committed_turns(h.session)
@@ -462,7 +462,9 @@ async def test_dropped_summary_rebudgets_recent_history(image_count, extra_query
         plugin.apply_auxiliary_result(request=request, output=summary_output("private", "S" * 479), state=state)
         assert state.memory.covered_messages == 4
         saved_memory = replace(state.memory)
-        conversation = [dict(message) for message in h.session.history]
+        # Keep the removable tail cheaper than the accepted summary under the
+        # fake character tokenizer, including each historical query's wrapper.
+        conversation = [dict(message) for message in h.session.history[:8]]
         for index, message in enumerate(conversation[4:]):
             message["content"] = f"tail-{index}"
         conversation.append({"role": "user", "content": "Q"})
@@ -488,13 +490,21 @@ async def test_dropped_summary_rebudgets_recent_history(image_count, extra_query
             return len(inputs["input_ids"][0])
 
         assert saved_memory.text in plan(prepared)["prompt"]  # Short queries still use the accepted summary.
-        short_prompt = plan({**prepared, "joyai_summary": ""})
+        short_prompt = plan(
+            {
+                **prepared,
+                "joyai_summary": "",
+                "joyai_summary_messages": saved_memory.covered_messages + 2 * dropped_pairs,
+            }
+        )
         budget = plugin.max_model_len - 256
-        conversation[-1]["content"] = "Q" * (budget - token_count(short_prompt) + 1 + extra_query_tokens)
+        # Size the query to fit the chosen recent tail exactly, so template
+        # formatting changes cannot silently change which pairs should fit.
+        conversation[-1]["content"] = "Q" * (budget - token_count(short_prompt) + 1)
         expected = plan({**prepared, "joyai_summary": ""})
         actual = plan(prepared)
         assert actual["prompt"] == expected["prompt"]
-        assert actual["prompt"].count("tail-") == (8 if extra_query_tokens == 0 else 4)
+        assert actual["prompt"].count("tail-") == 4 - 2 * dropped_pairs
         assert actual["prompt"].count(conversation[-1]["content"]) == 1
         assert "Remember cabinet" not in actual["prompt"]  # Covered history stays covered.
         assert saved_memory.text not in actual["prompt"]

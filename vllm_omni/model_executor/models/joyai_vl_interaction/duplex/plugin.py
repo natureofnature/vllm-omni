@@ -9,6 +9,8 @@ import io
 import math
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
+from dataclasses import replace
+from time import monotonic
 
 import pybase64
 from PIL import Image
@@ -32,15 +34,24 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     LONG_TERM_COMPRESS_PROMPT,
     MID_TERM_SUMMARY_PROMPT,
     QA_HISTORY_HEADER,
+    QA_QUERY_LABEL,
+    QA_RESPONSE_LABEL,
     SILENT_SYSTEM_PROMPT,
     USER_QUERY_HEADER,
     VIDEO_HISTORY_HEADER,
 )
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, JoyAISessionState
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import (
+    JoyAIDataPlane,
+    JoyAISessionState,
+    QueryReference,
+    WorkingObservation,
+)
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
+    EncodedVisualImage,
+    VisualClosureReason,
     VisualFrame,
     VisualMemoryCapacityError,
     VisualMemorySource,
@@ -167,12 +178,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             # Conservatively revoke derived blocks as well as raw images. An
             # image edit can arrive after its raw source has been compressed.
             state.visual_memory.clear()
+            state.observations.clear()
+            state.queries.clear()
+            state.closed_frame_id = -1
+            state.visual_source = None
             state.frames = []
             state.conversation_images = ()
         return images
 
     def _visual_source(self, state: JoyAISessionState) -> VisualMemorySource | None:
         memory = state.visual_memory
+        self._close_working_chunk(state)
         if state.visual_source is not None and memory.matches(state.visual_source):
             return state.visual_source
         state.visual_source = self._choose_visual_source(state)
@@ -186,14 +202,36 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             len(memory.mid_term) >= 2 and mid_tokens + memory.mid_max_tokens > long_budget
         ):
             return memory.long_source(closure_reason="count" if len(memory.mid_term) >= memory.mid_group else "context")
-        frame_tokens = sum(frame.token_count + self._timestamp_tokens for frame in memory.pending)
-        if len(memory.pending) >= memory.chunk_frames:
-            return memory.frame_source()
-        if memory.pending and len(memory.pending) >= self.max_images:
-            return memory.frame_source(closure_reason="image_limit")
-        if memory.pending and frame_tokens + self._mid_prompt_tokens + memory.mid_max_tokens >= self.max_model_len:
-            return memory.frame_source(closure_reason="context")
+        closed = [frame for frame in memory.pending if frame.id <= state.closed_frame_id]
+        if not closed:
+            return None
+        # A preparation budget may split a closed chunk. Its remaining prefix
+        # is still eligible even below the ordinary chunk threshold.
+        return memory.frame_source(
+            min(len(closed), memory.chunk_frames),
+            closure_reason=self._frame_closure_reason(state, closed) or "context",
+        )
+
+    def _frame_closure_reason(self, state: JoyAISessionState, frames: list[VisualFrame]) -> VisualClosureReason | None:
+        memory = state.visual_memory
+        if len(frames) >= memory.chunk_frames:
+            return "count"
+        if not frames:
+            return None
+        if sum(len(frame.encoded_image.data) for frame in frames) >= memory.max_encoded_bytes // 2:
+            return "capacity"
+        if len(frames) >= self.max_images:
+            return "image_limit"
+        frame_tokens = sum(frame.token_count + self._timestamp_tokens for frame in frames)
+        if frame_tokens + self._mid_prompt_tokens + memory.mid_max_tokens >= self.max_model_len:
+            return "context"
         return None
+
+    def _close_working_chunk(self, state: JoyAISessionState) -> None:
+        """Close the interactive view while retaining its source for consolidation."""
+        working = [frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id]
+        if self._frame_closure_reason(state, working) is not None:
+            state.closed_frame_id = working[-1].id
 
     def auxiliary_policy(
         self,
@@ -238,6 +276,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise TypeError("JoyAI requires JoyAISessionState")
         state.memory.validate(duplex_text_history(config.get("conversation", [])))
         images = self._sync_visual_history(state, config.get("conversation", []))
+        self._close_working_chunk(state)
         previous = state.conversation_images
         new_images = [*images[len(previous) :], *payload.get("video_frames", [])]
         # Append each conversation image once, alongside newly committed camera
@@ -249,7 +288,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             "joyai_frames": frames,
             "joyai_conversation_images": images,
             "joyai_new_frames": new_images,
-            "joyai_pending_frames": tuple(state.visual_memory.pending),
+            "joyai_pending_frames": tuple(
+                frame for frame in state.visual_memory.pending if frame.id > state.closed_frame_id
+            ),
+            "joyai_observations": tuple(state.observations),
+            "joyai_queries": tuple(state.queries),
+            "joyai_closed_frame_id": state.closed_frame_id,
             "joyai_visual_summaries": tuple([*state.visual_memory.long_term, *state.visual_memory.mid_term]),
             "joyai_summary": state.memory.text,
             "joyai_summary_messages": state.memory.covered_messages,
@@ -349,8 +393,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         entries: tuple[VisualFrame, ...] | tuple[VisualSummary, ...],
         output_limit: int,
     ) -> DuplexAuxiliaryRequest | None:
-        # The caller snapshots before offloading; image objects are borrowed
-        # read-only, never re-encoded or copied into a second memory queue.
+        # The caller snapshots immutable encoded frames before offloading.
+        # Decode only this prompt's images in the preparation worker.
         entries = entries[: len(source.covered_ids)]
         closure_reason = source.closure_reason
         if source.kind == "frames" and len(entries) > self.max_images:
@@ -365,23 +409,22 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                         "type": "text",
                         "text": MID_TERM_SUMMARY_PROMPT.format(
                             chunk_index=source.chunk_index,
-                            frame_range=f"{first:.3f}s ~ {last:.3f}s",
+                            frame_range=f"{first:.1f} seconds-{last:.1f} seconds",
                             length_instruction="",
                             preferred_time_span="10 seconds",
                         ),
                     }
                 ]
                 for entry in entries:
-                    content.extend([{"type": "text", "text": f"<{entry.time_s:.3f}s>"}, {"type": "image"}])
-                    images.append(entry.image)
-                visual_tokens = sum(entry.token_count for entry in entries) - len(images)
+                    content.extend([{"type": "text", "text": f"<{entry.time_s:.1f} seconds>"}, {"type": "image"}])
+                visual_tokens = sum(entry.token_count for entry in entries) - len(entries)
             else:
                 if len(entries) < 2:
                     return None
                 content = LONG_TERM_COMPRESS_PROMPT.format(
-                    merged_range=f"{entries[0].start_s:.3f}s-{entries[-1].end_s:.3f}s",
+                    merged_range=f"{entries[0].start_s:.1f} seconds-{entries[-1].end_s:.1f} seconds",
                     summaries_text="\n\n".join(
-                        f"<{entry.start_s:.3f}s ~ {entry.end_s:.3f}s>\n{entry.text}" for entry in entries
+                        f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}" for entry in entries
                     ),
                     length_instruction="",
                 )
@@ -394,6 +437,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 <= self.max_model_len
             ):
                 covered = source.covered_ids[: len(entries)]
+                images = [entry.encoded_image.decode() for entry in entries] if source.kind == "frames" else []
                 return DuplexAuxiliaryRequest(
                     stage_id=self.joyai_stage_id,
                     prompt={"prompt": prompt, "multi_modal_data": {"image": images} if images else {}},
@@ -438,7 +482,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         text = text.removeprefix("</response>").strip()
         tokens = len(self.processor.tokenizer(text=[text])["input_ids"][0])
         if isinstance(request.model_source, VisualMemorySource):
-            return state.visual_memory.apply(request.model_source, text=text, token_count=tokens)
+            applied = state.visual_memory.apply(request.model_source, text=text, token_count=tokens)
+            if applied and request.model_source.kind == "frames":
+                state.closed_frame_id = max(state.closed_frame_id, request.model_source.covered_ids[-1])
+                remaining = {frame.id for frame in state.visual_memory.pending}
+                state.observations = [
+                    replace(item, frame_ids=frame_ids)
+                    for item in state.observations
+                    if (frame_ids := tuple(frame_id for frame_id in item.frame_ids if frame_id in remaining))
+                ]
+            return applied
         if not text or tokens > SUMMARY_MAX_TOKENS:
             return False
         state.memory.text = text
@@ -472,6 +525,31 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.modalities = tuple(config["modalities"])
         request.previous_response = state.last_response_text
         request.visual_generation = state.visual_memory.generation
+        request.frame_time_s = monotonic() - state.visual_memory.start_time
+        request.query, request.query_index = self._current_query(config, runtime_config)
+        item_ids = config.get("conversation_item_ids", ())
+        if 0 <= request.query_index < len(item_ids):
+            request.query_item_id = item_ids[request.query_index]
+        if request.query_item_id and any(
+            request.query_item_id in item.history_anchor_item_ids for item in config.get("joyai_observations", ())
+        ):
+            request.query = ""
+        request.history_anchor_item_ids = tuple(
+            item_id for item_id in item_ids[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :] if item_id
+        )
+        latest_query, latest_index = self._latest_query(config, runtime_config)
+        latest_item_id = item_ids[latest_index] if 0 <= latest_index < len(item_ids) else None
+        if latest_query and (latest_item_id is not None or latest_index == -1):
+            query_digest = duplex_history_digest((("user", latest_query),))
+            request.query_reference = next(
+                (
+                    query
+                    for query in state.queries
+                    if (query.item_id, query.text_digest) == (latest_item_id, query_digest)
+                ),
+                QueryReference(latest_item_id, query_digest, request.frame_time_s, state.visual_memory.next_id),
+            )
+        config["joyai_new_frame_time"] = request.frame_time_s
 
         def prepare():
             new_images = self._decode_images(config.get("joyai_new_frames", []))
@@ -489,7 +567,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 final=final,
                 sampling_params=sampling_params,
             )
-            return plan, list(zip(new_images, counts))
+            return plan, [(EncodedVisualImage.from_image(image), tokens) for image, tokens in zip(new_images, counts)]
 
         try:
             plan, new_frames = await asyncio.to_thread(prepare)
@@ -508,8 +586,45 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.state.frames = request.frames
         request.state.conversation_images = request.conversation_images
         if request.visual_generation == request.state.visual_memory.generation:
+            first_frame_id = request.state.visual_memory.next_id
+            frames = []
             for image, tokens in request.new_frames:
-                request.state.visual_memory.append(source_id=request_id, image=image, token_count=tokens)
+                frames.append(
+                    request.state.visual_memory.append(
+                        source_id=request_id, image=image, token_count=tokens, time_s=request.frame_time_s
+                    )
+                )
+            if frames:
+                request.state.observations.append(
+                    WorkingObservation(
+                        request_id,
+                        tuple(frame.id for frame in frames),
+                        request.query,
+                        request.query_index,
+                        query_item_id=request.query_item_id,
+                        history_anchor_item_ids=request.history_anchor_item_ids,
+                    )
+                )
+            request.response_frame_id = frames[-1].id if frames else first_frame_id
+            request.response_time_s = (
+                request.frame_time_s
+                if frames
+                else max(
+                    [frame.time_s for frame in request.state.visual_memory.pending]
+                    + [
+                        entry.end_s
+                        for entry in (*request.state.visual_memory.long_term, *request.state.visual_memory.mid_term)
+                    ],
+                    default=0.0,
+                )
+            )
+            if request.query_reference is not None and not any(
+                (query.item_id, query.text_digest)
+                == (request.query_reference.item_id, request.query_reference.text_digest)
+                for query in request.state.queries
+            ):
+                request.state.queries.append(request.query_reference)
+                del request.state.queries[: -(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES)]
 
     @staticmethod
     def _decode_images(frames: list[str]) -> list[Image.Image]:
@@ -543,21 +658,21 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._mid_prompt_tokens = overhead(
             MID_TERM_SUMMARY_PROMPT.format(
                 chunk_index=1,
-                frame_range="0.000s ~ 999999999.999s",
+                frame_range="0.0 seconds-999999999.9 seconds",
                 length_instruction="",
                 preferred_time_span="10 seconds",
             )
         )
         self._long_prompt_tokens = overhead(
             LONG_TERM_COMPRESS_PROMPT.format(
-                merged_range="0.000s-999999999.999s",
+                merged_range="0.0 seconds-999999999.9 seconds",
                 summaries_text="",
                 length_instruction="",
             )
         )
         # Conservative scheduling hint for each timestamp and template boundary.
         # The actual full prompt is tokenized again before every submission.
-        self._timestamp_tokens = overhead("<999999999.999s ~ 999999999.999s>")
+        self._timestamp_tokens = overhead("<999999999.9 seconds-999999999.9 seconds>")
         image_tokens = self._image_token_counts([Image.new("RGB", (512, 512))])[0]
         if self.max_images < 1 or (
             self._mid_prompt_tokens + self._timestamp_tokens + image_tokens + memory.mid_max_tokens > self.max_model_len
@@ -568,6 +683,232 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 "JoyAI visual memory requires a context that fits one image summary and two mid-term summaries; "
                 "increase the JoyAI stage max_model_len."
             )
+
+    @staticmethod
+    def _latest_query(session_config: Mapping[str, object], runtime_config: Mapping[str, object]) -> tuple[str, int]:
+        query = runtime_config.get("initial_user_text") or ""
+        query_index = -1
+        for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
+            if role == "user" and text:
+                query, query_index = text, index
+        return query, query_index
+
+    @staticmethod
+    def _current_query(session_config: Mapping[str, object], runtime_config: Mapping[str, object]) -> tuple[str, int]:
+        query = runtime_config.get("initial_user_text") or ""
+        query_index = -1
+        for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
+            if role == "user" and text:
+                query, query_index = text, index
+            elif role == "assistant" and text:
+                query, query_index = "", -1
+        return query, query_index
+
+    def _working_messages(
+        self, session_config: Mapping[str, object], runtime_config: Mapping[str, object]
+    ) -> tuple[list[dict[str, object]], list[Image.Image], list[int]]:
+        """Render retained visual observations in order, without owning played Q&A."""
+        pending = {frame.id: frame for frame in session_config.get("joyai_pending_frames", ())}
+        groups = []
+        represented: set[int] = set()
+        for observation in session_config.get("joyai_observations", ()):
+            frames = [pending[frame_id] for frame_id in observation.frame_ids if frame_id in pending]
+            if frames:
+                groups.append((frames[0].id, frames, observation))
+                represented.update(frame.id for frame in frames)
+        # Sources restored independently of the observation ledger still retain
+        # their original frame order and timestamps.
+        for frame in pending.values():
+            if frame.id not in represented:
+                groups.append((frame.id, [frame], WorkingObservation("", (frame.id,), "")))
+        groups.sort(key=lambda item: item[0])
+        messages: list[dict[str, object]] = []
+        images: list[Image.Image] = []
+        counts: list[int] = []
+        last_query = ""
+        last_query_key = None
+        item_ids = session_config.get("conversation_item_ids", ())
+        user_queries = {
+            item_ids[index] if index < len(item_ids) and item_ids[index] else index: text
+            for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", [])))
+            if role == "user" and text
+        }
+        query, query_index = self._current_query(session_config, runtime_config)
+        current_query_key = (
+            (item_ids[query_index] if 0 <= query_index < len(item_ids) and item_ids[query_index] else query_index)
+            if query
+            else None
+        )
+        retained_queries = {-1: runtime_config.get("initial_user_text") or "", **user_queries}
+        for _, frames, observation in groups:
+            content = []
+            query_key = observation.query_item_id or observation.query_index
+            included_query_key = None
+            # Text edits/deletions remain authoritative in Session.history.
+            if (
+                observation.query
+                and (observation.query != last_query or query_key != last_query_key)
+                and retained_queries.get(query_key) == observation.query
+            ):
+                content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{observation.query}"})
+                last_query = observation.query
+                last_query_key = included_query_key = query_key
+            for frame in frames:
+                content.extend([{"type": "text", "text": f"<{frame.time_s:.1f} seconds>"}, {"type": "image"}])
+                images.append(frame.encoded_image.decode())
+                counts.append(frame.token_count)
+            messages.append(
+                {
+                    "role": "user",
+                    "content": content,
+                    "_query_key": included_query_key,
+                    "_history_anchors": observation.history_anchor_item_ids,
+                    "_response_item_id": observation.response_item_id,
+                }
+            )
+            if observation.silent:
+                messages.append({"role": "assistant", "content": "</silence>"})
+        new_images = session_config.get("joyai_new_images", [])
+        new_counts = session_config.get("joyai_new_image_tokens", [])
+        if not images and not new_images:
+            # Closed sources remain stored for retries, not as the next
+            # interactive observation's legacy last-four-frame fallback.
+            frames_key = "joyai_new_frames" if session_config.get("joyai_closed_frame_id", -1) >= 0 else "joyai_frames"
+            new_images = self._decode_images(session_config.get(frames_key, []))
+            new_counts = self._image_token_counts(new_images)
+        content = []
+        if query and (query != last_query or current_query_key != last_query_key or not new_images):
+            content.append({"type": "text", "text": f"{USER_QUERY_HEADER}\n{query}"})
+        time_s = session_config.get("joyai_new_frame_time", 0.0)
+        for image, tokens in zip(new_images, new_counts):
+            content.extend([{"type": "text", "text": f"<{time_s:.1f} seconds>"}, {"type": "image"}])
+            images.append(image)
+            counts.append(tokens)
+        if not content:
+            content.append(
+                {"type": "text", "text": "Observe the current scene and choose whether to speak or stay silent."}
+            )
+        messages.append({"role": "user", "content": content, "_query_key": current_query_key, "_current": True})
+        return messages, images, counts
+
+    @staticmethod
+    def _archived_qa_prefix(session_config, runtime_config, history):
+        """Render bounded reference metadata using only current committed text."""
+        item_ids = session_config.get("conversation_item_ids", ())
+        canonical = {
+            item_ids[index]: (role, text)
+            for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", [])))
+            if index < len(item_ids) and item_ids[index] is not None and text
+        }
+        seed = runtime_config.get("initial_user_text") or ""
+        if seed:
+            canonical[-1] = ("user", seed)
+        selected = {message["_item_key"] for message in history}
+        latest_query, latest_index = JoyAIDuplexPlugin._latest_query(session_config, runtime_config)
+        latest_key = item_ids[latest_index] if 0 <= latest_index < len(item_ids) else -1
+        closed = session_config.get("joyai_closed_frame_id", -1)
+        lines = []
+        prefix_keys = set()
+        active_query = ""
+        for query in session_config.get("joyai_queries", ()):
+            key = query.item_id if query.item_id is not None else -1
+            role, text = canonical.get(key, ("", ""))
+            if role != "user" or duplex_history_digest((("user", text),)) != query.text_digest:
+                continue
+            if query.first_frame_id > closed:
+                continue
+            if key == latest_key and latest_query:
+                active_query = latest_query
+                prefix_keys.add(key)
+            responses = [
+                response
+                for response in query.responses
+                if response.source_frame_id <= closed
+                and response.item_id in selected
+                and canonical.get(response.item_id, ("", ""))[0] == "assistant"
+            ]
+            if responses:
+                parts = [f"#{len(lines) + 1} [{QA_QUERY_LABEL}@{query.time_s:.1f} seconds] {text}"]
+                parts.extend(
+                    f"[{QA_RESPONSE_LABEL}@{response.time_s:.1f} seconds] {canonical[response.item_id][1]}"
+                    for response in responses
+                )
+                lines.append("\n".join(parts))
+                prefix_keys.add(key)
+                prefix_keys.update(response.item_id for response in responses)
+        return "\n".join(lines), active_query, prefix_keys
+
+    @staticmethod
+    def _interleave_history(
+        history: list[dict[str, object]], working_messages: list[dict[str, object]], prefix_keys: set
+    ) -> list[dict[str, object]]:
+        """Place committed Q&A at its visual source, resolving item references anew."""
+        by_key = {message["_item_key"]: message for message in history}
+        positions = {message["_item_key"]: index for index, message in enumerate(history)}
+        current_query_key = working_messages[-1].get("_query_key")
+        query_has_position = current_query_key in by_key and any(
+            current_query_key in message.get("_history_anchors", ()) for message in working_messages[:-1]
+        )
+        claimed = {
+            key
+            for message in working_messages
+            for key in (message.get("_query_key"), message.get("_response_item_id"))
+            if key is not None and not (message.get("_current") and query_has_position and key == current_query_key)
+        }
+        messages = []
+        cursor = 0
+
+        def append_history(end: int) -> None:
+            nonlocal cursor
+            while cursor < end:
+                message = history[cursor]
+                if message["_item_key"] not in claimed:
+                    content = message["content"]
+                    if message["role"] == "user":
+                        content = [{"type": "text", "text": f"{USER_QUERY_HEADER}\n{content}"}]
+                    messages.append({"role": message["role"], "content": content})
+                cursor += 1
+
+        for source in working_messages:
+            if source.get("_current"):
+                append_history(len(history))
+            else:
+                anchor = next(
+                    (positions[key] for key in reversed(source.get("_history_anchors", ())) if key in positions), -1
+                )
+                append_history(anchor + 1)
+            content = source["content"]
+            query_key = source.get("_query_key")
+            if isinstance(content, list) and query_key is not None:
+                # Budget-trimmed or deleted historical queries stay removed.
+                # The current instruction remains available with its images.
+                if (
+                    query_key in prefix_keys
+                    or (source.get("_current") and query_has_position)
+                    or (query_key not in by_key and query_key != current_query_key)
+                ):
+                    content = [part for part in content if not part.get("text", "").startswith(USER_QUERY_HEADER)]
+            messages.append({"role": source["role"], "content": content})
+            response = by_key.get(source.get("_response_item_id"))
+            if response is not None and response["role"] == "assistant":
+                messages.append({"role": "assistant", "content": response["content"]})
+        return messages
+
+    @staticmethod
+    def _drop_oldest_visual_frame(messages: list[dict[str, object]]) -> None:
+        """Trim one frame and its timestamp at an explicit model-context boundary."""
+        for index, message in enumerate(messages):
+            content = message["content"]
+            if message["role"] != "user" or not isinstance(content, list):
+                continue
+            for part_index, part in enumerate(content):
+                if part.get("type") == "image":
+                    del content[part_index - 1 : part_index + 1]
+                    if not content:
+                        del messages[index]
+                        if index < len(messages) and messages[index]["role"] == "assistant":
+                            del messages[index]
+                    return
 
     def plan_append(
         self,
@@ -585,7 +926,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not final or not isinstance(payload, Mapping) or payload.get("audio"):
             raise DuplexRuntimeConfigError("JoyAI video profile requires committed text/image/video input")
         history = []
+        item_ids = session_config.get("conversation_item_ids", ())
         query = runtime_config.get("initial_user_text") or ""
+        if query:
+            history.append({"role": "user", "content": query, "_item_key": -1})
         for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
             if role not in {"user", "assistant"}:
                 continue
@@ -593,31 +937,31 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 if role == "user":
                     query = text
                 if index >= session_config.get("joyai_summary_messages", 0):
-                    history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
+                    history.append(
+                        {
+                            "role": role,
+                            "content": ("</response> " if role == "assistant" else "") + text,
+                            "_item_key": item_ids[index] if index < len(item_ids) and item_ids[index] else index,
+                        }
+                    )
         # Keep interactive prefill bounded even while summary generation fails
         # or falls behind. The complete unsummarized ledger stays available to
         # prepare_auxiliary_request for eventual consolidation.
         history = history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :]
-        while history and history[0]["role"] == "assistant":
+        response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
+        while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
             history.pop(0)
-        # The active instruction is attached to the latest observation below.
-        if history and history[-1]["role"] == "user":
-            history.pop()
+        # Rendering attaches fresh queries to their visual observation and
+        # leaves already-observed items at their committed history position.
         unsummarized_history = history.copy()
-        pending_frames = session_config.get("joyai_pending_frames", ())
-        images = [entry.image for entry in pending_frames] + session_config.get("joyai_new_images", [])
-        image_token_counts = [entry.token_count for entry in pending_frames] + session_config.get(
-            "joyai_new_image_tokens", []
-        )
-        if not images:
-            images = self._decode_images(session_config.get("joyai_frames", []))
-            image_token_counts = self._image_token_counts(images)
-        images = images[-self.max_images :] if self.max_images else []
-        image_token_counts = image_token_counts[-self.max_images :] if self.max_images else []
+        working_messages, images, image_token_counts = self._working_messages(session_config, runtime_config)
+        while len(images) > self.max_images:
+            self._drop_oldest_visual_frame(working_messages)
+            images.pop(0)
+            image_token_counts.pop(0)
         system = SILENT_SYSTEM_PROMPT
         if runtime_config.get("instructions"):
             system += "\n\n" + runtime_config["instructions"]
-        base_system = system
         summary = session_config.get("joyai_summary")
         visual_summaries = [
             entry
@@ -628,27 +972,35 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
         while True:
-            system = base_system
+            prefix = []
             if visual_summaries:
-                system += (
-                    "\n\n"
-                    + VIDEO_HISTORY_HEADER
+                prefix.append(
+                    VIDEO_HISTORY_HEADER
                     + "\n\n".join(
-                        f"<{entry.start_s:.3f}s ~ {entry.end_s:.3f}s>\n{entry.text}" for entry in visual_summaries
+                        f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
+                        for entry in visual_summaries
                     )
                 )
-            if summary and query:
-                system += "\n\n" + QA_HISTORY_HEADER + summary
-            content = [{"type": "image"} for _ in images]
-            content.append(
-                {
-                    "type": "text",
-                    "text": f"{USER_QUERY_HEADER}\n{query}"
-                    if query
-                    else "Observe the current scene and choose whether to speak or stay silent.",
-                }
-            )
-            messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+            archived_qa, active_query, prefix_keys = self._archived_qa_prefix(session_config, runtime_config, history)
+            qa_memory = [text for text in (summary if query else "", archived_qa) if text]
+            if qa_memory:
+                prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
+            if active_query:
+                prefix.append(USER_QUERY_HEADER + "\n" + active_query)
+            messages = [
+                {"role": "system", "content": system},
+                *self._interleave_history(
+                    [message for message in history if message["_item_key"] not in prefix_keys],
+                    working_messages,
+                    prefix_keys,
+                ),
+            ]
+            if prefix:
+                first_user = next(message for message in messages if message["role"] == "user")
+                content = first_user["content"]
+                if isinstance(content, str):
+                    content = [{"type": "text", "text": content}]
+                first_user["content"] = [{"type": "text", "text": "\n\n".join(prefix)}, *content]
             prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
             if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
@@ -669,6 +1021,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 # working chunk. Omitted blocks remain in bounded model memory.
                 visual_summaries.pop(0)
             elif len(images) > 1:
+                self._drop_oldest_visual_frame(working_messages)
                 images.pop(0)
                 image_token_counts.pop(0)
             else:

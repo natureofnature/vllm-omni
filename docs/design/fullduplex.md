@@ -374,7 +374,9 @@ requests. A failed cleanup retains its resource for teardown retry and prevents
 new auxiliary work from accumulating behind it.
 The plugin supplies a stable work key and whether work can enter the existing
 stage queue during an ordinary observation. Explicit user interaction takes
-priority through cancellation and suppresses restart until its turn completes.
+priority through cancellation after its append plan passes validation, and
+suppresses restart until its turn completes. Rejected input leaves an in-flight
+summary running so it can release memory capacity for the next input.
 Requests may specify bounded retry delays; failures remain keyed to the same
 source as newer observations arrive. Successful application allows the next
 bounded chunk to catch up without waiting for new input.

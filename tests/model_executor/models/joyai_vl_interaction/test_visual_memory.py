@@ -11,6 +11,7 @@ from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary
 from vllm_omni.experimental.fullduplex.joyvl.serving.config import InteractionConfig
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex import memory as memory_module
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
+    EncodedVisualImage,
     JoyAIVisualMemory,
     VisualMemoryCapacityError,
 )
@@ -35,15 +36,48 @@ def summarize(memory, text="A red cup is visible."):
     return source
 
 
-def test_frames_share_images_and_keep_identical_observations_distinct():
+def test_frames_retain_lossless_encoded_pixels_and_distinct_observations():
     memory = JoyAIVisualMemory()
     image = Image.new("RGB", (13, 7), "red")
     first = append(memory, 1, image)
     second = append(memory, 2, image)
-    assert first.image is image and second.image is image
+    assert first.image.tobytes() == second.image.tobytes() == image.tobytes()
+    image.paste("blue", (0, 0, 13, 7))
+    assert first.image.getpixel((0, 0)) == (255, 0, 0)
     assert (first.id, second.id) == (0, 1)
     assert first.source_id != second.source_id
     assert memory.pixel_bytes == 2 * 13 * 7 * 3
+    assert memory.encoded_bytes == len(first.encoded_image.data) + len(second.encoded_image.data)
+
+
+def test_encoded_capacity_is_atomic_and_released_by_summary():
+    encoded = EncodedVisualImage.from_image(Image.new("RGB", (32, 32), "red"))
+    memory = JoyAIVisualMemory(max_encoded_bytes=len(encoded.data))
+    first = memory.append(source_id="one", image=encoded, token_count=4)
+    with pytest.raises(VisualMemoryCapacityError):
+        memory.append(source_id="two", image=encoded, token_count=4)
+    assert memory.pending == [first] and memory.next_id == 1
+    summarize(memory)
+    assert memory.encoded_bytes == 0
+    memory.append(source_id="two", image=encoded, token_count=4)
+    memory.clear()
+    assert memory.encoded_bytes == 0
+
+
+def test_prepared_encoded_frames_admit_without_encoding_or_decoding(monkeypatch):
+    encoded = EncodedVisualImage.from_image(Image.new("RGB", (512, 512), "red"))
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Session admission must only bind prepared bytes")
+
+    monkeypatch.setattr(EncodedVisualImage, "from_image", unexpected)
+    monkeypatch.setattr(EncodedVisualImage, "decode", unexpected)
+    memory = JoyAIVisualMemory()
+    memory.check_capacity([encoded])
+    retained = memory.append(source_id="one", image=encoded, token_count=256)
+    assert retained.encoded_image is encoded
+    assert memory.encoded_bytes < memory.pixel_bytes / 10
+    assert memory.frame_source().covered_ids == (0,)
 
 
 def test_default_timestamp_uses_elapsed_monotonic_time(monkeypatch):
@@ -225,8 +259,8 @@ async def test_visual_summary_request_matches_experimental(kind):
         source = memory.frame_source()
         await experimental.summarize_chunk(
             source.chunk_index,
-            f"{entries[0].time_s:.3f}s ~ {entries[-1].time_s:.3f}s",
-            [(f"{entry.time_s:.3f}s", url) for entry, url in zip(entries, data_urls)],
+            f"{entries[0].time_s:.1f} seconds-{entries[-1].time_s:.1f} seconds",
+            [(f"{entry.time_s:.1f} seconds", url) for entry, url in zip(entries, data_urls)],
         )
     else:
         for index in range(memory.mid_group):
@@ -236,7 +270,7 @@ async def test_visual_summary_request_matches_experimental(kind):
         source = memory.long_source()
         await experimental.compress_to_long_term(
             [
-                MidTermSummary(entry.chunk_index, f"{entry.start_s:.3f}s ~ {entry.end_s:.3f}s", entry.text)
+                MidTermSummary(entry.chunk_index, f"{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds", entry.text)
                 for entry in entries
             ]
         )

@@ -151,10 +151,18 @@ async def test_accepted_append_wakes_concurrent_work_without_idle_gap(mocker):
 
 
 @pytest.mark.asyncio
-async def test_new_user_item_preempts_and_blocks_immediate_restart(mocker):
+async def test_user_item_preempts_only_after_append_preparation(mocker):
     h = await open_harness()
     try:
         install_work(h, mocker)
+        preparing, ready = asyncio.Event(), asyncio.Event()
+
+        async def prepare(**kwargs):
+            preparing.set()
+            await ready.wait()
+            return DuplexAppendPlan(prompt={"prompt_token_ids": [1]})
+
+        mocker.patch.object(h.runner.plugin, "prepare_append_plan", side_effect=prepare)
         h.session.begin_response()
         h.submit(Heartbeat())
         await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
@@ -169,15 +177,66 @@ async def test_new_user_item_preempts_and_blocks_immediate_restart(mocker):
                 }
             )
         )
-        await wait_until(lambda: ([request_id], True) in h.port.cleanups)
-        for _ in range(3):
-            await h.run(Heartbeat())
+        await wait_until(lambda: h.runner.memory._interaction_pending)
         assert h.runner.memory._interaction_pending
+        task = await h.runner._start_append({}, final=True, precreate_response=True)
+        await asyncio.wait_for(preparing.wait(), timeout=2)
+        assert ([request_id], True) not in h.port.cleanups
+        assert not h.runner.memory._task.done()
+        ready.set()
+        assert await task
+        await wait_until(lambda: ([request_id], True) in h.port.cleanups)
         assert len(auxiliary_submissions(h)) == 1
         assert h.runner.memory._failures == 0
         assert request_id not in h.session.resource_request_ids()
     finally:
         await close_harness(h)
+
+
+@pytest.mark.asyncio
+async def test_rejected_mixed_observation_keeps_capacity_releasing_summary():
+    from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import frame, open_joyai
+    from tests.model_executor.models.joyai_vl_interaction.test_visual_memory_pipeline import (
+        camera,
+        command,
+        finish_summary,
+        submissions,
+        user_item,
+        wait_auxiliary,
+    )
+    from vllm_omni.engine.duplex.commands import AppendAudio, Commit
+
+    h = await open_joyai(modalities=("text",))
+    try:
+        memory = h.runner.model_state.visual_memory
+        memory.chunk_frames = memory.max_pending = 2
+        await camera(h, "red")
+        await camera(h, "blue")
+        summary = await wait_auxiliary(h)
+        summary_task = h.runner.memory._task
+        summary_id = summary.context.request_id
+        source = h.runner.memory._source
+        before = tuple(memory.pending)
+        count = len(submissions(h, auxiliary=False))
+
+        for index in range(3):
+            await command(h, user_item(f"question-{index}", [{"type": "input_text", "text": "Describe the scene."}]))
+            await command(h, AppendAudio(video_frames=(frame("green"),)))
+            events = await command(h, Commit(final=True, create_response=True))
+            assert any(getattr(event, "code", None) == "visual_memory_capacity" for event in events)
+            assert tuple(memory.pending) == before
+            assert len(submissions(h, auxiliary=False)) == count
+            assert h.runner.memory._task is summary_task and not summary_task.done()
+            assert h.runner.memory._source == source
+            assert ([summary_id], True) not in h.port.cleanups
+
+        await finish_summary(h, summary, "A red object preceded a blue object.")
+        assert not memory.pending and len(memory.mid_term) == 1
+        await camera(h, "green")
+        assert len(submissions(h, auxiliary=False)) == count + 1
+        assert not h.runner.closing
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -201,7 +260,10 @@ async def test_deleting_pending_user_items_restores_observation_work(mocker, ite
                 )
             )
         await wait_until(lambda: len(h.runner.memory._pending_user_items) == item_count)
-        await wait_until(lambda: ([request_id], True) in h.port.cleanups)
+        assert ([request_id], True) not in h.port.cleanups
+        finish_work(h)
+        await wait_until(lambda: work.applied == [0])
+        work.ready, work.revision = True, 1
         for index in range(item_count):
             h.submit(DeleteItem(item_id=f"question-{index}"))
             h.submit(Heartbeat())
@@ -212,7 +274,7 @@ async def test_deleting_pending_user_items_restores_observation_work(mocker, ite
         await wait_until(lambda: len(auxiliary_submissions(h)) == 2)
         assert not h.runner.memory._interaction_pending
         finish_work(h)
-        await wait_until(lambda: work.applied == [0])
+        await wait_until(lambda: work.applied == [0, 1])
     finally:
         await close_harness(h)
 

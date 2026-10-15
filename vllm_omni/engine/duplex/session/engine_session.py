@@ -471,6 +471,13 @@ class DuplexEngineSession:
         placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
         return tuple(dict(message) for message in self._conversation.messages if id(message) not in placeholders)
 
+    def history_snapshot(self) -> tuple[tuple[dict[str, object], ...], tuple[str | None, ...]]:
+        """Snapshot committed messages and their aligned, optional item identities."""
+        placeholders = {id(message) for message in self._conversation.history_item_placeholders.values()}
+        item_ids = {id(message): item_id for item_id, message in self._conversation.item_ids.items()}
+        messages = [message for message in self._conversation.messages if id(message) not in placeholders]
+        return tuple(dict(message) for message in messages), tuple(item_ids.get(id(message)) for message in messages)
+
     @property
     def active_request_id(self) -> str | None:
         return self._response.active_request_id

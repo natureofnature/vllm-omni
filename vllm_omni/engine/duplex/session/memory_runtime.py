@@ -136,21 +136,21 @@ class SessionMemoryRuntime:
             self._task.cancel()
 
     def note_user_item(self, payload: Mapping[str, object], item_id: str) -> None:
-        if self._preempt_for_input(payload, has_new_user_input=True):
+        if self._interactive_input(payload, has_new_user_input=True):
             self._pending_user_items.add(item_id)
 
     def forget_user_item(self, item_id: str) -> None:
         self._pending_user_items.discard(item_id)
 
     def note_committed_input(self, payload: Mapping[str, object], *, has_new_user_input: bool | None = None) -> None:
-        if self._preempt_for_input(
+        if self._interactive_input(
             payload,
             has_new_user_input=self._interaction_pending if has_new_user_input is None else has_new_user_input,
         ):
             self._input_pending = True
 
     def begin_append(self, payload: Mapping[str, object], *, silence_continuation: bool) -> bool:
-        interactive = not silence_continuation and self._preempt_for_input(
+        interactive = not silence_continuation and self._interactive_input(
             payload, has_new_user_input=self._interaction_pending
         )
         if interactive:
@@ -198,12 +198,18 @@ class SessionMemoryRuntime:
         self._retry_source = None
         self._failures = 0
 
-    def _preempt_for_input(self, payload: Mapping[str, object], *, has_new_user_input: bool) -> bool:
-        """Let model-classified user input take priority without losing its source."""
-        if not self._ctx.plugin.supports_auxiliary_requests or not self._ctx.plugin.auxiliary_preempted_by_input(
+    def _interactive_input(self, payload: Mapping[str, object], *, has_new_user_input: bool) -> bool:
+        """Record input intent without cancelling work needed to admit it."""
+        return self._ctx.plugin.supports_auxiliary_requests and self._ctx.plugin.auxiliary_preempted_by_input(
             payload=payload, state=self._ctx.model_state, has_new_user_input=has_new_user_input
-        ):
-            return False
+        )
+
+    def preempt_for_submission(self) -> None:
+        """Give a successfully prepared interactive append the model slot.
+
+        Capacity rejection happens before this point: an inadmissible frame
+        must leave the summary that frees visual memory running.
+        """
         self.cancel_retry()
         self._generation += 1
         self._completion_pending = False
@@ -211,7 +217,6 @@ class SessionMemoryRuntime:
         if self._task is not None and not self._task.done():
             if not helpers.task_is_cancelling(self._task):
                 self._task.cancel()
-        return True
 
     def _schedule_retry(self, request: DuplexAuxiliaryRequest) -> None:
         """Retry a submitted failure finitely; unchanged traffic cannot reset it."""

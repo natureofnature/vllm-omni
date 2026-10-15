@@ -420,6 +420,34 @@ def test_history_revision_tracks_append_and_same_length_edit():
     assert session.history == ({"role": "user", "content": "other"},)
 
 
+def test_history_snapshot_aligns_item_identity_across_late_playback_materialization():
+    session = _session(config=DuplexSessionConfig(playback_commit_policy="ack_only"))
+    first = {"role": "user", "content": "same question"}
+    session.append_history_message(first)
+    session.register_history_item("q1", first)
+    response_id = session.begin_response()
+    item_id = f"item_{response_id}"
+    session.reserve_history_item(item_id)
+    session.append_assistant_text("played answer")
+    session.mark_audio_sent(duration_ms=1_000, text_chars=13)
+    assert session.end_response(commit_text=True) is None
+    second = {"role": "user", "content": "same question"}
+    session.append_history_message(second)
+    session.register_history_item("q2", second)
+    session.append_history_message({"role": "user", "content": "anonymous"})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", "q2", None)
+
+    apply_playback_ack(session, {"response_id": response_id, "played_ms": 1_000})
+    messages, item_ids = session.history_snapshot()
+    assert messages == session.history
+    assert item_ids == ("q1", item_id, "q2", None)
+    assert messages[1]["content"] == "played answer"
+    assert session.delete_history_item(item_id)
+    assert session.history_snapshot()[1] == ("q1", "q2", None)
+
+
 # ---- turn signals / model turns ----
 
 

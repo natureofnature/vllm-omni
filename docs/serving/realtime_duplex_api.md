@@ -58,17 +58,34 @@ remaining frames for the next chunk. Chunk indices and session-relative time
 ranges preserve their order. These times record server acceptance of observations.
 
 Only a successful, source-valid summary retires its input frames or summaries.
-At most 200 uncompressed frames and approximately 150 MiB of normalized RGB pixels
-are retained per session. Reaching either limit returns a recoverable capacity
+The pending-frame buffer retains at most 200 frames and 32 MiB of losslessly
+encoded PNG data per session. Prompt-preparation workers decode selected frames for inference.
+The session limit bounds this retained frame storage across sessions (for example,
+256 MiB at eight sessions), separately from temporary model-input allocations.
+Encoded storage reaching half its budget schedules an earlier frame summary.
+Reaching a retention limit returns a recoverable capacity
 error; the client can retry after summarization progresses. Visual failures retry
 after 1, 5, and 30 seconds, then pause with a warning while retaining their source.
-Observation-only camera commits can queue alongside summarization. New user text
-or audio preempts it, so interactive work takes priority even with one stage slot.
+Observation-only camera commits can queue alongside summarization. An admissible
+user turn preempts it after prompt preparation, so interactive work takes priority
+even with one stage slot. A rejected observation leaves the in-flight summary
+running to release capacity for a retry.
 
-Recent raw frames and chunk summaries provide the observation context. A current
+Recent raw frames and chunk summaries provide the observation context. Frames
+retain their timestamps and silent actions in observation order. Accepted memory
+is prepended to the first user message, following the experimental working-chunk
+format; played answers come from the shared Session conversation history. Closing
+a working chunk moves its committed question/answer references into the archived
+Q&A prefix and starts a fresh interactive view. The old encoded frames remain
+available privately for consolidation and retries until a valid summary succeeds.
+While consolidation is pending, prompts use the new working chunk, previously
+accepted summaries, and the archived Q&A. The latest user instruction stays active
+for subsequent observations.
+The model keeps bounded item identities and timestamps for this ordering; playback
+corrections and deletions apply to the text resolved for every new prompt. A current
 user query also includes long-term visual memory, subject to the deployed context
-budget. Conversation image edits revoke derived visual memory. Summaries are
-lossy; same-stage summarization quality should be validated for the application.
+budget. Conversation image edits revoke derived visual memory. Summaries
+are lossy; same-stage summarization quality should be validated for the application.
 
 ### Committed conversation text
 

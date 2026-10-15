@@ -67,6 +67,9 @@ class AppendAttempt:
     #: Commits timing state once the runtime accepts the append (before any
     #: returned output event can clear the continuation chain).
     on_append_accepted: Callable[[float], None] | None = None
+    #: After prompt validation and fencing, before stage admission. Interactive
+    #: requests can release a private model slot without preempting for rejected input.
+    on_append_prepared: Callable[[], None] | None = None
     #: Last chance to call the append off, checked once the predecessor is done.
     before_append: Callable[[], bool] | None = None
 
@@ -193,6 +196,7 @@ class AppendAttempt:
                 final=self.final,
                 expected_epoch=self.epoch,
                 on_append_accepted=self.on_append_accepted,
+                on_append_prepared=self.on_append_prepared,
             )
             if append_ok:
                 model_state.context_locked = True
