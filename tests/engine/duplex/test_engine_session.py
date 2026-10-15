@@ -395,12 +395,29 @@ def test_truncate_history_item_uses_response_alignment_marks():
     item_id = f"item_{response_id}"
     session.register_history_item(item_id, committed)
 
+    revision = session.history_revision
     assert session.truncate_history_item(item_id, audio_end_ms=1_000) is True
+    assert session.history_revision > revision
 
     assert session.history[-1] == {"role": "assistant", "content": "hello"}
     assert session.history_item_ids[item_id] == {"role": "assistant", "content": "hello"}
+    revision = session.history_revision
     assert session.delete_history_item(item_id) is True
+    assert session.history_revision > revision
     assert session.history == ()
+
+
+def test_history_revision_tracks_append_and_same_length_edit():
+    session = _session()
+    revision = session.history_revision
+    message = {"role": "user", "content": "first"}
+    session.append_history_message(message)
+    assert session.history_revision > revision
+    session.register_history_item("input-1", message)
+    revision = session.history_revision
+    session.register_history_item("input-1", {"role": "user", "content": "other"})
+    assert session.history_revision > revision
+    assert session.history == ({"role": "user", "content": "other"},)
 
 
 # ---- turn signals / model turns ----

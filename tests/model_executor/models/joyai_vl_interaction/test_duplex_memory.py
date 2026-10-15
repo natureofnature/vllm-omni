@@ -10,10 +10,11 @@ from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import tts_output
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import frame, observe, open_joyai
-from vllm_omni.engine.duplex.commands import AckPlayback, CancelInput, Heartbeat
+from vllm_omni.engine.duplex.commands import AckPlayback, AppendAudio, CancelInput, Commit, CreateItem, Heartbeat
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
+from vllm_omni.engine.duplex.session import runner as runner_module
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -582,12 +583,113 @@ async def test_unchanged_short_history_does_not_schedule_repeated_preparation(mo
     try:
         committed_turns(h.session, count=2)
         prepare = mocker.spy(h.runner.plugin, "prepare_auxiliary_request")
+        snapshot = mocker.spy(runner_module, "duplex_text_history")
         await h.run(Heartbeat())
         first_count = prepare.call_count
         assert first_count == 1
+        snapshots = snapshot.call_count
         await h.run(Heartbeat())
         assert prepare.call_count == first_count
+        assert snapshot.call_count == snapshots
         assert h.port.submissions == []
+        # Editing an existing message must invalidate the fast path even when
+        # the number of messages is unchanged.
+        before_edit = prepare.call_count
+        h.session.register_history_item("user-0", {"role": "user", "content": "Edited instruction"})
+        await h.run(Heartbeat())
+        assert prepare.call_count == before_edit + 1
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_interactive_turn_preempts_summary_with_one_stage_slot(mocker):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        summary = await start_summary(h)
+        summary_id = summary.context.request_id
+        released = asyncio.Event()
+        original_submit, original_cleanup = h.port.submit, h.port.cleanup
+
+        async def single_slot_submit(submission):
+            if "auxiliary-" not in submission.context.request_id:
+                await released.wait()
+            return await original_submit(submission)
+
+        async def cleanup(request_ids, *, abort=False):
+            await original_cleanup(request_ids, abort=abort)
+            if summary_id in request_ids:
+                released.set()
+
+        mocker.patch.object(h.port, "submit", side_effect=single_slot_submit)
+        mocker.patch.object(h.port, "cleanup", side_effect=cleanup)
+        h.submit(
+            CreateItem(
+                item={
+                    "id": "interactive-query",
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "What do you see now?"}],
+                }
+            )
+        )
+        h.submit(AppendAudio(video_frames=(frame(),)))
+        h.submit(Commit(final=True, create_response=True))
+
+        async def wait_for_interaction():
+            while len(h.port.submissions) == 1:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(wait_for_interaction(), timeout=2)
+        assert released.is_set()
+        assert ([summary_id], True) in h.port.cleanups
+        assert summary_id not in h.session.resource_request_ids()
+        assert "auxiliary-" not in h.port.submissions[-1].context.request_id
+        h.deliver(summary_output(summary_id), stage_id=0, segment_finished=True)
+        await h.settle()
+        assert h.runner.model_state.memory.text == ""
+        foreground = h.port.submissions[-1]
+        h.deliver(
+            tts_output(foreground.context.request_id, finished=True, text="</silence>"),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.settle(timeout_s=0.2)
+        assert "auxiliary-" in h.port.submissions[-1].context.request_id
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_failed_summary_keeps_interactive_history_bounded(mocker):
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session, count=30)
+        h.port.fail_submit = RuntimeError("summary unavailable")
+        await h.run(Heartbeat())
+        original_history = h.session.history
+        plugin = h.runner.plugin
+        render = mocker.spy(plugin.processor, "apply_chat_template")
+        config = plugin.prepare_prompt_config(
+            {"conversation": list(original_history)}, state=h.runner.model_state, payload={}
+        )
+        plan = plugin.plan_append(
+            request_id="normal",
+            fence=DuplexFence("s"),
+            session_config=config,
+            runtime_config=h.session.runtime_config,
+            seq=1,
+            turn_seq=1,
+            payload={},
+            final=True,
+            sampling_params=SamplingParams(max_tokens=64),
+        )
+        assert len(render.call_args.args[0]) <= 18  # system + 16 history messages + observation
+        assert "Cabinet 29 recorded." in plan.prompt["prompt"]
+        assert "Cabinet 0 recorded." not in plan.prompt["prompt"]
+        assert h.session.history == original_history
+        assert h.runner.model_state.memory.covered_messages == 0
     finally:
         await h.manager.shutdown()
 

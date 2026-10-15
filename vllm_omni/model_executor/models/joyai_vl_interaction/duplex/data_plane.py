@@ -8,12 +8,17 @@ from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 
 import numpy as np
+from PIL import Image
 
 from vllm_omni.engine.duplex.contracts import duplex_resource_request_belongs_to_session
 from vllm_omni.engine.duplex.plugin import DefaultDuplexModelSessionState, DuplexDataPlane, DuplexDataPlaneContext
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action, ParsedAction, parse_action
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
-from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import JoyAISummaryMemory
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
+    JoyAISummaryMemory,
+    JoyAIVisualMemory,
+    VisualMemorySource,
+)
 
 
 @dataclass
@@ -23,6 +28,8 @@ class JoyAISessionState(DefaultDuplexModelSessionState):
     conversation_images: tuple[str, ...] = ()
     last_response_text: str = ""
     memory: JoyAISummaryMemory = field(default_factory=JoyAISummaryMemory)
+    visual_memory: JoyAIVisualMemory = field(default_factory=JoyAIVisualMemory)
+    visual_source: VisualMemorySource | None = None
 
 
 @dataclass
@@ -32,6 +39,8 @@ class Observation:
     conversation_images: tuple[str, ...] = ()
     modalities: tuple[str, ...] = ("text", "audio")
     previous_response: str = ""
+    new_frames: list[tuple[Image.Image, int]] = field(default_factory=list)
+    visual_generation: int = 0
     text_sent: bool = False
     response_text: str = ""
 

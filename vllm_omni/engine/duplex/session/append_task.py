@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from vllm.logger import init_logger
 
 from vllm_omni.engine.duplex.config import DuplexSessionState, DuplexTurnEventType
-from vllm_omni.engine.duplex.plugin import PcmAppendReservation
+from vllm_omni.engine.duplex.plugin import DuplexInputCapacityError, PcmAppendReservation
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
@@ -220,6 +220,14 @@ class AppendAttempt:
             return append_ok
         except asyncio.CancelledError:
             raise
+        except DuplexInputCapacityError as exc:
+            self.abandon(reason=exc.code)
+            self.out.emit_error(exc.code, str(exc), retryable=True)
+            # Already queued successors keep their failed predecessor. A new
+            # client commit may retry admission without a poisoned append tail.
+            if self.ctx.tasks.append_tail is asyncio.current_task():
+                self.ctx.tasks.append_tail = None
+            return False
         except Exception as exc:
             # Compensate while the session is still open, so the client gets
             # the failed ``response.done`` before the error and the close.

@@ -41,7 +41,36 @@ Grouping and pruning affect only the model-input view. They do not merge or
 delete the source conversation items exposed to clients, and do not change
 playback acknowledgement or interruption handling.
 
-## JoyAI conversation memory
+## JoyAI visual and conversation memory
+
+JoyAI keeps three levels of visual memory: accepted observation frames, summaries
+of consecutive frame chunks, and longer-term summaries of those chunks. It uses
+the deployed JoyAI VLM stage for both summarization levels. Auxiliary requests
+finish at that stage and keep their outputs private to the session.
+
+The visual policy follows the experimental JoyAI serving profile: up to 100
+frames per chunk, five chunk summaries per long-term block, and the latest 15
+long-term blocks. Both summary levels allow up to 4,000 generated tokens. Frames
+are normalized to RGB with an area of at most 262,144 pixels. Every frame in a
+selected chunk participates in summarization. When the deployed context or image
+limit requires it, the plugin closes a shorter consecutive chunk and leaves the
+remaining frames for the next chunk. Chunk indices and session-relative time
+ranges preserve their order. These times record server acceptance of observations.
+
+Only a successful, source-valid summary retires its input frames or summaries.
+At most 200 uncompressed frames and approximately 150 MiB of normalized RGB pixels
+are retained per session. Reaching either limit returns a recoverable capacity
+error; the client can retry after summarization progresses. Visual failures retry
+after 1, 5, and 30 seconds, then pause with a warning while retaining their source.
+Observation-only camera commits can queue alongside summarization. New user text
+or audio preempts it, so interactive work takes priority even with one stage slot.
+
+Recent raw frames and chunk summaries provide the observation context. A current
+user query also includes long-term visual memory, subject to the deployed context
+budget. Conversation image edits revoke derived visual memory. Summaries are
+lossy; same-stage summarization quality should be validated for the application.
+
+### Committed conversation text
 
 The JoyAI duplex plugin preserves at least eight recent text messages and consolidates
 older committed conversation into one summary of at most 512 generated tokens.
@@ -53,8 +82,9 @@ There is at most one such request per session and no queue of older snapshots.
 The previous summary remains available if consolidation fails or times out.
 A failed attempt may retry after committed history or session context changes,
 but unchanged heartbeats do not trigger immediate retries.
-Any older unsummarized backlog remains in the normal prompt, subject to the
-existing context budget, while successive bounded requests catch up.
+The normal prompt keeps at most sixteen unsummarized text messages (the recent
+eight plus one summary chunk), subject to the model context budget. The complete
+backlog remains in the session ledger for successive summary requests to process.
 
 Standing instructions and the current user query remain explicit in the normal
 interaction prompt. Summary input contains committed conversation text, not
@@ -64,10 +94,10 @@ complete audio has been acknowledged. Playback corrections and conversation
 edits invalidate summaries derived from the changed text; newer appended turns
 can coexist with consolidation of an unchanged older prefix.
 
-This bounds the summary and model-input context, not the underlying Session
-conversation ledger. Summaries are lossy and do not preserve visual facts that
-were never represented in committed text. They share compute capacity with
-interactive requests; latency and long-session recall depend on the deployment.
+The text summary and model-input context are bounded; the underlying Session
+conversation ledger retains its source items. Visual facts can also enter the
+separate three-level visual memory described above. Text consolidation runs during
+idle time; frequent interactions can delay it.
 If instructions and the current observation exhaust the context budget, derived
 memory is omitted. Pending delegated tool calls require the shared tool lifecycle
 adapter and are not synthesized by memory consolidation.

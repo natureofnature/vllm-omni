@@ -44,6 +44,7 @@ from vllm_omni.engine.duplex.contracts import (
     duplex_session_id_from_request_id,
 )
 from vllm_omni.engine.duplex.plugin import (
+    DuplexInputCapacityError,
     DuplexRuntimeConfigError,
     coerce_int,
     payload_turn_id,
@@ -182,7 +183,7 @@ class ModelChannel:
                 operation_id=operation_id,
                 expected_epoch=expected_epoch,
             )
-        except asyncio.CancelledError:
+        except (asyncio.CancelledError, DuplexInputCapacityError):
             raise
         except Exception as exc:
             logger.exception("Failed to append duplex runtime input: %s", exc)
@@ -376,6 +377,19 @@ class ModelChannel:
                     }
                 ],
             }
+        except DuplexInputCapacityError:
+            resource = session.request_resources.get((stage_id, request_id))
+            if resource is not None and not resource.submitted:
+                try:
+                    await self._ctx.stage_port.cleanup([request_id])
+                except Exception:
+                    logger.warning("Rejected duplex input retains its resource for teardown", exc_info=True)
+                else:
+                    session.release_resources_for_request_ids([request_id])
+                    self._ctx.manager.unregister_request(request_id)
+            if not resumable:
+                self._ctx.plugin.data_plane.close_stream(request_id)
+            raise
         except BaseException:
             if not resumable:
                 self._ctx.plugin.data_plane.close_stream(request_id)

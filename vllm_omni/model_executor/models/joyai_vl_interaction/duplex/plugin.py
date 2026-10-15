@@ -6,7 +6,8 @@ from __future__ import annotations
 
 import asyncio
 import io
-from collections.abc import Callable, Mapping
+import math
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 
 import pybase64
@@ -17,7 +18,9 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
 from vllm_omni.engine.duplex.plugin import (
+    DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
+    DuplexInputCapacityError,
     DuplexModelPlugin,
     DuplexModelSessionState,
     DuplexRuntimeConfigError,
@@ -27,15 +30,21 @@ from vllm_omni.engine.duplex.plugin import (
 from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Action
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     LONG_TERM_COMPRESS_PROMPT,
+    MID_TERM_SUMMARY_PROMPT,
     QA_HISTORY_HEADER,
     SILENT_SYSTEM_PROMPT,
     USER_QUERY_HEADER,
+    VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import JoyAIDataPlane, JoyAISessionState
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
+    VisualFrame,
+    VisualMemoryCapacityError,
+    VisualMemorySource,
+    VisualSummary,
 )
 
 
@@ -48,6 +57,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.data_plane = JoyAIDataPlane(encode_audio)
         self.processor = None
         self.max_model_len = 0
+        self.max_images = 32
+        self._mid_prompt_tokens = 0
+        self._long_prompt_tokens = 0
+        self._timestamp_tokens = 0
         self._processor_lock = asyncio.Lock()
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
@@ -101,6 +114,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     revision=getattr(model_config, "revision", None),
                 )
                 self.max_model_len = model_config.max_model_len
+                self.max_images = model_config.multimodal_config.get_limit_per_prompt("image")
+                await asyncio.to_thread(self._prepare_memory_budget)
         return self.runtime_config_for_update(config, {})
 
     def runtime_config_for_update(
@@ -138,35 +153,104 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             configured.append(params)
         return tuple(configured)
 
+    @staticmethod
+    def _sync_visual_history(state: JoyAISessionState, history: Sequence[dict[str, object]]) -> tuple[str, ...]:
+        images = tuple(
+            part["image_url"]["url"]
+            for message in history
+            if message.get("role") == "user" and isinstance(message.get("content"), list)
+            for part in message["content"]
+            if part.get("type") == "image_url"
+        )
+        previous = state.conversation_images
+        if images[: len(previous)] != previous:
+            # Conservatively revoke derived blocks as well as raw images. An
+            # image edit can arrive after its raw source has been compressed.
+            state.visual_memory.clear()
+            state.frames = []
+            state.conversation_images = ()
+        return images
+
+    def _visual_source(self, state: JoyAISessionState) -> VisualMemorySource | None:
+        memory = state.visual_memory
+        if state.visual_source is not None and memory.matches(state.visual_source):
+            return state.visual_source
+        state.visual_source = self._choose_visual_source(state)
+        return state.visual_source
+
+    def _choose_visual_source(self, state: JoyAISessionState) -> VisualMemorySource | None:
+        memory = state.visual_memory
+        mid_tokens = sum(entry.token_count + self._timestamp_tokens for entry in memory.mid_term)
+        long_budget = self.max_model_len - memory.long_max_tokens - self._long_prompt_tokens
+        if len(memory.mid_term) >= memory.mid_group or (
+            len(memory.mid_term) >= 2 and mid_tokens + memory.mid_max_tokens > long_budget
+        ):
+            return memory.long_source(closure_reason="count" if len(memory.mid_term) >= memory.mid_group else "context")
+        frame_tokens = sum(frame.token_count + self._timestamp_tokens for frame in memory.pending)
+        if len(memory.pending) >= memory.chunk_frames:
+            return memory.frame_source()
+        if memory.pending and len(memory.pending) >= self.max_images:
+            return memory.frame_source(closure_reason="image_limit")
+        if memory.pending and frame_tokens + self._mid_prompt_tokens + memory.mid_max_tokens >= self.max_model_len:
+            return memory.frame_source(closure_reason="context")
+        return None
+
+    def auxiliary_policy(
+        self,
+        *,
+        state: DuplexModelSessionState,
+        history_revision: int,
+        history: tuple[dict[str, object], ...],
+    ) -> DuplexAuxiliaryPolicy:
+        if not isinstance(state, JoyAISessionState):
+            raise TypeError("JoyAI requires JoyAISessionState")
+        self._sync_visual_history(state, history)
+        source = self._visual_source(state)
+        return DuplexAuxiliaryPolicy(source_key=source or history_revision, allow_during_response=source is not None)
+
+    def auxiliary_source_matches(
+        self,
+        *,
+        request: DuplexAuxiliaryRequest,
+        state: DuplexModelSessionState,
+        history: tuple[dict[str, object], ...],
+    ) -> bool:
+        if not isinstance(state, JoyAISessionState):
+            raise TypeError("JoyAI requires JoyAISessionState")
+        self._sync_visual_history(state, history)
+        if isinstance(request.model_source, VisualMemorySource):
+            return state.visual_memory.matches(request.model_source)
+        return super().auxiliary_source_matches(request=request, state=state, history=history)
+
+    def auxiliary_preempted_by_input(
+        self,
+        *,
+        payload: Mapping[str, object],
+        state: DuplexModelSessionState,
+        has_new_user_input: bool,
+    ) -> bool:
+        return bool(has_new_user_input or payload.get("audio") or not payload.get("video_frames"))
+
     def prepare_prompt_config(
         self, config: dict[str, object], *, state: DuplexModelSessionState, payload: dict[str, object]
     ) -> dict[str, object]:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
         state.memory.validate(duplex_text_history(config.get("conversation", [])))
-        images = tuple(
-            part["image_url"]["url"]
-            for message in config.get("conversation", [])
-            if message.get("role") == "user" and isinstance(message.get("content"), list)
-            for part in message["content"]
-            if part.get("type") == "image_url"
-        )
+        images = self._sync_visual_history(state, config.get("conversation", []))
         previous = state.conversation_images
-        if images[: len(previous)] == previous:
-            frames = state.frames
-            new_images = images[len(previous) :]
-        else:
-            # Rebuild the visual window after conversation images are edited or deleted.
-            frames = []
-            new_images = images
+        new_images = [*images[len(previous) :], *payload.get("video_frames", [])]
         # Append each conversation image once, alongside newly committed camera
         # frames, so retained camera history cannot displace a newer user image.
-        frames = [*frames, *new_images, *payload.get("video_frames", [])][-4:]
+        frames = [*state.frames, *new_images][-4:]
         return {
             **config,
             "joyai_state": state,
             "joyai_frames": frames,
             "joyai_conversation_images": images,
+            "joyai_new_frames": new_images,
+            "joyai_pending_frames": tuple(state.visual_memory.pending),
+            "joyai_visual_summaries": tuple([*state.visual_memory.long_term, *state.visual_memory.mid_term]),
             "joyai_summary": state.memory.text,
             "joyai_summary_messages": state.memory.covered_messages,
         }
@@ -180,6 +264,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     ) -> DuplexAuxiliaryRequest | None:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
+        visual = state.visual_memory
+        source = self._visual_source(state)
+        if source is not None:
+            return await asyncio.to_thread(
+                self._prepare_visual_summary,
+                source,
+                tuple(visual.pending if source.kind == "frames" else visual.mid_term),
+                visual.mid_max_tokens if source.kind == "frames" else visual.long_max_tokens,
+            )
         # Snapshot model-owned memory before yielding; preparation never mutates
         # it. Prompt invalidation and result application stay on the mailbox.
         current = state.memory.matches(history)
@@ -250,6 +343,86 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
         return await asyncio.to_thread(prepare)
 
+    def _prepare_visual_summary(
+        self,
+        source: VisualMemorySource,
+        entries: tuple[VisualFrame, ...] | tuple[VisualSummary, ...],
+        output_limit: int,
+    ) -> DuplexAuxiliaryRequest | None:
+        # The caller snapshots before offloading; image objects are borrowed
+        # read-only, never re-encoded or copied into a second memory queue.
+        entries = entries[: len(source.covered_ids)]
+        closure_reason = source.closure_reason
+        if source.kind == "frames" and len(entries) > self.max_images:
+            entries = entries[: self.max_images]
+            closure_reason = "image_limit"
+        while entries:
+            images = []
+            if source.kind == "frames":
+                first, last = entries[0].time_s, entries[-1].time_s
+                content = [
+                    {
+                        "type": "text",
+                        "text": MID_TERM_SUMMARY_PROMPT.format(
+                            chunk_index=source.chunk_index,
+                            frame_range=f"{first:.3f}s ~ {last:.3f}s",
+                            length_instruction="",
+                            preferred_time_span="10 seconds",
+                        ),
+                    }
+                ]
+                for entry in entries:
+                    content.extend([{"type": "text", "text": f"<{entry.time_s:.3f}s>"}, {"type": "image"}])
+                    images.append(entry.image)
+                visual_tokens = sum(entry.token_count for entry in entries) - len(images)
+            else:
+                if len(entries) < 2:
+                    return None
+                content = LONG_TERM_COMPRESS_PROMPT.format(
+                    merged_range=f"{entries[0].start_s:.3f}s-{entries[-1].end_s:.3f}s",
+                    summaries_text="\n\n".join(
+                        f"<{entry.start_s:.3f}s ~ {entry.end_s:.3f}s>\n{entry.text}" for entry in entries
+                    ),
+                    length_instruction="",
+                )
+                visual_tokens = 0
+            prompt = self.processor.apply_chat_template(
+                [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+            )
+            if (
+                len(self.processor.tokenizer(text=[prompt])["input_ids"][0]) + visual_tokens + output_limit
+                <= self.max_model_len
+            ):
+                covered = source.covered_ids[: len(entries)]
+                return DuplexAuxiliaryRequest(
+                    stage_id=self.joyai_stage_id,
+                    prompt={"prompt": prompt, "multi_modal_data": {"image": images} if images else {}},
+                    sampling_params=SamplingParams(
+                        temperature=0.8 if images else 0.3,
+                        top_p=0.9 if images else 0.7,
+                        top_k=40 if images else 30,
+                        repetition_penalty=1.1,
+                        presence_penalty=1.0 if images else 0.5,
+                        max_tokens=output_limit,
+                        output_kind=RequestOutputKind.FINAL_ONLY,
+                        detokenize=True,
+                    ),
+                    history_length=0,
+                    history_digest="",
+                    model_source=VisualMemorySource(
+                        source.kind,
+                        source.generation,
+                        covered,
+                        source.chunk_index,
+                        closure_reason,
+                    ),
+                    timeout_s=300.0,
+                    retry_delays_s=(1.0, 5.0, 30.0),
+                )
+            entries = entries[:-1]
+            closure_reason = "context"
+        return None
+
     def apply_auxiliary_result(
         self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState
     ) -> bool:
@@ -263,7 +436,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if any(marker in text for marker in ("</silence>", "</delegation>")):
             return False
         text = text.removeprefix("</response>").strip()
-        if not text or len(self.processor.tokenizer(text=[text])["input_ids"][0]) > SUMMARY_MAX_TOKENS:
+        tokens = len(self.processor.tokenizer(text=[text])["input_ids"][0])
+        if isinstance(request.model_source, VisualMemorySource):
+            return state.visual_memory.apply(request.model_source, text=text, token_count=tokens)
+        if not text or tokens > SUMMARY_MAX_TOKENS:
             return False
         state.memory.text = text
         state.memory.covered_messages = request.history_length
@@ -295,9 +471,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.conversation_images = config.pop("joyai_conversation_images")
         request.modalities = tuple(config["modalities"])
         request.previous_response = state.last_response_text
-        try:
-            return await asyncio.to_thread(
-                self.plan_append,
+        request.visual_generation = state.visual_memory.generation
+
+        def prepare():
+            new_images = self._decode_images(config.get("joyai_new_frames", []))
+            counts = self._image_token_counts(new_images)
+            config["joyai_new_images"] = new_images
+            config["joyai_new_image_tokens"] = counts
+            plan = self.plan_append(
                 request_id=request_id,
                 fence=fence,
                 session_config=config,
@@ -308,6 +489,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 final=final,
                 sampling_params=sampling_params,
             )
+            return plan, list(zip(new_images, counts))
+
+        try:
+            plan, new_frames = await asyncio.to_thread(prepare)
+            try:
+                state.visual_memory.check_capacity([image for image, _ in new_frames])
+            except VisualMemoryCapacityError as exc:
+                raise DuplexInputCapacityError(str(exc), code="visual_memory_capacity") from exc
+            request.new_frames = new_frames
+            return plan
         except BaseException:
             self.data_plane.close_stream(request_id)
             raise
@@ -316,6 +507,67 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request = self.data_plane.requests[request_id]
         request.state.frames = request.frames
         request.state.conversation_images = request.conversation_images
+        if request.visual_generation == request.state.visual_memory.generation:
+            for image, tokens in request.new_frames:
+                request.state.visual_memory.append(source_id=request_id, image=image, token_count=tokens)
+
+    @staticmethod
+    def _decode_images(frames: list[str]) -> list[Image.Image]:
+        images = []
+        for encoded in frames:
+            if encoded.startswith("data:"):
+                encoded = encoded.split(",", 1)[1]
+            with Image.open(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
+                if image.width * image.height > 262144:
+                    ratio = math.sqrt(262144 / (image.width * image.height))
+                    image = image.resize((max(1, int(image.width * ratio)), max(1, int(image.height * ratio))))
+                images.append(image.convert("RGB").copy())
+        return images
+
+    def _image_token_counts(self, images: list[Image.Image]) -> list[int]:
+        processor = self.processor.image_processor
+        return [
+            processor.get_number_of_image_patches(image.height, image.width, {}) // processor.merge_size**2
+            for image in images
+        ]
+
+    def _prepare_memory_budget(self) -> None:
+        memory = self.create_session_state().visual_memory
+
+        def overhead(content: str) -> int:
+            prompt = self.processor.apply_chat_template(
+                [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
+            )
+            return len(self.processor.tokenizer(text=[prompt])["input_ids"][0])
+
+        self._mid_prompt_tokens = overhead(
+            MID_TERM_SUMMARY_PROMPT.format(
+                chunk_index=1,
+                frame_range="0.000s ~ 999999999.999s",
+                length_instruction="",
+                preferred_time_span="10 seconds",
+            )
+        )
+        self._long_prompt_tokens = overhead(
+            LONG_TERM_COMPRESS_PROMPT.format(
+                merged_range="0.000s-999999999.999s",
+                summaries_text="",
+                length_instruction="",
+            )
+        )
+        # Conservative scheduling hint for each timestamp and template boundary.
+        # The actual full prompt is tokenized again before every submission.
+        self._timestamp_tokens = overhead("<999999999.999s ~ 999999999.999s>")
+        image_tokens = self._image_token_counts([Image.new("RGB", (512, 512))])[0]
+        if self.max_images < 1 or (
+            self._mid_prompt_tokens + self._timestamp_tokens + image_tokens + memory.mid_max_tokens > self.max_model_len
+            or self._long_prompt_tokens + 2 * (memory.mid_max_tokens + self._timestamp_tokens) + memory.long_max_tokens
+            > self.max_model_len
+        ):
+            raise DuplexRuntimeConfigError(
+                "JoyAI visual memory requires a context that fits one image summary and two mid-term summaries; "
+                "increase the JoyAI stage max_model_len."
+            )
 
     def plan_append(
         self,
@@ -342,37 +594,51 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     query = text
                 if index >= session_config.get("joyai_summary_messages", 0):
                     history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
+        # Keep interactive prefill bounded even while summary generation fails
+        # or falls behind. The complete unsummarized ledger stays available to
+        # prepare_auxiliary_request for eventual consolidation.
+        history = history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :]
         while history and history[0]["role"] == "assistant":
             history.pop(0)
         # The active instruction is attached to the latest observation below.
         if history and history[-1]["role"] == "user":
             history.pop()
         unsummarized_history = history.copy()
-        images = []
-        for encoded in session_config.get("joyai_frames", [])[-4:]:
-            if encoded.startswith("data:"):
-                encoded = encoded.split(",", 1)[1]
-            with Image.open(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
-                image.thumbnail((448, 448))
-                images.append(image.convert("RGB").copy())
+        pending_frames = session_config.get("joyai_pending_frames", ())
+        images = [entry.image for entry in pending_frames] + session_config.get("joyai_new_images", [])
+        image_token_counts = [entry.token_count for entry in pending_frames] + session_config.get(
+            "joyai_new_image_tokens", []
+        )
+        if not images:
+            images = self._decode_images(session_config.get("joyai_frames", []))
+            image_token_counts = self._image_token_counts(images)
+        images = images[-self.max_images :] if self.max_images else []
+        image_token_counts = image_token_counts[-self.max_images :] if self.max_images else []
         system = SILENT_SYSTEM_PROMPT
         if runtime_config.get("instructions"):
             system += "\n\n" + runtime_config["instructions"]
         base_system = system
         summary = session_config.get("joyai_summary")
-        if summary:
-            system += "\n\n" + QA_HISTORY_HEADER + summary
+        visual_summaries = [
+            entry
+            for entry in session_config.get("joyai_visual_summaries", ())
+            if query or entry.chunk_index is not None
+        ]
         if not isinstance(sampling_params, SamplingParams):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
-        # Qwen3-VL expands each image placeholder to this many visual tokens.
-        # Infer the grid from image sizes once; budget trimming needs no pixels.
-        image_processor = self.processor.image_processor
-        image_token_counts = [
-            image_processor.get_number_of_image_patches(image.height, image.width, {}) // image_processor.merge_size**2
-            for image in images
-        ]
         while True:
+            system = base_system
+            if visual_summaries:
+                system += (
+                    "\n\n"
+                    + VIDEO_HISTORY_HEADER
+                    + "\n\n".join(
+                        f"<{entry.start_s:.3f}s ~ {entry.end_s:.3f}s>\n{entry.text}" for entry in visual_summaries
+                    )
+                )
+            if summary and query:
+                system += "\n\n" + QA_HISTORY_HEADER + summary
             content = [{"type": "image"} for _ in images]
             content.append(
                 {
@@ -395,10 +661,13 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 # Derived memory must not displace standing instructions or
                 # make a previously admissible current observation fail.
                 summary = ""
-                system = base_system
                 # Rebudget the recent turns now that the summary no longer
                 # consumes their space. Covered history remains summarized.
                 history = unsummarized_history
+            elif visual_summaries:
+                # Current observations/query take priority, as in the original
+                # working chunk. Omitted blocks remain in bounded model memory.
+                visual_summaries.pop(0)
             elif len(images) > 1:
                 images.pop(0)
                 image_token_counts.pop(0)

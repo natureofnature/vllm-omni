@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Hashable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from importlib import import_module
@@ -38,6 +38,19 @@ class DuplexRuntimeConfigError(ValueError):
     """A model plugin rejected client-visible runtime configuration."""
 
     def __init__(self, message: str, *, code: str = "invalid_duplex_runtime_config") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class DuplexInputCapacityError(ValueError):
+    """Reject an append before submission without ending its Session.
+
+    Plugins raise this only for recoverable admission limits. The append owner
+    compensates reservations and its response; ordinary runtime failures keep
+    their existing fatal behavior.
+    """
+
+    def __init__(self, message: str, *, code: str = "input_capacity_exceeded") -> None:
         super().__init__(message)
         self.code = code
 
@@ -311,6 +324,20 @@ def duplex_history_digest(history: tuple[tuple[str, str], ...]) -> str:
 
 
 @dataclass(frozen=True)
+class DuplexAuxiliaryPolicy:
+    """Model-owned work identity and eligibility for the single auxiliary slot.
+
+    ``source_key`` must remain unchanged when unrelated input is appended so
+    that observation traffic cannot reset retries for the same failed work.
+    ``allow_during_response`` permits queueing alongside ordinary responses;
+    pending or active user interactions still take priority.
+    """
+
+    source_key: Hashable
+    allow_during_response: bool = False
+
+
+@dataclass(frozen=True)
 class DuplexAuxiliaryRequest:
     """One private, non-resumable request ending at its selected stage.
 
@@ -324,6 +351,8 @@ class DuplexAuxiliaryRequest:
     history_length: int
     history_digest: str
     timeout_s: float = 30.0
+    model_source: object | None = None
+    retry_delays_s: tuple[float, ...] = ()
 
 
 class DuplexModelPlugin(ABC):
@@ -389,6 +418,48 @@ class DuplexModelPlugin(ABC):
     ) -> DuplexAuxiliaryRequest | None:
         """Plan bounded background work from committed text; default opt-out."""
         return None
+
+    def auxiliary_policy(
+        self,
+        *,
+        state: DuplexModelSessionState,
+        history_revision: int,
+        history: tuple[dict[str, object], ...],
+    ) -> DuplexAuxiliaryPolicy | None:
+        """Reconcile model sources and select work without preparing its prompt.
+
+        The runner caches the current conversation view by revision. Plugins
+        can invalidate derived state here even when no append follows an edit.
+        The default preserves idle-only text consolidation.
+        """
+        return DuplexAuxiliaryPolicy(source_key=history_revision)
+
+    def auxiliary_source_matches(
+        self,
+        *,
+        request: DuplexAuxiliaryRequest,
+        state: DuplexModelSessionState,
+        history: tuple[dict[str, object], ...],
+    ) -> bool:
+        """Validate model evidence before submission and result application."""
+        text = duplex_text_history(history)
+        return len(text) >= request.history_length and (
+            duplex_history_digest(text[: request.history_length]) == request.history_digest
+        )
+
+    def auxiliary_preempted_by_input(
+        self,
+        *,
+        payload: Mapping[str, object],
+        state: DuplexModelSessionState,
+        has_new_user_input: bool,
+    ) -> bool:
+        """Classify an input as interactive; models may exempt observations.
+
+        ``has_new_user_input`` carries successfully accepted user-item intent
+        until its next append, independently of the conversation item counter.
+        """
+        return True
 
     def apply_auxiliary_result(
         self, *, request: DuplexAuxiliaryRequest, output: object, state: DuplexModelSessionState

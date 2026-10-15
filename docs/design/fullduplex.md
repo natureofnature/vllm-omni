@@ -363,15 +363,24 @@ Model plugins may opt into one bounded auxiliary request per Session. The runner
 gives it a separate resource identity, submits and terminates it at the selected
 stage, and intercepts its output and errors before response policy, speech
 routing, playback history or response metrics. The plugin receives immutable
-committed text and owns prompt/result formatting. The runner checks the epoch,
-configuration generation, operation identity and summarized-prefix fingerprint
-before mailbox writeback. Appending newer history does not invalidate a stable
-prefix; editing or deleting that prefix does. Cancellation and close abort owned
+committed history and owns prompt/result formatting and source validation. Sources
+can cover text, images or model-owned derived state. The runner checks the epoch,
+configuration generation, operation identity and plugin source validity before
+mailbox writeback. Appending newer history can preserve a stable prefix; editing
+or deleting its evidence invalidates it. Cancellation and close abort owned
 requests. A failed cleanup retains its resource for teardown retry and prevents
 new auxiliary work from accumulating behind it.
-Failed attempts wait for committed history or session context to change before
-retrying; unchanged heartbeats do not retrigger them. Successful application
-allows the next bounded chunk to catch up without waiting for new input.
+The plugin supplies a stable work key and whether work can enter the existing
+stage queue during an ordinary observation. Explicit user interaction takes
+priority through cancellation and suppresses restart until its turn completes.
+Requests may specify bounded retry delays; failures remain keyed to the same
+source as newer observations arrive. Successful application allows the next
+bounded chunk to catch up without waiting for new input.
+The session's committed-history revision lets unchanged input events skip history
+snapshotting and hashing. Prefix fingerprints still validate summary writeback.
+The Session layer owns execution and cleanup; model plugins own content policy,
+memory tiers, prompts and budgets. Recoverable input-capacity rejection releases
+the unsubmitted request and its reservations while keeping the Session open.
 
 ### Experimental output limits
 

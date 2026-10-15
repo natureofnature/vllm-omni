@@ -602,12 +602,12 @@ async def test_conversation_images_and_camera_frames_share_input_order():
         "content": [{"type": "image_url", "image_url": {"url": frame("blue")}}],
     }
     conversation.append(image_message)
-    assert await prepare() == [red, red, red, blue]
-    assert await prepare([frame("green")]) == [red, red, blue, green]
+    assert await prepare() == [red] * 4 + [blue]
+    assert await prepare([frame("green")]) == [red] * 4 + [blue, green]
     conversation.append({"role": "user", "content": "What changed?"})
-    assert await prepare() == [red, red, blue, green]
+    assert await prepare() == [red] * 4 + [blue, green]
     conversation.append(image_message.copy())
-    assert await prepare() == [red, blue, green, blue]
+    assert await prepare() == [red] * 4 + [blue, green, blue]
     config["conversation"] = [{"role": "user", "content": "New scene"}]
     assert await prepare([frame("green")]) == [green]
 
@@ -660,6 +660,12 @@ async def test_failed_append_preserves_visual_history_and_next_observation_runs(
         state = h.runner.model_state
         state.frames = [frame("red")]
         state.conversation_images = (frame("green"),)
+        h.session.append_history_message(
+            {
+                "role": "user",
+                "content": [{"type": "image_url", "image_url": {"url": frame("green")}}],
+            }
+        )
         before = (list(state.frames), state.conversation_images)
         failed_frame = frame("blue")
         if failure == "image":
