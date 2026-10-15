@@ -14,7 +14,7 @@ from vllm_omni.engine.duplex.commands import AckPlayback, AppendAudio, CancelInp
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
-from vllm_omni.engine.duplex.session import runner as runner_module
+from vllm_omni.engine.duplex.session import memory_runtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -286,7 +286,7 @@ async def test_close_cancels_auxiliary_and_late_result_cannot_write():
     h = await open_joyai(modalities=("text",))
     committed_turns(h.session)
     submission = await start_summary(h)
-    task = h.runner._auxiliary_task
+    task = h.runner.memory._task
     await h.manager.shutdown()
     assert task.done()
     assert ([submission.context.request_id], True) in h.port.cleanups
@@ -381,7 +381,7 @@ async def test_input_cancel_retains_auxiliary_after_failed_aborts_until_close_re
         cancelled_request_ids = h.session.resource_request_ids()
         assert h.session.resource_request_ids(submitted=True) == [request_id]
         old_epoch = h.session.epoch
-        task = h.runner._auxiliary_task
+        task = h.runner.memory._task
         h.port.cleanup = fail_cleanup
 
         events = await h.run(CancelInput())
@@ -583,7 +583,7 @@ async def test_unchanged_short_history_does_not_schedule_repeated_preparation(mo
     try:
         committed_turns(h.session, count=2)
         prepare = mocker.spy(h.runner.plugin, "prepare_auxiliary_request")
-        snapshot = mocker.spy(runner_module, "duplex_text_history")
+        snapshot = mocker.spy(memory_runtime, "duplex_text_history")
         await h.run(Heartbeat())
         first_count = prepare.call_count
         assert first_count == 1
@@ -701,7 +701,7 @@ async def test_queued_completion_keeps_identity_when_earlier_command_appends_tai
     try:
         committed_turns(h.session)
         submission = await start_summary(h)
-        task = h.runner._auxiliary_task
+        task = h.runner.memory._task
         entered = asyncio.Event()
         original = h.runner._on_command
 

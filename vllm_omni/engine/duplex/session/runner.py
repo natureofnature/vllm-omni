@@ -21,10 +21,9 @@ orchestrator loop (the session is never touched from another thread):
 from __future__ import annotations
 
 import asyncio
-import math
 import time
 import uuid
-from collections.abc import Awaitable, Callable, Hashable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
@@ -61,10 +60,6 @@ from vllm_omni.engine.duplex.contracts import (
     DuplexOutputContext,
     DuplexOutputDecision,
     DuplexStagePort,
-    DuplexStageRequestContext,
-    DuplexStageSubmission,
-    duplex_is_auxiliary_request,
-    duplex_resource_request_id,
 )
 from vllm_omni.engine.duplex.events import (
     DuplexEvent,
@@ -75,11 +70,9 @@ from vllm_omni.engine.duplex.events import (
     SessionHeartbeatAck,
 )
 from vllm_omni.engine.duplex.plugin import (
-    DuplexAuxiliaryRequest,
     DuplexModelPlugin,
     DuplexModelSessionState,
     PcmAppendReservation,
-    duplex_text_history,
 )
 from vllm_omni.engine.duplex.realtime_events import (
     RealtimeProjectionState,
@@ -106,6 +99,7 @@ from vllm_omni.engine.duplex.session.control import SessionControl
 from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 from vllm_omni.engine.duplex.session.engine_session import DuplexEngineSession
 from vllm_omni.engine.duplex.session.lease import DuplexLeaseActivity
+from vllm_omni.engine.duplex.session.memory_runtime import SessionMemoryRuntime
 from vllm_omni.engine.duplex.session.model_channel import ModelChannel
 from vllm_omni.engine.duplex.turn_detection import (
     TurnDetectionResult,
@@ -193,23 +187,6 @@ class DuplexSessionRunner:
         self._worker_stopped = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
-        self._auxiliary_task: asyncio.Task[None] | None = None
-        self._auxiliary_output: asyncio.Future[object] | None = None
-        self._auxiliary_request_id: str | None = None
-        self._auxiliary_source: tuple[int, int, Hashable] | None = None
-        self._auxiliary_completion_pending = False
-        self._auxiliary_epoch = session.epoch
-        self._auxiliary_generation = 0
-        self._auxiliary_history_revision = -1
-        self._auxiliary_history: tuple[dict[str, object], ...] = ()
-        self._auxiliary_retry_source: tuple[int, int, Hashable] | None = None
-        self._auxiliary_failures = 0
-        self._auxiliary_retry_timer: asyncio.TimerHandle | None = None
-        self._auxiliary_input_pending = False
-        self._auxiliary_pending_user_items: set[str] = set()
-        self._auxiliary_interaction_active = False
-        self._auxiliary_interaction_epoch = session.epoch
-        self._auxiliary_interaction_turn: int | None = None
         #: Flags more than one component reads and writes (see session_context).
         self.run = DuplexRunState()
         self.ctx = DuplexSessionContext(
@@ -223,6 +200,7 @@ class DuplexSessionRunner:
             services=self,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
+        self.memory = SessionMemoryRuntime(self.ctx, self.out, post=self._post_memory_event, wake=self._wake_memory)
         self.model = ModelChannel(
             self.ctx,
             self.out,
@@ -272,9 +250,7 @@ class DuplexSessionRunner:
         context: DuplexOutputContext,
     ) -> bool:
         """Accept one stage output (orchestrator loop); return True when it must not be forwarded."""
-        if duplex_is_auxiliary_request(request_id):
-            if request_id == self._auxiliary_request_id and context.segment_finished:
-                self._mailbox.put_nowait(_Internal("auxiliary_output", {"request_id": request_id, "output": output}))
+        if self.memory.on_output(request_id, output, finished=context.segment_finished):
             return True
         decision: DuplexOutputDecision | None = None
         project = False
@@ -338,8 +314,7 @@ class DuplexSessionRunner:
         ``session.expired``. Emitting here keeps the order
         ``error`` -> failed ``response.done`` -> ``session.expired``.
         """
-        if duplex_is_auxiliary_request(request_id):
-            self._mailbox.put_nowait(_Internal("auxiliary_error", {"request_id": request_id, "error": exc}))
+        if self.memory.on_error(request_id, exc):
             return
         session = self.session
         if session.state == DuplexSessionState.CLOSED:
@@ -489,7 +464,7 @@ class DuplexSessionRunner:
             try:
                 await self._handle_item(item)
                 if isinstance(item, (DuplexCommand, StageOutput)):
-                    self._maybe_start_auxiliary()
+                    self.memory.maybe_start()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -497,7 +472,7 @@ class DuplexSessionRunner:
                 self._emit_error("internal_error", str(exc))
 
     async def _stop_worker(self) -> None:
-        self._reset_auxiliary_retry()
+        self.memory.cancel_retry()
         worker = self._worker
         self._worker = None
         # Set even when the worker itself is stopping (a wire ``session.close``
@@ -543,51 +518,7 @@ class DuplexSessionRunner:
         await self._on_command(item)
 
     async def _on_internal(self, item: _Internal) -> None:
-        if item.kind == "auxiliary_ready":
-            self._maybe_start_auxiliary()
-            return
-        if item.kind == "auxiliary_retry":
-            if (
-                item.payload["operation"] == self._auxiliary_generation
-                and item.payload["source"] == self._auxiliary_source
-            ):
-                self._auxiliary_retry_timer = None
-                self._auxiliary_source = None
-                self._maybe_start_auxiliary()
-            return
-        if item.kind in {"auxiliary_output", "auxiliary_error"}:
-            future = self._auxiliary_output
-            if item.payload["request_id"] == self._auxiliary_request_id and future is not None and not future.done():
-                if item.kind == "auxiliary_error":
-                    error = item.payload["error"]
-                    assert isinstance(error, BaseException)
-                    future.set_exception(error)
-                else:
-                    future.set_result(item.payload["output"])
-            return
-        if item.kind == "auxiliary_result":
-            if item.payload["operation"] != self._auxiliary_generation:
-                return
-            self._auxiliary_completion_pending = False
-            request = item.payload["request"]
-            epoch, generation = item.payload["epoch"], item.payload["generation"]
-            assert isinstance(request, DuplexAuxiliaryRequest)
-            assert isinstance(epoch, int) and isinstance(generation, int)
-            if self._auxiliary_context_matches(request, epoch, generation):
-                output = item.payload["output"]
-                try:
-                    applied = output is not None and self.plugin.apply_auxiliary_result(
-                        request=request, output=output, state=self.model_state
-                    )
-                except Exception as exc:
-                    logger.warning("Duplex auxiliary result failed: %s", type(exc).__name__)
-                    applied = False
-                if applied:
-                    self._auxiliary_source = None
-                    self._reset_auxiliary_retry()
-                else:
-                    self._schedule_auxiliary_retry(request)
-            self._maybe_start_auxiliary()
+        if self.memory.handle_event(item.kind, item.payload):
             return
         if item.kind == "stage_metrics":
             stage_metrics = item.payload.get("stage_metrics")
@@ -728,17 +659,15 @@ class DuplexSessionRunner:
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self._run_internal_payload(payload)
-            if session.unanswered_user_items() > previous_user_items and self._preempt_auxiliary_for_input(
-                command.payload(), has_new_user_input=True
-            ):
-                self._auxiliary_pending_user_items.add(str(command.item["id"]))
+            if session.unanswered_user_items() > previous_user_items:
+                self.memory.note_user_item(command.payload(), str(command.item["id"]))
         elif isinstance(command, DeleteItem):
             control = resolve_delete_item(projector, command)
             self._emit_events(control.events)
             for payload in control.payloads:
                 await self.control.on_turn_signal(payload)
             if control.payloads:
-                self._auxiliary_pending_user_items.discard(command.item_id)
+                self.memory.forget_user_item(command.item_id)
         elif isinstance(command, TruncateItem):
             control = resolve_truncate_item(projector, command)
             self._emit_events(control.events)
@@ -825,247 +754,15 @@ class DuplexSessionRunner:
         self.run.closing = True
         self.run.close_reason = self.run.close_reason or reason
         self.session.mark_closing()
-        self._reset_auxiliary_retry()
-        if self._auxiliary_task is not None:
-            self._auxiliary_task.cancel()
+        self.memory.close()
 
-    def _auxiliary_context_matches(self, request: DuplexAuxiliaryRequest, epoch: int, generation: int) -> bool:
-        if self.closing or self.session.epoch != epoch or self.session.config_generation != generation:
-            return False
-        return self.plugin.auxiliary_source_matches(
-            request=request, state=self.model_state, history=self._current_auxiliary_history()
-        )
+    def _post_memory_event(self, kind: str, payload: dict[str, object]) -> None:
+        self._mailbox.put_nowait(_Internal(kind, payload))
 
-    def _current_auxiliary_history(self) -> tuple[dict[str, object], ...]:
-        """Reuse the conversation view until a committed history revision changes."""
-        if self._auxiliary_history_revision != self.session.history_revision:
-            self._auxiliary_history = self.session.history
-            self._auxiliary_history_revision = self.session.history_revision
-        return self._auxiliary_history
-
-    @property
-    def _auxiliary_interaction_pending(self) -> bool:
-        """Unconsumed input intent, including only user items still present."""
-        return self._auxiliary_input_pending or bool(self._auxiliary_pending_user_items)
-
-    def _clear_auxiliary_interaction_pending(self) -> None:
-        """Consume or cancel both item-backed and committed-input intent."""
-        self._auxiliary_input_pending = False
-        self._auxiliary_pending_user_items.clear()
-
-    def _wake_auxiliary(self, _completed: object = None) -> None:
-        """Wake policy on the mailbox after accepted input or owned work finishes."""
+    def _wake_memory(self, _completed: object = None) -> None:
+        """Wake memory policy on the mailbox after accepted input or owned work finishes."""
         if self.plugin.supports_auxiliary_requests and not self.closing and not self._worker_stopped:
-            self._mailbox.put_nowait(_Internal("auxiliary_ready", {}))
-
-    def _reset_auxiliary_retry(self) -> None:
-        """Forget a retired source's retry budget and its single timer."""
-        if self._auxiliary_retry_timer is not None:
-            self._auxiliary_retry_timer.cancel()
-            self._auxiliary_retry_timer = None
-        self._auxiliary_retry_source = None
-        self._auxiliary_failures = 0
-
-    def _preempt_auxiliary_for_input(self, payload: Mapping[str, object], *, has_new_user_input: bool) -> bool:
-        """Let model-classified user input take priority without losing its source."""
-        if not self.plugin.supports_auxiliary_requests or not self.plugin.auxiliary_preempted_by_input(
-            payload=payload, state=self.model_state, has_new_user_input=has_new_user_input
-        ):
-            return False
-        self._reset_auxiliary_retry()
-        self._auxiliary_generation += 1
-        self._auxiliary_completion_pending = False
-        self._auxiliary_source = None
-        if self._auxiliary_task is not None and not self._auxiliary_task.done():
-            if not self._auxiliary_task.cancelling():
-                self._auxiliary_task.cancel()
-        return True
-
-    def _schedule_auxiliary_retry(self, request: DuplexAuxiliaryRequest) -> None:
-        """Retry a submitted failure finitely; unchanged traffic cannot reset it."""
-        source = self._auxiliary_source
-        if not request.retry_delays_s or source is None:
-            return
-        if self._auxiliary_retry_source != source:
-            self._reset_auxiliary_retry()
-            self._auxiliary_retry_source = source
-        self._auxiliary_failures += 1
-        if self._auxiliary_failures > len(request.retry_delays_s):
-            self._emit_error(
-                "auxiliary_work_paused",
-                "Background processing paused after repeated failures; new user input can retry it.",
-                retryable=True,
-            )
-            return
-        event = _Internal("auxiliary_retry", {"source": source, "operation": self._auxiliary_generation})
-        self._auxiliary_retry_timer = asyncio.get_running_loop().call_later(
-            request.retry_delays_s[self._auxiliary_failures - 1], self._mailbox.put_nowait, event
-        )
-
-    def _maybe_start_auxiliary(self) -> None:
-        if not self.plugin.supports_auxiliary_requests or self.closing:
-            return
-        history = self._current_auxiliary_history()
-        policy = self.plugin.auxiliary_policy(
-            state=self.model_state, history_revision=self.session.history_revision, history=history
-        )
-        if self._auxiliary_interaction_epoch != self.session.epoch:
-            self._auxiliary_interaction_epoch = self.session.epoch
-            self._auxiliary_interaction_active = False
-            self._clear_auxiliary_interaction_pending()
-            self._auxiliary_interaction_turn = None
-        if self._auxiliary_interaction_active and (
-            (
-                self._auxiliary_interaction_turn is not None
-                and self.session.turn_id > self._auxiliary_interaction_turn
-                and self.session.active_response_turn_id != self._auxiliary_interaction_turn
-            )
-            or (
-                self.session.active_response_id is None
-                and not self.tasks.append_tasks
-                and self.run.stream_request_id is None
-            )
-        ):
-            self._auxiliary_interaction_active = False
-            self._auxiliary_interaction_turn = None
-        if self._auxiliary_completion_pending:
-            return
-        if self._auxiliary_task is not None and not self._auxiliary_task.done():
-            if self.session.epoch != self._auxiliary_epoch:
-                self._auxiliary_task.cancel()
-            return
-        # A failed abort retains its resource for teardown retry. Do not build
-        # an unbounded collection of abandoned background requests behind it.
-        if any(duplex_is_auxiliary_request(request_id) for _, request_id in self.session.request_resources):
-            return
-        if policy is None:
-            self._auxiliary_source = None
-            self._reset_auxiliary_retry()
-            return
-        source = (self.session.epoch, self.session.config_generation, policy.source_key)
-        if self._auxiliary_retry_source is not None and self._auxiliary_retry_source != source:
-            self._reset_auxiliary_retry()
-        if self._auxiliary_interaction_pending or self._auxiliary_interaction_active:
-            return
-        if not policy.allow_during_response and (
-            self.session.active_response_id is not None or self.tasks.append_tasks
-        ):
-            return
-        # An attempted source remains parked until success, a bounded retry,
-        # changed evidence, or explicit user interaction releases it.
-        if source == self._auxiliary_source:
-            return
-        self._auxiliary_source = source
-        self._auxiliary_epoch = self.session.epoch
-        self._auxiliary_generation += 1
-        self._auxiliary_task = asyncio.create_task(
-            self._run_auxiliary(duplex_text_history(history)), name="duplex-auxiliary"
-        )
-        self._background_tasks.add(self._auxiliary_task)
-        self._auxiliary_task.add_done_callback(self._background_tasks.discard)
-        self._auxiliary_task.add_done_callback(self._wake_auxiliary)
-
-    async def _run_auxiliary(self, history: tuple[tuple[str, str], ...]) -> None:
-        session = self.session
-        epoch, generation = session.epoch, session.config_generation
-        operation = self._auxiliary_generation
-        request_id = None
-        request = None
-        output = None
-        submission_started = False
-        try:
-            request = await asyncio.wait_for(
-                self.plugin.prepare_auxiliary_request(
-                    history=history,
-                    runtime_config=session.runtime_config,
-                    state=self.model_state,
-                ),
-                timeout=30.0,
-            )
-            if request is None or not self._auxiliary_context_matches(request, epoch, generation):
-                return
-            if (
-                not 0 <= request.stage_id < self.stage_port.stage_count
-                or not math.isfinite(request.timeout_s)
-                or request.timeout_s <= 0
-                or any(not math.isfinite(delay) or delay < 0 for delay in request.retry_delays_s)
-            ):
-                raise ValueError("Invalid auxiliary stage or deadline")
-            request_id = duplex_resource_request_id(session.fence, f"auxiliary-{uuid.uuid4().hex}")
-            self._auxiliary_request_id = request_id
-            output_future: asyncio.Future[object] = asyncio.get_running_loop().create_future()
-            self._auxiliary_output = output_future
-            sampling = list(self.manager.sampling_params_for(session))
-            sampling[request.stage_id] = request.sampling_params
-            context = DuplexStageRequestContext(
-                request_id=request_id,
-                session_id=session.session_id,
-                fence=session.fence,
-                stage_id=request.stage_id,
-                final_stage_id=request.stage_id,
-                config_generation=generation,
-                sampling_params=tuple(sampling),
-            )
-            session.reserve_stage_request(request.stage_id, request_id, fence=context.fence)
-            # Mark submitted before yielding so concurrent close always aborts
-            # an in-flight submit rather than merely dropping its reservation.
-            session.request_resources[(request.stage_id, request_id)].submitted = True
-            self.stage_port.ensure_request(context)
-            self.manager.register_request(request_id, session.session_id)
-
-            async def submit_and_wait() -> object:
-                nonlocal submission_started
-                submission_started = True
-                result = await self.stage_port.submit(
-                    DuplexStageSubmission(context, request.prompt, already_submitted=False, resumable=False)
-                )
-                if result.request_id != request_id or result.stage_id != request.stage_id:
-                    raise RuntimeError("Auxiliary stage submission returned a mismatched identity")
-                if not self._auxiliary_context_matches(request, epoch, generation):
-                    return None
-                return await output_future
-
-            output = await asyncio.wait_for(submit_and_wait(), timeout=request.timeout_s)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            logger.warning("Duplex auxiliary request failed: %s", type(exc).__name__)
-        finally:
-            if request_id is not None:
-                assert request is not None
-                try:
-                    # Cancellation may already have cleaned and released this
-                    # request. A failed cancellation leaves it owned for retry.
-                    if (request.stage_id, request_id) in session.request_resources:
-                        await self.stage_port.cleanup([request_id], abort=True)
-                except Exception as exc:
-                    # Keep the reservation for the manager's teardown retry.
-                    logger.warning("Duplex auxiliary cleanup failed: %s", type(exc).__name__)
-                else:
-                    session.request_resources.pop((request.stage_id, request_id), None)
-                    self.manager.unregister_request(request_id)
-                if self._auxiliary_request_id == request_id:
-                    if self._auxiliary_output is not None and self._auxiliary_output.done():
-                        if not self._auxiliary_output.cancelled():
-                            self._auxiliary_output.exception()
-                    self._auxiliary_request_id = None
-                    self._auxiliary_output = None
-        # Queue completion after cleanup, so the mailbox may schedule the next
-        # bounded chunk without racing the previous task's owned resources.
-        if request is not None and submission_started and operation == self._auxiliary_generation:
-            self._auxiliary_completion_pending = True
-            self._mailbox.put_nowait(
-                _Internal(
-                    "auxiliary_result",
-                    {
-                        "request": request,
-                        "output": output,
-                        "epoch": epoch,
-                        "generation": generation,
-                        "operation": operation,
-                    },
-                )
-            )
+            self._post_memory_event("auxiliary_ready", {})
 
     def _session_auto_responds(self) -> bool:
         return self.out.auto_responds()
@@ -1418,14 +1115,7 @@ class DuplexSessionRunner:
     ) -> asyncio.Task[bool]:
         session = self.session
         model_state = self.model_state
-        interactive = not silence_continuation and self._preempt_auxiliary_for_input(
-            payload,
-            has_new_user_input=self._auxiliary_interaction_pending,
-        )
-        if interactive:
-            self._clear_auxiliary_interaction_pending()
-            self._auxiliary_interaction_active = True
-            self._auxiliary_interaction_epoch = session.epoch
+        interactive = self.memory.begin_append(payload, silence_continuation=silence_continuation)
         if not silence_continuation:
             self._mark_pending_silence_superseded()
             if on_append_accepted is None:
@@ -1442,14 +1132,14 @@ class DuplexSessionRunner:
         def _accepted(submit_time: float) -> None:
             if accepted_callback is not None:
                 accepted_callback(submit_time)
-            self._wake_auxiliary()
+            self._wake_memory()
 
         on_append_accepted = _accepted
         append_epoch = session.epoch
         append_fence = helpers.append_fence(session, payload, epoch=append_epoch)
         append_turn_id = append_fence.turn_id
         if interactive:
-            self._auxiliary_interaction_turn = append_turn_id
+            self.memory.bind_interaction_turn(append_turn_id)
         request_id = self.ctx.manager.stage_request_id(
             append_fence,
             stage_id=0,
@@ -1498,7 +1188,7 @@ class DuplexSessionRunner:
             final=final,
             response_bound=final or precreate_response,
         )
-        task.add_done_callback(self._wake_auxiliary)
+        task.add_done_callback(self._wake_memory)
         if silence_continuation:
             model_state.pending_silence_task = task
             task.add_done_callback(attempt.clear_pending_silence)
@@ -1705,8 +1395,7 @@ class DuplexSessionRunner:
                 )
                 return
         had_unbuffered_append = model_state.input_since_commit and not model_state.audio_buffer.has_pending()
-        self._clear_auxiliary_interaction_pending()
-        self._auxiliary_interaction_active = False
+        self.memory.cancel_interaction()
         playback_was_active = helpers.assistant_playback_active(self.session)
         if event_type in {"input.cancel", "barge_in"}:
             model_state.audio_buffer.clear()
@@ -1994,8 +1683,7 @@ class DuplexSessionRunner:
                     session.release_input_bytes(pending_bytes)
                 model_state.input_since_commit = False
             return False
-        if self._preempt_auxiliary_for_input(flushed, has_new_user_input=self._auxiliary_interaction_pending):
-            self._auxiliary_input_pending = True
+        self.memory.note_committed_input(flushed)
         if overlap_policy.should_force_listen_for_short_commit(self.session, event, flushed):
             flushed = dict(flushed)
             flushed["force_listen"] = True
@@ -2166,11 +1854,7 @@ class DuplexSessionRunner:
         if video_only and (not deferred_payload.get("video_frames") or deferred_payload.get("audio")):
             commit_reservation.rollback()
             return False
-        if self._preempt_auxiliary_for_input(
-            deferred_payload,
-            has_new_user_input=self._auxiliary_interaction_pending,
-        ):
-            self._auxiliary_input_pending = True
+        self.memory.note_committed_input(deferred_payload)
         retained_payload: dict[str, object]
         if model_state.committed_audio_payload is not None:
             retained_payload = overlap_policy.merge_audio_payloads(
@@ -2383,10 +2067,8 @@ class DuplexSessionRunner:
                 await self._commit_and_start_auto_response(event, realtime_item_id=realtime_item_id)
                 return
         if event_type == "response.create":
-            if (
-                session.unanswered_user_items() or model_state.committed_audio_payload is not None
-            ) and self._preempt_auxiliary_for_input(event, has_new_user_input=True):
-                self._auxiliary_input_pending = True
+            if session.unanswered_user_items() or model_state.committed_audio_payload is not None:
+                self.memory.note_committed_input(event, has_new_user_input=True)
             await self._start_response_from_committed_audio()
             return
         next_commit_allowed = helpers.next_commit_allowed(

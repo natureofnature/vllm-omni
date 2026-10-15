@@ -237,6 +237,7 @@ vllm_omni/
 │           ├── context.py           DuplexSessionContext / DuplexRunState: what the runner shares with its components
 │           ├── emitter.py           SessionEmitter: projection, epoch filter, domain effects of a terminal event
 │           ├── model_channel.py     ModelChannel: submit an append, project stage output, continue a turn
+│           ├── memory_runtime.py    SessionMemoryRuntime: execute private model-planned memory requests
 │           ├── control.py           SessionControl: server VAD and the events that reconfigure it
 │           ├── append_task.py       AppendAttempt: one append in flight and the rollback its failure owes
 │           ├── helpers.py           pure reads and payload builders over a session
@@ -359,12 +360,13 @@ for queue updates and the final validity check before delivery.
   `ResponseDone.stage_metrics` and `metadata.vllm_omni.stage_metrics` on the
   wire keep their meaning.
 
-Model plugins may opt into one bounded auxiliary request per Session. The runner
-gives it a separate resource identity, submits and terminates it at the selected
-stage, and intercepts its output and errors before response policy, speech
-routing, playback history or response metrics. The plugin receives immutable
+Model plugins may opt into one bounded auxiliary request per Session. The
+Session-owned `SessionMemoryRuntime` gives it a separate resource identity,
+submits and terminates it at the selected stage, and intercepts its output and
+errors before response policy, speech routing, playback history or response
+metrics. The plugin receives immutable
 committed history and owns prompt/result formatting and source validation. Sources
-can cover text, images or model-owned derived state. The runner checks the epoch,
+can cover text, images or model-owned derived state. The helper checks the epoch,
 configuration generation, operation identity and plugin source validity before
 mailbox writeback. Appending newer history can preserve a stable prefix; editing
 or deleting its evidence invalidates it. Cancellation and close abort owned
@@ -378,9 +380,12 @@ source as newer observations arrive. Successful application allows the next
 bounded chunk to catch up without waiting for new input.
 The session's committed-history revision lets unchanged input events skip history
 snapshotting and hashing. Prefix fingerprints still validate summary writeback.
-The Session layer owns execution and cleanup; model plugins own content policy,
-memory tiers, prompts and budgets. Recoverable input-capacity rejection releases
-the unsubmitted request and its reservations while keeping the Session open.
+The runner delegates auxiliary lifecycle and retry state to this helper through
+`DuplexSessionContext`, tracks its tasks, and dispatches completion events through
+the existing mailbox. Model plugins retain the existing policy hooks and own
+content policy, memory tiers, prompts and budgets. Recoverable input-capacity
+rejection releases the unsubmitted request and its reservations while keeping
+the Session open.
 
 ### Experimental output limits
 
