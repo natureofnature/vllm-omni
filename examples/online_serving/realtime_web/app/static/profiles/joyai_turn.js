@@ -61,6 +61,9 @@
         item_id: `item_${responseId}`, played_ms: playedMs, committed_ms: playedMs };
     },
     mapEvent(event) {
+      if (event.type === 'input_audio_buffer.committed' && event.event?.no_response === true) {
+        return { kind: 'commit-settled', eventId: event.event.realtime_event_id };
+      }
       // A reply can finish generating while its audio is still queued locally.
       if (vad && event.type === 'input_audio_buffer.speech_started') return { kind: 'interrupt' };
       if (vad && (event.type === 'output_audio_buffer.cleared' ||

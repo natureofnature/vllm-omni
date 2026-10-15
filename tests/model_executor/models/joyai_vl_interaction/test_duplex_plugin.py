@@ -126,6 +126,40 @@ async def open_joyai(*, modalities=("text", "audio"), asr=False):
     return harness
 
 
+@pytest.mark.asyncio
+async def test_quiet_pcm_commit_keeps_client_identity_without_creating_response():
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        command = translate_realtime_command(
+            {
+                "type": "input_audio_buffer.append",
+                "audio": base64.b64encode(struct.pack("<h", 1) * 3200).decode(),
+                "format": "pcm16",
+                "sample_rate_hz": 16000,
+            }
+        )
+        assert command.audio and command.is_speech is False
+        await h.run(command)
+        events = await h.run(
+            translate_realtime_command(
+                {
+                    "type": "input_audio_buffer.commit",
+                    "event_id": "quiet-commit",
+                    "final": True,
+                    "create_response": True,
+                }
+            )
+        )
+        committed = next(event.to_realtime() for event in events if event.type == "input_audio_buffer.committed")
+        assert committed["event"]["no_response"] is True
+        assert committed["event"]["realtime_event_id"] == "quiet-commit"
+        assert not h.port.submissions
+        assert not any(event.type in {"error", "response.created"} for event in events)
+        await observe(h)  # A later camera observation still opens a response.
+    finally:
+        await h.manager.shutdown()
+
+
 async def observe(h):
     count = len(h.port.submissions)
     await h.run(AppendAudio(video_frames=(frame(),)))

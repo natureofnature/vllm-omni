@@ -128,6 +128,21 @@
     if (profile.halfDuplex) pendingCapture = [];
   }
 
+  function settleCommitWithoutResponse(eventId) {
+    if (!pendingCommits.delete(eventId) || pendingCommits.size !== 0) return;
+    // Release this group's idle-to-busy state only once every commit has
+    // settled without a response. Another pending commit may still succeed.
+    if (pendingCommitsOwnBusy && !currentResponseId) {
+      clearTimeout(turnTimeout);
+      turnSubmitted = false;
+      assistantActive = false;
+      responseComplete = false;
+      sendTurnButton.disabled = !profile.clientCommit;
+      if (!pttHeld) setModel(profile.waiting);
+    }
+    pendingCommitsOwnBusy = false;
+  }
+
   function armTurnTimeout() {
     clearTimeout(turnTimeout);
     turnTimeout = window.setTimeout(() => {
@@ -697,21 +712,12 @@
         if (sessionCloseResolver) sessionCloseResolver();
         sessionCloseResolver = null;
         break;
+      case 'commit-settled':
+        settleCommitWithoutResponse(action.eventId);
+        break;
       case 'error':
         if (action.fatal) { await failSession(action.message); break; }
-        if (pendingCommits.delete(event.error?.event_id) && pendingCommits.size === 0) {
-          // Release this group's idle-to-busy state only after every commit
-          // is explicitly rejected. An older pending commit may still succeed.
-          if (pendingCommitsOwnBusy && !currentResponseId) {
-            clearTimeout(turnTimeout);
-            turnSubmitted = false;
-            assistantActive = false;
-            responseComplete = false;
-            sendTurnButton.disabled = !profile.clientCommit;
-            if (!pttHeld) setModel(profile.waiting);
-          }
-          pendingCommitsOwnBusy = false;
-        }
+        settleCommitWithoutResponse(event.error?.event_id);
         // A rejected frame or a refused update costs one operation, not the
         // call: report it and keep listening.
         appendLog(action.message, true);

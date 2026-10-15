@@ -1911,7 +1911,7 @@ class DuplexSessionRunner:
                 retained_committed_payload=final_payload,
             )
 
-    def _commit_silent_input(self) -> None:
+    def _commit_silent_input(self, *, event_id: str | None = None) -> None:
         """Commit a turn the client itself marked as silence: drop it and keep listening."""
         session = self.session
         model_state = self.model_state
@@ -1929,6 +1929,7 @@ class DuplexSessionRunner:
                 "empty": True,
                 "is_speech": False,
                 "no_response": True,
+                **({"realtime_event_id": event_id} if event_id is not None else {}),
             }
         )
         self.emit(
@@ -1974,7 +1975,7 @@ class DuplexSessionRunner:
                 or model_state.committed_audio_payload is not None
             )
             if not has_pending_turn:
-                self._commit_silent_input()
+                self._commit_silent_input(event_id=event.get("realtime_event_id"))
                 return
         precreate_response_requested = event_type == "response.create" or bool(
             event.get("response_create", event_type == "input.commit")

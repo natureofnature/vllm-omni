@@ -330,17 +330,48 @@ test('JoyAI rejects only its own pending commit and resumes camera observations 
   await app.ui.stopSession({ terminal: false });
 });
 
-for (const responseStarted of [false, true]) {
-  test(`JoyAI rejected overlapping PTT preserves an older ${responseStarted ? 'active' : 'pending'} response`, async () => {
+function settledCommit(kind, commit) {
+  return kind === 'silent'
+    ? { type: 'input_audio_buffer.committed', event: { no_response: true, realtime_event_id: commit.event_id } }
+    : { type: 'error', error: { code: 'commit_aborted', message: 'Commit rejected', event_id: commit.event_id } };
+}
+
+test('JoyAI quiet nonempty PTT finishes without a response and leaves camera observations available', async () => {
+  const app = shell('joyai-turn', 'manual', { speechInput: true });
+  await app.ui.startSession();
+  app.ui.setPttHeld(true); app.ui.capture([1, 1, 1, 1]); app.ui.setPttHeld(false);
+  const commit = app.sockets[0].sent.at(-1);
+  assert.equal(commit.type, 'input_audio_buffer.commit');
+  assert.ok(app.sockets[0].sent.at(-2).audio);
+  for (const event of [
+    settledCommit('silent', {}), settledCommit('silent', { event_id: 'unrelated' }),
+    { type: 'response.listen', reason: 'silence_or_noise' },
+    { type: 'input_audio_buffer.committed', event: { realtime_event_id: commit.event_id } },
+  ]) {
+    await app.ui.handleEvent(event);
+    assert.equal(app.ui.state().turnSubmitted, true, 'only the matching no-response acknowledgement settles a commit');
+  }
+  await app.ui.handleEvent(settledCommit('silent', commit));
+  await app.ui.handleEvent({ type: 'response.listen', reason: 'silence_or_noise' });
+  assert.equal(app.ui.state().turnSubmitted, false);
+  assert.equal(app.ui.state().assistantActive, false);
+  assert.equal(app.elements.get('sendTurnButton').disabled, false);
+  await app.turnWatchdog();
+  assert.equal(app.ui.state().running, true);
+  app.ui.setPendingFrame('after-quiet-hold'); app.ui.flushCapture();
+  assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-quiet-hold']);
+  await app.ui.stopSession({ terminal: false });
+});
+
+for (const outcome of ['rejected', 'silent']) for (const responseStarted of [false, true]) {
+  test(`JoyAI ${outcome} overlapping PTT preserves an older ${responseStarted ? 'active' : 'pending'} response`, async () => {
     const app = shell('joyai-turn', 'manual', { speechInput: true });
     await app.ui.startSession();
     app.ui.setPendingFrame('first'); app.ui.flushCapture();
     if (responseStarted) await app.ui.handleEvent({ type: 'response.created', response: { id: 'first' } });
     app.ui.setPttHeld(true); app.ui.capture(); app.ui.setPttHeld(false);
     const commit = app.sockets[0].sent.at(-1);
-    await app.ui.handleEvent({ type: 'error', error: {
-      code: 'input_audio_buffer_empty', message: 'Input buffer was empty', event_id: commit.event_id,
-    } });
+    await app.ui.handleEvent(settledCommit(outcome, commit));
     assert.equal(app.ui.state().assistantActive, true);
     assert.equal(app.ui.state().turnSubmitted, true);
     const count = app.sockets[0].sent.length;
@@ -353,8 +384,8 @@ for (const responseStarted of [false, true]) {
   });
 }
 
-for (const reverseOrder of [false, true]) {
-  test(`JoyAI releases busy only after both pending commits are rejected in ${reverseOrder ? 'reverse' : 'send'} order`, async () => {
+for (const outcomes of [['rejected', 'rejected'], ['silent', 'silent'], ['silent', 'rejected']]) for (const reverseOrder of [false, true]) {
+  test(`JoyAI releases busy after ${outcomes.join('/')} commits settle in ${reverseOrder ? 'reverse' : 'send'} order`, async () => {
     const app = shell('joyai-turn', 'manual', { speechInput: true });
     await app.ui.startSession();
     for (let index = 0; index < 2; index += 1) {
@@ -362,29 +393,27 @@ for (const reverseOrder of [false, true]) {
     }
     const commits = app.sockets[0].sent.filter(event => event.type === 'input_audio_buffer.commit');
     assert.equal(commits.length, 2);
-    const rejected = reverseOrder ? [...commits].reverse() : commits;
-    const rejection = commit => ({ type: 'error', error: {
-      code: 'commit_aborted', message: 'The preceding append failed', event_id: commit.event_id,
-    } });
-    await app.ui.handleEvent(rejection(rejected[0]));
+    const settled = commits.map((commit, index) => settledCommit(outcomes[index], commit));
+    if (reverseOrder) settled.reverse();
+    await app.ui.handleEvent(settled[0]);
     assert.equal(app.ui.state().assistantActive, true, 'the other commit may still succeed');
     assert.equal(app.ui.state().turnSubmitted, true);
     const before = app.sockets[0].sent.length;
     app.ui.setPendingFrame('after-rejections'); app.ui.flushCapture();
     assert.equal(app.sockets[0].sent.length, before);
 
-    await app.ui.handleEvent(rejection(rejected[1]));
+    await app.ui.handleEvent(settled[1]);
     assert.equal(app.ui.state().assistantActive, false);
     assert.equal(app.ui.state().turnSubmitted, false);
     await app.turnWatchdog();
-    assert.equal(app.ui.state().running, true, 'all rejected commits must disarm their watchdog');
+    assert.equal(app.ui.state().running, true, 'settled commits must disarm their watchdog');
     app.ui.flushCapture();
     assert.deepEqual(app.sockets[0].sent.at(-2).video_frames, ['after-rejections']);
     const newCommit = app.sockets[0].sent.at(-1);
-    for (const commit of commits) await app.ui.handleEvent(rejection(commit));
-    assert.equal(app.ui.state().assistantActive, true, 'late rejections do not release a newer pending commit');
+    for (const event of settled) await app.ui.handleEvent(event);
+    assert.equal(app.ui.state().assistantActive, true, 'late acknowledgements do not release a newer pending commit');
     await app.ui.handleEvent({ type: 'response.created', response: { id: 'new-response' } });
-    await app.ui.handleEvent(rejection(newCommit));
+    await app.ui.handleEvent(settledCommit(outcomes[0], newCommit));
     assert.equal(app.ui.state().assistantActive, true, 'a begun response owns its lifecycle');
     await app.ui.stopSession({ terminal: false });
   });
