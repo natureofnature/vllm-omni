@@ -20,6 +20,7 @@ from vllm_omni.engine.duplex.plugin import (
     DuplexInputCapacityError,
     duplex_history_digest,
 )
+from vllm_omni.engine.duplex.session import memory_runtime
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -128,20 +129,22 @@ async def test_memory_tasks_remain_session_local_and_runner_owned(mocker):
 
 
 @pytest.mark.asyncio
-async def test_cancelled_cleanup_timeout_retains_resource_for_teardown_retry(mocker):
+@pytest.mark.parametrize("generation_timeout", [0.05, 300.0])
+async def test_cancelled_cleanup_timeout_retains_resource_for_teardown_retry(mocker, generation_timeout):
     h = await open_harness()
-    entered, cancelled = asyncio.Event(), asyncio.Event()
+    entered, cancelled, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     original_cleanup = h.port.cleanup
 
     async def blocked_cleanup(request_ids, *, abort=False):
         entered.set()
         try:
-            await asyncio.Event().wait()
+            await release.wait()
         finally:
             cancelled.set()
 
     try:
-        install_work(h, mocker, timeout_s=0.1)
+        mocker.patch.object(memory_runtime, "_CLEANUP_TIMEOUT_S", 0.1, create=True)
+        install_work(h, mocker, timeout_s=generation_timeout)
         h.submit(Heartbeat())
         await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
         task = h.runner.memory._task
@@ -161,6 +164,7 @@ async def test_cancelled_cleanup_timeout_retains_resource_for_teardown_retry(moc
         assert ([request_id], True) in h.port.cleanups
         assert request_id not in h.manager._request_index
     finally:
+        release.set()
         mocker.patch.object(h.port, "cleanup", side_effect=original_cleanup)
         await close_harness(h)
 

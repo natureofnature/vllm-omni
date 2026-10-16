@@ -371,7 +371,9 @@ configuration generation, operation identity and plugin source validity before
 mailbox writeback. Appending newer history can preserve a stable prefix; editing
 or deleting its evidence invalidates it. Cancellation and close abort owned
 requests. A failed cleanup retains its resource for teardown retry and prevents
-new auxiliary work from accumulating behind it.
+new auxiliary work from accumulating behind it. Each auxiliary cleanup attempt
+uses the shorter of five seconds and the model request timeout, keeping long
+generation deadlines separate from this cancellation-safe cleanup wait.
 The plugin supplies a stable work key and whether work can enter the existing
 stage queue during an ordinary observation. Explicit user interaction takes
 priority through cancellation after its append plan passes validation, and

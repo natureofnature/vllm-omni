@@ -31,6 +31,8 @@ from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 
 logger = init_logger(__name__)
 
+_CLEANUP_TIMEOUT_S = 5.0
+
 
 class SessionMemoryRuntime:
     """Execute memory work through the existing plugin and Session contracts."""
@@ -376,13 +378,15 @@ class SessionMemoryRuntime:
                     if (request.stage_id, request_id) in session.request_resources:
                         cleanup = asyncio.create_task(
                             asyncio.wait_for(
-                                self._ctx.stage_port.cleanup([request_id], abort=True), timeout=request.timeout_s
+                                self._ctx.stage_port.cleanup([request_id], abort=True),
+                                timeout=min(request.timeout_s, _CLEANUP_TIMEOUT_S),
                             )
                         )
                         # Close/preemption and runner shutdown can all cancel
                         # this task. Join the same cleanup RPC before releasing
                         # ownership, even when cancellation arrives repeatedly.
-                        # The request deadline also bounds this cleanup attempt.
+                        # Cleanup has its own short cap even when model work
+                        # permits a much longer generation deadline.
                         while not cleanup.done():
                             try:
                                 await asyncio.shield(cleanup)

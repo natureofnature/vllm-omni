@@ -36,12 +36,10 @@ from vllm_omni.experimental.fullduplex.joyvl.decision.output_parser import Actio
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import (
     LONG_TERM_COMPRESS_PROMPT,
     MID_TERM_SUMMARY_PROMPT,
-    QA_HISTORY_HEADER,
     QA_QUERY_LABEL,
     QA_RESPONSE_LABEL,
     SILENT_SYSTEM_PROMPT,
     USER_QUERY_HEADER,
-    VIDEO_HISTORY_HEADER,
 )
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane import (
     JoyAIDataPlane,
@@ -64,6 +62,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
 from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
     _clean_qwen3_asr_transcript,
     _extract_completed_action_text,
+    render_joyai_memory_prefix,
 )
 
 if TYPE_CHECKING:
@@ -458,6 +457,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         for index in range(end - 1, start - 1, -1):
             if history[index][0] == "assistant":
                 return index + 1
+        # Silent turns can advance on their own, but a question whose answer
+        # lies just outside the chunk must remain with that answer. Empty
+        # camera observations between them do not break the pair.
+        next_role = next((role for role, text in history[end:] if role in {"user", "assistant"} and text), None)
+        if next_role == "assistant":
+            for index in range(end - 1, start - 1, -1):
+                if history[index][0] == "user" and history[index][1]:
+                    end = index
+                    break
         return end if any(role == "user" and text for role, text in history[start:end]) else start
 
     def _prepare_visual_summary(
@@ -1029,31 +1037,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             history.pop(0)
         return history, latest_instruction, query
 
-    @staticmethod
-    def _memory_prefix(
-        summary: str | None,
-        visual_summaries: Sequence[VisualSummary],
-        *,
-        archived_qa: str = "",
-        active_query: str = "",
-    ) -> str:
-        """Render model-owned memory with the same headings for text and speech."""
-        prefix = []
-        if visual_summaries:
-            prefix.append(
-                VIDEO_HISTORY_HEADER
-                + "\n\n".join(
-                    f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
-                    for entry in visual_summaries
-                )
-            )
-        qa_memory = [text for text in (summary, archived_qa) if text]
-        if qa_memory:
-            prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
-        if active_query:
-            prefix.append(USER_QUERY_HEADER + "\n" + active_query)
-        return "\n\n".join(prefix)
-
     def plan_append(
         self,
         *,
@@ -1091,7 +1074,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             system += "\n\n" + runtime_config["instructions"]
         summary = session_config.get("joyai_summary")
         visual_summaries = [
-            entry
+            f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
             for entry in session_config.get("joyai_visual_summaries", ())
             if query or entry.chunk_index is not None
         ]
@@ -1099,7 +1082,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         rebudget_history = False
         while True:
             archived_qa, active_query, prefix_keys = self._archived_qa_prefix(session_config, runtime_config, history)
-            prefix = self._memory_prefix(
+            prefix = render_joyai_memory_prefix(
                 summary if query else "", visual_summaries, archived_qa=archived_qa, active_query=active_query
             )
             messages = [
@@ -1165,9 +1148,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # instruction separate from evictable history until ASR supplies it.
         instruction = runtime_config.get("initial_user_text") or ""
         history = [{"role": item["role"], "content": item["content"]} for item in history if item["_item_key"] != -1]
-        memory = self._memory_prefix(
-            session_config.get("joyai_summary"), session_config.get("joyai_visual_summaries", ())
-        )
         images = []
         for encoded in session_config.get("joyai_frames", [])[-4:]:
             if encoded.startswith("data:"):
@@ -1191,7 +1171,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not audio.size or not np.isfinite(audio).all() or not np.any(audio):
             raise DuplexRuntimeConfigError("JoyAI speech commit requires non-silent finite PCM")
         prompt_data["additional_information"].update(
-            joyai_prompt_context={"system": system, "history": history, "instruction": instruction, "memory": memory},
+            joyai_prompt_context={
+                "system": system,
+                "history": history,
+                "instruction": instruction,
+                "summary": session_config.get("joyai_summary") or "",
+                "visual_summaries": [
+                    f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
+                    for entry in session_config.get("joyai_visual_summaries", ())
+                ],
+            },
             joyai_prompt_budget=budget,
             joyai_image_token_counts=image_token_counts,
             deferred_multi_modal_data={"image": images} if images else {},

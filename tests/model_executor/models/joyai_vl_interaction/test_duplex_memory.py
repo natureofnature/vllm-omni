@@ -4,7 +4,6 @@
 import asyncio
 import struct
 from dataclasses import replace
-from types import SimpleNamespace
 
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -334,6 +333,60 @@ async def test_summary_catches_up_past_text_bearing_silent_turns(existing_summar
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("shrink_to_budget", [False, True])
+@pytest.mark.parametrize("empty_observations", [0, 2])
+async def test_summary_boundary_keeps_question_with_answer(shrink_to_budget, empty_observations):
+    h = await open_joyai(modalities=("text",))
+    try:
+        plugin = h.runner.plugin
+        silent = tuple(("user", f"Silent fact {index}.") for index in range(6 if shrink_to_budget else 7))
+        tail = tuple((role, f"Recent {index} {role}.") for index in range(4) for role in ("user", "assistant"))
+        question, answer = "What is the cabinet code?", "The cabinet code is CODE_K731."
+        if shrink_to_budget:
+            # Fit the silent prefix and question alone, but not its answer.
+            # Shrinking the chunk must back off over the whole pair.
+            prefix_request = await plugin.prepare_auxiliary_request(
+                history=silent + (("user", question),) + tail,
+                runtime_config=h.session.runtime_config,
+                state=h.runner.model_state,
+            )
+            plugin.max_model_len = (
+                len(plugin.processor.tokenizer(text=[prefix_request.prompt["prompt"]])["input_ids"][0])
+                + prefix_request.sampling_params.max_tokens
+            )
+        history = (
+            silent + (("user", question),) + (("user", ""),) * empty_observations + (("assistant", answer),) + tail
+        )
+        request = await plugin.prepare_auxiliary_request(
+            history=history, runtime_config=h.session.runtime_config, state=h.runner.model_state
+        )
+        assert request is not None
+        assert request.history_length == len(silent)
+        assert question not in request.prompt["prompt"] and answer not in request.prompt["prompt"]
+        config = {
+            "conversation": [{"role": role, "content": text} for role, text in history],
+            "joyai_summary_messages": request.history_length,
+            "joyai_summary": "The older silent facts.",
+        }
+        # The next interactive prompt must retain both halves of the pair.
+        plugin.max_model_len = 16384
+        plan = plugin.plan_append(
+            request_id="boundary-check",
+            fence=h.session.fence,
+            session_config=config,
+            runtime_config=h.session.runtime_config,
+            seq=1,
+            turn_seq=1,
+            payload={},
+            final=True,
+            sampling_params=SamplingParams(max_tokens=256),
+        )
+        assert question in plan.prompt["prompt"] and answer in plan.prompt["prompt"]
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("preempt", [False, True])
 async def test_close_during_auxiliary_cleanup_preserves_cleanup_ownership(monkeypatch, preempt):
     h = await open_joyai(modalities=("text",))
@@ -416,7 +469,7 @@ async def test_asr_uses_bounded_memory_and_preserves_initial_instruction(monkeyp
                 add_generation_prompt=True,
             )
             info["joyai_prompt_budget"] = len(h.runner.plugin.processor.tokenizer(text=[minimum])["input_ids"][0]) + 32
-        (result,) = joyai_bridge.asr_to_joyai([SimpleNamespace(outputs=[SimpleNamespace(text=transcript)])], raw_prompt)
+        (result,) = joyai_bridge.asr_to_joyai([summary_output("asr", text=transcript)], raw_prompt)
         prompt = result["prompt"]
         assert instruction in prompt
         assert transcript in prompt
@@ -427,6 +480,70 @@ async def test_asr_uses_bounded_memory_and_preserves_initial_instruction(monkeyp
             assert "The kettle is on the stove." in prompt
             assert "Remember cabinet 0:" not in prompt
         assert raw_prompt["additional_information"]["tts_speaker"] == "Vivian"
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drop_oldest_visual", [False, True])
+async def test_asr_evicts_memory_blocks_before_rebudgeting_history(monkeypatch, drop_oldest_visual):
+    from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import VIDEO_HISTORY_HEADER
+
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        instruction = "Always warn me when the kettle boils."
+        h.session.replace_runtime_config({**h.session.runtime_config, "initial_user_text": instruction})
+        committed_turns(h.session, count=12)
+        memory = h.runner.model_state.memory
+        memory.text = "Older text summary. " * 400
+        memory.covered_messages = 8
+        memory.covered_digest = duplex_history_digest(duplex_text_history(h.session.history)[:8])
+        visuals = [
+            VisualSummary(
+                0, 7, 0.0, 7.0, "The cabinet is closed. " * (200 if drop_oldest_visual else 1), 20, chunk_index=0
+            ),
+            VisualSummary(8, 15, 8.0, 15.0, "The kettle is on the stove.", 20, chunk_index=1),
+        ]
+        h.runner.model_state.visual_memory.mid_term.extend(visuals)
+        monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda config: h.runner.plugin.processor)
+        await h.run(AppendAudio(audio=struct.pack("<hh", 1000, 2000), format="pcm16", sample_rate_hz=16000))
+        await h.run(Commit(final=True, create_response=True))
+        raw_prompt = dict(h.port.submissions[-1].prompt)
+        info = raw_prompt["additional_information"]
+        context = info["joyai_prompt_context"]
+        transcript = "Is the water boiling now?"
+        retained_memory = VIDEO_HISTORY_HEADER + "\n\n".join(
+            f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
+            for entry in visuals[int(drop_oldest_visual) :]
+        )
+        # Fit remaining visual memory plus the latest Q&A, leaving no space
+        # for the text summary (or the oversized oldest visual block).
+        expected = h.runner.plugin.processor.apply_chat_template(
+            [
+                {"role": "system", "content": context["system"]},
+                {"role": "user", "content": retained_memory},
+                {"role": "user", "content": instruction},
+                *context["history"][-2:],
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": f"{joyai_bridge.USER_QUERY_HEADER}\n{transcript}"}],
+                },
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        info["joyai_prompt_budget"] = len(h.runner.plugin.processor.tokenizer(text=[expected])["input_ids"][0])
+        (result,) = joyai_bridge.asr_to_joyai([summary_output("asr", text=transcript)], raw_prompt)
+        prompt = result["prompt"]
+        assert instruction in prompt and transcript in prompt
+        assert "Older text summary." not in prompt
+        assert "The kettle is on the stove." in prompt
+        assert ("The cabinet is closed." in prompt) is not drop_oldest_visual
+        assert "Remember cabinet 11:" in prompt and "Cabinet 11 recorded." in prompt
+        assert len(h.runner.plugin.processor.tokenizer(text=[prompt])["input_ids"][0]) <= info["joyai_prompt_budget"]
+        # Eviction changes only this prompt, not the stored model memory.
+        assert memory.text.startswith("Older text summary.")
+        assert h.runner.model_state.visual_memory.mid_term == visuals
     finally:
         await h.manager.shutdown()
 

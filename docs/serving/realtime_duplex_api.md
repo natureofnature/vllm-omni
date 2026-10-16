@@ -109,7 +109,9 @@ Speech turns use the same bounded recent-text selection and accepted text/visual
 summaries. The ASR stage supplies the new query before the JoyAI stage performs
 the final token-budget check. The initial standing instruction stays outside
 evictable history; older turns and derived memory yield space to that instruction
-and the transcribed query.
+and the transcribed query. As with text input, budgeting removes older history,
+then the text summary, then visual summary blocks oldest-first, and rebudgets
+recent history against the remaining space.
 
 ### Committed conversation text
 
@@ -119,6 +121,7 @@ Camera-only commits with no text do not count toward that recent-message window.
 Each consolidation handles at most eight more text messages, advancing past
 textless camera observations and older text-bearing silent turns in the history, and uses JoyAI's own
 deployed stage, with a separate request that ends before speech synthesis.
+Chunk and context-budget boundaries keep each question with its recorded answer.
 There is at most one such request per session and no queue of older snapshots.
 The previous summary remains available if consolidation fails or times out.
 A failed attempt may retry after committed history or session context changes,
