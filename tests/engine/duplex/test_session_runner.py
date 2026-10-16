@@ -706,6 +706,9 @@ async def test_auto_response_commit_releases_residual_audio_before_the_next_turn
             assert h.runner.model_state.committed_audio_payload is None
             assert h.session.pending_input_bytes == 0
             assert len(h.port.submissions) == (turn + 1) * 2
+            streaming_append = h.port.submissions[-2].prompt["model_intermediate_buffer"]["duplex"]
+            assert streaming_append["final"] is False
+            assert base64.b64decode(streaming_append["payload"]["audio"]) == pcm_f32(16000, value=value)
             final_append = h.port.submissions[-1].prompt["model_intermediate_buffer"]["duplex"]
             assert final_append["final"] is True
             assert base64.b64decode(final_append["payload"]["audio"]) == (
