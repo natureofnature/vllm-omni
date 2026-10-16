@@ -176,6 +176,7 @@ async def test_runtime_uses_deployed_image_limit(mocker, image_limit):
 async def test_invalid_memory_budget_rejects_repeated_session_opens(mocker, max_model_len, image_limit, error):
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     loader = mocker.patch("transformers.AutoProcessor.from_pretrained", side_effect=lambda *args, **kwargs: Processor())
+    prepare_budget = mocker.spy(plugin, "_prepare_memory_budget")
     model_config = SimpleNamespace(
         model="joyai",
         trust_remote_code=True,
@@ -209,9 +210,59 @@ async def test_invalid_memory_budget_rejects_repeated_session_opens(mocker, max_
         assert plugin.processor is None
         assert (plugin.max_model_len, plugin.max_images) == (0, 0)
         assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == (0, 0, 0)
-        assert loader.call_count == 2
+        assert loader.call_count == prepare_budget.call_count == int(image_limit > 0)
     finally:
         await manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_opens_share_invalid_memory_budget_result(mocker):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    loader = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=Processor())
+    prepare_budget = mocker.spy(plugin, "_prepare_memory_budget")
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=8192,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    results = await asyncio.gather(
+        *(plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config) for _ in range(8)),
+        return_exceptions=True,
+    )
+    assert all(isinstance(result, DuplexRuntimeConfigError) and "max_model_len" in str(result) for result in results)
+    assert len({str(result) for result in results}) == 1
+    assert loader.call_count == prepare_budget.call_count == 1
+    assert plugin.processor is None
+    assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure_during", ["load", "budget"])
+async def test_transient_runtime_initialization_failure_can_retry(mocker, failure_during):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    processor = Processor()
+    loader = mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=processor)
+    if failure_during == "load":
+        loader.side_effect = [OSError("temporary load failure"), processor]
+    else:
+        prepare_budget = plugin._prepare_memory_budget
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=OSError("temporary budget failure"))
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    with pytest.raises(OSError, match="temporary"):
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    assert plugin.processor is None
+    assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+    if failure_during == "budget":
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=prepare_budget)
+    await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    assert plugin.processor is processor
+    assert loader.call_count == 2
 
 
 @pytest.mark.asyncio

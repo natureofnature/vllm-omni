@@ -77,6 +77,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._long_prompt_tokens = 0
         self._timestamp_tokens = 0
         self._processor_lock = asyncio.Lock()
+        self._memory_budget_error: str | None = None
 
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return DuplexCapabilities(
@@ -120,6 +121,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             if self.processor is None:
                 if model_config is None:
                     raise DuplexRuntimeConfigError("JoyAI requires the stage-0 model configuration")
+                max_model_len = model_config.max_model_len
+                max_images = model_config.multimodal_config.get_limit_per_prompt("image")
+                if max_images < 1:
+                    raise DuplexRuntimeConfigError("JoyAI visual memory requires limit_mm_per_prompt.image >= 1.")
+                if self._memory_budget_error is not None:
+                    raise DuplexRuntimeConfigError(self._memory_budget_error)
                 from transformers import AutoProcessor
 
                 processor = await asyncio.to_thread(
@@ -128,11 +135,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     trust_remote_code=model_config.trust_remote_code,
                     revision=getattr(model_config, "revision", None),
                 )
-                max_model_len = model_config.max_model_len
-                max_images = model_config.multimodal_config.get_limit_per_prompt("image")
-                budget = await asyncio.to_thread(
-                    self._prepare_memory_budget, processor, max_model_len=max_model_len, max_images=max_images
-                )
+                try:
+                    budget = await asyncio.to_thread(
+                        self._prepare_memory_budget, processor, max_model_len=max_model_len
+                    )
+                except DuplexRuntimeConfigError as exc:
+                    # The plugin belongs to one static stage configuration.
+                    # Cache only deterministic validation failures, not load errors or cancellation.
+                    self._memory_budget_error = str(exc)
+                    raise
                 # Publish only validated state. A cancelled preparation worker
                 # may still finish, but cannot mutate this shared plugin.
                 self.max_model_len = max_model_len
@@ -652,17 +663,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return images
 
     def _image_token_counts(self, images: list[Image.Image]) -> list[int]:
-        processor = self.processor.image_processor
-        return [
-            processor.get_number_of_image_patches(image.height, image.width, {}) // processor.merge_size**2
-            for image in images
-        ]
+        return [self._image_token_count(self.processor, height=image.height, width=image.width) for image in images]
 
-    def _prepare_memory_budget(
-        self, processor: ProcessorMixin, *, max_model_len: int, max_images: int
-    ) -> tuple[int, int, int]:
-        if max_images < 1:
-            raise DuplexRuntimeConfigError("JoyAI visual memory requires limit_mm_per_prompt.image >= 1.")
+    @staticmethod
+    def _image_token_count(processor: ProcessorMixin, *, height: int, width: int) -> int:
+        image_processor = processor.image_processor
+        return image_processor.get_number_of_image_patches(height, width, {}) // image_processor.merge_size**2
+
+    def _prepare_memory_budget(self, processor: ProcessorMixin, *, max_model_len: int) -> tuple[int, int, int]:
         memory = self.create_session_state().visual_memory
 
         def overhead(content: str) -> int:
@@ -689,8 +697,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         # Conservative scheduling hint for each timestamp and template boundary.
         # The actual full prompt is tokenized again before every submission.
         timestamp_tokens = overhead("<999999999.9 seconds-999999999.9 seconds>")
-        image_processor = processor.image_processor
-        image_tokens = image_processor.get_number_of_image_patches(512, 512, {}) // image_processor.merge_size**2
+        image_tokens = self._image_token_count(processor, height=512, width=512)
         if (
             mid_prompt_tokens + timestamp_tokens + image_tokens + memory.mid_max_tokens > max_model_len
             or long_prompt_tokens + 2 * (memory.mid_max_tokens + timestamp_tokens) + memory.long_max_tokens

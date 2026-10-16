@@ -68,7 +68,9 @@ must be at least one, and `max_model_len` must fit both a single-image summary a
 the compression of two 4,000-token summaries with up to 4,000 output tokens, plus
 prompt overhead. A smaller context that can serve ordinary interaction requests
 may therefore be rejected. Retrying a failed or cancelled initialization does not
-bypass these checks.
+bypass these checks. An image ceiling of zero is rejected before processor loading.
+Context-budget errors are cached for the deployed stage so repeated session opens
+fail fast; transient loading failures and cancelled initialization remain retryable.
 
 Only a successful, source-valid summary retires its input frames or summaries.
 The pending-frame buffer retains at most 200 frames and 32 MiB of losslessly
