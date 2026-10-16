@@ -721,7 +721,11 @@ async def test_auto_response_commit_releases_residual_audio_before_the_next_turn
                 tts_output(h.stage0_request_id(), samples=samples, turn_end=True, turn_id=turn)
             )
             done = find(events, "response.done")
-            await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
+            assert done.status == "completed"
+            ack = await h.run(commands.AckPlayback(played_ms=1000, response_id=done.response_id))
+            assert types(ack) == ["playback.acknowledged"]
+            assert ack[0].details["history_committed"] is True
+            assert ack[0].details["playback"]["committed_ms"] == 1000
     finally:
         await close_harness(h)
 
