@@ -368,7 +368,7 @@ class ModelChannel:
                 self._ctx.plugin.commit_append_plan(request_id)
             except BaseException:
                 try:
-                    await self._ctx.stage_port.cleanup([request_id])
+                    await self._ctx.stage_port.cleanup([request_id], abort=True)
                 except Exception as cleanup_exc:
                     logger.warning(
                         "duplex append compensation remains pending for session %s: %s",
@@ -679,10 +679,9 @@ class ModelChannel:
         session = self._ctx.session
         pending = self._input_transcriptions.pop(item.request_id, None)
         self._ctx.plugin.data_plane.close_stream(item.request_id)
-        # A failed submission may already have dropped the continuation. Its
-        # queued ASR output still owns stage cleanup unless cancel/close did it.
-        if (item.stage_id, item.request_id) in session.request_resources:
-            await self._ctx.stage_port.cleanup([item.request_id], abort=abandon and not item.context.segment_finished)
+        # Local bindings can be pruned independently of the stage request.
+        # Cleanup is idempotent, including after submission compensation.
+        await self._ctx.stage_port.cleanup([item.request_id], abort=abandon and not item.context.segment_finished)
         if (
             session.epoch != item.context.identity.fence.epoch
             or session.state != DuplexSessionState.OPEN

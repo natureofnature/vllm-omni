@@ -813,7 +813,9 @@ async def test_batched_commits_wait_for_submission_acceptance_before_continuing(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["error", "cancel"])
-async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(failure, monkeypatch):
+@pytest.mark.parametrize("failure_at", ["engine-send", "append-commit"])
+@pytest.mark.parametrize("finished", [False, True], ids=["partial-asr", "finished-asr"])
+async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(failure, failure_at, finished, monkeypatch):
     from tests.engine.test_duplex_orchestrator import _settle
 
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
@@ -824,6 +826,12 @@ async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(fail
     accepted, release = asyncio.Event(), asyncio.Event()
     output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
     add_request = clients[0].add_request_async
+    commit_plan = plugin.commit_append_plan
+
+    def fail_ack(*args):
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        raise RuntimeError("submission acknowledgement failed after ASR output")
 
     async def build_request(request_id, *args, **kwargs):
         return SimpleNamespace(request_id=request_id, mm_features=None)
@@ -832,14 +840,15 @@ async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(fail
         await add_request(*args, **kwargs)
         accepted.set()
         await release.wait()
-        if failure == "cancel":
-            raise asyncio.CancelledError()
-        raise RuntimeError("submission acknowledgement failed after ASR output")
+        if failure_at == "engine-send":
+            fail_ack()
 
     # Exercise real stage ownership and cleanup, with engine acceptance before
     # its submission acknowledgement fails underneath an already queued output.
     monkeypatch.setattr(orchestrator, "_build_next_stage_request", build_request)
     monkeypatch.setattr(clients[0], "add_request_async", accept_then_fail)
+    if failure_at == "append-commit":
+        monkeypatch.setattr(plugin, "commit_append_plan", fail_ack)
     try:
         assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, output_buffer=output_buffer)).ok
         runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
@@ -855,13 +864,13 @@ async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(fail
         request = orchestrator.request_states[request_id]
         runner.on_stage_output(
             0,
-            tts_output(request_id, finished=True, text="Remember the red cup."),
+            tts_output(request_id, finished=finished, text="Remember the red cup."),
             None,
             request_id=request_id,
             context=DuplexOutputContext(
                 identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
                 final_stage_id=0,
-                segment_finished=True,
+                segment_finished=finished,
             ),
             input_transcript="Remember the red cup.",
             input_item_id=next(iter(runner.session.history_item_ids)),
@@ -877,10 +886,13 @@ async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(fail
         assert runner.session.pending_input_bytes == 0
         assert runner.session.active_response_id is None
         assert len(clients[0].add_request_calls) == 1  # Do not start the remaining segment.
+        if not finished:
+            assert any(request_id in ids for ids in clients[0].abort_calls)
         events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
         done = [event.to_realtime() for event in events if event.type == "response.done"]
         assert len(done) == 1 and done[0]["response"]["status"] == "failed"
         monkeypatch.setattr(clients[0], "add_request_async", add_request)
+        monkeypatch.setattr(plugin, "commit_append_plan", commit_plan)
         await _submit(
             orchestrator,
             AppendAudio(audio=struct.pack("<h", 3000) * 8000, format="pcm16", sample_rate_hz=16000),
@@ -890,6 +902,56 @@ async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(fail
         assert clients[0].add_request_calls[-1][0].request_id != request_id
     finally:
         release.set()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_batched_commits_cleanup_finished_asr_without_local_resource(monkeypatch):
+    from tests.engine.test_duplex_orchestrator import _settle
+
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
+
+    async def build_request(request_id, *args, **kwargs):
+        return SimpleNamespace(request_id=request_id, mm_features=None)
+
+    monkeypatch.setattr(orchestrator, "_build_next_stage_request", build_request)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False})).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        for sample in (1000, 2000):
+            await _submit(
+                orchestrator,
+                AppendAudio(audio=struct.pack("<h", sample) * 8000, format="pcm16", sample_rate_hz=16000),
+            )
+            await _submit(orchestrator, Commit(final=True, create_response=False))
+        await _submit(orchestrator, CreateResponse())
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        request = orchestrator.request_states[request_id]
+        # A local binding is not the lifetime of the orchestrator request.
+        # Completing ASR must release both owners even if that binding was pruned.
+        runner.session.request_resources.pop((0, request_id))
+        runner.on_stage_output(
+            0,
+            tts_output(request_id, finished=True, text="Remember the red cup."),
+            None,
+            request_id=request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
+                final_stage_id=0,
+                segment_finished=True,
+            ),
+        )
+        await _settle(orchestrator)
+        assert request_id not in orchestrator.request_states
+        assert request_id not in orchestrator.session_manager._request_index
+        assert not runner.model._input_transcriptions
+        assert len(clients[0].add_request_calls) == 2
+        assert clients[0].add_request_calls[-1][0].request_id != request_id
+    finally:
         await orchestrator.session_manager.shutdown()
 
 
@@ -1818,7 +1880,7 @@ async def test_late_submission_ack_does_not_commit_visual_history(mocker):
         await h.settle()
         assert pending.done() and not pending.cancelled()
         assert len(h.port.submissions) == 1
-        assert cleanup.await_args_list == [mocker.call([request_id], abort=True), mocker.call([request_id])]
+        assert cleanup.await_args_list == [mocker.call([request_id], abort=True), mocker.call([request_id], abort=True)]
         commit_plan.assert_not_called()
         assert h.session.input_seq == 0
         assert h.runner.model_state.frames == []

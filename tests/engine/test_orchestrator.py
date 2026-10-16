@@ -2006,10 +2006,25 @@ def test_image_ttfo_preserves_request_time_and_tracks_stage_time() -> None:
 
 
 @pytest.mark.asyncio
-async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
+@pytest.mark.parametrize("cancelled", [False, True])
+@pytest.mark.parametrize("abort_fails", [False, True])
+async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails(
+    cancelled: bool, abort_fails: bool
+) -> None:
+    submission_error = asyncio.CancelledError() if cancelled else RuntimeError("submit failed")
+    abort_attempts: list[list[str]] = []
+
     class FailingStageClient(FakeStageClient):
         async def add_request_async(self, *args, **kwargs) -> None:
-            raise RuntimeError("submit failed")
+            await super().add_request_async(*args, **kwargs)
+            raise submission_error
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            assert pool.get_bound_replica_id("req-0") == 0
+            abort_attempts.append(request_ids)
+            if abort_fails:
+                raise RuntimeError("abort failed")
+            await super().abort_requests_async(request_ids)
 
     class TrackingOutputProcessor(FakeOutputProcessor):
         def __init__(self) -> None:
@@ -2037,10 +2052,20 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
         final_stage_id=0,
     )
 
-    with pytest.raises(RuntimeError, match="submit failed"):
+    with pytest.raises(type(submission_error)) as raised:
         await pool.submit_initial("req-0", req_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
 
+    assert raised.value is submission_error
+    assert abort_attempts == [["req-0"]]
     assert output_processor.added_request_ids == ["req-0"]
+    if abort_fails:
+        assert output_processor.removed_request_ids == []
+        assert pool.get_bound_replica_id("req-0") == 0
+        abort_fails = False
+        await pool.abort_requests(["req-0"])
+        assert client.abort_calls == [["req-0"]]
+        return
+    assert client.abort_calls == [["req-0"]]
     assert output_processor.removed_request_ids == ["req-0"]
     assert pool.get_bound_replica_id("req-0") is None
 

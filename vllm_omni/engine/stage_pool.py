@@ -857,7 +857,7 @@ class StagePool:
 
     def _infer_audio_sample_rate(
         self,
-        mm_output: dict[str, Any] | None = None,
+        mm_output: Mapping[str, Any] | None = None,
         *,
         use_default: bool = True,
     ) -> int:
@@ -1056,8 +1056,7 @@ class StagePool:
                 f"stage {self.stage_id} replica {expected_replica_id} keyed by {request_id} became "
                 "unavailable before submit"
             )
-        client = self.clients[replica_id]
-        if client is None:
+        if self.clients[replica_id] is None:
             raise StageUnavailableError(f"stage {self.stage_id} replica {replica_id} is not attached")
         try:
             self.output_processor.add_request(
@@ -1073,19 +1072,32 @@ class StagePool:
 
         try:
             await self._llm_client(replica_id).add_request_async(request, **submit_kwargs)
-        except Exception:
-            self.release_binding(request_id)
-            rollback = getattr(self.output_processor, "remove_request", None)
-            if callable(rollback):
-                try:
-                    rollback(request_id)
-                except Exception as rollback_error:
-                    logger.warning(
-                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
-                        request_id,
-                        self.stage_id,
-                        rollback_error,
-                    )
+        except BaseException:
+            # Sending can fail or be cancelled after the engine accepted the
+            # request. Abort while its replica binding is still available.
+            try:
+                await self.abort_requests([request_id])
+            except Exception as abort_error:
+                # Keep routing and processor state so owner cleanup can retry.
+                logger.warning(
+                    "[StagePool] Failed to abort rejected submission for req=%s stage-%s: %s",
+                    request_id,
+                    self.stage_id,
+                    abort_error,
+                )
+            else:
+                self.release_binding(request_id)
+                rollback = getattr(self.output_processor, "remove_request", None)
+                if callable(rollback):
+                    try:
+                        rollback(request_id)
+                    except Exception as rollback_error:
+                        logger.warning(
+                            "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                            request_id,
+                            self.stage_id,
+                            rollback_error,
+                        )
             raise
         return replica_id
 
