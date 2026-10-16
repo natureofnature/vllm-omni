@@ -37,7 +37,6 @@ import json
 import sys
 import time
 import wave
-from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1014,24 +1013,7 @@ async def _wait_for(
         if predicate():
             return
         await asyncio.sleep(0.02)
-    last_commit = next(
-        (
-            i
-            for i in range(len(state.events) - 1, -1, -1)
-            if state.events[i].get("type") == "input_audio_buffer.committed"
-        ),
-        -1,
-    )
-    events = state.events[last_commit + 1 :]
-    diagnostics = {
-        "input_commits": state.count("input_audio_buffer.committed"),
-        "events_since_commit": dict(Counter(event.get("type") for event in events)),
-        "last_error": next((event.get("error") for event in reversed(events) if event.get("type") == "error"), None),
-        "last_listen": next(
-            (event.get("response") for event in reversed(events) if event.get("type") == "response.listen"), None
-        ),
-    }
-    raise TimeoutError(f"Timed out waiting for {label}; {json.dumps(diagnostics, ensure_ascii=False)}")
+    raise TimeoutError(f"Timed out waiting for {label}")
 
 
 async def _wait_for_model_policy_outcome(

@@ -4,7 +4,6 @@
 import asyncio
 import base64
 import importlib.util
-import json
 import subprocess
 import sys
 import wave
@@ -1369,33 +1368,6 @@ def test_realtime_duplex_demo_full_turn_duration_does_not_slice_audio():
 
     assert demo._select_turn_audio(pcm16, None) == pcm16
     assert len(demo._select_turn_audio(pcm16, 1000)) == demo.PCM16_SAMPLE_RATE * demo.PCM16_BYTES_PER_SAMPLE
-
-
-def test_response_wait_timeout_reports_events_after_the_latest_commit():
-    demo = _load_demo_module()
-    state = demo.DemoState()
-    listen = {"status": "listening", "metadata": {"model_listen": True}}
-    error = {"code": "runtime_append_failed", "message": "append rejected"}
-    for event in [
-        {"type": "input_audio_buffer.committed"},
-        {"type": "response.created", "response": {"id": "previous"}},
-        {"type": "input_audio_buffer.committed"},
-        {"type": "response.listen", "response": listen},
-        {"type": "error", "error": error},
-    ]:
-        state.add(event)
-
-    with pytest.raises(TimeoutError) as exc:
-        asyncio.run(demo._wait_for(state, lambda: False, timeout_s=0, label="second response.created"))
-
-    message, diagnostics = str(exc.value).split("; ", 1)
-    assert message == "Timed out waiting for second response.created"
-    assert json.loads(diagnostics) == {
-        "input_commits": 2,
-        "events_since_commit": {"response.listen": 1, "error": 1},
-        "last_error": error,
-        "last_listen": listen,
-    }
 
 
 def test_realtime_duplex_demo_distinct_inputs_compare_audio_content():
