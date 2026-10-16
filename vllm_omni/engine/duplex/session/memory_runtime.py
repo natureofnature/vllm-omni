@@ -132,7 +132,7 @@ class SessionMemoryRuntime:
 
     def close(self) -> None:
         self.cancel_retry()
-        if self._task is not None:
+        if self._task is not None and not helpers.task_is_cancelling(self._task):
             self._task.cancel()
 
     def note_user_item(self, payload: Mapping[str, object], item_id: str) -> None:
@@ -369,23 +369,41 @@ class SessionMemoryRuntime:
         finally:
             if request_id is not None:
                 assert request is not None
+                cancelled_during_cleanup = False
                 try:
                     # Cancellation may already have cleaned and released this
                     # request. A failed cancellation leaves it owned for retry.
                     if (request.stage_id, request_id) in session.request_resources:
-                        await self._ctx.stage_port.cleanup([request_id], abort=True)
+                        cleanup = asyncio.create_task(
+                            asyncio.wait_for(
+                                self._ctx.stage_port.cleanup([request_id], abort=True), timeout=request.timeout_s
+                            )
+                        )
+                        # Close/preemption and runner shutdown can all cancel
+                        # this task. Join the same cleanup RPC before releasing
+                        # ownership, even when cancellation arrives repeatedly.
+                        # The request deadline also bounds this cleanup attempt.
+                        while not cleanup.done():
+                            try:
+                                await asyncio.shield(cleanup)
+                            except asyncio.CancelledError:
+                                cancelled_during_cleanup = True
+                        cleanup.result()
                 except Exception as exc:
                     # Keep the reservation for the manager's teardown retry.
                     logger.warning("Duplex auxiliary cleanup failed: %s", type(exc).__name__)
                 else:
                     session.request_resources.pop((request.stage_id, request_id), None)
                     self._ctx.manager.unregister_request(request_id)
-                if self._request_id == request_id:
-                    if self._output is not None and self._output.done():
-                        if not self._output.cancelled():
-                            self._output.exception()
-                    self._request_id = None
-                    self._output = None
+                finally:
+                    if self._request_id == request_id:
+                        if self._output is not None and self._output.done():
+                            if not self._output.cancelled():
+                                self._output.exception()
+                        self._request_id = None
+                        self._output = None
+                if cancelled_during_cleanup:
+                    raise asyncio.CancelledError
         # Queue completion after cleanup, so the mailbox may schedule the next
         # bounded chunk without racing the previous task's owned resources.
         if request is not None and submission_started and operation == self._generation:

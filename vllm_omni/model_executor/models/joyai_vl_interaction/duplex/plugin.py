@@ -403,9 +403,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             if role in {"user", "assistant"} and text:
                 pending_text += 1
             end += 1
-        # Preserve the current query and unresolved user turn outside the summary.
-        while end > covered and history[end - 1][0] != "assistant":
-            end -= 1
+        end = self._summary_boundary(history, covered, end)
         if end <= covered:
             return None
 
@@ -444,11 +442,23 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                         history_digest=duplex_history_digest(history[:target]),
                     )
                 target -= 1
-                while target > covered and history[target - 1][0] != "assistant":
-                    target -= 1
+                target = self._summary_boundary(history, covered, target)
             return None
 
         return await asyncio.to_thread(prepare)
+
+    @staticmethod
+    def _summary_boundary(history: tuple[tuple[str, str], ...], start: int, end: int) -> int:
+        """Prefer complete Q&A, while allowing older text-bearing silent turns.
+
+        The recent-text window already protects the current query. Older user
+        messages can be committed without an assistant entry when JoyAI stays
+        silent; requiring such an entry would stall the prefix indefinitely.
+        """
+        for index in range(end - 1, start - 1, -1):
+            if history[index][0] == "assistant":
+                return index + 1
+        return end if any(role == "user" and text for role, text in history[start:end]) else start
 
     def _prepare_visual_summary(
         self,
@@ -980,30 +990,11 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                             del messages[index]
                     return
 
-    def plan_append(
-        self,
-        *,
-        request_id: str,
-        fence: DuplexFence,
-        session_config: dict[str, object],
-        runtime_config: dict[str, object],
-        seq: int,
-        turn_seq: int,
-        payload: object,
-        final: bool,
-        sampling_params: object,
-    ) -> DuplexAppendPlan:
-        if not final or not isinstance(payload, Mapping):
-            raise DuplexRuntimeConfigError("JoyAI requires committed input")
-        has_audio = bool(payload.get("audio"))
-        self.input_stage_id(payload)
-        stage_sampling_params = session_config.get("stage_sampling_params")
-        if stage_sampling_params is not None:
-            sampling_params = stage_sampling_params[self.joyai_stage_id]
-        if not isinstance(sampling_params, SamplingParams):
-            raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
-        if has_audio:
-            return self._plan_speech_append(session_config, runtime_config, payload, sampling_params)
+    @staticmethod
+    def _bounded_text_history(
+        session_config: dict[str, object], runtime_config: dict[str, object]
+    ) -> tuple[list[dict[str, object]], dict[str, object] | None, str]:
+        """Select unsummarized recent turns and retain the latest instruction."""
         history = []
         item_ids = session_config.get("conversation_item_ids", ())
         query = runtime_config.get("initial_user_text") or ""
@@ -1036,6 +1027,57 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
         while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
             history.pop(0)
+        return history, latest_instruction, query
+
+    @staticmethod
+    def _memory_prefix(
+        summary: str | None,
+        visual_summaries: Sequence[VisualSummary],
+        *,
+        archived_qa: str = "",
+        active_query: str = "",
+    ) -> str:
+        """Render model-owned memory with the same headings for text and speech."""
+        prefix = []
+        if visual_summaries:
+            prefix.append(
+                VIDEO_HISTORY_HEADER
+                + "\n\n".join(
+                    f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
+                    for entry in visual_summaries
+                )
+            )
+        qa_memory = [text for text in (summary, archived_qa) if text]
+        if qa_memory:
+            prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
+        if active_query:
+            prefix.append(USER_QUERY_HEADER + "\n" + active_query)
+        return "\n\n".join(prefix)
+
+    def plan_append(
+        self,
+        *,
+        request_id: str,
+        fence: DuplexFence,
+        session_config: dict[str, object],
+        runtime_config: dict[str, object],
+        seq: int,
+        turn_seq: int,
+        payload: object,
+        final: bool,
+        sampling_params: object,
+    ) -> DuplexAppendPlan:
+        if not final or not isinstance(payload, Mapping):
+            raise DuplexRuntimeConfigError("JoyAI requires committed input")
+        self.input_stage_id(payload)
+        stage_sampling_params = session_config.get("stage_sampling_params")
+        if stage_sampling_params is not None:
+            sampling_params = stage_sampling_params[self.joyai_stage_id]
+        if not isinstance(sampling_params, SamplingParams):
+            raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
+        if payload.get("audio"):
+            return self._plan_speech_append(session_config, runtime_config, payload, sampling_params)
+        history, latest_instruction, query = self._bounded_text_history(session_config, runtime_config)
         # Rendering attaches fresh queries to their visual observation and
         # leaves already-observed items at their committed history position.
         unsummarized_history = history.copy()
@@ -1056,21 +1098,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
         rebudget_history = False
         while True:
-            prefix = []
-            if visual_summaries:
-                prefix.append(
-                    VIDEO_HISTORY_HEADER
-                    + "\n\n".join(
-                        f"<{entry.start_s:.1f} seconds-{entry.end_s:.1f} seconds>\n{entry.text}"
-                        for entry in visual_summaries
-                    )
-                )
             archived_qa, active_query, prefix_keys = self._archived_qa_prefix(session_config, runtime_config, history)
-            qa_memory = [text for text in (summary if query else "", archived_qa) if text]
-            if qa_memory:
-                prefix.append(QA_HISTORY_HEADER + "\n\n".join(qa_memory))
-            if active_query:
-                prefix.append(USER_QUERY_HEADER + "\n" + active_query)
+            prefix = self._memory_prefix(
+                summary if query else "", visual_summaries, archived_qa=archived_qa, active_query=active_query
+            )
             messages = [
                 {"role": "system", "content": system},
                 *self._interleave_history(
@@ -1084,7 +1115,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 content = first_user["content"]
                 if isinstance(content, str):
                     content = [{"type": "text", "text": content}]
-                first_user["content"] = [{"type": "text", "text": "\n\n".join(prefix)}, *content]
+                first_user["content"] = [{"type": "text", "text": prefix}, *content]
             prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
             if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
@@ -1129,12 +1160,14 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
 
     def _plan_speech_append(self, session_config, runtime_config, payload, sampling_params) -> DuplexAppendPlan:
         """Keep ASR handoff budgeting deferred until the transcript is available."""
-        history = []
-        if query := runtime_config.get("initial_user_text"):
-            history.append({"role": "user", "content": query})
-        for role, text in duplex_text_history(session_config.get("conversation", [])):
-            if role in {"user", "assistant"} and text:
-                history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
+        history, _, _ = self._bounded_text_history(session_config, runtime_config)
+        # The new spoken query is not known yet. Keep the initial standing
+        # instruction separate from evictable history until ASR supplies it.
+        instruction = runtime_config.get("initial_user_text") or ""
+        history = [{"role": item["role"], "content": item["content"]} for item in history if item["_item_key"] != -1]
+        memory = self._memory_prefix(
+            session_config.get("joyai_summary"), session_config.get("joyai_visual_summaries", ())
+        )
         images = []
         for encoded in session_config.get("joyai_frames", [])[-4:]:
             if encoded.startswith("data:"):
@@ -1158,7 +1191,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not audio.size or not np.isfinite(audio).all() or not np.any(audio):
             raise DuplexRuntimeConfigError("JoyAI speech commit requires non-silent finite PCM")
         prompt_data["additional_information"].update(
-            joyai_prompt_context={"system": system, "history": history},
+            joyai_prompt_context={"system": system, "history": history, "instruction": instruction, "memory": memory},
             joyai_prompt_budget=budget,
             joyai_image_token_counts=image_token_counts,
             deferred_multi_modal_data={"image": images} if images else {},

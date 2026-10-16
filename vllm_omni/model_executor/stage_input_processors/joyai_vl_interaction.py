@@ -55,9 +55,16 @@ def render_joyai_session_prompt(
     images: list[Any],
     image_token_counts: list[int],
     budget: int,
+    instruction: str = "",
+    memory: str = "",
 ) -> tuple[str, list[Any]]:
-    """Fit the actual query, keeping system policy and the latest observation."""
+    """Fit ASR's query, preserving the standing instruction and current input.
+
+    Model-prepared history is bounded before the handoff. Derived memory may
+    be omitted under pressure; the standing instruction is never evicted.
+    """
     history, images, image_token_counts = list(history), list(images), list(image_token_counts)
+    recent_history = history.copy()
     while True:
         content = [{"type": "image"} for _ in images]
         content.append(
@@ -68,7 +75,8 @@ def render_joyai_session_prompt(
                 else "Observe the current scene and choose whether to speak or stay silent.",
             }
         )
-        messages = [{"role": "system", "content": system}, *history, {"role": "user", "content": content}]
+        prefix = [{"role": "user", "content": value} for value in (memory, instruction) if value]
+        messages = [{"role": "system", "content": system}, *prefix, *history, {"role": "user", "content": content}]
         rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         text_tokens = processor.tokenizer(text=[rendered])["input_ids"][0]
         if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
@@ -77,6 +85,9 @@ def render_joyai_session_prompt(
             history.pop(0)
             while history and history[0]["role"] == "assistant":
                 history.pop(0)
+        elif memory:
+            memory = ""
+            history = recent_history.copy()
         elif len(images) > 1:
             images.pop(0)
             image_token_counts.pop(0)
@@ -121,6 +132,7 @@ def asr_to_joyai(
                 not isinstance(context, dict)
                 or not isinstance(context.get("system"), str)
                 or not isinstance(context.get("history"), list)
+                or any(not isinstance(context.get(key, ""), str) for key in ("instruction", "memory"))
                 or any(
                     not isinstance(message, dict)
                     or message.get("role") not in ("user", "assistant")
@@ -153,6 +165,8 @@ def asr_to_joyai(
                 images=images,
                 image_token_counts=image_token_counts,
                 budget=budget,
+                instruction=context.get("instruction", ""),
+                memory=context.get("memory", ""),
             )
             visual_inputs = {"image": images} if images else {}
         if requires_multimodal_data and visual_inputs:

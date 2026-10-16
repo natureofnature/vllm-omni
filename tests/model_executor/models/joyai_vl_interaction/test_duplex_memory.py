@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import asyncio
+import struct
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
@@ -15,6 +17,8 @@ from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
 from vllm_omni.engine.duplex.session import memory_runtime
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import VisualSummary
+from vllm_omni.model_executor.stage_input_processors import joyai_vl_interaction as joyai_bridge
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -276,6 +280,153 @@ async def test_text_cutoff_preserves_ledger_indices_and_empty_prefix_fingerprint
             {"conversation": list(h.session.history)}, state=h.runner.model_state, payload={}
         )
         assert config["joyai_summary"] == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_summary", [False, True])
+async def test_summary_catches_up_past_text_bearing_silent_turns(existing_summary):
+    h = await open_joyai(modalities=("text",))
+    try:
+        memory = h.runner.model_state.memory
+        if existing_summary:
+            committed_turns(h.session, count=1)
+            memory.text = "The cabinet code is K731."
+            memory.covered_messages = 2
+            memory.covered_digest = duplex_history_digest(duplex_text_history(h.session.history))
+        covered = memory.covered_messages
+        for index in range(8):
+            await h.run(
+                CreateItem(
+                    item={
+                        "id": f"silent-{index}",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": f"Remember silent fact {index}."}],
+                    }
+                )
+            )
+            request_id = await observe(h)
+            await h.deliver_and_settle(
+                tts_output(request_id, text="</silence>", finished=True), stage_id=0, segment_finished=True
+            )
+        history = duplex_text_history(h.session.history)
+        assert [text for role, text in history[covered:] if text] == [
+            f"Remember silent fact {index}." for index in range(8)
+        ]
+        committed_turns(h.session, count=10)
+        history = duplex_text_history(h.session.history)
+        await h.run(Heartbeat())
+        for _ in range(8):
+            if memory.covered_messages >= len(history) - 8:
+                break
+            submission = h.port.submissions[-1]
+            assert "auxiliary-" in submission.context.request_id
+            previous = memory.covered_messages
+            h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)
+            await h.settle()
+            assert memory.covered_messages > previous
+        assert memory.covered_messages == len(history) - 8
+        assert memory.covered_digest == duplex_history_digest(history[:-8])
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("preempt", [False, True])
+async def test_close_during_auxiliary_cleanup_preserves_cleanup_ownership(monkeypatch, preempt):
+    h = await open_joyai(modalities=("text",))
+    entered, release = asyncio.Event(), asyncio.Event()
+    original_cleanup = h.port.cleanup
+    closing = None
+    try:
+        committed_turns(h.session)
+        submission = await start_summary(h)
+        request_id = submission.context.request_id
+
+        async def blocked_cleanup(request_ids, *, abort=False):
+            entered.set()
+            await release.wait()
+            await original_cleanup(request_ids, abort=abort)
+
+        monkeypatch.setattr(h.port, "cleanup", blocked_cleanup)
+        if preempt:
+            h.runner.memory.preempt_for_submission()
+        else:
+            h.deliver(summary_output(request_id), stage_id=0, segment_finished=True)
+        await asyncio.wait_for(entered.wait(), 2)
+        closing = asyncio.create_task(h.runner.close("client close"))
+        await asyncio.sleep(0.02)
+        # Repeated close and runner shutdown may both cancel the owned task.
+        h.runner.memory.close()
+        release.set()
+        await asyncio.wait_for(closing, 2)
+        assert ([request_id], True) in h.port.cleanups
+        assert request_id not in h.session.resource_request_ids()
+        assert request_id not in h.manager._request_index
+        assert h.runner.memory._request_id is None
+        assert h.runner.memory._output is None
+    finally:
+        release.set()
+        if closing is not None:
+            await asyncio.gather(closing, return_exceptions=True)
+        monkeypatch.setattr(h.port, "cleanup", original_cleanup)
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tight_budget", [False, True])
+async def test_asr_uses_bounded_memory_and_preserves_initial_instruction(monkeypatch, tight_budget):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        instruction = "Always warn me when the kettle boils."
+        h.session.replace_runtime_config({**h.session.runtime_config, "initial_user_text": instruction})
+        committed_turns(h.session, count=60)
+        memory = h.runner.model_state.memory
+        memory.text = "The cabinet contains a blue mug."
+        memory.covered_messages = 80
+        memory.covered_digest = duplex_history_digest(duplex_text_history(h.session.history)[:80])
+        h.runner.model_state.visual_memory.mid_term.append(
+            VisualSummary(0, 7, 0.0, 7.0, "The kettle is on the stove.", 20, chunk_index=0)
+        )
+        monkeypatch.setattr(joyai_bridge, "cached_processor_from_config", lambda config: h.runner.plugin.processor)
+        await h.run(AppendAudio(audio=struct.pack("<hh", 1000, 2000), format="pcm16", sample_rate_hz=16000))
+        await h.run(Commit(final=True, create_response=True))
+        submission = h.port.submissions[-1]
+        assert submission.context.stage_id == 0
+        # The stage port materializes the immutable submission mapping before
+        # passing its raw prompt to the stage input processor.
+        raw_prompt = dict(submission.prompt)
+        info = raw_prompt["additional_information"]
+        transcript = "Is the water boiling now?"
+        if tight_budget:
+            # Fit the standing instruction and actual transcript, with no room
+            # for old history. This uses the same tokenizer as the handoff.
+            minimum = h.runner.plugin.processor.apply_chat_template(
+                [
+                    {"role": "system", "content": info["joyai_prompt_context"]["system"]},
+                    {"role": "user", "content": instruction},
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": f"{joyai_bridge.USER_QUERY_HEADER}\n{transcript}"}],
+                    },
+                ],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            info["joyai_prompt_budget"] = len(h.runner.plugin.processor.tokenizer(text=[minimum])["input_ids"][0]) + 32
+        (result,) = joyai_bridge.asr_to_joyai([SimpleNamespace(outputs=[SimpleNamespace(text=transcript)])], raw_prompt)
+        prompt = result["prompt"]
+        assert instruction in prompt
+        assert transcript in prompt
+        assert len(h.runner.plugin.processor.tokenizer(text=[prompt])["input_ids"][0]) <= info["joyai_prompt_budget"]
+        assert len(info["joyai_prompt_context"]["history"]) <= 16
+        if not tight_budget:
+            assert "The cabinet contains a blue mug." in prompt
+            assert "The kettle is on the stove." in prompt
+            assert "Remember cabinet 0:" not in prompt
+        assert raw_prompt["additional_information"]["tts_speaker"] == "Vivian"
     finally:
         await h.manager.shutdown()
 

@@ -105,13 +105,19 @@ user query also includes long-term visual memory, subject to the deployed contex
 budget. Conversation image edits revoke derived visual memory. Summaries
 are lossy; same-stage summarization quality should be validated for the application.
 
+Speech turns use the same bounded recent-text selection and accepted text/visual
+summaries. The ASR stage supplies the new query before the JoyAI stage performs
+the final token-budget check. The initial standing instruction stays outside
+evictable history; older turns and derived memory yield space to that instruction
+and the transcribed query.
+
 ### Committed conversation text
 
 The JoyAI duplex plugin preserves at least eight recent text messages and consolidates
 older committed conversation into one summary of at most 512 generated tokens.
 Camera-only commits with no text do not count toward that recent-message window.
 Each consolidation handles at most eight more text messages, advancing past
-textless camera observations in the history, and uses JoyAI's own
+textless camera observations and older text-bearing silent turns in the history, and uses JoyAI's own
 deployed stage, with a separate request that ends before speech synthesis.
 There is at most one such request per session and no queue of older snapshots.
 The previous summary remains available if consolidation fails or times out.

@@ -13,6 +13,7 @@ from tests.engine.duplex.test_session_runner import close_harness, open_harness
 from vllm_omni.engine.duplex.commands import CreateItem, DeleteItem, Heartbeat
 from vllm_omni.engine.duplex.config import DuplexSessionState
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, duplex_is_auxiliary_request
+from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import (
     DuplexAuxiliaryPolicy,
     DuplexAuxiliaryRequest,
@@ -31,7 +32,7 @@ async def wait_until(predicate):
     await asyncio.wait_for(wait(), timeout=2)
 
 
-def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=()):
+def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=(), timeout_s=30.0):
     """Supply a small model policy while exercising the actual Session runner."""
     work = SimpleNamespace(ready=True, revision=0, applied=[], histories=[])
     plugin = h.runner.plugin
@@ -52,6 +53,7 @@ def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=()):
             history_digest=duplex_history_digest(()),
             model_source=work.revision,
             retry_delays_s=retry_delays_s,
+            timeout_s=timeout_s,
         )
 
     def apply(*, request, output, state):
@@ -123,6 +125,44 @@ async def test_memory_tasks_remain_session_local_and_runner_owned(mocker):
     finally:
         await close_harness(first)
         await close_harness(second)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_cleanup_timeout_retains_resource_for_teardown_retry(mocker):
+    h = await open_harness()
+    entered, cancelled = asyncio.Event(), asyncio.Event()
+    original_cleanup = h.port.cleanup
+
+    async def blocked_cleanup(request_ids, *, abort=False):
+        entered.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    try:
+        install_work(h, mocker, timeout_s=0.1)
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
+        task = h.runner.memory._task
+        mocker.patch.object(h.port, "cleanup", side_effect=blocked_cleanup)
+        request_id = finish_work(h)
+        await asyncio.wait_for(entered.wait(), timeout=2)
+        h.runner.memory.close()
+        await wait_until(task.done)
+        assert task.cancelled()
+        assert cancelled.is_set()
+        assert request_id in h.session.resource_request_ids()
+        assert request_id in h.manager._request_index
+        assert h.runner.memory._request_id is None
+        assert h.runner.memory._output is None
+        mocker.patch.object(h.port, "cleanup", side_effect=original_cleanup)
+        await h.manager.close(CloseDuplexSessionMessage(control_id="close-memory", session_id=h.session.session_id))
+        assert ([request_id], True) in h.port.cleanups
+        assert request_id not in h.manager._request_index
+    finally:
+        mocker.patch.object(h.port, "cleanup", side_effect=original_cleanup)
+        await close_harness(h)
 
 
 @pytest.mark.asyncio
