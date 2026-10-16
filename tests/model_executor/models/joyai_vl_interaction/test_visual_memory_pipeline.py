@@ -840,6 +840,44 @@ def test_answered_instruction_survives_history_and_context_trimming(mocker, answ
         plugin.plan_append(session_config=config, **kwargs)
 
 
+def test_visual_summary_rebudget_tokenizations_scale_with_history_plus_summaries(mocker):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.processor = Processor()
+    plugin.max_model_len = 65536
+    plugin.max_images = 100
+    config = {
+        "conversation": [
+            {"role": role, "content": f"{role} turn {index}: " + "text " * 10}
+            for index in range(8)
+            for role in ("user", "assistant")
+        ],
+        "joyai_new_images": [Image.new("RGB", (32, 32))] * 100,
+        "joyai_new_image_tokens": [256] * 100,
+    }
+    kwargs = dict(
+        request_id="budget",
+        fence=DuplexFence("s"),
+        runtime_config=plugin.runtime_config_for_update(DuplexSessionConfig(), {}),
+        seq=1,
+        turn_seq=1,
+        payload={},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=256),
+    )
+    expected = plugin.plan_append(session_config=config, **kwargs).prompt
+    inputs = plugin.processor(text=[expected["prompt"]], images=expected["multi_modal_data"]["image"])
+    plugin.max_model_len = len(inputs["input_ids"][0]) + 256
+    summaries = [VisualSummary(i, i, 0.0, 0.0, "S" * 2000, 2000, chunk_index=i) for i in range(15)]
+    tokenizer = mocker.spy(plugin.processor, "tokenizer")
+    actual = plugin.plan_append(session_config={**config, "joyai_visual_summaries": summaries}, **kwargs).prompt
+    assert actual["prompt"] == expected["prompt"]
+    assert len(actual["multi_modal_data"]["image"]) == 100
+    assert len(summaries) == 15
+    # Trim history once, omit summaries against the protected instruction,
+    # then rebudget recent history once against the remaining space.
+    assert tokenizer.call_count <= 2 * len(config["conversation"]) + len(summaries) + 3
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed_query", [False, True])
 @pytest.mark.parametrize("summary_ready", [False, True])

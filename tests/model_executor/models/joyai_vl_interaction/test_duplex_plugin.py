@@ -171,6 +171,118 @@ async def test_runtime_uses_deployed_image_limit(mocker, image_limit):
     assert plugin.max_images == image_limit
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("max_model_len,image_limit,error", [(8192, 256, "max_model_len"), (16384, 0, "image")])
+async def test_invalid_memory_budget_rejects_repeated_session_opens(mocker, max_model_len, image_limit, error):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    loader = mocker.patch("transformers.AutoProcessor.from_pretrained", side_effect=lambda *args, **kwargs: Processor())
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=max_model_len,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: image_limit),
+    )
+    results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
+    manager = DuplexSessionManager(
+        plugin=plugin,
+        stage_port=RecordingStagePort(stage_count=3),
+        output_sink=asyncio.Queue(),
+        result_sink=results,
+        runtime_config=DuplexSessionRuntimeConfig(),
+        model_config=model_config,
+    )
+    try:
+        attempts = []
+        for index in range(2):
+            await manager.open(
+                OpenDuplexSessionMessage(
+                    control_id=f"open-{index}",
+                    session_id=SESSION_ID,
+                    session_config=DuplexSessionConfig(model="joyai", modalities=["text"]),
+                    output_buffer=DuplexOutputBuffer(max_bytes=1024 * 1024, max_events=512),
+                )
+            )
+            attempts.append(await results.get())
+        assert [result.ok for result in attempts] == [False, False]
+        assert all(error in result.error_message for result in attempts)
+        assert not manager.runners
+        assert plugin.processor is None
+        assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == (0, 0, 0)
+        assert loader.call_count == 2
+    finally:
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_during", ["load", "budget"])
+async def test_cancelled_runtime_initialization_can_retry_without_stale_publication(mocker, cancel_during):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    started, release, finished = threading.Event(), threading.Event(), threading.Event()
+
+    def block_first(call):
+        def wrapped(*args, **kwargs):
+            if started.is_set():
+                return call(*args, **kwargs)
+            started.set()
+            try:
+                assert release.wait(timeout=10)
+                return call(*args, **kwargs)
+            finally:
+                finished.set()
+
+        return wrapped
+
+    def load(*args, **kwargs):
+        return Processor()
+
+    loader = mocker.patch(
+        "transformers.AutoProcessor.from_pretrained", side_effect=block_first(load) if cancel_during == "load" else load
+    )
+    if cancel_during == "budget":
+        mocker.patch.object(plugin, "_prepare_memory_budget", side_effect=block_first(plugin._prepare_memory_budget))
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 256),
+    )
+    task = asyncio.create_task(plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert plugin.processor is None
+        assert (plugin.max_model_len, plugin.max_images) == (0, 0)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == (0, 0, 0)
+        retry_config = SimpleNamespace(
+            model="joyai",
+            trust_remote_code=True,
+            max_model_len=32768,
+            multimodal_config=SimpleNamespace(get_limit_per_prompt=lambda kind: 2),
+        )
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=retry_config)
+        processor = plugin.processor
+        budget = (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens)
+        assert processor is not None and all(value > 0 for value in budget)
+        # The cancelled to_thread call still finishes, but cannot overwrite the
+        # successful retry's processor, deployment limits or budget estimates.
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
+        assert plugin.processor is processor
+        assert (plugin.max_model_len, plugin.max_images) == (32768, 2)
+        assert (plugin._mid_prompt_tokens, plugin._long_prompt_tokens, plugin._timestamp_tokens) == budget
+        await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=retry_config)
+        assert loader.call_count == 2
+    finally:
+        release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.to_thread(finished.wait, 5)
+
+
 def test_capabilities_and_configuration_refuse_audio_and_tools():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     caps = plugin.capabilities(max_sessions=2)

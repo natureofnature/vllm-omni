@@ -63,6 +63,13 @@ both interaction and summarization. For example, setting it to 32 in the stage's
 reached. With a ceiling of 100 or higher, the 100-frame working-chunk policy is
 the count limit; context and retained-byte budgets can still close chunks earlier.
 
+Opening a JoyAI session validates the VLM stage's memory budget. The image ceiling
+must be at least one, and `max_model_len` must fit both a single-image summary and
+the compression of two 4,000-token summaries with up to 4,000 output tokens, plus
+prompt overhead. A smaller context that can serve ordinary interaction requests
+may therefore be rejected. Retrying a failed or cancelled initialization does not
+bypass these checks.
+
 Only a successful, source-valid summary retires its input frames or summaries.
 The pending-frame buffer retains at most 200 frames and 32 MiB of losslessly
 encoded PNG data per session. Prompt-preparation workers decode selected frames for inference.

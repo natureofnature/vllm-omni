@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 from time import monotonic
+from typing import TYPE_CHECKING
 
 import pybase64
 from PIL import Image
@@ -57,6 +58,9 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     VisualMemorySource,
     VisualSummary,
 )
+
+if TYPE_CHECKING:
+    from transformers import ProcessorMixin
 
 
 class JoyAIDuplexPlugin(DuplexModelPlugin):
@@ -111,23 +115,31 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     async def prepare_runtime_config(
         self, config: DuplexSessionConfig, *, model_config: ModelConfig | None
     ) -> dict[str, object]:
-        self.validate_client_extra_body(config.extra_body)
+        runtime_config = self.runtime_config_for_update(config, {})
         async with self._processor_lock:
             if self.processor is None:
                 if model_config is None:
                     raise DuplexRuntimeConfigError("JoyAI requires the stage-0 model configuration")
                 from transformers import AutoProcessor
 
-                self.processor = await asyncio.to_thread(
+                processor = await asyncio.to_thread(
                     AutoProcessor.from_pretrained,
                     model_config.model,
                     trust_remote_code=model_config.trust_remote_code,
                     revision=getattr(model_config, "revision", None),
                 )
-                self.max_model_len = model_config.max_model_len
-                self.max_images = model_config.multimodal_config.get_limit_per_prompt("image")
-                await asyncio.to_thread(self._prepare_memory_budget)
-        return self.runtime_config_for_update(config, {})
+                max_model_len = model_config.max_model_len
+                max_images = model_config.multimodal_config.get_limit_per_prompt("image")
+                budget = await asyncio.to_thread(
+                    self._prepare_memory_budget, processor, max_model_len=max_model_len, max_images=max_images
+                )
+                # Publish only validated state. A cancelled preparation worker
+                # may still finish, but cannot mutate this shared plugin.
+                self.max_model_len = max_model_len
+                self.max_images = max_images
+                self._mid_prompt_tokens, self._long_prompt_tokens, self._timestamp_tokens = budget
+                self.processor = processor
+        return runtime_config
 
     def runtime_config_for_update(
         self, config: DuplexSessionConfig, current: Mapping[str, object]
@@ -646,16 +658,20 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             for image in images
         ]
 
-    def _prepare_memory_budget(self) -> None:
+    def _prepare_memory_budget(
+        self, processor: ProcessorMixin, *, max_model_len: int, max_images: int
+    ) -> tuple[int, int, int]:
+        if max_images < 1:
+            raise DuplexRuntimeConfigError("JoyAI visual memory requires limit_mm_per_prompt.image >= 1.")
         memory = self.create_session_state().visual_memory
 
         def overhead(content: str) -> int:
-            prompt = self.processor.apply_chat_template(
+            prompt = processor.apply_chat_template(
                 [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
             )
-            return len(self.processor.tokenizer(text=[prompt])["input_ids"][0])
+            return len(processor.tokenizer(text=[prompt])["input_ids"][0])
 
-        self._mid_prompt_tokens = overhead(
+        mid_prompt_tokens = overhead(
             MID_TERM_SUMMARY_PROMPT.format(
                 chunk_index=1,
                 frame_range="0.0 seconds-999999999.9 seconds",
@@ -663,7 +679,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 preferred_time_span="10 seconds",
             )
         )
-        self._long_prompt_tokens = overhead(
+        long_prompt_tokens = overhead(
             LONG_TERM_COMPRESS_PROMPT.format(
                 merged_range="0.0 seconds-999999999.9 seconds",
                 summaries_text="",
@@ -672,17 +688,19 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         )
         # Conservative scheduling hint for each timestamp and template boundary.
         # The actual full prompt is tokenized again before every submission.
-        self._timestamp_tokens = overhead("<999999999.9 seconds-999999999.9 seconds>")
-        image_tokens = self._image_token_counts([Image.new("RGB", (512, 512))])[0]
-        if self.max_images < 1 or (
-            self._mid_prompt_tokens + self._timestamp_tokens + image_tokens + memory.mid_max_tokens > self.max_model_len
-            or self._long_prompt_tokens + 2 * (memory.mid_max_tokens + self._timestamp_tokens) + memory.long_max_tokens
-            > self.max_model_len
+        timestamp_tokens = overhead("<999999999.9 seconds-999999999.9 seconds>")
+        image_processor = processor.image_processor
+        image_tokens = image_processor.get_number_of_image_patches(512, 512, {}) // image_processor.merge_size**2
+        if (
+            mid_prompt_tokens + timestamp_tokens + image_tokens + memory.mid_max_tokens > max_model_len
+            or long_prompt_tokens + 2 * (memory.mid_max_tokens + timestamp_tokens) + memory.long_max_tokens
+            > max_model_len
         ):
             raise DuplexRuntimeConfigError(
                 "JoyAI visual memory requires a context that fits one image summary and two mid-term summaries; "
                 "increase the JoyAI stage max_model_len."
             )
+        return mid_prompt_tokens, long_prompt_tokens, timestamp_tokens
 
     @staticmethod
     def _latest_query(session_config: Mapping[str, object], runtime_config: Mapping[str, object]) -> tuple[str, int]:
@@ -977,6 +995,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         if not isinstance(sampling_params, SamplingParams):
             raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
+        rebudget_history = False
         while True:
             prefix = []
             if visual_summaries:
@@ -1010,6 +1029,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             prompt = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
             text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
             if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
+                if rebudget_history:
+                    # Omit summaries against minimal history first, then
+                    # restore recent turns once instead of once per summary.
+                    history = unsummarized_history.copy()
+                    rebudget_history = False
+                    continue
                 break
             if len(history) > (1 if latest_instruction is not None else 0):
                 history.pop(1 if history[0] is latest_instruction else 0)
@@ -1021,12 +1046,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 summary = ""
                 # Rebudget the recent turns now that the summary no longer
                 # consumes their space. Covered history remains summarized.
-                history = unsummarized_history.copy()
+                rebudget_history = True
             elif visual_summaries:
                 # Current observations/query take priority, as in the original
                 # working chunk. Omitted blocks remain in bounded model memory.
                 visual_summaries.pop(0)
-                history = unsummarized_history.copy()
+                rebudget_history = True
             elif len(images) > 1:
                 self._drop_oldest_visual_frame(working_messages)
                 images.pop(0)
