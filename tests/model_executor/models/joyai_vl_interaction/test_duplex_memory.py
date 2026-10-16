@@ -62,10 +62,9 @@ def summary_output(request_id, text="Cabinet 0 has code K731.", finish_reason="s
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_id,stage_count", [(0, 3), (1, 4)])
 async def test_summary_uses_private_same_stage_request_and_preserves_new_tail(stage_id, stage_count):
-    h = await open_joyai(modalities=("text",))
+    h = await open_joyai(modalities=("text",), asr=stage_id == 1)
     try:
-        h.port._stage_count = stage_count
-        h.runner.plugin.joyai_stage_id = stage_id
+        assert h.port.stage_count == stage_count
         committed_turns(h.session)
         initial_seq = h.session.input_seq
         submission = await start_summary(h)

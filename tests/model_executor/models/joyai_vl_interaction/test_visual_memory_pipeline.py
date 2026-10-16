@@ -101,12 +101,9 @@ def user_item(item_id, content):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage_id,stage_count", [(0, 3), (1, 4)])
 async def test_silent_frames_submit_timestamped_images_to_selected_private_stage(stage_id, stage_count):
-    h = await open_joyai(modalities=("text",))
+    h = await open_joyai(modalities=("text",), asr=stage_id == 1)
     try:
-        # Exercise the auxiliary stage-selection contract. Observations still
-        # use the base JoyAI stage 0; this is not an ASR-profile integration test.
-        h.port._stage_count = stage_count
-        h.runner.plugin.joyai_stage_id = stage_id
+        assert h.port.stage_count == stage_count
         memory = h.runner.model_state.visual_memory
         memory.chunk_frames = 4
         for color in ("red", "blue", "green", "yellow"):

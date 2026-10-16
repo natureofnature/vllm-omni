@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Turn-commit JoyAI observations on the existing three-stage pipeline."""
+"""Turn-commit JoyAI observations with optional Qwen3-ASR speech input."""
 
 from __future__ import annotations
 
@@ -13,11 +13,13 @@ from dataclasses import replace
 from time import monotonic
 from typing import TYPE_CHECKING
 
+import numpy as np
 import pybase64
 from PIL import Image
 from vllm.config import ModelConfig
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
+from vllm_omni.config.stage_config import PipelineConfig
 from vllm_omni.engine.duplex.config import DuplexCapabilities, DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexAppendPlan, DuplexFence, DuplexOutputAction, DuplexOutputDecision
 from vllm_omni.engine.duplex.plugin import (
@@ -47,6 +49,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.data_plane impo
     QueryReference,
     WorkingObservation,
 )
+from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.input import JoyAIFrameBuffer
 from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     RECENT_MESSAGES,
     SUMMARY_CHUNK_MESSAGES,
@@ -58,6 +61,10 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     VisualMemorySource,
     VisualSummary,
 )
+from vllm_omni.model_executor.stage_input_processors.joyai_vl_interaction import (
+    _clean_qwen3_asr_transcript,
+    _extract_completed_action_text,
+)
 
 if TYPE_CHECKING:
     from transformers import ProcessorMixin
@@ -67,6 +74,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     plugin_id = "joyai-vl-interaction"
     supports_auxiliary_requests = True
     joyai_stage_id = 0
+    asr_stage_id: int | None = None
+    audio_stage_id = 2
 
     def __init__(self, encode_audio: Callable[..., str]) -> None:
         self.data_plane = JoyAIDataPlane(encode_audio)
@@ -79,6 +88,39 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._processor_lock = asyncio.Lock()
         self._memory_budget_error: str | None = None
 
+    def configure_pipeline(self, pipeline_config: PipelineConfig) -> None:
+        stages = {stage.model_stage: stage.stage_id for stage in pipeline_config.stages}
+        self.joyai_stage_id = stages["joyvl"]
+        self.asr_stage_id = stages.get("asr")
+        self.audio_stage_id = stages["code2wav"]
+        self.data_plane.joyai_stage_id = self.joyai_stage_id
+        self.data_plane.audio_stage_id = self.audio_stage_id
+
+    def input_stage_id(self, payload: object) -> int:
+        if isinstance(payload, Mapping) and payload.get("audio"):
+            if self.asr_stage_id is None:
+                raise DuplexRuntimeConfigError("JoyAI speech input requires the ASR pipeline")
+            return self.asr_stage_id
+        return self.joyai_stage_id
+
+    def split_transcription_input(self, payload: object) -> tuple[object, dict[str, object] | None]:
+        if not isinstance(payload, Mapping):
+            return payload, None
+        segments = payload.get("committed_audio_segments")
+        if not isinstance(segments, list) or len(segments) < 2:
+            return payload, None
+        raw = pybase64.b64decode(payload["audio"], validate=True)
+        if sum(segment["byte_count"] for segment in segments) != len(raw):
+            raise DuplexRuntimeConfigError("Committed audio boundaries do not match the retained PCM")
+        boundary = segments[0]["byte_count"]
+        first = {**payload, "audio": pybase64.b64encode(raw[:boundary]).decode("ascii")}
+        first["realtime_item_id"] = segments[0]["item_id"]
+        first.pop("committed_audio_segments", None)
+        first.pop("video_frames", None)
+        remaining = {**payload, "audio": pybase64.b64encode(raw[boundary:]).decode("ascii")}
+        remaining["committed_audio_segments"] = segments[1:]
+        return first, remaining
+
     def capabilities(self, *, max_sessions: int) -> DuplexCapabilities:
         return DuplexCapabilities(
             supports_input_append=True,
@@ -87,7 +129,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             supports_turn_commit_only=True,
             supports_core_resumable_request=False,
             required_input_modalities=frozenset(),
-            optional_input_modalities=frozenset({"video"}),
+            optional_input_modalities=frozenset({"video", "audio"} if self.asr_stage_id is not None else {"video"}),
             supports_independent_io_streams=True,
             supports_realtime_endpoint=True,
             supports_multi_session=max_sessions > 1,
@@ -104,7 +146,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         )
 
     def create_session_state(self) -> JoyAISessionState:
-        return JoyAISessionState()
+        return JoyAISessionState(audio_buffer=JoyAIFrameBuffer(accepts_audio=self.asr_stage_id is not None))
 
     def validate_client_extra_body(self, extra_body: object) -> None:
         super().validate_client_extra_body(extra_body)
@@ -120,20 +162,18 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         async with self._processor_lock:
             if self.processor is None:
                 if model_config is None:
-                    raise DuplexRuntimeConfigError("JoyAI requires the stage-0 model configuration")
+                    raise DuplexRuntimeConfigError("JoyAI requires its comprehension-stage model configuration")
                 max_model_len = model_config.max_model_len
                 max_images = model_config.multimodal_config.get_limit_per_prompt("image")
                 if max_images < 1:
                     raise DuplexRuntimeConfigError("JoyAI visual memory requires limit_mm_per_prompt.image >= 1.")
                 if self._memory_budget_error is not None:
                     raise DuplexRuntimeConfigError(self._memory_budget_error)
-                from transformers import AutoProcessor
+                from vllm.transformers_utils.processor import cached_processor_from_config
 
                 processor = await asyncio.to_thread(
-                    AutoProcessor.from_pretrained,
-                    model_config.model,
-                    trust_remote_code=model_config.trust_remote_code,
-                    revision=getattr(model_config, "revision", None),
+                    cached_processor_from_config,
+                    model_config,
                 )
                 try:
                     budget = await asyncio.to_thread(
@@ -178,7 +218,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             if isinstance(params, SamplingParams):
                 params = params.clone()
                 params.output_kind = RequestOutputKind.FINAL_ONLY
-                if index == 0:
+                if index == self.joyai_stage_id:
                     params.detokenize = True
                     params.skip_special_tokens = False
                     for key in ("temperature", "max_tokens"):
@@ -549,7 +589,9 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         request.previous_response = state.last_response_text
         request.visual_generation = state.visual_memory.generation
         request.frame_time_s = monotonic() - state.visual_memory.start_time
-        request.query, request.query_index = self._current_query(config, runtime_config)
+        awaiting_transcript = isinstance(payload, Mapping) and bool(payload.get("audio"))
+        if not awaiting_transcript:
+            request.query, request.query_index = self._current_query(config, runtime_config)
         item_ids = config.get("conversation_item_ids", ())
         if 0 <= request.query_index < len(item_ids):
             request.query_item_id = item_ids[request.query_index]
@@ -562,7 +604,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         )
         latest_query, latest_index = self._latest_query(config, runtime_config)
         latest_item_id = item_ids[latest_index] if 0 <= latest_index < len(item_ids) else None
-        if latest_query and (latest_item_id is not None or latest_index == -1):
+        # Speech owns a new query whose text arrives after this plan. Its
+        # committed history anchor retains the eventual transcript; the previous
+        # text query must not acquire this request's answer as its own memory.
+        if not awaiting_transcript and latest_query and (latest_item_id is not None or latest_index == -1):
             query_digest = duplex_history_digest((("user", latest_query),))
             request.query_reference = next(
                 (
@@ -948,8 +993,17 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         final: bool,
         sampling_params: object,
     ) -> DuplexAppendPlan:
-        if not final or not isinstance(payload, Mapping) or payload.get("audio"):
-            raise DuplexRuntimeConfigError("JoyAI video profile requires committed text/image/video input")
+        if not final or not isinstance(payload, Mapping):
+            raise DuplexRuntimeConfigError("JoyAI requires committed input")
+        has_audio = bool(payload.get("audio"))
+        self.input_stage_id(payload)
+        stage_sampling_params = session_config.get("stage_sampling_params")
+        if stage_sampling_params is not None:
+            sampling_params = stage_sampling_params[self.joyai_stage_id]
+        if not isinstance(sampling_params, SamplingParams):
+            raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
+        if has_audio:
+            return self._plan_speech_append(session_config, runtime_config, payload, sampling_params)
         history = []
         item_ids = session_config.get("conversation_item_ids", ())
         query = runtime_config.get("initial_user_text") or ""
@@ -999,8 +1053,6 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             for entry in session_config.get("joyai_visual_summaries", ())
             if query or entry.chunk_index is not None
         ]
-        if not isinstance(sampling_params, SamplingParams):
-            raise DuplexRuntimeConfigError("JoyAI requires autoregressive sampling parameters")
         budget = self.max_model_len - (sampling_params.max_tokens or 256)
         rebudget_history = False
         while True:
@@ -1075,6 +1127,56 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             }
         )
 
+    def _plan_speech_append(self, session_config, runtime_config, payload, sampling_params) -> DuplexAppendPlan:
+        """Keep ASR handoff budgeting deferred until the transcript is available."""
+        history = []
+        if query := runtime_config.get("initial_user_text"):
+            history.append({"role": "user", "content": query})
+        for role, text in duplex_text_history(session_config.get("conversation", [])):
+            if role in {"user", "assistant"} and text:
+                history.append({"role": role, "content": ("</response> " if role == "assistant" else "") + text})
+        images = []
+        for encoded in session_config.get("joyai_frames", [])[-4:]:
+            if encoded.startswith("data:"):
+                encoded = encoded.split(",", 1)[1]
+            with Image.open(io.BytesIO(pybase64.b64decode(encoded, validate=True))) as image:
+                image.thumbnail((448, 448))
+                images.append(image.convert("RGB").copy())
+        system = SILENT_SYSTEM_PROMPT
+        if runtime_config.get("instructions"):
+            system += "\n\n" + runtime_config["instructions"]
+        budget = self.max_model_len - (sampling_params.max_tokens or 256)
+        image_token_counts = self._image_token_counts(images)
+        prompt_data = {
+            "additional_information": {
+                key: runtime_config[key] for key in ("tts_speaker", "tts_language", "tts_instruct")
+            },
+        }
+        if payload.get("format") != "pcm_f32le" or payload.get("sample_rate_hz") != 16000:
+            raise DuplexRuntimeConfigError("JoyAI speech input requires normalized 16 kHz pcm_f32le")
+        audio = np.frombuffer(pybase64.b64decode(payload["audio"], validate=True), dtype="<f4")
+        if not audio.size or not np.isfinite(audio).all() or not np.any(audio):
+            raise DuplexRuntimeConfigError("JoyAI speech commit requires non-silent finite PCM")
+        prompt_data["additional_information"].update(
+            joyai_prompt_context={"system": system, "history": history},
+            joyai_prompt_budget=budget,
+            joyai_image_token_counts=image_token_counts,
+            deferred_multi_modal_data={"image": images} if images else {},
+        )
+        if payload.get("realtime_item_id"):
+            prompt_data["additional_information"]["realtime_item_id"] = payload["realtime_item_id"]
+        prompt_data["prompt"] = (
+            "<|im_start|>user\n<|audio_start|><|audio_pad|><|audio_end|>"
+            "Please transcribe this speech.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_data["multi_modal_data"] = {"audio": (audio, 16000)}
+        return DuplexAppendPlan(prompt=prompt_data)
+
+    def user_transcript(self, *, stage_id: int, output: object, prompt: object, finished: bool) -> str | None:
+        if stage_id != self.asr_stage_id or not finished or not getattr(output, "outputs", None):
+            return None
+        return _clean_qwen3_asr_transcript(_extract_completed_action_text(output)) or None
+
     def decide_output(
         self,
         *,
@@ -1085,7 +1187,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         segment_output_metadata: dict[str, object],
         output: object,
     ) -> DuplexOutputDecision | None:
-        if stage_id != 0 or not segment_finished:
+        if stage_id != self.joyai_stage_id or not segment_finished:
             return None
         observation = self.data_plane.requests.get(output.request_id)
         if observation is None:
@@ -1101,4 +1203,4 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         return None
 
     def project_intermediate_output(self, *, stage_id: int, output: object, context: object) -> bool:
-        return stage_id == 0 and context.segment_finished
+        return stage_id == self.joyai_stage_id and context.segment_finished

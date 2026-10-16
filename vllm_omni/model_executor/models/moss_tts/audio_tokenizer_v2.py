@@ -873,6 +873,8 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
 
         self._register_load_state_dict_pre_hook(self._load_hook, with_module=True)
 
+        self._cached_attn_bias: torch.Tensor | None = None
+
     @staticmethod
     def _load_hook(module, state_dict, prefix, *_):
         mappings = {
@@ -946,6 +948,7 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
         key: torch.Tensor,
         value: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         state = cast(MHAState | None, self._streaming_state)
         B, T = query.shape[:2]
@@ -1020,42 +1023,47 @@ class MossAudioTokenizerMultiheadAttention(StreamingModule):
             )
         else:
             k, v, pos_k = self._complete_kv(k, v, execution_context)
-            pos_k = pos_k[:, None]
 
-            if metadata is not None:
-                attn_bias = metadata.attn_bias
-                streaming_attention = getattr(self, "_streaming_attention", None)
-            elif self.causal:
-                # Reuse cached arange(T) — keyed by (device, T) so that changing
-                # T never frees a previous allocation (CUDA graph safety: a
-                # captured graph bakes in the pointer, so storage must live as
-                # long as the module and all captured graphs).
-                cache_key = (q.device, T)
-                if cache_key not in self._arange_t_cache:
-                    self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
-                pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
-                delta = pos_q - pos_k
-                # Build mask directly in the convention needed by the active path.
-                # SDPA / streaming_attention use True=attend; npu_fusion_attention
-                # uses True=masked.  On NPU we construct the inverted mask directly
-                # (avoids a ~attn_bias allocation + kernel per layer per step).
-                is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
-                streaming_attention = getattr(self, "_streaming_attention", None)
-                use_npu_path = is_npu and streaming_attention is None
-                if use_npu_path:
-                    # NPU convention: True = masked (inverted)
-                    attn_bias = (pos_k < 0) | (delta < 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias | (delta >= self.context)
-                    attn_bias = attn_bias[:, None]
+            if attn_bias is None:
+                pos_k = pos_k[:, None]
+                if metadata is not None:
+                    attn_bias = metadata.attn_bias
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                elif self.causal:
+                    # Reuse cached arange(T) — keyed by (device, T) so that changing
+                    # T never frees a previous allocation (CUDA graph safety: a
+                    # captured graph bakes in the pointer, so storage must live as
+                    # long as the module and all captured graphs).
+                    cache_key = (q.device, T)
+                    if cache_key not in self._arange_t_cache:
+                        self._arange_t_cache[cache_key] = torch.arange(T, device=q.device, dtype=torch.long)
+                    pos_q = offset.view(-1, 1, 1) + self._arange_t_cache[cache_key].view(-1, 1)
+                    delta = pos_q - pos_k
+                    # Build mask directly in the convention needed by the active path.
+                    # SDPA / streaming_attention use True=attend; npu_fusion_attention
+                    # uses True=masked.  On NPU we construct the inverted mask directly
+                    # (avoids a ~attn_bias allocation + kernel per layer per step).
+                    is_npu = q.device.type == "npu" and q.dtype in (torch.float16, torch.bfloat16)
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = is_npu and streaming_attention is None
+                    if use_npu_path:
+                        # NPU convention: True = masked (inverted)
+                        attn_bias = (pos_k < 0) | (delta < 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias | (delta >= self.context)
+                        attn_bias = attn_bias[:, None]
+                    else:
+                        # SDPA / streaming_attention convention: True = attend
+                        attn_bias = (pos_k >= 0) & (delta >= 0)
+                        if self.context is not None:
+                            attn_bias = attn_bias & (delta < self.context)
+                        attn_bias = attn_bias[:, None]
                 else:
-                    # SDPA / streaming_attention convention: True = attend
-                    attn_bias = (pos_k >= 0) & (delta >= 0)
-                    if self.context is not None:
-                        attn_bias = attn_bias & (delta < self.context)
-                    attn_bias = attn_bias[:, None]
+                    attn_bias = None
+                    streaming_attention = getattr(self, "_streaming_attention", None)
+                    use_npu_path = False
+                self._cached_attn_bias = attn_bias
             else:
-                attn_bias = None
                 streaming_attention = getattr(self, "_streaming_attention", None)
                 use_npu_path = False
 
@@ -1221,37 +1229,95 @@ class MossAudioTokenizerTransformerLayer(StreamingModule):
         if self.gating is None:
             assert self.linear1 is not None
             assert self.linear2 is not None
-            update = self.linear2(self.activation(self.linear1(x)))
+            gelu_bias = getattr(self, "_gelu_epilogue_bias", None)
+            if gelu_bias is not None:
+                # GELU in the up-projection GEMM
+                # epilogue (cuBLASLt, tanh form, applied before bf16 rounding)
+                # instead of a separate pass over the FFN activations. Under
+                # the decoder's bf16 autocast the norm output is FP32; round it
+                # here as autocast does for linear1, so Inductor fuses the cast
+                # into the norm kernel.
+                weight = self.linear1.weight
+                hidden = linear_gelu_epilogue(x.reshape(-1, x.shape[-1]).to(weight.dtype), weight, gelu_bias)
+                update = self.linear2(hidden.view(*x.shape[:-1], hidden.shape[-1]))
+            else:
+                update = self.linear2(self.activation(self.linear1(x)))
         else:
             if self.weights_per_step:
                 assert isinstance(self.gating, nn.ModuleList)
                 update = apply_weights_per_step(self.gating, self.weights_per_step_schedule, x, offset)
             else:
                 update = self.gating(x)
+        if isinstance(self.layer_scale_2, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_2.scale)
         return x_orig.to(update.dtype) + self.layer_scale_2(update)
 
     def _sa_block(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
         x_orig = x
         x = self.norm1(x)
-        update = self.self_attn(x, x, x, execution_context=execution_context)
+        update = self.self_attn(x, x, x, execution_context=execution_context, attn_bias=attn_bias)
+        if isinstance(self.layer_scale_1, MossAudioTokenizerLayerScale):
+            return torch.addcmul(x_orig.to(update.dtype), update, self.layer_scale_1.scale)
         return x_orig.to(update.dtype) + self.layer_scale_1(update)
 
     def forward(
         self,
         x: torch.Tensor,
         execution_context: StreamingExecutionContext | None = None,
+        attn_bias: torch.Tensor | None = None,
     ):
-        x = self._sa_block(x, execution_context)
+        x = self._sa_block(x, execution_context, attn_bias)
         x = self._ff_block(x, execution_context)
         state = self._streaming_state
         if state is not None and execution_context is None:
             assert isinstance(state, LayerState)
             state.offset_cpu += x.shape[1]
         return x
+
+
+@torch.library.custom_op("vllm_omni::moss_linear_gelu_epilogue", mutates_args=())
+def linear_gelu_epilogue(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    """``gelu(x @ weight.T)`` with GELU (tanh form) in the cuBLASLt epilogue.
+
+    Custom ops are not autocast-aware, so callers pass ``x`` in the weight
+    dtype; other input is rounded to it here, as autocast would for a GEMM.
+    """
+    return torch._addmm_activation(zero_bias, x.to(weight.dtype), weight.t(), use_gelu=True)
+
+
+@linear_gelu_epilogue.register_fake
+def _(x: torch.Tensor, weight: torch.Tensor, zero_bias: torch.Tensor) -> torch.Tensor:
+    return x.new_empty((x.shape[0], weight.shape[0]), dtype=weight.dtype)
+
+
+def enable_gelu_epilogue(model: nn.Module) -> int:
+    """Fuse each eligible CUDA FFN GELU into its up-projection GEMM.
+
+    Eligible layers use the plain GELU FFN with a bias-free half-precision
+    CUDA ``linear1``. cuBLASLt's GELU epilogue uses the tanh form on the FP32
+    accumulator, so outputs change at bf16-rounding level (not bitwise).
+    Returns the number of layers switched.
+    """
+    switched = 0
+    for module in model.modules():
+        if not isinstance(module, MossAudioTokenizerTransformerLayer):
+            continue
+        linear1 = module.linear1
+        if module.gating is not None or module.weights_per_step or module.activation is not F.gelu:
+            continue
+        if not isinstance(linear1, nn.Linear) or linear1.bias is not None:
+            continue
+        weight = linear1.weight
+        if weight.device.type != "cuda" or weight.dtype not in (torch.bfloat16, torch.float16):
+            continue
+        module._gelu_epilogue_bias = torch.zeros(weight.shape[0], device=weight.device, dtype=weight.dtype)
+        switched += 1
+    return switched
 
 
 # =============================================================================
@@ -1324,6 +1390,8 @@ class MossAudioTokenizerTransformer(StreamingModule):
                 )
             )
 
+        self._share_attn_bias: bool = True
+
     def _init_streaming_state(self, batch_size: int) -> TransformerState:
         device = next(self.parameters()).device
         return TransformerState(
@@ -1384,8 +1452,19 @@ class MossAudioTokenizerTransformer(StreamingModule):
             )
             execution_context = dataclasses.replace(execution_context, rope_table=table)
 
-        for layer in self.layers:
-            x = layer(x, *args, execution_context=execution_context, **kwargs)
+        shared_attn_bias: torch.Tensor | None = None
+        try:
+            for i, layer in enumerate(self.layers):
+                if self._share_attn_bias and i == 0:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+                    shared_attn_bias = layer.self_attn._cached_attn_bias
+                elif self._share_attn_bias:
+                    x = layer(x, *args, attn_bias=shared_attn_bias, execution_context=execution_context, **kwargs)
+                else:
+                    x = layer(x, *args, attn_bias=None, execution_context=execution_context, **kwargs)
+        finally:
+            for layer in self.layers:
+                layer.self_attn._cached_attn_bias = None
 
         if state is not None:
             assert isinstance(state, TransformerState)
