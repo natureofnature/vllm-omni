@@ -2071,6 +2071,157 @@ async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_submission", [False, True])
+async def test_stage_pool_preserves_submission_error_when_abort_is_cancelled(mocker, cancel_submission) -> None:
+    submitted, aborting = asyncio.Event(), asyncio.Event()
+    submission_errors: list[BaseException] = []
+    retry_abort = False
+
+    class InterruptedClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            await super().add_request_async(*args, **kwargs)
+            submitted.set()
+            try:
+                if cancel_submission:
+                    await asyncio.Event().wait()
+                raise RuntimeError("original submission failure")
+            except (RuntimeError, asyncio.CancelledError) as error:
+                submission_errors.append(error)
+                raise
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            assert pool.get_bound_replica_id("req-0") == 0
+            if not retry_abort:
+                aborting.set()
+                await asyncio.Event().wait()
+            await super().abort_requests_async(request_ids)
+
+    client = InterruptedClient()
+    pool = _build_stage_pools([[client]])[0]
+    state = OrchestratorRequestState(request_id="req-0", sampling_params_list=[_sampling_params()], final_stage_id=0)
+    warning = mocker.spy(logging.getLogger("vllm_omni.engine.stage_pool"), "warning")
+    task = asyncio.create_task(pool.submit_initial("req-0", state, FakePromptRequest("req-0", [1, 2])))
+    try:
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        if cancel_submission:
+            task.cancel("original submission cancellation")
+        await asyncio.wait_for(aborting.wait(), timeout=2)
+        task.cancel("abort cancellation")
+        with pytest.raises(type(submission_errors[0])) as raised:
+            await task
+        assert raised.value is submission_errors[0]
+        warning.assert_called_once()
+        assert isinstance(warning.call_args.args[-1], asyncio.CancelledError)
+        assert pool.get_bound_replica_id("req-0") == 0
+        # A cancelled abort leaves no shielded background task; the owner can
+        # retry using the retained binding.
+        retry_abort = True
+        await pool.abort_requests(["req-0"])
+        assert client.abort_calls == [["req-0"]]
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_survivor", [False, True])
+@pytest.mark.parametrize("companion", [False, True])
+async def test_submit_and_abort_engine_death_evicts_replica_and_fails_request_once(has_survivor, companion) -> None:
+    class DeadClient(FakeStageClient):
+        fail_submission = True
+
+        async def add_request_async(self, *args, **kwargs) -> None:
+            await super().add_request_async(*args, **kwargs)
+            if self.fail_submission:
+                raise EngineDeadError("engine died during submission")
+
+        async def abort_requests_async(self, request_ids: list[str]) -> None:
+            await super().abort_requests_async(request_ids)
+            raise EngineDeadError("engine is still dead during abort")
+
+    dead, survivor = DeadClient(), FakeStageClient()
+    processor = MultimodalOutputProcessor(tokenizer=None, log_stats=False)
+    pool = StagePool(
+        0,
+        [dead, survivor] if has_survivor else [dead],
+        output_processor=processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    counter = FakeRunningCounter()
+    output: asyncio.Queue = asyncio.Queue()
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=output,
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+        running_counter=counter,
+    )
+
+    params = SamplingParams(max_tokens=4, detokenize=False)
+
+    def prompt(request_id):
+        request = _processed_request(f"{request_id}-internal", params)
+        request.external_req_id = request_id
+        return request
+
+    async def submit(request_id):
+        await orchestrator._handle_add_request(
+            StageSubmissionMessage(
+                type="add_request",
+                request_id=request_id,
+                prompt=prompt(request_id),
+                original_prompt={},
+                output_prompt_text=None,
+                sampling_params_list=[params],
+                final_stage_id=0,
+                preprocess_ms=0,
+                request_timestamp=0,
+                enqueue_ts=0,
+            )
+        )
+
+    if companion:
+        dead.fail_submission = False
+        await submit("req-dead")
+        dead.fail_submission = True
+        await orchestrator._handle_add_companion(
+            AddCompanionRequestMessage(
+                companion_id="req-cfg",
+                parent_id="req-dead",
+                role="negative",
+                prompt=prompt("req-cfg"),
+                companion_prompt_text=None,
+                sampling_params_list=[params],
+            )
+        )
+    else:
+        await submit("req-dead")
+    error = output.get_nowait()
+    assert isinstance(error, ErrorMessage) and error.request_id == "req-dead"
+    assert error.fatal and output.empty()
+    assert pool.live_replica_ids() == ([1] if has_survivor else [])
+    assert dead.shutdown_calls == 1
+    assert dead.abort_calls == [["req-cfg-internal" if companion else "req-dead-internal"]]
+    assert pool.get_bound_replica_id("req-dead") is None
+    assert pool.get_bound_replica_id("req-cfg") is None
+    assert not orchestrator.request_states and counter.value == 0
+    assert not processor.request_states and not processor.external_req_ids
+    await submit("req-next")
+    if has_survivor:
+        assert pool.get_bound_replica_id("req-next") == 1
+        assert len(survivor.add_request_calls) == 1
+        assert output.empty() and counter.value == 1
+        await orchestrator._cleanup_request_ids(["req-next"], abort=True)
+        assert not processor.request_states and not processor.external_req_ids
+    else:
+        error = output.get_nowait()
+        assert isinstance(error, ErrorMessage) and error.request_id == "req-next"
+        assert output.empty() and counter.value == 0
+    assert len(dead.add_request_calls) == (2 if companion else 1)
+
+
+@pytest.mark.asyncio
 async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
     stage0 = FakeStageClient(stage_type="llm", final_output=False)
     pool = StagePool(

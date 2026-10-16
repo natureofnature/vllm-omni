@@ -1471,7 +1471,14 @@ class OrchestratorBase:
         )
         self._prom_metrics.set_stage_waiting_requests(stage_id, total)
 
-    async def _handle_dead_replica(self, stage_id: int, replica_id: int, error: EngineDeadError) -> None:
+    async def _handle_dead_replica(
+        self,
+        stage_id: int,
+        replica_id: int,
+        error: EngineDeadError,
+        *,
+        failed_request_id: str | None = None,
+    ) -> None:
         """Evict a dead stage replica and fail the requests stranded on it (#4285).
 
         A dead replica must not tear down the whole server: evict it and keep the
@@ -1490,6 +1497,12 @@ class OrchestratorBase:
         )
         pool.evict_replica(replica_id)
         self._remove_stage_replica_waiting(stage_id, replica_id)
+        if failed_request_id is not None:
+            # A rejected submission can retain its binding when abort also
+            # fails. Evict before cleanup so it cannot abort the dead engine
+            # again. Fail the attributed request first (the parent for CFG),
+            # removing it and its companions before collecting other failures.
+            await self._fail_request_dead_stage(failed_request_id, stage_id)
         stage_has_live = bool(pool.live_replica_ids())
         failed_ids: list[str] = []
         for req_id, req_state in list(self.request_states.items()):
@@ -1646,8 +1659,8 @@ class OrchestratorBase:
             # A live replica died mid-submit before the poll loop evicted it.
             # Evict it now (and fail every request bound to it) so a burst of
             # new requests stops round-robining onto the dead slot until the
-            # poll catches up. Capture the replica before failing this request,
-            # since the failure releases its binding.
+            # poll catches up. Evict before failing this request, since its
+            # cleanup may otherwise try to abort the already-dead engine.
             pool = self.stage_pools[stage_id]
             dead_replica = pool.get_bound_replica_id(dispatch_req_id or req_id)
             logger.error(
@@ -1658,9 +1671,10 @@ class OrchestratorBase:
                 dead_replica,
                 e,
             )
-            await self._fail_request_dead_stage(req_id, stage_id)
             if dead_replica is not None and dead_replica in pool.live_replica_ids():
-                await self._handle_dead_replica(stage_id, dead_replica, e)
+                await self._handle_dead_replica(stage_id, dead_replica, e, failed_request_id=req_id)
+            else:
+                await self._fail_request_dead_stage(req_id, stage_id)
             return False
         except OmniClientError as e:
             # A dispatch (including an inter-stage bridge such as a
