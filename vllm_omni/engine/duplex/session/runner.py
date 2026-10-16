@@ -517,6 +517,7 @@ class DuplexSessionRunner:
         session = self.session
         if isinstance(item, StageOutput):
             if self.model.is_input_transcription(item.request_id) and not await self._wait_for_append_tail():
+                await self.model.finish_input_transcription(item, abandon=True)
                 return
             remaining_input = await self.model.on_stage_output_item(item)
             if remaining_input is not None:

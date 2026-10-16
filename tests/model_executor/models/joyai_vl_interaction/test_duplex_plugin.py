@@ -812,6 +812,88 @@ async def test_batched_commits_wait_for_submission_acceptance_before_continuing(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["error", "cancel"])
+async def test_batched_commits_cleanup_asr_output_when_submission_ack_fails(failure, monkeypatch):
+    from tests.engine.test_duplex_orchestrator import _settle
+
+    plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
+    plugin.configure_pipeline(JOYAI_VL_INTERACTION_ASR_PIPELINE)
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    orchestrator, clients, rpc_q, _ = _build(stages=4, plugin=plugin)
+    accepted, release = asyncio.Event(), asyncio.Event()
+    output_buffer = DuplexOutputBuffer(max_bytes=2 * 1024 * 1024, max_events=512)
+    add_request = clients[0].add_request_async
+
+    async def build_request(request_id, *args, **kwargs):
+        return SimpleNamespace(request_id=request_id, mm_features=None)
+
+    async def accept_then_fail(*args, **kwargs):
+        await add_request(*args, **kwargs)
+        accepted.set()
+        await release.wait()
+        if failure == "cancel":
+            raise asyncio.CancelledError()
+        raise RuntimeError("submission acknowledgement failed after ASR output")
+
+    # Exercise real stage ownership and cleanup, with engine acceptance before
+    # its submission acknowledgement fails underneath an already queued output.
+    monkeypatch.setattr(orchestrator, "_build_next_stage_request", build_request)
+    monkeypatch.setattr(clients[0], "add_request_async", accept_then_fail)
+    try:
+        assert (await _open(orchestrator, rpc_q, extra_body={"auto_response": False}, output_buffer=output_buffer)).ok
+        runner = orchestrator.session_manager.runners[ORCHESTRATOR_SESSION_ID]
+        for sample in (1000, 2000):
+            await _submit(
+                orchestrator,
+                AppendAudio(audio=struct.pack("<h", sample) * 8000, format="pcm16", sample_rate_hz=16000),
+            )
+            await _submit(orchestrator, Commit(final=True, create_response=False))
+        runner.submit(CreateResponse())
+        await asyncio.wait_for(accepted.wait(), timeout=3)
+        request_id = clients[0].add_request_calls[-1][0].request_id
+        request = orchestrator.request_states[request_id]
+        runner.on_stage_output(
+            0,
+            tts_output(request_id, finished=True, text="Remember the red cup."),
+            None,
+            request_id=request_id,
+            context=DuplexOutputContext(
+                identity=DuplexRequestIdentity(session_id=ORCHESTRATOR_SESSION_ID, fence=request.fence),
+                final_stage_id=0,
+                segment_finished=True,
+            ),
+            input_transcript="Remember the red cup.",
+            input_item_id=next(iter(runner.session.history_item_ids)),
+        )
+        await _settle(orchestrator, timeout_s=0.05)
+        assert runner.model.is_input_transcription(request_id)
+        release.set()
+        await _settle(orchestrator)
+        assert not runner.model._input_transcriptions
+        assert not plugin.data_plane.requests
+        assert request_id not in orchestrator.request_states
+        assert not runner.session.resource_request_ids()
+        assert runner.session.pending_input_bytes == 0
+        assert runner.session.active_response_id is None
+        assert len(clients[0].add_request_calls) == 1  # Do not start the remaining segment.
+        events = [await output_buffer.get() for _ in range(output_buffer.pending_events)]
+        done = [event.to_realtime() for event in events if event.type == "response.done"]
+        assert len(done) == 1 and done[0]["response"]["status"] == "failed"
+        monkeypatch.setattr(clients[0], "add_request_async", add_request)
+        await _submit(
+            orchestrator,
+            AppendAudio(audio=struct.pack("<h", 3000) * 8000, format="pcm16", sample_rate_hz=16000),
+        )
+        await _submit(orchestrator, Commit(final=True, create_response=True))
+        assert len(clients[0].add_request_calls) == 2
+        assert clients[0].add_request_calls[-1][0].request_id != request_id
+    finally:
+        release.set()
+        await orchestrator.session_manager.shutdown()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("cancel", [False, True])
 async def test_asr_transcript_history_and_camera_bypass_are_fenced(cancel):
     h = await open_joyai(asr=True, modalities=("text",))

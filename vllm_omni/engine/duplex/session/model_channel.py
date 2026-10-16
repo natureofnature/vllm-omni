@@ -626,20 +626,7 @@ class ModelChannel:
         if pending_transcription is not None:
             if not item.context.segment_finished:
                 return None
-            self._input_transcriptions.pop(item.request_id)
-            self._ctx.plugin.data_plane.close_stream(item.request_id)
-            await self._ctx.stage_port.cleanup([item.request_id])
-            if session.epoch != expected_epoch or session.state != DuplexSessionState.OPEN or self._ctx.run.closing:
-                return None
-            session.request_resources.pop((item.stage_id, item.request_id), None)
-            session.clear_request(item.request_id)
-            session.complete_model_turn(item.context.identity.fence.turn_id)
-            if self._ctx.run.stream_request_id == item.request_id:
-                self._ctx.run.stream_request_id = None
-            return replace(
-                pending_transcription,
-                payload={**pending_transcription.payload, "duplex_turn_id": session.turn_id},
-            )
+            return await self.finish_input_transcription(item)
         if not item.project_output:
             # Pass-through ASR belongs to the user, not the assistant output
             # projector. Its metrics and transcript still use this mailbox.
@@ -685,6 +672,31 @@ class ModelChannel:
                     name="duplex-continue",
                 )
         return None
+
+    async def finish_input_transcription(
+        self, item: StageOutput, *, abandon: bool = False
+    ) -> CommittedInputContinuation | None:
+        session = self._ctx.session
+        pending = self._input_transcriptions.pop(item.request_id, None)
+        self._ctx.plugin.data_plane.close_stream(item.request_id)
+        # A failed submission may already have dropped the continuation. Its
+        # queued ASR output still owns stage cleanup unless cancel/close did it.
+        if (item.stage_id, item.request_id) in session.request_resources:
+            await self._ctx.stage_port.cleanup([item.request_id], abort=abandon and not item.context.segment_finished)
+        if (
+            session.epoch != item.context.identity.fence.epoch
+            or session.state != DuplexSessionState.OPEN
+            or self._ctx.run.closing
+        ):
+            return None
+        session.request_resources.pop((item.stage_id, item.request_id), None)
+        session.clear_request(item.request_id)
+        session.complete_model_turn(item.context.identity.fence.turn_id)
+        if self._ctx.run.stream_request_id == item.request_id:
+            self._ctx.run.stream_request_id = None
+        if abandon or pending is None:
+            return None
+        return replace(pending, payload={**pending.payload, "duplex_turn_id": session.turn_id})
 
     async def _send_model_output_events(
         self,
