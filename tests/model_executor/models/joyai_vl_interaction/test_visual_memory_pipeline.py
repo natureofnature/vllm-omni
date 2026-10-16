@@ -24,7 +24,7 @@ from vllm_omni.engine.duplex.commands import (
 )
 from vllm_omni.engine.duplex.config import DuplexSessionConfig
 from vllm_omni.engine.duplex.contracts import DuplexFence
-from vllm_omni.engine.duplex.plugin import duplex_text_history
+from vllm_omni.engine.duplex.plugin import DuplexRuntimeConfigError, duplex_text_history
 from vllm_omni.engine.duplex.realtime_commands import translate_realtime_command
 from vllm_omni.experimental.fullduplex.joyvl.decision.prompts import USER_QUERY_HEADER
 from vllm_omni.experimental.fullduplex.joyvl.memory.memory import MidTermSummary, WorkingChunk
@@ -394,6 +394,7 @@ async def test_working_prompt_matches_experimental_session_order_and_memory_role
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     state = plugin.create_session_state()
     memory_text = "Earlier a green card showed code K731."
     reference._policy.brain.memory.mid_term_summaries.append(MidTermSummary(0, "0.0 seconds-0.0 seconds", memory_text))
@@ -468,6 +469,7 @@ def test_repeated_fresh_query_survives_visual_history_deduplication(mocker, with
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     state = plugin.create_session_state()
     query = "What is on the card?"
     old = state.visual_memory.append(source_id="old", image=Image.new("RGB", (32, 32)), token_count=256, time_s=1.0)
@@ -524,6 +526,7 @@ def test_repeated_fresh_query_survives_visual_history_deduplication(mocker, with
 def test_visual_ledger_does_not_restore_deleted_user_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     state = plugin.create_session_state()
     old = state.visual_memory.append(source_id="old", image=Image.new("RGB", (32, 32)), token_count=256, time_s=1.0)
     state.observations.append(WorkingObservation("old", (old.id,), "Deleted instruction", silent=True))
@@ -736,6 +739,105 @@ async def test_visual_response_reference_uses_only_current_playback_committed_te
         assert "Red card." not in str(render())
     finally:
         await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("text_summary", ["", "T" * 2000], ids=["visual", "text-and-visual"])
+async def test_omitted_visual_summaries_rebudget_answered_open_chunk(text_summary):
+    h = await open_joyai(modalities=("text",))
+    try:
+        query = "Tell me whenever the card color changes."
+        await command(
+            h,
+            user_item(
+                "query",
+                [
+                    {"type": "input_text", "text": query},
+                    {"type": "input_image", "image_url": "data:image/png;base64," + frame()},
+                ],
+            ),
+        )
+        await command(h, CreateResponse())
+        request_id = submissions(h, auxiliary=False)[-1].context.request_id
+        await h.deliver_and_settle(
+            tts_output(request_id, text="</response> I will monitor the color.", finished=True),
+            stage_id=0,
+            segment_finished=True,
+        )
+        plugin, state = h.runner.plugin, h.runner.model_state
+        conversation, item_ids = h.session.history_snapshot()
+        config = plugin.prepare_prompt_config(
+            {"conversation": conversation, "conversation_item_ids": item_ids},
+            state=state,
+            payload={"video_frames": [frame("blue")]},
+        )
+        config["joyai_new_images"] = plugin._decode_images(config["joyai_new_frames"])
+        config["joyai_new_image_tokens"] = plugin._image_token_counts(config["joyai_new_images"])
+        assert state.closed_frame_id < state.observations[0].frame_ids[0]
+
+        def plan(prepared):
+            return plugin.plan_append(
+                request_id="next-observation",
+                fence=DuplexFence("s"),
+                session_config=prepared,
+                runtime_config=h.session.runtime_config,
+                seq=2,
+                turn_seq=2,
+                payload={},
+                final=True,
+                sampling_params=SamplingParams(max_tokens=256),
+            ).prompt
+
+        expected = plan(config)
+        inputs = plugin.processor(text=[expected["prompt"]], images=expected["multi_modal_data"]["image"])
+        plugin.max_model_len = len(inputs["input_ids"][0]) + 256
+        summaries = [VisualSummary(i, i, 0.0, 0.0, "S" * 2000, 2000, chunk_index=i) for i in range(2)]
+        actual = plan({**config, "joyai_summary": text_summary, "joyai_visual_summaries": summaries})
+        assert actual["prompt"] == expected["prompt"]
+        assert actual["prompt"].count(query) == 1
+        assert "I will monitor the color." in actual["prompt"]
+        assert len(actual["multi_modal_data"]["image"]) == 2
+        assert len(summaries) == 2  # Budget omission leaves accepted memory available.
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.parametrize("answer_count,covered_messages", [(1, 0), (20, 0), (1, 2)])
+def test_answered_instruction_survives_history_and_context_trimming(mocker, answer_count, covered_messages):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    plugin.processor = Processor()
+    plugin.max_model_len = 16384
+    plugin.max_images = 999
+    query = "Tell me whenever the card color changes."
+    config = {
+        "joyai_summary_messages": covered_messages,
+        "conversation": [
+            {"role": "user", "content": query},
+            *[{"role": "assistant", "content": "Red."} for _ in range(answer_count)],
+        ],
+    }
+    kwargs = dict(
+        request_id="budget",
+        fence=DuplexFence("s"),
+        runtime_config=plugin.runtime_config_for_update(DuplexSessionConfig(), {}),
+        seq=1,
+        turn_seq=1,
+        payload={},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=256),
+    )
+    template = mocker.spy(plugin.processor, "apply_chat_template")
+    initial = plugin.plan_append(session_config=config, **kwargs).prompt
+    assert initial["prompt"].count(query) == 1
+    messages = [message for message in template.call_args.args[0] if message["role"] != "assistant"]
+    expected = plugin.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    plugin.max_model_len = len(plugin.processor.tokenizer(text=[expected])["input_ids"][0]) + 256
+    actual = plugin.plan_append(session_config=config, **kwargs).prompt
+    assert actual["prompt"].count(query) == 1
+    assert "Red." not in actual["prompt"]
+    plugin.max_model_len -= 1
+    with pytest.raises(DuplexRuntimeConfigError, match="context budget"):
+        plugin.plan_append(session_config=config, **kwargs)
 
 
 @pytest.mark.asyncio

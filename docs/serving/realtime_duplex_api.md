@@ -57,6 +57,12 @@ limit requires it, the plugin closes a shorter consecutive chunk and leaves the
 remaining frames for the next chunk. Chunk indices and session-relative time
 ranges preserve their order. These times record server acceptance of observations.
 
+The VLM stage's `limit_mm_per_prompt.image` is the per-request image ceiling for
+both interaction and summarization. For example, setting it to 32 in the stage's
+`engine_args` closes chunks at 32 frames or earlier when the context budget is
+reached. With a ceiling of 100 or higher, the 100-frame working-chunk policy is
+the count limit; context and retained-byte budgets can still close chunks earlier.
+
 Only a successful, source-valid summary retires its input frames or summaries.
 The pending-frame buffer retains at most 200 frames and 32 MiB of losslessly
 encoded PNG data per session. Prompt-preparation workers decode selected frames for inference.
@@ -81,6 +87,9 @@ available privately for consolidation and retries until a valid summary succeeds
 While consolidation is pending, prompts use the new working chunk, previously
 accepted summaries, and the archived Q&A. The latest user instruction stays active
 for subsequent observations.
+When context is tight, older Q&A and derived summaries yield space to that
+instruction and the current observation. Omitting a summary rebudgets the recent
+Q&A against the freed space; the accepted summary remains available in memory.
 The model keeps bounded item identities and timestamps for this ordering; playback
 corrections and deletions apply to the text resolved for every new prompt. A current
 user query also includes long-term visual memory, subject to the deployed context

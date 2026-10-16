@@ -76,6 +76,7 @@ async def open_joyai(*, modalities=("text", "audio")):
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     port = RecordingStagePort(stage_count=3)
     output: asyncio.Queue[object] = asyncio.Queue()
     results: asyncio.Queue[DuplexControlResultMessage] = asyncio.Queue()
@@ -151,6 +152,23 @@ def test_opt_in_profile_preserves_turn_pipeline():
     stages = merge_pipeline_deploy(JOYAI_VL_INTERACTION_PIPELINE, duplex)
     assert len(stages) == 3
     assert all(stage.session_mode == "duplex" for stage in stages)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_limit", [2, 999])
+async def test_runtime_uses_deployed_image_limit(mocker, image_limit):
+    plugin = JoyAIDuplexPlugin(lambda *args: "")
+    mocker.patch("transformers.AutoProcessor.from_pretrained", return_value=Processor())
+    get_limit = mocker.Mock(return_value=image_limit)
+    model_config = SimpleNamespace(
+        model="joyai",
+        trust_remote_code=True,
+        max_model_len=16384,
+        multimodal_config=SimpleNamespace(get_limit_per_prompt=get_limit),
+    )
+    await plugin.prepare_runtime_config(DuplexSessionConfig(), model_config=model_config)
+    get_limit.assert_called_once_with("image")
+    assert plugin.max_images == image_limit
 
 
 def test_capabilities_and_configuration_refuse_audio_and_tools():
@@ -572,6 +590,7 @@ async def test_conversation_images_and_camera_frames_share_input_order():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     state = plugin.create_session_state()
     conversation: list[dict[str, object]] = []
     config = {"conversation": conversation, "modalities": ["text", "audio"]}
@@ -616,6 +635,7 @@ def test_prompt_budget_counts_visual_tokens_and_keeps_instruction():
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
     plugin.max_model_len = 1500
+    plugin.max_images = 999
     config = DuplexSessionConfig(instructions="Watch the pot.")
     runtime = plugin.runtime_config_for_update(config, {})
     kwargs = dict(
@@ -764,6 +784,7 @@ async def test_teardown_aborts_accepted_submission_before_ack(close_session, mon
     plugin = JoyAIDuplexPlugin(lambda audio, *args: "AAAA")
     plugin.processor = Processor()
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     orchestrator, clients, rpc_q, _ = _build(stages=3, plugin=plugin)
     accepted, ack = asyncio.Event(), asyncio.Event()
     add_request = clients[0].add_request_async
@@ -914,6 +935,7 @@ def test_prompt_budget_matches_qwen3_vl_processor(sizes):
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = processor
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     kwargs = dict(
         request_id="r",
         fence=DuplexFence("s"),

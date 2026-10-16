@@ -242,11 +242,12 @@ def test_experimental_defaults_and_independent_summary_token_budgets():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["frames", "long"])
-async def test_visual_summary_request_matches_experimental(kind):
+async def test_visual_summary_request_matches_experimental(mocker, kind):
     plugin = JoyAIDuplexPlugin(lambda *args: "")
     plugin.processor = Processor()
-    plugin.processor.apply_chat_template = Mock(wraps=plugin.processor.apply_chat_template)
+    template = mocker.spy(plugin.processor, "apply_chat_template")
     plugin.max_model_len = 16384
+    plugin.max_images = 999
     memory = JoyAIVisualMemory()
     backend = Mock(generate=AsyncMock(return_value=("A visual summary.", None)))
     experimental = Summarizer(backend)
@@ -285,7 +286,7 @@ async def test_visual_summary_request_matches_experimental(kind):
         ]
     request = plugin._prepare_visual_summary(source, entries, 4000)
     assert request is not None and request.model_source == source
-    assert plugin.processor.apply_chat_template.call_args.args[0] == expected_messages
+    assert template.call_args.args[0] == expected_messages
     if kind == "frames":
         assert request.prompt["multi_modal_data"]["image"] == images
     expected_sampling = backend.generate.call_args.kwargs

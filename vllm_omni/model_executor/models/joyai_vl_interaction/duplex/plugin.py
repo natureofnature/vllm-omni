@@ -68,7 +68,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self.data_plane = JoyAIDataPlane(encode_audio)
         self.processor = None
         self.max_model_len = 0
-        self.max_images = 32
+        self.max_images = 0  # Loaded with the processor from the stage's multimodal config.
         self._mid_prompt_tokens = 0
         self._long_prompt_tokens = 0
         self._timestamp_tokens = 0
@@ -928,26 +928,32 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         history = []
         item_ids = session_config.get("conversation_item_ids", ())
         query = runtime_config.get("initial_user_text") or ""
+        latest_instruction = None
         if query:
-            history.append({"role": "user", "content": query, "_item_key": -1})
+            latest_instruction = {"role": "user", "content": query, "_item_key": -1}
+            history.append(latest_instruction)
         for index, (role, text) in enumerate(duplex_text_history(session_config.get("conversation", []))):
             if role not in {"user", "assistant"}:
                 continue
             if text:
+                message = {
+                    "role": role,
+                    "content": ("</response> " if role == "assistant" else "") + text,
+                    "_item_key": item_ids[index] if index < len(item_ids) and item_ids[index] else index,
+                }
                 if role == "user":
                     query = text
+                    latest_instruction = message
                 if index >= session_config.get("joyai_summary_messages", 0):
-                    history.append(
-                        {
-                            "role": role,
-                            "content": ("</response> " if role == "assistant" else "") + text,
-                            "_item_key": item_ids[index] if index < len(item_ids) and item_ids[index] else index,
-                        }
-                    )
+                    history.append(message)
         # Keep interactive prefill bounded even while summary generation fails
         # or falls behind. The complete unsummarized ledger stays available to
         # prepare_auxiliary_request for eventual consolidation.
         history = history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES) :]
+        # A reply does not retire a standing instruction. Resolve it from the
+        # current conversation even when summaries or the history bound cover it.
+        if latest_instruction is not None and latest_instruction not in history:
+            history = [latest_instruction, *history[-(RECENT_MESSAGES + SUMMARY_CHUNK_MESSAGES - 1) :]]
         response_refs = {item.response_item_id for item in session_config.get("joyai_observations", ())}
         while history and history[0]["role"] == "assistant" and history[0]["_item_key"] not in response_refs:
             history.pop(0)
@@ -1005,8 +1011,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             text_tokens = self.processor.tokenizer(text=[prompt])["input_ids"][0]
             if len(text_tokens) + sum(image_token_counts) - len(images) <= budget:
                 break
-            if history:
-                history.pop(0)
+            if len(history) > (1 if latest_instruction is not None else 0):
+                history.pop(1 if history[0] is latest_instruction else 0)
                 while history and history[0]["role"] == "assistant":
                     history.pop(0)
             elif summary:
@@ -1015,11 +1021,12 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 summary = ""
                 # Rebudget the recent turns now that the summary no longer
                 # consumes their space. Covered history remains summarized.
-                history = unsummarized_history
+                history = unsummarized_history.copy()
             elif visual_summaries:
                 # Current observations/query take priority, as in the original
                 # working chunk. Omitted blocks remain in bounded model memory.
                 visual_summaries.pop(0)
+                history = unsummarized_history.copy()
             elif len(images) > 1:
                 self._drop_oldest_visual_frame(working_messages)
                 images.pop(0)
