@@ -11,7 +11,16 @@ from vllm.sampling_params import SamplingParams
 
 from tests.engine.duplex.test_session_runner import tts_output
 from tests.model_executor.models.joyai_vl_interaction.test_duplex_plugin import frame, observe, open_joyai
-from vllm_omni.engine.duplex.commands import AckPlayback, AppendAudio, CancelInput, Commit, CreateItem, Heartbeat
+from vllm_omni.engine.duplex.commands import (
+    AckPlayback,
+    AppendAudio,
+    CancelInput,
+    ClearInput,
+    Commit,
+    CreateItem,
+    DeleteItem,
+    Heartbeat,
+)
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
 from vllm_omni.engine.duplex.plugin import duplex_history_digest, duplex_text_history
@@ -60,6 +69,176 @@ def summary_output(request_id, text="Cabinet 0 has code K731.", finish_reason="s
             )
         ],
     )
+
+
+def admitted_large_exchange(h):
+    plugin = h.runner.plugin
+    question = "Remember the cabinet code K731. " * 450
+    answer = "Recorded the cabinet code K731."
+    kwargs = dict(
+        request_id="long-question",
+        fence=h.session.fence,
+        session_config={"conversation": [{"role": "user", "content": question}]},
+        runtime_config=h.session.runtime_config,
+        seq=1,
+        turn_seq=1,
+        payload={},
+        final=True,
+        sampling_params=SamplingParams(max_tokens=len(answer)),
+    )
+    plan = plugin.plan_append(**kwargs)
+    plugin.max_model_len = len(plugin.processor.tokenizer(text=[plan.prompt["prompt"]])["input_ids"][0]) + len(answer)
+    plugin._prepare_memory_budget(plugin.processor, max_model_len=plugin.max_model_len)
+    assert plugin.plan_append(**kwargs).prompt == plan.prompt
+    return (("user", question), ("assistant", answer)) + tuple(
+        (role, f"Recent {index} {role}") for index in range(4) for role in ("user", "assistant")
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing_summary", [False, True])
+async def test_oversized_first_exchange_summarizes_in_full_before_advancing_coverage(mocker, existing_summary):
+    h = await open_joyai(modalities=("text",))
+    try:
+        history = admitted_large_exchange(h)
+        covered = 2 if existing_summary else 0
+        previous_summary = "Earlier cabinet fact." if existing_summary else ""
+        if existing_summary:
+            history = (("user", "An earlier question."), ("assistant", "An earlier answer."), *history)
+        memory = h.runner.model_state.memory
+        memory.text = previous_summary
+        memory.covered_messages = covered
+        memory.covered_digest = duplex_history_digest(history[:covered])
+        for role, text in history:
+            h.session.append_history_message({"role": role, "content": text})
+        requests = []
+        plugin = h.runner.plugin
+        original = plugin.prepare_auxiliary_request
+
+        async def capture(**kwargs):
+            request = await original(**kwargs)
+            requests.append(request)
+            return request
+
+        mocker.patch.object(plugin, "prepare_auxiliary_request", side_effect=capture)
+        submission = await start_summary(h)
+        transcript = "\n".join(
+            f"[{index + 1}] {role}: {text}"
+            for index, (role, text) in enumerate(history[covered : covered + 2], start=covered)
+        )
+        offset = 0
+        for part in range(4):
+            request = requests[-1]
+            source = request.model_source
+            assert request.history_length == covered + 2
+            assert source is not None
+            assert offset < source.end_offset <= len(transcript)
+            assert (source.previous.offset if source.previous else 0) == offset
+            # The fixture's chat template renders messages with repr().
+            assert transcript[offset : source.end_offset].replace("\n", "\\n") in request.prompt["prompt"]
+            assert (
+                len(plugin.processor.tokenizer(text=[request.prompt["prompt"]])["input_ids"][0]) + 512
+                <= plugin.max_model_len
+            )
+            if part:
+                assert "Partial cabinet fact." in request.prompt["prompt"]
+            else:
+                assert previous_summary in request.prompt["prompt"]
+                # A newer tail must neither invalidate nor restart this Q&A.
+                h.session.append_history_message({"role": "user", "content": "A newer observation."})
+            h.deliver(
+                summary_output(submission.context.request_id, text="Partial cabinet fact."),
+                stage_id=0,
+                segment_finished=True,
+            )
+            await h.settle()
+            offset = source.end_offset
+            if source.complete:
+                assert offset == len(transcript)
+                assert memory.covered_messages == covered + 2
+                assert memory.text == "Partial cabinet fact."
+                assert memory.partial is None
+                break
+            assert memory.covered_messages == covered and memory.text == previous_summary
+            assert memory.partial.offset == offset
+            assert not plugin.auxiliary_source_matches(
+                request=request, state=h.runner.model_state, history=h.session.history
+            )
+            config = plugin.prepare_prompt_config(
+                {"conversation": list(h.session.history)}, state=h.runner.model_state, payload={}
+            )
+            assert config["joyai_summary"] == previous_summary
+
+            async def next_part():
+                while len(h.port.submissions) <= part + 1:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(next_part(), timeout=2)
+            submission = h.port.submissions[-1]
+        else:
+            pytest.fail("bounded excerpts did not finish the first exchange")
+
+        completed = len(h.port.submissions)
+        h.session.append_history_message({"role": "assistant", "content": "The newer observation is recorded."})
+        h.submit(Heartbeat())
+
+        async def next_exchange():
+            while len(h.port.submissions) <= completed:
+                await asyncio.sleep(0.005)
+
+        await asyncio.wait_for(next_exchange(), timeout=2)
+        request = requests[-1]
+        assert request.model_source is None
+        assert request.history_length == covered + 4
+        assert "Partial cabinet fact." in request.prompt["prompt"]
+        assert "Recent 0 user" in request.prompt["prompt"]
+        assert "Recent 0 assistant" in request.prompt["prompt"]
+        h.deliver(
+            summary_output(h.port.submissions[-1].context.request_id, text="Cabinet fact and later exchange."),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.settle()
+        assert memory.covered_messages == covered + 4
+        assert memory.text == "Cabinet fact and later exchange."
+        assert memory.partial is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["edit", "delete"])
+async def test_partial_summary_retries_failed_excerpt_and_rejects_changed_source(mutation):
+    h = await open_joyai(modalities=("text",))
+    try:
+        history = admitted_large_exchange(h)
+        plugin, state = h.runner.plugin, h.runner.model_state
+
+        async def prepare():
+            return await plugin.prepare_auxiliary_request(
+                history=history, runtime_config=h.session.runtime_config, state=state
+            )
+
+        first = await prepare()
+        assert first is not None
+        assert plugin.apply_auxiliary_result(request=first, output=summary_output("first"), state=state)
+        progress = state.memory.partial
+        assert progress is not None and state.memory.covered_messages == 0
+        second = await prepare()
+        assert not plugin.apply_auxiliary_result(
+            request=second, output=summary_output("second", finish_reason="length"), state=state
+        )
+        assert state.memory.partial == progress
+        retry = await prepare()
+        assert retry.prompt == second.prompt and retry.model_source == second.model_source
+        history = (("user", "Edited question"), *history[1:]) if mutation == "edit" else history[1:]
+        conversation = tuple({"role": role, "content": text} for role, text in history)
+        assert not plugin.auxiliary_source_matches(request=retry, state=state, history=conversation)
+        plugin.prepare_prompt_config({"conversation": list(conversation)}, state=state, payload={})
+        assert state.memory.partial is None
+        assert state.memory.covered_messages == 0 and state.memory.text == ""
+    finally:
+        await h.manager.shutdown()
 
 
 @pytest.mark.asyncio
@@ -544,6 +723,45 @@ async def test_asr_evicts_memory_blocks_before_rebudgeting_history(monkeypatch, 
         # Eviction changes only this prompt, not the stored model memory.
         assert memory.text.startswith("Older text summary.")
         assert h.runner.model_state.visual_memory.mid_term == visuals
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("pending_text", [False, True])
+async def test_clear_committed_audio_resumes_memory_and_preserves_text_intent(pending_text):
+    h = await open_joyai(asr=True, modalities=("text",))
+    try:
+        await h.run(AppendAudio(audio=struct.pack("<hh", 1000, 2000), format="pcm16", sample_rate_hz=16000))
+        await h.run(Commit(final=True, create_response=False))
+        assert h.runner.model_state.committed_audio_payload is not None
+        assert h.runner.memory._input_pending
+        committed_turns(h.session)
+        if pending_text:
+            await h.run(
+                CreateItem(
+                    item={
+                        "id": "pending-question",
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Where is the kettle?"}],
+                    }
+                )
+            )
+        await h.run(ClearInput())
+        assert h.runner.model_state.committed_audio_payload is None
+        assert not h.runner.memory._input_pending
+        if pending_text:
+            await h.run(Heartbeat())
+            assert h.runner.memory._pending_user_items == {"pending-question"}
+            assert h.port.submissions == []
+            await h.run(DeleteItem(item_id="pending-question"))
+        submission = await start_summary(h)
+        assert "auxiliary-" in submission.context.request_id
+        assert submission.context.stage_id == 1
+        h.deliver(summary_output(submission.context.request_id), stage_id=1, segment_finished=True)
+        await h.settle()
+        assert h.runner.model_state.memory.covered_messages > 0
     finally:
         await h.manager.shutdown()
 

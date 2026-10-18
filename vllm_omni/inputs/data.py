@@ -56,6 +56,7 @@ class OmniInteractionPrompt(TypedDict):
     event_id: str
     event: OmniInteractionEvent
     transition_chunks: NotRequired[int]
+    received_at: NotRequired[float]  # Internal engine-clock ingress stamp; never trusted from clients.
 
 
 class OmniTokensPrompt(TokensPrompt):
@@ -135,6 +136,12 @@ class OmniCustomPrompt(TypedDict, total=False):
 
     Allows users to pass pre-tokenized prompt IDs, attention masks, and extra
     arguments directly, bypassing the tokenization stage in the pipeline.
+
+    ``prompt_ids`` / ``negative_prompt_ids`` are honored only by pipelines that
+    declare ``supports_pre_tokenized_prompt_ids = True``. The diffusion engine
+    rejects a request that sets them for any other in-tree pipeline (HTTP 400)
+    instead of silently generating from an empty or text-only condition. A
+    user-supplied custom pipeline is not checked unless it declares the flag.
 
     Attributes:
         prompt_ids: Pre-tokenized prompt token IDs (single or batched)
