@@ -53,6 +53,8 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     SUMMARY_CHUNK_MESSAGES,
     SUMMARY_MAX_TOKENS,
     EncodedVisualImage,
+    TextSummaryChunk,
+    TextSummaryProgress,
     VisualClosureReason,
     VisualFrame,
     VisualMemoryCapacityError,
@@ -320,6 +322,8 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         self._sync_visual_history(state, history)
         if isinstance(request.model_source, VisualMemorySource):
             return state.visual_memory.matches(request.model_source)
+        if isinstance(request.model_source, TextSummaryChunk) and state.memory.partial != request.model_source.previous:
+            return False
         return super().auxiliary_source_matches(request=request, state=state, history=history)
 
     def auxiliary_preempted_by_input(
@@ -384,6 +388,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         current = state.memory.matches(history)
         covered = state.memory.covered_messages if current else 0
         previous_summary = state.memory.text if current else ""
+        partial = state.memory.partial
         # Camera-only commits keep their ledger positions for fingerprints but
         # must not displace text from the verbatim recent-history window.
         cutoff = len(history)
@@ -405,44 +410,88 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         end = self._summary_boundary(history, covered, end)
         if end <= covered:
             return None
+        continuation = (
+            partial
+            if current
+            and partial is not None
+            and partial.matches(history)
+            and covered < partial.history_length <= cutoff
+            else None
+        )
 
         def prepare() -> DuplexAuxiliaryRequest | None:
-            target = end
-            while target > covered:
-                transcript = "\n".join(
+            def transcript_until(target: int) -> str:
+                return "\n".join(
                     f"[{index + 1}] {role}: {text}"
                     for index, (role, text) in enumerate(history[covered:target], start=covered)
                     if role in {"user", "assistant"} and text
                 )
+
+            def render(transcript: str, target: int) -> str:
                 content = LONG_TERM_COMPRESS_PROMPT.format(
                     merged_range=f"conversation turns 1-{target}",
                     summaries_text=(
-                        f"Previous committed summary:\n{previous_summary}\n\nCommitted conversation:\n{transcript}"
+                        f"Previous committed summary:\n{continuation.text if continuation else previous_summary}"
+                        f"\n\nCommitted conversation:\n{transcript}"
                     ),
                     length_instruction=f" (at most {SUMMARY_MAX_TOKENS} tokens) ",
                 )
-                prompt = self.processor.apply_chat_template(
+                return self.processor.apply_chat_template(
                     [{"role": "user", "content": content}], tokenize=False, add_generation_prompt=True
                 )
-                if (
+
+            def fits(prompt: str) -> bool:
+                return (
                     len(self.processor.tokenizer(text=[prompt])["input_ids"][0]) + SUMMARY_MAX_TOKENS
                     <= self.max_model_len
-                ):
-                    return DuplexAuxiliaryRequest(
-                        stage_id=self.joyai_stage_id,
-                        prompt={"prompt": prompt},
-                        sampling_params=SamplingParams(
-                            temperature=0.0,
-                            max_tokens=SUMMARY_MAX_TOKENS,
-                            output_kind=RequestOutputKind.FINAL_ONLY,
-                            detokenize=True,
-                        ),
-                        history_length=target,
-                        history_digest=duplex_history_digest(history[:target]),
-                    )
-                target -= 1
-                target = self._summary_boundary(history, covered, target)
-            return None
+                )
+
+            def request(prompt: str, target: int, source: TextSummaryChunk | None = None) -> DuplexAuxiliaryRequest:
+                return DuplexAuxiliaryRequest(
+                    stage_id=self.joyai_stage_id,
+                    prompt={"prompt": prompt},
+                    sampling_params=SamplingParams(
+                        temperature=0.0,
+                        max_tokens=SUMMARY_MAX_TOKENS,
+                        output_kind=RequestOutputKind.FINAL_ONLY,
+                        detokenize=True,
+                    ),
+                    history_length=target,
+                    history_digest=duplex_history_digest(history[:target]),
+                    model_source=source,
+                )
+
+            target = continuation.history_length if continuation else end
+            if continuation is None:
+                while True:
+                    transcript = transcript_until(target)
+                    prompt = render(transcript, target)
+                    if fits(prompt):
+                        return request(prompt, target)
+                    smaller = self._summary_boundary(history, covered, target - 1)
+                    if smaller <= covered:
+                        break
+                    target = smaller
+            else:
+                transcript = transcript_until(target)
+            # An admitted exchange can exceed the compression budget. Fold
+            # bounded excerpts into private progress; publish coverage only
+            # after the entire Q&A has been consumed.
+            offset = continuation.offset if continuation else 0
+            low, high = offset + 1, len(transcript)
+            candidate = None
+            while low <= high:
+                stop = (low + high) // 2
+                excerpt = (
+                    f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n{transcript[offset:stop]}"
+                )
+                prompt = render(excerpt, target)
+                if fits(prompt):
+                    candidate = request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
+                    low = stop + 1
+                else:
+                    high = stop - 1
+            return candidate
 
         return await asyncio.to_thread(prepare)
 
@@ -575,6 +624,16 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             return applied
         if not text or tokens > SUMMARY_MAX_TOKENS:
             return False
+        if isinstance(request.model_source, TextSummaryChunk):
+            source = request.model_source
+            if state.memory.partial != source.previous:
+                return False
+            if not source.complete:
+                state.memory.partial = TextSummaryProgress(
+                    request.history_length, request.history_digest, source.end_offset, text
+                )
+                return True
+        state.memory.partial = None
         state.memory.text = text
         state.memory.covered_messages = request.history_length
         state.memory.covered_digest = request.history_digest

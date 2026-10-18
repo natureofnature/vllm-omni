@@ -151,6 +151,10 @@ class SessionMemoryRuntime:
         ):
             self._input_pending = True
 
+    def forget_committed_input(self) -> None:
+        """Discard cleared audio intent, preserving text items and active work."""
+        self._input_pending = False
+
     def begin_append(self, payload: Mapping[str, object], *, silence_continuation: bool) -> bool:
         interactive = not silence_continuation and self._interactive_input(
             payload, has_new_user_input=self._interaction_pending

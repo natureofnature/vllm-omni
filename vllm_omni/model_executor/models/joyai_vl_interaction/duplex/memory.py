@@ -18,11 +18,35 @@ SUMMARY_CHUNK_MESSAGES = 8
 VisualClosureReason = Literal["count", "context", "image_limit", "capacity"]
 
 
+@dataclass(frozen=True)
+class TextSummaryProgress:
+    """Private fold of an oversized exchange; offsets address its transcript."""
+
+    history_length: int
+    history_digest: str
+    offset: int
+    text: str
+
+    def matches(self, history: tuple[tuple[str, str], ...]) -> bool:
+        return (
+            len(history) >= self.history_length
+            and duplex_history_digest(history[: self.history_length]) == self.history_digest
+        )
+
+
+@dataclass(frozen=True)
+class TextSummaryChunk:
+    previous: TextSummaryProgress | None
+    end_offset: int
+    complete: bool
+
+
 @dataclass
 class JoyAISummaryMemory:
     text: str = ""
     covered_messages: int = 0
     covered_digest: str = ""
+    partial: TextSummaryProgress | None = None
 
     def matches(self, history: tuple[tuple[str, str], ...]) -> bool:
         return not self.covered_messages or (
@@ -36,6 +60,9 @@ class JoyAISummaryMemory:
             self.text = ""
             self.covered_messages = 0
             self.covered_digest = ""
+            self.partial = None
+        if self.partial is not None and not self.partial.matches(history):
+            self.partial = None
 
 
 @dataclass(frozen=True)
