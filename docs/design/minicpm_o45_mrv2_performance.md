@@ -68,6 +68,15 @@ Reference extraction and initial cache setup remain separate for each
 reference; speaker conditioning, attention lengths and cache trimming stay
 per request. Cache epochs remain separate unless cross-turn batching is enabled.
 
+The MiniCPM Code2Wav stage runs CAM++ speaker embedding on CUDA and NPU using
+the in-tree FP32 torch model loaded from the checkpoint's `campplus.onnx`.
+The CUDA path does not require TensorRT. Set `token2wav_device_spk: false`
+in connector `extra` to use CPU ONNX Runtime for accuracy triage; explicitly
+enabling `token2wav_trt` retains its TensorRT speaker embedding path.
+This moves speaker embedding off the CPU but does not batch reference
+extraction or initial cache setup. Device kernels can change floating-point
+rounding, so this does not promise bit-identical embeddings or waveforms.
+
 The ragged Whole-Euler path masks padded history and returns each request's
 own cache length, reserving each row's retained length so it can reuse its
 storage across chunks. Encoder work still groups by compatible cache shapes.
