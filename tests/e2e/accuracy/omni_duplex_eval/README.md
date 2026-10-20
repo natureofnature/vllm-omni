@@ -133,12 +133,9 @@ Changes to the judge, protocol or selected samples call for fresh references.
 
 ## Timing interpretation
 
-Use `duplex_response_ttft_ms` / `duplex_response_ttfp_ms` for server
-per-response comparisons within MiniCPM. The terminal labels
-`client created-to-text/audio` use a different clock: MiniCPM can emit
-`response.created` once output is ready, leaving only a few milliseconds
-until the client receives that output. Compatible JSON names remain
-`duplex_client_ttft_ms` / `duplex_client_ttfp_ms`.
+The job uses the shared benchmark's server and client latency metrics.
+See [benchmark timing definitions](../../../../docs/cli/bench/serve.md)
+for their measurement origins.
 
 Session E2EL and request throughput include real-time input replay.
 Audio RTF retains the benchmark's documented generation-window-to-output-

@@ -80,17 +80,6 @@ def test_client_latency_is_absent_for_a_response_without_output():
     assert [metric["response_id"] for metric in bundle.request_metrics] == ["r1"]
 
 
-def test_late_native_response_created_keeps_server_and_client_clocks_separate():
-    collector = EventCollector()
-    _turn(collector, "r1", 10.0, text_s=0.003, audio_s=0.004)
-    bundle = collect_duplex_session_metrics(collector, stream_start=9.0, session_id="s")
-    metrics = duplex_response_latency_metrics(bundle.request_metrics)
-    assert metrics["mean_duplex_client_ttft_ms"] == 3.0
-    assert metrics["mean_duplex_client_ttfp_ms"] == 4.0
-    assert metrics["mean_duplex_response_ttft_ms"] == 50.0
-    assert metrics["mean_duplex_response_ttfp_ms"] == 150.0
-
-
 def test_response_latency_counts_every_response_once_across_sessions():
     # One session has three responses, the other one. A mean of session means
     # would weigh the lone response like the other three together.
@@ -128,7 +117,6 @@ def test_report_and_console_expose_the_flat_latency_keys(capsys):
     print_duplex_response_latency_metrics(duplex_response_latency_metrics(bundle.request_metrics))
     printed = capsys.readouterr().out
     assert "Duplex Per-Response Latency" in printed
-    assert "Mean client created-to-audio (ms):" in printed and "400.00" in printed
-    assert "native duplex may emit it after model output is ready" in printed
+    assert "Mean client TTFP (ms):" in printed and "400.00" in printed
     print_duplex_response_latency_metrics({})
     assert capsys.readouterr().out == ""
