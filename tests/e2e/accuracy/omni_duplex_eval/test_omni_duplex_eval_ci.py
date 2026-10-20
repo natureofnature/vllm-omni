@@ -197,16 +197,29 @@ def test_empty_score_directory(tmp_path):
         "boundary",
     ],
 )
-def test_dfx_writes_both_artifacts_before_quality_gate(tmp_path, monkeypatch, result, config, failure):
+@pytest.mark.parametrize("accuracy_dir_override", [False, True])
+def test_dfx_writes_both_artifacts_before_quality_gate(
+    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override
+):
     from tests.dfx import conftest as dfx
     from tests.dfx.perf.scripts import run_benchmark as runner
     from vllm_omni.platforms import current_omni_platform
 
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
     monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", [dfx_config])
     monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: "H100")
-    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    monkeypatch.chdir(tmp_path)
+    perf_dir = tmp_path / "perf-results"
+    perf_dir.mkdir()
+    monkeypatch.setenv("BENCHMARK_DIR", str(perf_dir))
+    if accuracy_dir_override:
+        accuracy_dir = tmp_path / "accuracy-results"
+        monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+    else:
+        accuracy_dir = tmp_path / "tests/e2e/accuracy/omni_duplex_eval/results"
+        monkeypatch.delenv("ACC_BENCH_RESULT_DIR", raising=False)
     monkeypatch.setenv("BUILDKITE_BRANCH", "test-branch")
     if failure == "quality":
         result["omni_duplex_eval"]["accuracy"]["pr"]["mean_all_success"] = 0.0
@@ -257,9 +270,10 @@ def test_dfx_writes_both_artifacts_before_quality_gate(tmp_path, monkeypatch, re
         runner.test_performance_benchmark(ServerEndpoint(), case)
 
     assert len(commands) == 1
-    accuracy_paths = list(tmp_path.glob("result_acc_*.json"))
-    perf_paths = [p for p in tmp_path.glob("result_*.json") if p not in accuracy_paths]
+    accuracy_paths = list(accuracy_dir.glob("result_acc_*.json"))
+    perf_paths = list(perf_dir.glob("result_*.json"))
     assert len(accuracy_paths) == len(perf_paths) == 1
+    assert not list(perf_dir.glob("result_acc_*.json"))
     assert "_H100_" in accuracy_paths[0].name
     saved = json.loads(accuracy_paths[0].read_text())
     assert saved["Hardware"] == "H100"

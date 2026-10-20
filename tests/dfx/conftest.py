@@ -688,7 +688,9 @@ def run_benchmark(
 
         model = argument("--model", result.get("model_id", ""))
         dataset = argument("--dataset-path", dataset_name)
-        accuracy_path = Path(result_path).with_name(
+        accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
+        accuracy_dir.mkdir(parents=True, exist_ok=True)
+        accuracy_path = accuracy_dir / (
             f"result_acc_{_safe_filename_token(test_name)}_{_safe_filename_token(result['Hardware'])}_"
             f"{_safe_filename_token(dataset)}_{_safe_filename_token(model)}_"
             f"{name_token or 'default'}_{flow}_{num_prompt}_{current_dt}.json"

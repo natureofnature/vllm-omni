@@ -18,6 +18,7 @@ Run from the repository root:
 
 ```bash
 export BENCHMARK_DIR=tests/dfx/perf/results
+export ACC_BENCH_RESULT_DIR=tests/e2e/accuracy/omni_duplex_eval/results
 pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
   --test-config-file tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json \
   -m "full_model and cuda and (H100 or B200) and cards_2" \
@@ -40,14 +41,19 @@ and accuracy reference must select the same 66 IDs: 30 RTD and 36 PR samples.
 
 ## Results
 
-The common output directory contains:
+Performance and accuracy reports use their respective result directories.
+`BENCHMARK_DIR` selects the performance directory; `ACC_BENCH_RESULT_DIR`
+selects the accuracy directory, following the existing MiniCPM accuracy tests.
+The defaults are:
 
 ```text
 tests/dfx/perf/results/
 ├── result_<test>_<hardware>_<dataset>_...json
-├── result_acc_<test>_<hardware>_<dataset>_<model>_...json
 └── omni_duplex_eval_minicpmo_4_5/run-*/
     └── ... detailed audio, transcript, event and judge artifacts
+
+tests/e2e/accuracy/omni_duplex_eval/results/
+└── result_acc_<test>_<hardware>_<dataset>_<model>_...json
 ```
 
 The accuracy artifact uses this envelope:
@@ -85,9 +91,9 @@ The `generation` object preserves publication coverage and artifact errors.
 The full `accuracy` object also contains RTD/PR scores, per-task results,
 coverage counts, errors and the score directory. `status` describes judge
 completion; the subsequent assertions enforce the recorded quality floors.
-Both common artifacts are saved before the assertions, preserving partial
+Both result artifacts are saved before the assertions, preserving partial
 results when judging fails or a score falls below its threshold. Buildkite
-uploads the common JSON files and detailed artifacts even on test failure.
+uploads JSON files from both directories and detailed artifacts even on test failure.
 The CLI must exit successfully; the existing NPU SIGABRT-on-shutdown exception
 (`-6`) remains accepted when all artifact and score checks pass.
 
