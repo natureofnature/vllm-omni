@@ -681,7 +681,7 @@ def run_benchmark(
         result["name"] = benchmark_params_name
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
-    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args:
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
 
         def argument(name: str, default: str = "") -> str:
             return args[args.index(name) + 1] if name in args else default

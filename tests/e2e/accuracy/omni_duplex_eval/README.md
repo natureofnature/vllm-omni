@@ -27,6 +27,9 @@ pytest -s -v tests/dfx/perf/scripts/run_benchmark.py \
 
 For A3, use `-m "full_model and npu and A3 and cards_2"`.
 The existing CUDA and NPU nightly jobs use this same JSON configuration.
+Setting `duplex_eval_accuracy_config` opts a DFX case into the accuracy
+artifact and CLI-exit guard. Existing evaluated cases such as Qwen3-Omni's
+`pr_correction` keep their current result and exit-code behavior.
 
 The model uses the first allocated device and the judge uses the second.
 DFX maps the judge's `device_index` through the platform's visible-device
@@ -113,10 +116,12 @@ These fixed thresholds use the H800/C8 run at commit `2308562c` as the
 reference, with the same judge, protocol and 66 IDs. The RTD thresholds allow
 approximately 10.7% and 16% below that run's content and temporal scores.
 For the 36 PR samples, a threshold of 0.28 requires at least 11 successes:
-10/36 is approximately 0.2778. Later runs compare against these checked-in
+10/36 is approximately 0.2778, so one fewer success than this reference fails.
+Later runs compare against these checked-in
 values; changing the thresholds requires an explicit configuration update.
 The CUDA and NPU jobs share these thresholds. H100/B200 and NPU validation,
-and hardware-specific performance baseline calibration, remain pending.
+repeated-run stability checks, and hardware-specific performance baseline
+calibration remain pending.
 
 Keep per-task results when interpreting the aggregate. The reference's PR
 correction score was 11/13; event reminder and post-event reminder each scored
@@ -129,6 +134,11 @@ configuration, runtime, summary and each score file; all nine task groups;
 and finite, in-range RTD/PR scores meeting the configured thresholds. The accuracy
 suite keeps its existing scoring eligibility: silent output and responses
 still active at session close contribute their collected content to the judge.
+The batch must include at least one session with a measured client audio
+packet (`client_ttfp_ms.count > 0` and a finite mean). This catches a complete
+audio outage even when text answers pass the judge, while individual silent
+sessions remain eligible. The saved H800 reference has audio in all 66 sessions.
+An audio-coverage ratio floor can be calibrated from repeated runs.
 Artifacts retain unfinished-response counts and missing latency measurements,
 so performance comparisons can account for response coverage.
 Changes to the judge, protocol or selected samples call for fresh references.
@@ -138,6 +148,12 @@ Changes to the judge, protocol or selected samples call for fresh references.
 The job uses the shared benchmark's server and client latency metrics.
 See [benchmark timing definitions](../../../../docs/cli/bench/serve.md)
 for their measurement origins.
+
+Server TTFT and Audio TTFP record the first text and audio output independently.
+When both first appear in one model output, they share an observation timestamp.
+This occurred in all 66 sessions of the H800 reference, giving equal means of
+277.978 ms. These describe the response output boundary; Thinker token timing
+is available separately in the per-response `stage0_tokens` metrics.
 
 Session E2EL and request throughput include real-time input replay.
 Audio RTF retains the benchmark's documented generation-window-to-output-

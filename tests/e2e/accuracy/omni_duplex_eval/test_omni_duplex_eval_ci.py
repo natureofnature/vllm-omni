@@ -180,6 +180,21 @@ def test_dfx_invokes_full_accuracy_contract(result):
         assert_result(result, params, 66)
 
 
+@pytest.mark.parametrize("audio_sessions", [0, 1, 65, 66])
+def test_dfx_accuracy_requires_batch_audio(result, audio_sessions):
+    from tests.dfx.perf.scripts.run_benchmark import assert_result
+
+    test_root = Path(__file__).resolve().parents[3]
+    dfx = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
+    for session in result["duplex_session_metrics"][audio_sessions:]:
+        session["client_ttfp_ms"] = {"count": 0, "mean": None}
+    if audio_sessions:
+        assert_result(result, dfx["benchmark_params"][0], 66)
+    else:
+        with pytest.raises(AssertionError, match="no measured client audio"):
+            assert_result(result, dfx["benchmark_params"][0], 66)
+
+
 @pytest.mark.parametrize(
     "field,value", [("duplex_eval_ids", ["0"]), ("num_prompts", [3]), ("duplex_eval_evaluate", False)]
 )
@@ -216,6 +231,7 @@ def test_empty_score_directory(tmp_path):
         "cuda_abort",
         "npu_exit",
         "silence",
+        "audio_outage",
         "boundary",
     ],
 )
@@ -254,6 +270,9 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
             "client_ttft_ms": {"count": 0, "mean": None},
             "client_ttfp_ms": {"count": 0, "mean": None},
         }
+    elif failure == "audio_outage":
+        for session in result["duplex_session_metrics"]:
+            session["client_ttfp_ms"] = {"count": 0, "mean": None}
     elif failure == "boundary":
         result["omni_duplex_eval"]["published_with_unfinished_responses"] = 1
     monkeypatch.setattr(current_omni_platform, "is_npu", lambda: failure == "npu_exit")
@@ -316,3 +335,46 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
             **{k: v for k, v in result["omni_duplex_eval"].items() if k != "accuracy"},
         }
     assert json.loads(perf_paths[0].read_text())["Hardware"] == "H100"
+
+
+@pytest.mark.parametrize("returncode", [0, 1, -6])
+def test_qwen3_eval_keeps_existing_writer_behavior(tmp_path, monkeypatch, returncode):
+    from tests.dfx import conftest as dfx
+
+    test_root = Path(__file__).resolve().parents[3]
+    config = json.loads((test_root / "dfx/perf/tests/test_qwen3_omni_duplex_omni_duplex_eval.json").read_text())[0]
+    params = config["benchmark_params"][0]
+    assert params["duplex_eval_evaluate"] is True
+    assert "duplex_eval_accuracy_config" not in params
+    monkeypatch.setenv("BENCHMARK_DIR", str(tmp_path))
+    accuracy_dir = tmp_path / "accuracy"
+    monkeypatch.setenv("ACC_BENCH_RESULT_DIR", str(accuracy_dir))
+
+    class BenchmarkProcess:
+        def __init__(self, command, **kwargs):
+            self.stdout = io.StringIO("")
+            self.stderr = io.StringIO("")
+            path = Path(command[command.index("--result-dir") + 1]) / command[command.index("--result-filename") + 1]
+            path.write_text(json.dumps({"completed": params["num_prompts"][0]}))
+
+        def wait(self):
+            return returncode
+
+    monkeypatch.setattr(dfx.subprocess, "Popen", BenchmarkProcess)
+    saved = dfx.run_benchmark(
+        [
+            "--model",
+            config["server_params"]["model"],
+            "--dataset-path",
+            params["dataset_path"],
+            "--duplex-eval-evaluate",
+        ],
+        test_name=config["test_name"],
+        flow=params["max_concurrency"][0],
+        dataset_name=params["dataset_name"],
+        num_prompt=params["num_prompts"][0],
+        resource_label="H100",
+    )
+    assert saved["completed"] == params["num_prompts"][0]
+    assert len(list(tmp_path.glob("result_*.json"))) == 1
+    assert not accuracy_dir.exists()

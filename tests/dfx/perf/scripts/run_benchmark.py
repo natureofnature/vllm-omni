@@ -492,6 +492,12 @@ def _assert_duplex_eval_result(result: dict, params: dict, num_prompt: int) -> N
         # close-boundary responses. Preserve its eligibility policy; missing
         # client measurements and unfinished counts remain visible in artifacts.
         assert_accuracy_result(result, load_accuracy_config(path, params))
+        # Allow individual silent sessions, but fail a batch-wide audio outage
+        # even when the text-only RTD/PR judge accepts the responses.
+        audio_metrics = (session.get("client_ttfp_ms", {}) for session in sessions)
+        assert any(metric.get("count", 0) > 0 and _is_finite_number(metric.get("mean")) for metric in audio_metrics), (
+            "Omni-DuplexEval accuracy run has no measured client audio"
+        )
         return
     assert summary.get("published_with_unfinished_responses") == 0, "Omni-DuplexEval responses are unfinished"
     for session in sessions:
