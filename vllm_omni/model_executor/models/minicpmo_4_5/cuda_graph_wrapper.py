@@ -1951,6 +1951,7 @@ class WholeEulerCFMGraphWrapper:
         pad_frames: int = 0,
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
+        prompt_lengths: list[int] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | list[torch.Tensor]] | None:
         """Solve the chunk through captured graphs; ``None`` sends it to the step/eager path.
 
@@ -1975,6 +1976,10 @@ class WholeEulerCFMGraphWrapper:
         ``mu_cfg`` is padded to the longest row and ``attn_mask`` masks each
         row's padding. The new cache then always comes back per request, each
         row keeping only its own current frames.
+
+        ``prompt_lengths`` overrides the prefix in ``att_keep`` per request.
+        Arena rows are written directly at their final retained length, so a
+        shorter prompt does not require a second allocation to trim its cache.
         """
         _check_graph_failure(self)
         self._stats["calls"] += 1
@@ -1990,11 +1995,19 @@ class WholeEulerCFMGraphWrapper:
         if batch_size > self.max_graph_batch:
             return None
         groups = self._plan_groups(batch_size)
+        row_keeps = [att_keep] * batch_size
+        if prompt_lengths is not None:
+            if att_keep is None or len(prompt_lengths) != batch_size:
+                return None
+            row_keeps = [(length, att_keep[1]) for length in prompt_lengths]
+            att_keep = (max(prompt_lengths), att_keep[1])
 
         att_rows = None if att_cache is None or isinstance(att_cache, torch.Tensor) else list(att_cache)
         # Mixed histories use per-row masks and output slices in either the
         # resident slot pool or the padded arena.
         mixed_offsets = att_rows is not None and len({int(row.shape[4]) for row in att_rows}) != 1
+        if mixed_offsets and x.device.type != "cuda" and not self.row_offsets:
+            return None
         if att_rows is not None:
             if len(att_rows) != batch_size or (mixed_offsets and (valid_lengths is None or attn_mask is None)):
                 return None
@@ -2004,7 +2017,7 @@ class WholeEulerCFMGraphWrapper:
             offset = int(att_cache.shape[4]) if att_cache is not None else 0
             row_offsets = [offset] * batch_size
         mel_width = int(mu_cfg.shape[2])
-        att_rows_out = att_rows is not None or valid_lengths is not None
+        att_rows_out = att_rows is not None or valid_lengths is not None or prompt_lengths is not None
         if valid_lengths is not None:
             if self.ragged_body is None or len(valid_lengths) != batch_size:
                 return None
@@ -2046,7 +2059,14 @@ class WholeEulerCFMGraphWrapper:
                 groups=groups,
             )
             if slotted is not None:
+                if prompt_lengths is not None:
+                    for cache, length in zip(slotted[2], prompt_lengths, strict=True):
+                        cache.layout = cache.layout[:length]
                 return slotted
+        # Mixed-offset arena replay is currently validated only on CUDA.
+        # Preserve the existing opt-in slot path on other platforms.
+        if mixed_offsets and x.device.type != "cuda":
+            return None
         if att_rows is not None:
             # A refused slot replay can leave resident rows; the arena path reads tensors.
             att_rows = _materialize_att_rows(att_rows)
@@ -2067,12 +2087,12 @@ class WholeEulerCFMGraphWrapper:
             # capture padding does.
             mask_cap = _pad_invalid_queries(mask_cap, lengths)
         segments_by_shape = {
-            (length, row_offset): _whole_euler_att_segments(
-                mel_width=length, query_cap=query_cap, offset=row_offset, keep=att_keep
+            (length, row_offset, keep): _whole_euler_att_segments(
+                mel_width=length, query_cap=query_cap, offset=row_offset, keep=keep
             )
-            for length, row_offset in set(zip(row_lengths, row_offsets, strict=True))
+            for length, row_offset, keep in set(zip(row_lengths, row_offsets, row_keeps, strict=True))
         }
-        segments = segments_by_shape[row_lengths[0], row_offsets[0]]
+        segments = segments_by_shape[row_lengths[0], row_offsets[0], row_keeps[0]]
         keep_len = sum(length for _, length in segments)
 
         arena = self.arena
@@ -2122,7 +2142,6 @@ class WholeEulerCFMGraphWrapper:
         if entries is None:
             return None
         owners = Counter(row.data_ptr() for row in att_rows) if att_rows is not None else Counter()
-        steady_frames = sum(att_keep) if att_keep is not None else 0
 
         start = 0
         for (graph_batch, rows), fill, entry in zip(groups, fills, entries, strict=True):
@@ -2145,7 +2164,8 @@ class WholeEulerCFMGraphWrapper:
                 _copy_frame_segments(out_att_rows[:, :, :, start:stop], att_src, segments)
             else:
                 for row in range(rows):
-                    row_segments = segments_by_shape[row_lengths[start + row], row_offsets[start + row]]
+                    keep = row_keeps[start + row]
+                    row_segments = segments_by_shape[row_lengths[start + row], row_offsets[start + row], keep]
                     shape = (
                         self.n_timesteps,
                         arena.depth,
@@ -2161,7 +2181,7 @@ class WholeEulerCFMGraphWrapper:
                         request = _resized_frame_view(old, shape[4])
                     if request is None:
                         # Room for the steady length, so the cache grows into it in place.
-                        room = max(shape[4], steady_frames)
+                        room = max(shape[4], sum(keep) if keep is not None else 0)
                         request = torch.empty(
                             (*shape[:4], room, shape[5]), device=x.device, dtype=self.att_cache_dtype
                         )[..., : shape[4], :]

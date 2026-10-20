@@ -1326,6 +1326,7 @@ class BatchedToken2Wav(nn.Module):
         att_cache: torch.Tensor | list[torch.Tensor] | None,
         valid_lengths: list[int] | None = None,
         att_keep: tuple[int, int] | None = None,
+        prompt_lengths: list[int] | None = None,
     ) -> tuple[
         torch.Tensor,
         torch.Tensor,
@@ -1440,6 +1441,7 @@ class BatchedToken2Wav(nn.Module):
                 pad_frames=pad_frames,
                 valid_lengths=valid_lengths,
                 att_keep=att_keep,
+                prompt_lengths=prompt_lengths,
             )
             if whole_euler_result is not None:
                 return whole_euler_result
@@ -1959,6 +1961,7 @@ class BatchedToken2Wav(nn.Module):
                     else flow_cache["estimator_att_cache"]
                 ),
                 att_keep=att_keep,
+                prompt_lengths=prompt_lengths,
             )
 
         conformer_att = _trim_streaming_cache(conformer_att, prompt_len)
@@ -2142,6 +2145,7 @@ class BatchedToken2Wav(nn.Module):
                 ),
                 valid_lengths=hidden_lengths,
                 att_keep=(max(prompt_lengths), _CACHE_TRIM_SUFFIX),
+                prompt_lengths=prompt_lengths,
             )
 
         assert isinstance(estimator_att, list)

@@ -855,20 +855,25 @@ class MiniCPMO45Code2Wav(nn.Module):
         )
 
     @staticmethod
-    def _bucket_key(item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False) -> tuple[Any, ...]:
+    def _bucket_key(
+        item: _WorkItem, *, cross_turn: bool = False, row_offsets: bool = False, cross_reference: bool = False
+    ) -> tuple[Any, ...]:
         cache_signature: Any
         if item.previous is None:
             cache_signature = ("uninitialized",)
         elif row_offsets and _slot_resident(item):
             # A slot-pool row keeps its cache lengths per row (``cfm_row_offset_merge``).
             cache_signature = ("row_offsets", row_offset_signature(item.previous.token2wav))
-        else:
+        elif cross_reference:
             # The ragged decoder keeps attention lengths and voice conditioning
             # per request. Different references need not split a compute batch.
             cache_signature = row_offset_signature(item.previous.token2wav)
+        else:
+            cache_signature = state_shape_signature(item.previous.token2wav)
+        prompt = (None, None) if cross_reference else (item.prompt_cache_id, item.prompt_wav)
         if cross_turn:
-            return (cache_signature,)
-        return (cache_signature, item.cache_epoch)
+            return (*prompt, cache_signature)
+        return (*prompt, cache_signature, item.cache_epoch)
 
     def _prepare_decode_batch(
         self, items: list[_WorkItem]
@@ -928,7 +933,7 @@ class MiniCPMO45Code2Wav(nn.Module):
         last_chunks = [item.last_chunk for item in items]
         if (
             ragged
-            or isinstance(features, list)
+            or (isinstance(features, list) and self.backend._whole_euler_ragged_active())
             or len({state_shape_signature(state) for state in states}) > 1
             or len({int(t.numel()) for t in tokens}) > 1
             or len(set(last_chunks)) > 1
@@ -940,8 +945,8 @@ class MiniCPMO45Code2Wav(nn.Module):
     def _onset_group_key(key: tuple[Any, ...], *, cross_turn: bool = False) -> tuple[Any, ...]:
         """Keep turn epochs separate when merging onset and continuation rows."""
         if cross_turn:
-            return ()
-        return key[1:]
+            return key[:2]
+        return (*key[:2], key[-1])
 
     def _iter_limited_batches(
         self,
@@ -1118,9 +1123,19 @@ class MiniCPMO45Code2Wav(nn.Module):
 
         cross_turn = getattr(self, "_cross_turn_buckets", False) is True
         row_offsets = getattr(self, "_row_offset_merge", False) is True
+        # Without CUDA ragged Whole-Euler, keep exact reference/shape buckets
+        # so mixed voices do not bypass the configured step graphs or TRT.
+        cross_reference = (
+            self.backend is not None
+            and self.backend._whole_euler_ragged_active()
+            and self.backend._whole_euler_graph_wrapper.device.type == "cuda"
+        )
         buckets: dict[tuple[Any, ...], list[_WorkItem]] = {}
         for item in compute_items:
-            buckets.setdefault(self._bucket_key(item, cross_turn=cross_turn, row_offsets=row_offsets), []).append(item)
+            key = self._bucket_key(
+                item, cross_turn=cross_turn, row_offsets=row_offsets, cross_reference=cross_reference
+            )
+            buckets.setdefault(key, []).append(item)
         undersized = [
             {
                 "size": len(bucket),

@@ -687,7 +687,8 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
 
 
 @pytest.mark.parametrize("different_lengths", [False, True])
-def test_cross_reference_batch_matches_independent_streams(different_lengths):
+@pytest.mark.parametrize("ragged_device", [None, "cuda", "npu"])
+def test_cross_reference_batch_matches_independent_streams(different_lengths, ragged_device):
     """Different voices share a solve without sharing conditioning or history."""
     batch = 8
 
@@ -710,6 +711,17 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths):
 
     model, token2wav = make_model()
     independent = [make_model()[0] for _ in range(batch)]
+    replays = []
+    if ragged_device is not None:
+        # Exercise dispatch on CPU; real CUDA replay/parity is tested separately.
+        def replay(**kwargs):
+            replays.append(kwargs["prompt_lengths"])
+            return None
+
+        model.backend._whole_euler_graph_wrapper = SimpleNamespace(
+            enabled=True, device=SimpleNamespace(type=ragged_device), ragged_body=object(), replay=replay
+        )
+    merged = ragged_device == "cuda"
     for chunk in range(8):
         infos = []
         for row in range(batch):
@@ -717,11 +729,16 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths):
             info["meta"].update(prompt_cache_id=f"voice-{row}", prompt_wav=f"/fake/voice-{row}.wav")
             infos.append(info)
         result = _forward(model, infos)
-        # Reference setup is still per voice; every decode step is one CFG batch.
-        assert token2wav.flow.decoder.estimator.cfg_batches[-2:] == [2 * batch, 2 * batch]
-        expected_speakers = [1.0 if row % 2 == 0 else -1.0 for row in range(batch)] + [0.0] * batch
+        # Only CUDA ragged Whole-Euler opts into cross-reference batching.
+        expected_batch = batch if merged else 1
+        assert token2wav.flow.decoder.estimator.cfg_batches[-2:] == [2 * expected_batch] * 2
+        expected_speakers = (
+            [1.0 if row % 2 == 0 else -1.0 for row in range(batch)] + [0.0] * batch if merged else [-1.0, 0.0]
+        )
         assert token2wav.flow.decoder.estimator.speaker_order[-1] == expected_speakers
-        assert token2wav.hift.calls[-1] == batch
+        assert token2wav.hift.calls[-1] == expected_batch
+        if merged:
+            assert replays[-1] == [4 + row % 3 if different_lengths else 4 for row in range(batch)]
         for row, (single, info) in enumerate(zip(independent, infos, strict=True)):
             expected = _forward(single, [info])
             torch.testing.assert_close(
@@ -739,6 +756,70 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths):
             caches = [state.token2wav.flow_cache["estimator_att_cache"] for state in model._states.values()]
             assert len({cache.data_ptr() for cache in caches}) == len(caches)
     assert not model._states
+
+
+@pytest.mark.parametrize("backend_kind", ["step_graph", "trt"])
+@pytest.mark.parametrize("different_references", [False, True])
+@pytest.mark.parametrize("mixed_histories", [False, True])
+def test_mixed_requests_preserve_configured_cfm_backend(backend_kind, different_references, mixed_histories):
+    model, _ = _model()
+    independent = [_model()[0] for _ in range(2)]
+
+    def info(row, chunk):
+        result = _info(f"request-{row}", chunk, [10 + row, 20 + row, 30 + row])
+        voice = row if different_references else 0
+        result["meta"].update(prompt_cache_id=f"voice-{voice}", prompt_wav=f"/fake/voice-{voice}.wav")
+        return result
+
+    # Mixed references and mixed cache ages must preserve the configured backend.
+    initial_chunks = [2, 1] if mixed_histories else [1, 1]
+    for row, count in enumerate(initial_chunks):
+        for chunk in range(count):
+            _forward(model, [info(row, chunk)])
+            _forward(independent[row], [info(row, chunk)])
+    adapter = model.backend
+    calls = []
+
+    if backend_kind == "step_graph":
+
+        def replay(inputs, time, cnn, att, cnn_out, att_out, mask=None):
+            calls.append("step_graph")
+            out = adapter.flow.decoder.estimator.blocks_forward_chunk(inputs, time, mask, cnn, att, cnn_out, att_out)
+            return out, cnn_out, att_out
+
+        adapter._cfm_graph_wrapper = SimpleNamespace(enabled=True, replay=replay)
+    else:
+
+        def step(*, x, mu, t, spks, cond, cnn_cache, att_cache):
+            calls.append("trt")
+            stepper, adapter._trt_stepper = adapter._trt_stepper, None
+            try:
+                return adapter._estimator_step(
+                    adapter.flow.decoder.estimator,
+                    x=x,
+                    mu=mu,
+                    time=t,
+                    speakers=spks,
+                    cond=cond,
+                    cnn_cache=cnn_cache,
+                    att_cache=att_cache,
+                )
+            finally:
+                adapter._trt_stepper = stepper
+
+        adapter._trt_stepper = SimpleNamespace(step=step)
+
+    for chunk in range(3):
+        calls.clear()
+        infos = [info(row, chunk + count) for row, count in enumerate(initial_chunks)]
+        result = _forward(model, infos)
+        groups = 2 if different_references or mixed_histories else 1
+        assert calls == [backend_kind] * (groups * adapter.n_timesteps)
+        for row in range(2):
+            expected = _forward(independent[row], [infos[row]])
+            torch.testing.assert_close(
+                result.multimodal_outputs["model_outputs"][row], expected.multimodal_outputs["model_outputs"][0]
+            )
 
 
 def test_relpos_encode_token_budget_leaves_room_for_upsample_and_cache():
