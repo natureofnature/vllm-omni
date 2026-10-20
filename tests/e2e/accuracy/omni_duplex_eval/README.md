@@ -9,7 +9,7 @@ The DFX runner writes both performance and accuracy artifacts.
 | File | Responsibility |
 | --- | --- |
 | `tests/dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json` | Model, judge, benchmark parameters and hardware marks |
-| `omni_duplex_eval_ci_config.json` | Expected dataset, protocol pin, sample IDs and quality floors |
+| `omni_duplex_eval_ci_config.json` | Expected dataset, protocol pin, sample IDs and quality thresholds |
 | `validation.py` | Coverage, protocol, score-file and RTD/PR quality checks |
 | `test_omni_duplex_eval_ci.py` | CPU regressions for the accuracy contract |
 | `tests/dfx/conftest.py` | Common result metadata and artifact publication |
@@ -65,9 +65,9 @@ The accuracy artifact uses this envelope:
   "dataset": "Hothan/Omni-DuplexEval",
   "Hardware": "H100",
   "baseline": {
-    "min_rtd_mean_content_score": 1.0,
-    "min_rtd_mean_temporal_score": 0.9,
-    "min_pr_mean_all_success": 0.15
+    "min_rtd_mean_content_score": 1.8,
+    "min_rtd_mean_temporal_score": 1.4,
+    "min_pr_mean_all_success": 0.28
   },
   "branch": "main",
   "max_concurrency": 8,
@@ -90,41 +90,43 @@ The accuracy artifact uses this envelope:
 The `generation` object preserves publication coverage and artifact errors.
 The full `accuracy` object also contains RTD/PR scores, per-task results,
 coverage counts, errors and the score directory. `status` describes judge
-completion; the subsequent assertions enforce the recorded quality floors.
+completion; the subsequent assertions enforce the recorded quality thresholds.
 Both result artifacts are saved before the assertions, preserving partial
 results when judging fails or a score falls below its threshold. Buildkite
 uploads JSON files from both directories and detailed artifacts even on test failure.
 The CLI must exit successfully; the existing NPU SIGABRT-on-shutdown exception
 (`-6`) remains accepted when all artifact and score checks pass.
 
-## Accuracy metrics and initial quality floors
+## Accuracy metrics and fixed thresholds
 
 RTD means **Real-Time Description**: content and temporal scores each use
 a 0–3 scale. PR means **Proactive Reminder**: `mean_all_success` is the
 fraction of samples for which every required event succeeded, on a 0–1 scale.
 
-| Metric | Initial minimum | H100/C1 observation, 2026-10-19 |
+| Metric | Minimum passing score | H800/C8 reference, 2026-10-20 |
 | --- | ---: | ---: |
-| RTD mean content score | 1.0 | 2.05 |
-| RTD mean temporal score | 0.9 | 1.9167 |
-| PR mean all-success rate | 0.15 | 11/36 = 0.3056 |
+| RTD mean content score | 1.8 | 2.0167 |
+| RTD mean temporal score | 1.4 | 1.6667 |
+| PR mean all-success rate | 0.28 | 11/36 = 0.3056 |
 
-The reference is
-`result_acc_MiniCPM-o-4_5_Omni-DuplexEval_20261019-104844_92172798.json`,
-using the same judge, protocol and 66 IDs. Initial floors are half these
-observations, rounded down. They detect large quality failures; repeated
-**C8** runs on each target hardware are needed to calibrate tighter regression
-thresholds and performance baselines.
+These fixed thresholds use the H800/C8 run at commit `2308562c` as the
+reference, with the same judge, protocol and 66 IDs. The RTD thresholds allow
+approximately 10.7% and 16% below that run's content and temporal scores.
+For the 36 PR samples, a threshold of 0.28 requires at least 11 successes:
+10/36 is approximately 0.2778. Later runs compare against these checked-in
+values; changing the thresholds requires an explicit configuration update.
+The CUDA and NPU jobs share these thresholds. H100/B200 and NPU validation,
+and hardware-specific performance baseline calibration, remain pending.
 
 Keep per-task results when interpreting the aggregate. The reference's PR
 correction score was 11/13; event reminder and post-event reminder each scored
-zero. Passing the aggregate establishes the stated aggregate floor. Separate
+zero. Passing the aggregate establishes the stated aggregate threshold. Separate
 measured task baselines can track improvements in those two tasks.
 
 The guard checks complete generation, publication and evaluation; exact
 score-file count and split/ID membership; matching protocol pins in the
 configuration, runtime, summary and each score file; all nine task groups;
-and finite, in-range RTD/PR scores meeting the configured floors. The accuracy
+and finite, in-range RTD/PR scores meeting the configured thresholds. The accuracy
 suite keeps its existing scoring eligibility: silent output and responses
 still active at session close contribute their collected content to the judge.
 Artifacts retain unfinished-response counts and missing latency measurements,

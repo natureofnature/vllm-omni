@@ -81,6 +81,28 @@ def test_complete_scores_pass(result, config):
 
 
 @pytest.mark.parametrize(
+    "section,field,value,passes",
+    [
+        ("rtd", "mean_content_score", 1.8, True),
+        ("rtd", "mean_content_score", 1.7999, False),
+        ("rtd", "mean_avg_temporal_score", 1.4, True),
+        ("rtd", "mean_avg_temporal_score", 1.3999, False),
+        ("pr", "mean_all_success", 0.28, True),
+        ("pr", "mean_all_success", 0.2799, False),
+        ("pr", "mean_all_success", 11 / 36, True),
+        ("pr", "mean_all_success", 10 / 36, False),
+    ],
+)
+def test_fixed_quality_thresholds(result, config, section, field, value, passes):
+    result["omni_duplex_eval"]["accuracy"][section][field] = value
+    if passes:
+        assert_accuracy_result(result, config)
+    else:
+        with pytest.raises(AssertionError, match="outside"):
+            assert_accuracy_result(result, config)
+
+
+@pytest.mark.parametrize(
     "section,field,value,message",
     [
         ("benchmark", "completed", 65, "completed requests"),

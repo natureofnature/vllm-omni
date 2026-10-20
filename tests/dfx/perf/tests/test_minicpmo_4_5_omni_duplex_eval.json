@@ -1,7 +1,7 @@
 [
   {
     "test_name": "test_minicpmo_4_5_omni_duplex_eval",
-    "description": "One C8 replay of the 66 CI IDs, followed by RTD/PR judging. Uses the model-bundled HT_ref_audio.wav. Initial quality floors use half the 2026-10-19 H100/C1 scores, rounded down; tighter quality and hardware-specific performance baselines await repeated C8 measurements.",
+    "description": "One C8 replay of the 66 CI IDs, followed by RTD/PR judging. Uses the model-bundled HT_ref_audio.wav. Fixed accuracy thresholds are 1.8 RTD content, 1.4 RTD temporal and 0.28 PR all-success, selected from the 2026-10-20 H800/C8 reference. Target-hardware validation and performance baseline calibration remain pending.",
     "mark": [
       {
         "hardware_marks": {
