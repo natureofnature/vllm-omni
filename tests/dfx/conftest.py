@@ -564,6 +564,7 @@ def run_benchmark(
     resource_label: str | None = None,
     num_warmups: int = 2,
     benchmark_params_name: str | None = None,
+    accuracy_baseline: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Run one ``vllm bench serve --omni`` iteration and return parsed metrics.
 
@@ -601,6 +602,10 @@ def run_benchmark(
         ]
     )
     result_filename = "_".join(name_parts) + ".json"
+    result_dir = os.environ.get("BENCHMARK_DIR", "tests/dfx/perf/results")
+    result_path = os.path.join(result_dir, result_filename)
+    # A failed CLI invocation must never reuse an earlier run's result.
+    Path(result_path).unlink(missing_ok=True)
     if "--result-filename" in args:
         print(f"The result file will be overwritten by {result_filename}")
     command = (
@@ -611,7 +616,7 @@ def run_benchmark(
             str(num_warmups),
             "--save-result",
             "--result-dir",
-            os.environ.get("BENCHMARK_DIR", "tests"),
+            result_dir,
             "--result-filename",
             result_filename,
         ]
@@ -636,7 +641,7 @@ def run_benchmark(
     stderr_thread.start()
     stdout_thread.join()
     stderr_thread.join()
-    process.wait()
+    returncode = process.wait()
 
     if "--result-dir" in command:
         index = command.index("--result-dir")
@@ -676,6 +681,53 @@ def run_benchmark(
         result["name"] = benchmark_params_name
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
+    if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args:
+
+        def argument(name: str, default: str = "") -> str:
+            return args[args.index(name) + 1] if name in args else default
+
+        model = argument("--model", result.get("model_id", ""))
+        dataset = argument("--dataset-path", dataset_name)
+        accuracy_path = Path(result_path).with_name(
+            f"result_acc_{_safe_filename_token(test_name)}_{_safe_filename_token(result['Hardware'])}_"
+            f"{_safe_filename_token(dataset)}_{_safe_filename_token(model)}_"
+            f"{name_token or 'default'}_{flow}_{num_prompt}_{current_dt}.json"
+        )
+        # Persist before quality assertions, including partial or failed judging.
+        duplex = result.get("omni_duplex_eval")
+        accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
+        if not isinstance(accuracy, dict):
+            accuracy = {"status": "failed", "error": "benchmark did not produce an accuracy result"}
+        accuracy_path.write_text(
+            json.dumps(
+                {
+                    "test_name": test_name,
+                    "model": model,
+                    "dataset": dataset,
+                    "Hardware": result["Hardware"],
+                    "baseline": accuracy_baseline or {},
+                    "branch": result["branch"],
+                    "max_concurrency": int(argument("--max-concurrency")) if "--max-concurrency" in args else None,
+                    "benchmark_exit_code": returncode,
+                    "generation": {
+                        "completed": result.get("completed", 0),
+                        "failed": result.get("failed", 0),
+                        **({k: v for k, v in duplex.items() if k != "accuracy"} if isinstance(duplex, dict) else {}),
+                    },
+                    "accuracy": accuracy,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        print(f"Accuracy result saved to {accuracy_path}")
+        from vllm_omni.platforms import current_omni_platform
+
+        # Preserve the accuracy job's torch_npu shutdown exception while
+        # requiring complete artifacts and scores in the caller's assertions.
+        allowed_exit_codes = (0, -6) if current_omni_platform.is_npu() else (0,)
+        assert returncode in allowed_exit_codes, f"benchmark exited with unexpected code {returncode}"
     return result
 
 

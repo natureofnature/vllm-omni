@@ -50,8 +50,8 @@ _AUDIO_DELTA_TYPE = "response.output_audio.delta"
 DUPLEX_RESPONSE_LATENCY_FIELDS = (
     ("ttft_ms", "duplex_response_ttft_ms", "server TTFT"),
     ("ttfp_ms", "duplex_response_ttfp_ms", "server TTFP"),
-    ("client_ttft_ms", "duplex_client_ttft_ms", "client TTFT"),
-    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client TTFP"),
+    ("client_ttft_ms", "duplex_client_ttft_ms", "client created-to-text"),
+    ("client_ttfp_ms", "duplex_client_ttfp_ms", "client created-to-audio"),
 )
 _STREAM_MEASUREMENT_ORIGIN = {
     "ttft": "input stream start to first non-empty text delta",
@@ -241,6 +241,8 @@ def print_duplex_response_latency_metrics(metrics: Mapping[str, float | int]) ->
             continue
         for stat, title in (("mean", "Mean"), ("median", "Median"), ("p99", "P99")):
             print("{:<40} {:<10.2f}".format(f"{title} {label} (ms):", metrics[f"{stat}_{name}"]))
+    if any(f"mean_{name}" in metrics for name in ("duplex_client_ttft_ms", "duplex_client_ttfp_ms")):
+        print("Client intervals start at response.created; native duplex may emit it after model output is ready.")
     print("=" * 50)
 
 

@@ -546,6 +546,10 @@ preprocessing. The client timer starts when `response.created` is received, afte
 turn. It excludes VAD silence detection and any delay before that event arrives, so it does not measure the full
 user-speech-end to first-output latency. The server start point differs between model plugins, so compare server
 keys only within one model. VAD uses `silence_duration_ms: 500` by default.
+The terminal calls the client intervals `client created-to-text/audio`. MiniCPM native duplex can emit
+`response.created` after model output is ready, so a few milliseconds here describe event delivery,
+while the server per-response metrics describe generation from the accepted input. The JSON key names remain
+`duplex_client_ttft_ms` / `duplex_client_ttfp_ms` for compatibility.
 Qwen3-Omni duplex reports no per-token timing, so TPOT and ITL are unavailable. A turn-based model acknowledges a proactive request right away but does not speak again when the
 event later happens, so proactive and 1QnA scenarios score low by construction.
 
