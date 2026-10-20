@@ -238,8 +238,9 @@ def test_empty_score_directory(tmp_path):
 )
 @pytest.mark.parametrize("accuracy_dir_override", [False, True])
 @pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
+@pytest.mark.parametrize("benchmark_params_name", [None, "rtd-pr-c8"])
 def test_dfx_writes_both_artifacts_before_quality_gate(
-    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label
+    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label, benchmark_params_name
 ):
     from tests.dfx import conftest as dfx
     from tests.dfx.perf.scripts import run_benchmark as runner
@@ -248,6 +249,8 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
+    if benchmark_params_name is not None:
+        dfx_config["benchmark_params"][0]["name"] = benchmark_params_name
     result["model_id"] = "/models/MiniCPM-o-4_5"
     monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", [dfx_config])
     monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: resource_label)
@@ -329,6 +332,8 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     assert saved["dataset_path"] == config["dataset"]
     assert saved["date"] == (saved_perf.get("date") or timestamp)
     assert saved["test_name"] == dfx_config["test_name"]
+    assert saved["name"] == saved_perf.get("name") == benchmark_params_name
+    assert saved["num_prompts"] == dfx_config["benchmark_params"][0]["num_prompts"][0] == 66
     assert saved["branch"] == "test-branch"
     assert saved["max_concurrency"] == 8
     assert saved["baseline"] == config["baseline"]

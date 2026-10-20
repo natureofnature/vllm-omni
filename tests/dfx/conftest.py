@@ -702,6 +702,7 @@ def run_benchmark(
             json.dumps(
                 {
                     "test_name": test_name,
+                    "name": benchmark_params_name,
                     "model_id": model_id,
                     "dataset": dataset,
                     "dataset_path": argument("--dataset-path", dataset_name),
@@ -709,6 +710,7 @@ def run_benchmark(
                     "Hardware": result["Hardware"],
                     "baseline": accuracy_baseline or {},
                     "branch": result["branch"],
+                    "num_prompts": num_prompt,
                     "max_concurrency": int(argument("--max-concurrency")) if "--max-concurrency" in args else None,
                     "benchmark_exit_code": returncode,
                     "generation": {

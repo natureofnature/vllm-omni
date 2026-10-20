@@ -64,12 +64,15 @@ example `result_acc_MiniCPM-o-4_5_omni_duplex_eval_20261020_064320.json`.
 Hardware and concurrency are recorded in the JSON. `model_id` and `date`
 retain the benchmark metadata, `dataset` identifies the evaluation suite, and
 `dataset_path` records its Hub repository or local data path.
+`name` records the optional benchmark configuration label (`null` when unnamed),
+and `num_prompts` records the requested sample count.
 
 The accuracy artifact uses this envelope:
 
 ```json
 {
   "test_name": "test_minicpmo_4_5_omni_duplex_eval",
+  "name": null,
   "model_id": "openbmb/MiniCPM-o-4_5",
   "dataset": "omni_duplex_eval",
   "dataset_path": "Hothan/Omni-DuplexEval",
@@ -81,6 +84,7 @@ The accuracy artifact uses this envelope:
     "min_pr_mean_all_success": 0.28
   },
   "branch": "main",
+  "num_prompts": 66,
   "max_concurrency": 8,
   "benchmark_exit_code": 0,
   "generation": {
