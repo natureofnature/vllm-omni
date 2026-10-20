@@ -2358,6 +2358,78 @@ def test_whole_euler_ragged_rows_match_per_row_exact_solves(monkeypatch: pytest.
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
+def test_whole_euler_mixed_histories_match_independent_streams(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Different reference lengths share a graph without exposing padded history."""
+    pool = torch.cuda.graph_pool_handle()
+    monkeypatch.setattr(current_platform, "get_global_graph_pool", lambda: pool)
+    estimator = _tiny_upstream_dit()
+    wrapper = WholeEulerCFMGraphWrapper(
+        estimator=estimator,
+        n_timesteps=10,
+        max_graphs=8,
+        query_bucket_frames=16,
+        ragged_body=BatchedToken2Wav._blocks_forward_chunk_ragged,
+    )
+    batch_size, width = 3, 8
+    # Reuse the arena after longer histories have filled its padding columns.
+    for offsets in ([12, 9, 6], [8, 5, 3]):
+        histories = []
+        for offset in offsets:
+            first = _whole_euler_chunk(1, offset)
+            histories.append(
+                _eager_solve_euler(
+                    estimator,
+                    first["x"],
+                    first["mu_cfg"],
+                    first["speakers_cfg"],
+                    first["cond_cfg"],
+                    None,
+                    None,
+                    None,
+                    wrapper.timeline,
+                )[1:]
+            )
+        cnn = torch.cat(
+            [torch.cat([row[0][:, :, cfg : cfg + 1] for row in histories], dim=2) for cfg in range(2)],
+            dim=2,
+        )
+        lengths = [8, 6, 4]
+        current = _whole_euler_chunk(batch_size, width)
+        query_valid = torch.arange(width, device="cuda")[None, :] < torch.tensor(lengths * 2, device="cuda")[:, None]
+        history_valid = (
+            torch.arange(max(offsets), device="cuda")[None, :] < torch.tensor(offsets * 2, device="cuda")[:, None]
+        )
+        mask = query_valid[:, :, None] & torch.cat((query_valid, history_valid), dim=1)[:, None, :]
+        result = wrapper.replay(
+            **current,
+            cnn_cache=cnn,
+            att_cache=[row[1].clone() for row in histories],
+            attn_mask=mask,
+            valid_lengths=lengths,
+        )
+        assert result is not None
+        out_x, out_cnn, out_att = result
+        out_cnn_rows = _split_cfg_rows(out_cnn, batch_size)
+        for row, (length, offset) in enumerate(zip(lengths, offsets, strict=True)):
+            cfg = [row, batch_size + row]
+            expected_x, expected_cnn, expected_att = _eager_solve_euler(
+                estimator,
+                current["x"][row : row + 1, :, :length],
+                current["mu_cfg"][cfg, :, :length],
+                current["speakers_cfg"][cfg],
+                current["cond_cfg"][cfg, :, :length],
+                *histories[row],
+                None,
+                wrapper.timeline,
+            )
+            torch.testing.assert_close(out_x[row : row + 1, :, :length], expected_x, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(out_cnn_rows[row], expected_cnn, rtol=1e-4, atol=1e-5)
+            assert out_att[row].shape[4] == offset + length
+            torch.testing.assert_close(out_att[row], expected_att, rtol=1e-4, atol=1e-5)
+    wrapper._flush()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for graph capture")
 def test_whole_euler_padded_ragged_replay_after_a_wider_replay(monkeypatch: pytest.MonkeyPatch) -> None:
     """A padded ragged replay is exact after a wider replay of the same graph batch.
 

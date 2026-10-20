@@ -54,6 +54,19 @@ On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
 Slot pooling and row-offset merging remain opt-in. Fusion changes floating-point
 rounding and does not promise identical waveforms.
 
+## Code2Wav batching across reference audio
+
+Ready requests with different reference audio can share a Code2Wav decode
+batch. Reference extraction and initial cache setup remain separate for each
+reference; speaker conditioning, attention lengths and cache trimming stay
+per request. Cache epochs remain separate unless cross-turn batching is enabled.
+
+The ragged Whole-Euler path masks padded history and returns each request's
+own cache length. Encoder work still groups by compatible cache shapes.
+Unsupported ragged graph shapes retain the existing exact-shape fallback.
+This changes compute batching, not the content-based reference cache identity
+or reference normalization policy.
+
 ## Full-duplex MRv2
 
 `minicpmo_4_5_duplex_mrv2.yaml` opts all three CUDA stages into MRv2 and

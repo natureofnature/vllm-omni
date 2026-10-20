@@ -686,6 +686,61 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
     assert cache1[0, 0, 0, 0, 0].item() == 20
 
 
+@pytest.mark.parametrize("different_lengths", [False, True])
+def test_cross_reference_batch_matches_independent_streams(different_lengths):
+    """Different voices share a solve without sharing conditioning or history."""
+    batch = 8
+
+    def prepare_prompt(path):
+        voice = int(Path(path).stem.split("-")[-1])
+        length = 2 + voice % 3 if different_lengths else 2
+        return (
+            torch.arange(5, 5 + length).unsqueeze(0),
+            torch.tensor([length], dtype=torch.int32),
+            torch.tensor([[1.0 if voice % 2 == 0 else -1.0]]),
+            torch.full((1, length + 2, 1), float(voice + 1)),
+            torch.tensor([length + 2], dtype=torch.int32),
+        )
+
+    def make_model():
+        model, token2wav = _model()
+        token2wav._prepare_prompt = prepare_prompt
+        token2wav.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
+        return model, token2wav
+
+    model, token2wav = make_model()
+    independent = [make_model()[0] for _ in range(batch)]
+    for chunk in range(8):
+        infos = []
+        for row in range(batch):
+            info = _info(f"voice-{row}", chunk, list(range(10 + row, 30 + row)), last_chunk=chunk == 7)
+            info["meta"].update(prompt_cache_id=f"voice-{row}", prompt_wav=f"/fake/voice-{row}.wav")
+            infos.append(info)
+        result = _forward(model, infos)
+        # Reference setup is still per voice; every decode step is one CFG batch.
+        assert token2wav.flow.decoder.estimator.cfg_batches[-2:] == [2 * batch, 2 * batch]
+        expected_speakers = [1.0 if row % 2 == 0 else -1.0 for row in range(batch)] + [0.0] * batch
+        assert token2wav.flow.decoder.estimator.speaker_order[-1] == expected_speakers
+        assert token2wav.hift.calls[-1] == batch
+        for row, (single, info) in enumerate(zip(independent, infos, strict=True)):
+            expected = _forward(single, [info])
+            torch.testing.assert_close(
+                result.multimodal_outputs["model_outputs"][row], expected.multimodal_outputs["model_outputs"][0]
+            )
+            if chunk == 7:
+                continue
+            state = model._states[f"voice-{row}"].token2wav
+            reference = single._states[f"voice-{row}"].token2wav
+            for name, cache in reference.flow_cache.items():
+                torch.testing.assert_close(state.flow_cache[name], cache)
+            for name, cache in reference.hift_cache.items():
+                torch.testing.assert_close(state.hift_cache[name], cache)
+        if chunk:
+            caches = [state.token2wav.flow_cache["estimator_att_cache"] for state in model._states.values()]
+            assert len({cache.data_ptr() for cache in caches}) == len(caches)
+    assert not model._states
+
+
 def test_relpos_encode_token_budget_leaves_room_for_upsample_and_cache():
     # The NPU crash was 6968 vs 985: 3333 tokens * 2 + cache overflowed max_pos=5000.
     assert relpos_encode_token_budget(max_pos=5000, stride=2, cache_offset=150, lookahead=3) <= 1024

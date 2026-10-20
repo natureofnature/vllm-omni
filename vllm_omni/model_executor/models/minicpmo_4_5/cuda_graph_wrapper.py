@@ -1417,7 +1417,10 @@ class WholeEulerCFMGraphWrapper:
             static_att_rows[:, :, :, :rows].copy_(att_cache.unflatten(2, (2, batch_size))[:, :, :, start:stop])
         else:
             for row, source in enumerate(_materialize_att_rows(att_rows[start:stop])):
-                static_att_rows[:, :, :, row].copy_(source[..., :offset, :])
+                # A mixed-reference batch right-pads shorter histories. Their
+                # remaining arena columns are excluded by the per-row mask.
+                row_offset = int(source.shape[4])
+                static_att_rows[:, :, :, row, :, :row_offset].copy_(source)
 
     def _group_fills(self, groups: list[tuple[int, int]], after=None, **inputs) -> list[Callable]:
         """Per replay group, a ``fill(statics)`` that copies the group's requests in, then runs ``after``."""
@@ -1989,14 +1992,17 @@ class WholeEulerCFMGraphWrapper:
         groups = self._plan_groups(batch_size)
 
         att_rows = None if att_cache is None or isinstance(att_cache, torch.Tensor) else list(att_cache)
-        # Per-request caches of different lengths only replay from the slot pool (``row_offsets``).
+        # Mixed histories use per-row masks and output slices in either the
+        # resident slot pool or the padded arena.
         mixed_offsets = att_rows is not None and len({int(row.shape[4]) for row in att_rows}) != 1
         if att_rows is not None:
-            if len(att_rows) != batch_size or (mixed_offsets and not self.row_offsets):
+            if len(att_rows) != batch_size or (mixed_offsets and (valid_lengths is None or attn_mask is None)):
                 return None
-            offset = int(att_rows[0].shape[4])
+            row_offsets = [int(row.shape[4]) for row in att_rows]
+            offset = max(row_offsets)
         else:
             offset = int(att_cache.shape[4]) if att_cache is not None else 0
+            row_offsets = [offset] * batch_size
         mel_width = int(mu_cfg.shape[2])
         att_rows_out = att_rows is not None or valid_lengths is not None
         if valid_lengths is not None:
@@ -2017,7 +2023,13 @@ class WholeEulerCFMGraphWrapper:
             lengths = mel_width
             if valid_lengths is not None:
                 lengths = index_to_device((*row_lengths, *row_lengths), x.device)
-        if self.att_slots and att_rows is not None and pad_frames == 0 and att_keep is not None:
+        if (
+            self.att_slots
+            and att_rows is not None
+            and pad_frames == 0
+            and att_keep is not None
+            and (not mixed_offsets or self.row_offsets)
+        ):
             slotted = self._replay_slots(
                 x_cap=x_cap,
                 mu_cap=mu_cap,
@@ -2035,8 +2047,6 @@ class WholeEulerCFMGraphWrapper:
             )
             if slotted is not None:
                 return slotted
-        if mixed_offsets:
-            return None
         if att_rows is not None:
             # A refused slot replay can leave resident rows; the arena path reads tensors.
             att_rows = _materialize_att_rows(att_rows)
@@ -2056,11 +2066,13 @@ class WholeEulerCFMGraphWrapper:
             # Queries past a row's length take its first query's mask, as
             # capture padding does.
             mask_cap = _pad_invalid_queries(mask_cap, lengths)
-        segments_by_length = {
-            length: _whole_euler_att_segments(mel_width=length, query_cap=query_cap, offset=offset, keep=att_keep)
-            for length in set(row_lengths)
+        segments_by_shape = {
+            (length, row_offset): _whole_euler_att_segments(
+                mel_width=length, query_cap=query_cap, offset=row_offset, keep=att_keep
+            )
+            for length, row_offset in set(zip(row_lengths, row_offsets, strict=True))
         }
-        segments = segments_by_length[row_lengths[0]]
+        segments = segments_by_shape[row_lengths[0], row_offsets[0]]
         keep_len = sum(length for _, length in segments)
 
         arena = self.arena
@@ -2133,7 +2145,7 @@ class WholeEulerCFMGraphWrapper:
                 _copy_frame_segments(out_att_rows[:, :, :, start:stop], att_src, segments)
             else:
                 for row in range(rows):
-                    row_segments = segments_by_length[row_lengths[start + row]]
+                    row_segments = segments_by_shape[row_lengths[start + row], row_offsets[start + row]]
                     shape = (
                         self.n_timesteps,
                         arena.depth,
