@@ -579,7 +579,8 @@ def run_benchmark(
     under one ``test_name`` stay distinguishable (e.g. Wan USP2 832x480 vs
     1280x720).
     """
-    current_dt = datetime.now().strftime("%Y%m%d-%H%M%S")
+    started_at = datetime.now()
+    current_dt = started_at.strftime("%Y%m%d-%H%M%S")
     ri = _safe_filename_token(random_input_len)
     ro = _safe_filename_token(random_output_len)
     hw = resource_label_for_filename(resource_label)
@@ -682,19 +683,16 @@ def run_benchmark(
     with open(result_path, "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
     if dataset_name == "omni-duplex-eval" and "--duplex-eval-evaluate" in args and accuracy_baseline is not None:
+        from tests.e2e.accuracy.qwen3_omni.run_qwen_omni_acc_benchmark import _acc_result_filename
 
         def argument(name: str, default: str = "") -> str:
             return args[args.index(name) + 1] if name in args else default
 
-        model = argument("--model", result.get("model_id", ""))
-        dataset = argument("--dataset-path", dataset_name)
+        model_id = result.get("model_id") or argument("--model")
+        dataset = "omni_duplex_eval"
         accuracy_dir = Path(os.environ.get("ACC_BENCH_RESULT_DIR", "tests/e2e/accuracy/omni_duplex_eval/results"))
         accuracy_dir.mkdir(parents=True, exist_ok=True)
-        accuracy_path = accuracy_dir / (
-            f"result_acc_{_safe_filename_token(test_name)}_{_safe_filename_token(result['Hardware'])}_"
-            f"{_safe_filename_token(dataset)}_{_safe_filename_token(model)}_"
-            f"{name_token or 'default'}_{flow}_{num_prompt}_{current_dt}.json"
-        )
+        accuracy_path = accuracy_dir / _acc_result_filename(model_id, dataset, when=started_at)
         # Persist before quality assertions, including partial or failed judging.
         duplex = result.get("omni_duplex_eval")
         accuracy = duplex.get("accuracy") if isinstance(duplex, dict) else None
@@ -704,8 +702,10 @@ def run_benchmark(
             json.dumps(
                 {
                     "test_name": test_name,
-                    "model": model,
+                    "model_id": model_id,
                     "dataset": dataset,
+                    "dataset_path": argument("--dataset-path", dataset_name),
+                    "date": result.get("date") or current_dt,
                     "Hardware": result["Hardware"],
                     "baseline": accuracy_baseline or {},
                     "branch": result["branch"],

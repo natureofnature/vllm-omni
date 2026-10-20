@@ -61,8 +61,9 @@ def test_benchmark_result_preserves_tpot_sample_count(monkeypatch, measured, sel
         )
     )
     # DFX reads this dictionary from the benchmark's JSON result file.
-    saved_result = json.loads(json.dumps(result))
+    saved_result = json.loads(json.dumps(result, allow_nan=False))
     assert saved_result["completed"] == 1
+    assert saved_result["max_output_tokens_per_s"] > 0
     assert saved_result.get("num_tpot_samples") == int(measured)
     assert saved_result["num_ttft_samples"] == 1
     assert saved_result["num_itl_samples"] == 2
@@ -121,7 +122,8 @@ def test_benchmark_result_flattens_duplex_per_response_latency(monkeypatch):
             ready_check_timeout_sec=0,
         )
     )
-    saved_result = json.loads(json.dumps(result))
+    saved_result = json.loads(json.dumps(result, allow_nan=False))
+    assert saved_result["max_output_tokens_per_s"] is None
     assert saved_result["num_duplex_client_ttfp_ms_samples"] == 2
     assert saved_result["mean_duplex_client_ttfp_ms"] == pytest.approx(410.0)
     assert saved_result["mean_duplex_response_ttft_ms"] == pytest.approx(60.0)

@@ -56,16 +56,24 @@ tests/dfx/perf/results/
     └── ... detailed audio, transcript, event and judge artifacts
 
 tests/e2e/accuracy/omni_duplex_eval/results/
-└── result_acc_<test>_<hardware>_<dataset>_<model>_...json
+└── result_acc_<model>_omni_duplex_eval_<date>_<time>.json
 ```
+
+Accuracy filenames follow the shared Daily-Omni / Seed-TTS convention, for
+example `result_acc_MiniCPM-o-4_5_omni_duplex_eval_20261020_064320.json`.
+Hardware and concurrency are recorded in the JSON. `model_id` and `date`
+retain the benchmark metadata, `dataset` identifies the evaluation suite, and
+`dataset_path` records its Hub repository or local data path.
 
 The accuracy artifact uses this envelope:
 
 ```json
 {
   "test_name": "test_minicpmo_4_5_omni_duplex_eval",
-  "model": "openbmb/MiniCPM-o-4_5",
-  "dataset": "Hothan/Omni-DuplexEval",
+  "model_id": "openbmb/MiniCPM-o-4_5",
+  "dataset": "omni_duplex_eval",
+  "dataset_path": "Hothan/Omni-DuplexEval",
+  "date": "20261020-065052",
   "Hardware": "H100",
   "baseline": {
     "min_rtd_mean_content_score": 1.8,

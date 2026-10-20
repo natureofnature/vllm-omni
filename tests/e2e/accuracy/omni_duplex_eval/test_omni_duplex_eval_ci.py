@@ -58,6 +58,7 @@ def result(tmp_path, config):
         score_root=str(score_root),
     )
     return {
+        "date": "20261020-065052",
         "completed": expected,
         "failed": 0,
         "duplex_session_metrics": [
@@ -236,8 +237,9 @@ def test_empty_score_directory(tmp_path):
     ],
 )
 @pytest.mark.parametrize("accuracy_dir_override", [False, True])
+@pytest.mark.parametrize("resource_label", ["H100", "H800", "A3"])
 def test_dfx_writes_both_artifacts_before_quality_gate(
-    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override
+    tmp_path, monkeypatch, result, config, failure, accuracy_dir_override, resource_label
 ):
     from tests.dfx import conftest as dfx
     from tests.dfx.perf.scripts import run_benchmark as runner
@@ -246,8 +248,9 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     test_root = Path(__file__).resolve().parents[3]
     dfx_config = json.loads((test_root / "dfx/perf/tests/test_minicpmo_4_5_omni_duplex_eval.json").read_text())[0]
     dfx_config["benchmark_params"][0]["duplex_eval_accuracy_config"] = str(_CONFIG_PATH.resolve())
+    result["model_id"] = "/models/MiniCPM-o-4_5"
     monkeypatch.setattr(runner, "BENCHMARK_CONFIGS", [dfx_config])
-    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: "H100")
+    monkeypatch.setattr(runner, "get_runtime_resource_label", lambda: resource_label)
     monkeypatch.chdir(tmp_path)
     perf_dir = tmp_path / "perf-results"
     perf_dir.mkdir()
@@ -315,11 +318,16 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
     perf_paths = list(perf_dir.glob("result_*.json"))
     assert len(accuracy_paths) == len(perf_paths) == 1
     assert not list(perf_dir.glob("result_acc_*.json"))
-    assert "_H100_" in accuracy_paths[0].name
+    timestamp = perf_paths[0].stem.rsplit("_", 1)[-1]
+    assert accuracy_paths[0].name == f"result_acc_MiniCPM-o-4_5_omni_duplex_eval_{timestamp.replace('-', '_')}.json"
+    saved_perf = json.loads(perf_paths[0].read_text())
     saved = json.loads(accuracy_paths[0].read_text())
-    assert saved["Hardware"] == "H100"
-    assert saved["model"] == ServerEndpoint.model
-    assert saved["dataset"] == config["dataset"]
+    assert saved["Hardware"] == saved_perf["Hardware"] == resource_label
+    assert saved["model_id"] == (saved_perf.get("model_id") or ServerEndpoint.model)
+    assert "model" not in saved
+    assert saved["dataset"] == "omni_duplex_eval"
+    assert saved["dataset_path"] == config["dataset"]
+    assert saved["date"] == (saved_perf.get("date") or timestamp)
     assert saved["test_name"] == dfx_config["test_name"]
     assert saved["branch"] == "test-branch"
     assert saved["max_concurrency"] == 8
@@ -334,7 +342,6 @@ def test_dfx_writes_both_artifacts_before_quality_gate(
             "failed": result["failed"],
             **{k: v for k, v in result["omni_duplex_eval"].items() if k != "accuracy"},
         }
-    assert json.loads(perf_paths[0].read_text())["Hardware"] == "H100"
 
 
 @pytest.mark.parametrize("returncode", [0, 1, -6])

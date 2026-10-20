@@ -3819,7 +3819,10 @@ async def benchmark(
             "itls": [output.itl for output in outputs],
             "generated_texts": [output.generated_text for output in outputs],
             "errors": [output.error for output in outputs],
-            "max_output_tokens_per_s": mm_metrics.max_output_tokens_per_s,
+            # Missing duplex token timelines remain unmeasured in JSON.
+            "max_output_tokens_per_s": (
+                mm_metrics.max_output_tokens_per_s if np.isfinite(mm_metrics.max_output_tokens_per_s) else None
+            ),
             "max_concurrent_requests": mm_metrics.max_concurrent_requests,
             "rtfx": mm_metrics.rtfx,
         }
