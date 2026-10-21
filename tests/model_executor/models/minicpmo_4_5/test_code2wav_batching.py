@@ -16,12 +16,16 @@ import torch.nn as nn
 import vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav as batched_token2wav_module
 from vllm_omni.model_executor.models.minicpmo_4_5.batched_token2wav import (
     BatchedToken2Wav,
+    BatchedToken2WavState,
+    PromptFeatures,
     _token2wav_sdpa_context,
     plan_token2wav_encode_slices,
     relpos_encode_token_budget,
 )
 from vllm_omni.model_executor.models.minicpmo_4_5.minicpmo_4_5_code2wav import (
     MiniCPMO45Code2Wav,
+    _RequestState,
+    _WorkItem,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -427,6 +431,241 @@ def test_evict_prompt_clears_features_and_setup_state():
     assert all(key[0] != first.cache_key for key in adapter._setup_cache)
 
 
+def _reference_feature(voice, length=2, dtype=torch.float32):
+    return PromptFeatures(
+        cache_key=(f"voice-{voice}", f"/fake/voice-{voice}.wav"),
+        speech_tokens=torch.arange(5 + voice, 5 + voice + length).unsqueeze(0),
+        speaker_embedding=torch.tensor([[1.0 if voice % 2 == 0 else -1.0]], dtype=dtype),
+        mels=torch.full((1, length + 2, 1), float(voice + 1), dtype=dtype),
+    )
+
+
+def _reference_setup_backend(*, cache_size=4, micro_batch_size=2, max_graph_batch=8):
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=cache_size)
+    # CUDA dispatch with CPU tensors; eager CFM supplies deterministic results.
+    adapter._whole_euler_graph_wrapper = SimpleNamespace(
+        enabled=True,
+        device=torch.device("cuda"),
+        ragged_body=object(),
+        replay=lambda **kwargs: None,
+        micro_batch_size=micro_batch_size,
+        max_graph_batch=max_graph_batch,
+    )
+    return adapter
+
+
+def test_setup_references_batches_distinct_conditioning_with_single_row_encoders(monkeypatch):
+    adapter = _reference_setup_backend()
+    features = [_reference_feature(voice) for voice in range(2)]
+    solves, projections = [], []
+    decode, project = adapter._decode_cfm, adapter._project_speakers
+
+    def record_decode(mu, speakers, cond, **kwargs):
+        solves.append((mu.clone(), speakers.clone(), cond.clone()))
+        return decode(mu, speakers, cond, **kwargs)
+
+    def record_project(speakers):
+        projections.append(speakers.shape[0])
+        return project(speakers)
+
+    monkeypatch.setattr(adapter, "_decode_cfm", record_decode)
+    monkeypatch.setattr(adapter, "_project_speakers", record_project)
+    states = adapter.setup_references(features)
+
+    assert adapter.flow.encoder.calls == projections == [1, 1]
+    assert len(solves) == 1
+    mu, speakers, cond = solves[0]
+    torch.testing.assert_close(mu[:, 0, 0], torch.tensor([5.0, 6.0]))
+    torch.testing.assert_close(speakers, torch.tensor([[1.0], [-1.0]]))
+    torch.testing.assert_close(cond, torch.cat([f.mels.transpose(1, 2) for f in features]))
+    independent = BatchedToken2Wav(_FakeToken2Wav())
+    for feature, state in zip(features, states, strict=True):
+        expected = independent.setup_batch(feature, 1)[0]
+        for name, value in state.flow_cache.items():
+            torch.testing.assert_close(value, expected.flow_cache[name])
+
+
+@pytest.mark.parametrize(
+    ("micro_batch_size", "max_graph_batch", "cfg_batches"),
+    [(2, 8, [2] * 6 + [4] * 2), (8, 2, [2] * 6 + [4] * 2), (2, 0, [2] * 10), (2, -1, [2] * 10)],
+)
+def test_setup_references_groups_compatible_rows_and_restores_caller_order(
+    micro_batch_size, max_graph_batch, cfg_batches
+):
+    adapter = _reference_setup_backend(micro_batch_size=micro_batch_size, max_graph_batch=max_graph_batch)
+    features = [_reference_feature(i, length=3 if i == 1 else 2) for i in range(5)]
+    features[3] = _reference_feature(3, dtype=torch.float64)
+
+    states = adapter.setup_references(features)
+
+    assert adapter.flow.encoder.calls == [1] * 5
+    assert sorted(adapter.flow.decoder.estimator.cfg_batches) == cfg_batches
+    assert [state.flow_cache["conformer_cnn_cache"].flatten()[0].item() for state in states] == [5, 6, 7, 8, 9]
+    assert list(adapter._setup_cache) == [(feature.cache_key, 0) for feature in features[1:]]
+
+
+@pytest.mark.parametrize("cache_size", [0, 1])
+def test_setup_references_retains_results_and_hits_across_cache_eviction(cache_size):
+    adapter = _reference_setup_backend(cache_size=cache_size)
+    first, second, third = [_reference_feature(i) for i in range(3)]
+    previous = adapter.setup_batch(second, 1)[0]
+    adapter.flow.encoder.calls.clear()
+
+    states = adapter.setup_references([first, second, third])
+
+    assert adapter.flow.encoder.calls == [1] * (2 if cache_size else 3)
+    assert (states[1] is previous) == bool(cache_size)
+    assert [state.flow_cache["conformer_cnn_cache"].flatten()[0].item() for state in states] == [5, 6, 7]
+    assert list(adapter._setup_cache) == ([(third.cache_key, 0)] if cache_size else [])
+
+
+@pytest.mark.parametrize("gate", ["absent", "disabled", "cpu", "npu", "exact", "padding", "trt"])
+def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate):
+    adapter = _reference_setup_backend()
+    wrapper = adapter._whole_euler_graph_wrapper
+    if gate == "absent":
+        adapter._whole_euler_graph_wrapper = None
+    elif gate == "disabled":
+        wrapper.enabled = False
+    elif gate in ("cpu", "npu"):
+        wrapper.device = SimpleNamespace(type=gate)
+    elif gate == "exact":
+        wrapper.ragged_body = None
+    elif gate == "padding":
+        adapter._cfm_graph_bucket_frames = 8
+    else:
+        adapter._trt_stepper = object()
+    features = [_reference_feature(i) for i in range(2)]
+    calls = []
+
+    def setup(feature, batch_size):
+        calls.append((feature.cache_key, batch_size))
+        return [feature.cache_key]
+
+    monkeypatch.setattr(adapter, "setup_batch", setup)
+    assert adapter.setup_references(features) == [feature.cache_key for feature in features]
+    assert calls == [(feature.cache_key, 1) for feature in features]
+
+
+def test_setup_references_rechecks_disabled_graph_between_groups():
+    adapter = _reference_setup_backend()
+    wrapper = adapter._whole_euler_graph_wrapper
+
+    def disable(**kwargs):
+        wrapper.enabled = False
+        return None
+
+    wrapper.replay = disable
+    states = adapter.setup_references([_reference_feature(i) for i in range(4)])
+
+    assert len(states) == 4
+    assert adapter.flow.decoder.estimator.cfg_batches == [4, 4, 2, 2, 2, 2]
+
+
+def test_setup_references_failed_later_group_does_not_publish_or_touch_cache(monkeypatch):
+    adapter = _reference_setup_backend(cache_size=2)
+    features = [_reference_feature(i) for i in range(5)]
+    cached = [adapter.setup_batch(feature, 1)[0] for feature in features[:2]]
+    decode = adapter._decode_cfm
+    calls = 0
+
+    def fail_second_group(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("setup failed")
+        return decode(*args, **kwargs)
+
+    monkeypatch.setattr(adapter, "_decode_cfm", fail_second_group)
+    with pytest.raises(RuntimeError, match="setup failed"):
+        adapter.setup_references([features[1], *features[2:], features[0]])
+    assert calls == 2
+    assert list(adapter._setup_cache) == [(feature.cache_key, 0) for feature in features[:2]]
+    assert list(adapter._setup_cache.values()) == cached
+
+
+def test_setup_references_owns_each_cache_after_reused_cfm_scratch(monkeypatch):
+    adapter = _reference_setup_backend()
+    decode = adapter._decode_cfm
+    scratch: list[torch.Tensor] = []
+
+    def reuse_scratch(*args, **kwargs):
+        result = decode(*args, **kwargs)
+        if not scratch:
+            scratch.extend(value.clone() for value in result)
+        else:
+            for target, value in zip(scratch, result, strict=True):
+                target.copy_(value)
+        return tuple(scratch)
+
+    monkeypatch.setattr(adapter, "_decode_cfm", reuse_scratch)
+    features = [_reference_feature(i) for i in range(4)]
+    states = adapter.setup_references(features)
+    for value in scratch:
+        value.fill_(-100)
+    independent = BatchedToken2Wav(_FakeToken2Wav())
+    for name in states[0].flow_cache:
+        assert len({state.flow_cache[name].untyped_storage().data_ptr() for state in states}) == 4
+    for feature, state in zip(features, states, strict=True):
+        expected = independent.setup_batch(feature, 1)[0]
+        for name, value in state.flow_cache.items():
+            torch.testing.assert_close(value, expected.flow_cache[name])
+
+
+@pytest.mark.parametrize("same_reference", [False, True])
+def test_prepare_decode_batch_maps_unique_fresh_references_and_continuations(monkeypatch, same_reference):
+    model, _ = _model()
+    features = [_reference_feature(i) for i in range(2)]
+    by_key = {feature.cache_key: feature for feature in features}
+    keys = [features[0].cache_key, features[0 if same_reference else 1].cache_key, features[0].cache_key]
+    continuation = BatchedToken2WavState(flow_cache={}, hift_cache={})
+    items = [
+        _WorkItem(
+            output_index=row,
+            state_id=f"request-{row}",
+            request_id=f"request-{row}",
+            cache_epoch=0,
+            chunk_seq=int(row == 1),
+            prompt_cache_id=key[0],
+            prompt_wav=key[1],
+            last_chunk=False,
+            tokens=torch.tensor([10, 11]),
+            previous=_RequestState(0, 0, *key, continuation) if row == 1 else None,
+            runtime_prompt_key=None,
+            duplex_epoch=0,
+            duplex_turn_id=0,
+            segment_text_utf8=torch.empty(0, dtype=torch.uint8),
+            tts_is_last_chunk=False,
+            segment_end=False,
+            turn_end=False,
+        )
+        for row, key in enumerate([keys[0], keys[0], keys[1], keys[2]])
+    ]
+    prepared, setups = [], []
+    fresh_states = [BatchedToken2WavState(flow_cache={}, hift_cache={}) for _ in range(1 if same_reference else 2)]
+
+    def prepare(*key):
+        prepared.append(key)
+        return by_key[key]
+
+    def setup(fresh):
+        setups.append([feature.cache_key for feature in fresh])
+        return fresh_states
+
+    monkeypatch.setattr(model.backend, "prepare_prompt", prepare)
+    monkeypatch.setattr(model.backend, "setup_references", setup)
+    states, conditioning = model._prepare_decode_batch(items)
+    expected_keys = list(dict.fromkeys(keys))
+    assert prepared == expected_keys
+    assert setups == [expected_keys]
+    expected_states = [fresh_states[0], continuation, fresh_states[-1], fresh_states[0]]
+    assert all(actual is expected for actual, expected in zip(states, expected_states, strict=True))
+    if same_reference:
+        assert conditioning is features[0]
+    else:
+        assert [feature.cache_key for feature in conditioning] == [keys[0], keys[0], keys[1], keys[2]]
+
+
 def _enable_fake_ragged_kernel(adapter: BatchedToken2Wav) -> None:
     """Keep fake-model tests focused on ragged grouping and row mapping."""
     estimator = adapter.flow.decoder.estimator
@@ -687,7 +926,7 @@ def test_adapter_runs_true_batch_cfg_and_splits_request_caches():
 
 
 @pytest.mark.parametrize("different_lengths", [False, True])
-@pytest.mark.parametrize("ragged_device", [None, "cuda", "npu"])
+@pytest.mark.parametrize("ragged_device", [None, "cuda", "cuda_disable", "npu"])
 def test_cross_reference_batch_matches_independent_streams(different_lengths, ragged_device):
     """Different voices share a solve without sharing conditioning or history."""
     batch = 8
@@ -716,13 +955,20 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths, ra
         # Exercise dispatch on CPU; real CUDA replay/parity is tested separately.
         def replay(**kwargs):
             replays.append(kwargs["prompt_lengths"])
+            if ragged_device == "cuda_disable":
+                model.backend._whole_euler_graph_wrapper.enabled = False
             return None
 
         model.backend._whole_euler_graph_wrapper = SimpleNamespace(
-            enabled=True, device=SimpleNamespace(type=ragged_device), ragged_body=object(), replay=replay
+            enabled=True,
+            device=SimpleNamespace(type="cuda" if ragged_device == "cuda_disable" else ragged_device),
+            ragged_body=object(),
+            replay=replay,
+            micro_batch_size=batch,
+            max_graph_batch=batch,
         )
-    merged = ragged_device == "cuda"
     for chunk in range(8):
+        merged = ragged_device == "cuda" or (ragged_device == "cuda_disable" and chunk == 0)
         infos = []
         for row in range(batch):
             info = _info(f"voice-{row}", chunk, list(range(10 + row, 30 + row)), last_chunk=chunk == 7)
@@ -737,7 +983,7 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths, ra
         )
         assert token2wav.flow.decoder.estimator.speaker_order[-1] == expected_speakers
         assert token2wav.hift.calls[-1] == expected_batch
-        if merged:
+        if merged and ragged_device != "cuda_disable":
             assert replays[-1] == [4 + row % 3 if different_lengths else 4 for row in range(batch)]
         for row, (single, info) in enumerate(zip(independent, infos, strict=True)):
             expected = _forward(single, [info])

@@ -64,8 +64,12 @@ preserving CFM step-graph and TRT dispatch. Mixed-history arena replay is
 restricted to CUDA; the existing opt-in slot path is unchanged on other
 platforms.
 
-Reference extraction and initial cache setup remain separate for each
-reference; speaker conditioning, attention lengths and cache trimming stay
+Reference extraction, encoder initialization and speaker projection remain
+per reference. With CUDA ragged Whole-Euler and zero CFM frame padding,
+compatible cold references share an initial CFM solve, bounded by the configured
+microbatch and graph batch limits. Setup-cache hits are reused, and each
+reference retains its own cached state. Other configurations keep per-reference
+initialization. Speaker conditioning, attention lengths and cache trimming stay
 per request. Cache epochs remain separate unless cross-turn batching is enabled.
 
 The MiniCPM Code2Wav stage runs CAM++ speaker embedding on CUDA and NPU using
@@ -77,8 +81,8 @@ strict FP32 arithmetic.
 The CUDA path does not require TensorRT. Set `token2wav_device_spk: false`
 in connector `extra` to use CPU ONNX Runtime for accuracy triage; explicitly
 enabling `token2wav_trt` retains its TensorRT speaker embedding path.
-This moves speaker embedding off the CPU but does not batch reference
-extraction or initial cache setup. Device kernels can change floating-point
+This moves speaker embedding off the CPU; reference extraction stays separate
+from the initial CFM batching described above. Device kernels can change floating-point
 rounding, so this does not promise bit-identical embeddings or waveforms.
 
 The ragged Whole-Euler path masks padded history and returns each request's
