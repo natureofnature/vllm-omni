@@ -442,15 +442,34 @@ def _reference_feature(voice, length=2, dtype=torch.float32):
 
 def _reference_setup_backend(*, cache_size=4, micro_batch_size=2, max_graph_batch=8):
     adapter = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=cache_size, cfm_tf32=True)
-    # CUDA dispatch with CPU tensors; eager CFM supplies deterministic results.
-    adapter._whole_euler_graph_wrapper = SimpleNamespace(
+    adapter._ragged_fused_body = True
+    # CUDA dispatch with CPU tensors; model a successful graph with fake math.
+    decode = adapter._decode_cfm
+    wrapper = SimpleNamespace(
         enabled=True,
         device=torch.device("cuda"),
         ragged_body=object(),
-        replay=lambda **kwargs: None,
         micro_batch_size=micro_batch_size,
         max_graph_batch=max_graph_batch,
     )
+
+    def replay(**kwargs):
+        batch = kwargs["x"].shape[0]
+        wrapper.enabled = False
+        try:
+            return decode(
+                kwargs["mu_cfg"][:batch],
+                kwargs["speakers_cfg"][:batch],
+                kwargs["cond_cfg"][:batch],
+                cnn_cache=kwargs["cnn_cache"],
+                att_cache=kwargs["att_cache"],
+                att_keep=kwargs["att_keep"],
+            )
+        finally:
+            wrapper.enabled = True
+
+    wrapper.replay = replay
+    adapter._whole_euler_graph_wrapper = wrapper
     return adapter
 
 
@@ -519,7 +538,10 @@ def test_setup_references_retains_results_and_hits_across_cache_eviction(cache_s
     assert list(adapter._setup_cache) == ([(third.cache_key, 0)] if cache_size else [])
 
 
-@pytest.mark.parametrize("gate", ["absent", "disabled", "cpu", "npu", "exact", "padding", "trt", "tf32_off", "float16"])
+@pytest.mark.parametrize(
+    "gate",
+    ["absent", "disabled", "cpu", "npu", "exact", "padding", "trt", "tf32_off", "float16", "unfused", "bf16_cache"],
+)
 def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate):
     adapter = _reference_setup_backend()
     wrapper = adapter._whole_euler_graph_wrapper
@@ -537,6 +559,10 @@ def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate)
         adapter._cfm_tf32 = False
     elif gate == "float16":
         adapter.float16 = True
+    elif gate in ("unfused", "bf16_cache"):
+        adapter._ragged_fused_body = False
+        if gate == "bf16_cache":
+            adapter._estimator_att_cache_dtype = torch.bfloat16
     else:
         adapter._trt_stepper = object()
     features = [_reference_feature(i) for i in range(2)]
@@ -551,19 +577,69 @@ def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate)
     assert calls == [(feature.cache_key, 1) for feature in features]
 
 
-def test_setup_references_rechecks_disabled_graph_between_groups():
+@pytest.mark.parametrize("refusal", ["enabled", "disabled", "full_budget"])
+def test_setup_references_retries_refused_graphs_with_scalar_setup(refusal):
     adapter = _reference_setup_backend()
     wrapper = adapter._whole_euler_graph_wrapper
+    successful_replay = wrapper.replay
+    features = [_reference_feature(i) for i in range(4)]
+    original_features = [
+        tuple(value.clone() for value in (f.speech_tokens, f.speaker_embedding, f.mels)) for f in features
+    ]
+    original_noise = adapter.flow.decoder.rand_noise.clone()
+    single_key = ("whole_euler", 1, 4, 0, "torch.float32", "cpu")
+    graph_type = batched_token2wav_module.WholeEulerCFMGraphWrapper
+    graph_cache = graph_type.__new__(graph_type)
+    graph_cache._cache = {single_key: (None,) * 5}
+    graph_cache._slot_graphs = {}
+    graph_cache._unsupported = set()
+    graph_cache._stats = {"hits": 0}
+    graph_cache.max_graphs = 1
+    replay_batches = []
 
-    def disable(**kwargs):
-        wrapper.enabled = False
+    def replay(**kwargs):
+        batch = int(kwargs["x"].shape[0])
+        replay_batches.append(batch)
+        if refusal == "full_budget":
+            # Exercise the real admission check: the M=1 key is still usable
+            # but a new batched key cannot fit, without disabling the wrapper.
+            entry = batched_token2wav_module.WholeEulerCFMGraphWrapper._entry(
+                graph_cache,
+                graph_batch=batch,
+                query_cap=int(kwargs["mu_cfg"].shape[2]),
+                offset=0,
+                x=kwargs["x"],
+                spk_dim=int(kwargs["speakers_cfg"].shape[1]),
+                fill=None,
+            )
+            if entry is not None:
+                return successful_replay(**kwargs)
+        elif batch == 1:
+            return successful_replay(**kwargs)
+        if refusal == "disabled":
+            wrapper.enabled = False
         return None
 
-    wrapper.replay = disable
-    states = adapter.setup_references([_reference_feature(i) for i in range(4)])
+    wrapper.replay = replay
+    states = adapter.setup_references(features)
 
     assert len(states) == 4
-    assert adapter.flow.decoder.estimator.cfg_batches == [4, 4, 2, 2, 2, 2]
+    assert adapter.flow.decoder.estimator.cfg_batches == [2] * 8
+    assert replay_batches == ([2] if refusal == "disabled" else [2, 1, 1, 2, 1, 1])
+    if refusal == "full_budget":
+        assert graph_cache._stats["hits"] == 4
+        assert graph_cache._unsupported == {("whole_euler", 2, 4, 0, "torch.float32", "cpu")}
+        assert wrapper.enabled
+    independent = BatchedToken2Wav(_FakeToken2Wav())
+    for feature, state, original in zip(features, states, original_features, strict=True):
+        expected = independent.setup_batch(feature, 1)[0]
+        for name, value in state.flow_cache.items():
+            torch.testing.assert_close(value, expected.flow_cache[name])
+        for value, prior in zip(
+            (feature.speech_tokens, feature.speaker_embedding, feature.mels), original, strict=True
+        ):
+            torch.testing.assert_close(value, prior, rtol=0, atol=0)
+    torch.testing.assert_close(adapter.flow.decoder.rand_noise, original_noise, rtol=0, atol=0)
 
 
 def test_setup_references_failed_later_group_does_not_publish_or_touch_cache(monkeypatch):
@@ -949,6 +1025,9 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths, ra
     def make_model():
         model, token2wav = _model()
         model.backend._cfm_tf32 = True
+        model.backend._ragged_fused_body = True
+        # The fake kernel covers row mapping for either production body.
+        model.backend._ragged_body = model.backend._blocks_forward_chunk_ragged
         token2wav._prepare_prompt = prepare_prompt
         token2wav.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
         return model, token2wav

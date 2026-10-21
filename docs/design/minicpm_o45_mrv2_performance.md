@@ -65,12 +65,14 @@ restricted to CUDA; the existing opt-in slot path is unchanged on other
 platforms.
 
 Reference extraction, encoder initialization and speaker projection remain
-per reference. With FP32/TF32 CUDA ragged Whole-Euler and zero CFM frame padding,
+per reference. With FP32/TF32 CUDA fused ragged Whole-Euler and zero CFM frame padding,
 compatible cold references share an initial CFM solve, bounded by the configured
 microbatch and graph batch limits. Setup-cache hits are reused, and each
-reference retains its own cached state. FP16, TF32 opt-out and other execution
-configurations keep per-reference initialization. Speaker conditioning,
-attention lengths and cache trimming stay
+reference retains its own cached state. A refused graph replay retries setup
+per reference, preserving the existing solver selection. FP16, TF32 opt-out,
+unfused bodies (including BF16 attention caches) and other execution
+configurations keep per-reference initialization. Speaker
+conditioning, attention lengths and cache trimming stay
 per request. Cache epochs remain separate unless cross-turn batching is enabled.
 
 The MiniCPM Code2Wav stage runs CAM++ speaker embedding on CUDA and NPU using
