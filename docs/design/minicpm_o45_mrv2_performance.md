@@ -44,15 +44,18 @@ apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed) and on NPU. NVIDIA SM80+ uses tiled TF32 or FP16 attention; older CUDA devices
+allowed or Flow uses FP16) and on NPU. NVIDIA SM80+ uses tiled TF32 or FP16 attention; older CUDA devices
 use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts, BF16 attention
 caches, and non-FP32 caches on NPU retain the original body. Other platforms
 retain their existing default.
 Set `cfm_fused_body: false` in connector `extra` to restore the original body.
-On CUDA, disabling TF32 with `token2wav_allow_tf32: false` or
+On CUDA with FP32 Flow, disabling TF32 with `token2wav_allow_tf32: false` or
 `MINICPMO_CODE2WAV_TF32=off` also disables the default fusion choice; an explicit
 `cfm_fused_body: true` overrides that choice and may use TF32 attention.
+FP16 Flow keeps fusion enabled by default when TF32 is off because its fused
+GEMMs and tiled attention use FP16 products. An explicit `cfm_fused_body: false`
+still disables fusion for either precision.
 Slot pooling and its `cfm_row_offset_merge` option remain opt-in. Fusion changes
 floating-point rounding and does not promise identical waveforms.
 
