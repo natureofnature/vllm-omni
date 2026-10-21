@@ -131,3 +131,26 @@ These measurements cover the MRV2 turn-serving configuration above. FP16
 changes rounding; WER and finite-waveform checks do not establish equivalent
 speaker similarity or perceptual quality on all workloads. Default Flow
 precision remains FP32/TF32.
+
+## CFM body attribution
+
+[Component measurements](component-attribution.json) isolate the actual CFM
+`_ragged_body` dispatch with checkpoint weights, 50 frames and 200 cached frames.
+Two/eight classifier-free-guidance rows represent one/four requests. At the same
+FP16 precision, ragged/fused body times were 3.856/1.214 ms and 4.423/1.355 ms,
+respectively. Each value is a CUDA-event mean over 100 graph replays after three
+eager and five graph warmups. These are isolated component timings, not served
+throughput gains; the official C16 FP16 control above supplies the end-to-end
+ablation. The component probe does not measure the entire Code2Wav stage or
+establish that CFM is the only serving bottleneck.
+
+To repeat the diagnostic with the measured candidate checkout and the pinned
+model snapshot, set `MODEL_PATH` and run:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=/path/to/vllm-omni \
+  python /path/to/evidence/probe_dispatch.py
+```
+
+The probe imports a test fixture from the candidate checkout and records
+`dispatch-component-results.json` beside the script.

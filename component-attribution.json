@@ -1,0 +1,68 @@
+{
+  "candidate_revision": "618327d1ab01459dc6fea5b04c6b7ab9c63e7746",
+  "hardware": "NVIDIA H800 80 GB",
+  "measurement": "Isolated real-weight CFM DiT body, CUDA-event mean over 100 graph replays; not an end-to-end serving benchmark.",
+  "warmup": {
+    "eager_calls": 3,
+    "graph_replays": 5
+  },
+  "frames": 50,
+  "cached_frames": 200,
+  "cfg_rows_to_requests": {
+    "2": 1,
+    "8": 4
+  },
+  "scope": "Actual _ragged_body dispatcher; FP16 ragged and fused run with the same weights, precision and inputs. The fused-body call is asserted. One timing per configuration; no run-to-run confidence interval.",
+  "records": [
+    {
+      "rows": 2,
+      "label": "fp32_fused",
+      "milliseconds": 1.531890869140625,
+      "fused_body_called": true,
+      "finite": true
+    },
+    {
+      "rows": 2,
+      "label": "fp16_ragged",
+      "milliseconds": 3.8558578491210938,
+      "fused_body_called": false,
+      "finite": true
+    },
+    {
+      "rows": 2,
+      "label": "fp16_fused",
+      "milliseconds": 1.214072036743164,
+      "fused_body_called": true,
+      "finite": true
+    },
+    {
+      "rows": 2,
+      "fp16_output_relative_rmse": 0.001675168052315712
+    },
+    {
+      "rows": 8,
+      "label": "fp32_fused",
+      "milliseconds": 1.85189697265625,
+      "fused_body_called": true,
+      "finite": true
+    },
+    {
+      "rows": 8,
+      "label": "fp16_ragged",
+      "milliseconds": 4.4228341674804685,
+      "fused_body_called": false,
+      "finite": true
+    },
+    {
+      "rows": 8,
+      "label": "fp16_fused",
+      "milliseconds": 1.3549980163574218,
+      "fused_body_called": true,
+      "finite": true
+    },
+    {
+      "rows": 8,
+      "fp16_output_relative_rmse": 0.001664846553467214
+    }
+  ]
+}
