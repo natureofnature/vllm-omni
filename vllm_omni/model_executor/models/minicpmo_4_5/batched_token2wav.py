@@ -1860,8 +1860,11 @@ class BatchedToken2Wav(nn.Module):
     def setup_references(self, features: list[PromptFeatures]) -> list[BatchedToken2WavState]:
         """Initialize unique references in order, batching compatible cold CFM solves."""
         wrapper = self._whole_euler_graph_wrapper
+        # Keep other precision policies on their existing M=1 setup path.
         if (
             len(features) < 2
+            or self.float16
+            or not self._cfm_tf32
             or not self._whole_euler_ragged_active()
             or wrapper.device.type != "cuda"
             or self._cfm_graph_bucket_frames != 0

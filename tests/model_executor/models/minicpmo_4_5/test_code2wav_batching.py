@@ -441,7 +441,7 @@ def _reference_feature(voice, length=2, dtype=torch.float32):
 
 
 def _reference_setup_backend(*, cache_size=4, micro_batch_size=2, max_graph_batch=8):
-    adapter = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=cache_size)
+    adapter = BatchedToken2Wav(_FakeToken2Wav(), setup_cache_size=cache_size, cfm_tf32=True)
     # CUDA dispatch with CPU tensors; eager CFM supplies deterministic results.
     adapter._whole_euler_graph_wrapper = SimpleNamespace(
         enabled=True,
@@ -519,7 +519,7 @@ def test_setup_references_retains_results_and_hits_across_cache_eviction(cache_s
     assert list(adapter._setup_cache) == ([(third.cache_key, 0)] if cache_size else [])
 
 
-@pytest.mark.parametrize("gate", ["absent", "disabled", "cpu", "npu", "exact", "padding", "trt"])
+@pytest.mark.parametrize("gate", ["absent", "disabled", "cpu", "npu", "exact", "padding", "trt", "tf32_off", "float16"])
 def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate):
     adapter = _reference_setup_backend()
     wrapper = adapter._whole_euler_graph_wrapper
@@ -533,6 +533,10 @@ def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate)
         wrapper.ragged_body = None
     elif gate == "padding":
         adapter._cfm_graph_bucket_frames = 8
+    elif gate == "tf32_off":
+        adapter._cfm_tf32 = False
+    elif gate == "float16":
+        adapter.float16 = True
     else:
         adapter._trt_stepper = object()
     features = [_reference_feature(i) for i in range(2)]
@@ -944,6 +948,7 @@ def test_cross_reference_batch_matches_independent_streams(different_lengths, ra
 
     def make_model():
         model, token2wav = _model()
+        model.backend._cfm_tf32 = True
         token2wav._prepare_prompt = prepare_prompt
         token2wav.flow.decoder.rand_noise = torch.zeros(1, 1, 1024)
         return model, token2wav
