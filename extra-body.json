@@ -1,0 +1,38 @@
+{
+  "modalities": [
+    "text",
+    "audio"
+  ],
+  "chat_template_kwargs": {
+    "enable_thinking": false,
+    "use_tts_template": true
+  },
+  "sampling_params_list": [
+    {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "max_tokens": 256,
+      "seed": 42,
+      "detokenize": true,
+      "repetition_penalty": 1.0
+    },
+    {
+      "temperature": 0.8,
+      "top_p": 0.85,
+      "top_k": 25,
+      "repetition_penalty": 1.05,
+      "min_tokens": 50,
+      "max_tokens": 2048,
+      "seed": 42,
+      "detokenize": false
+    },
+    {
+      "temperature": 0.0,
+      "top_p": 1.0,
+      "top_k": -1,
+      "max_tokens": 65536,
+      "detokenize": true
+    }
+  ]
+}
