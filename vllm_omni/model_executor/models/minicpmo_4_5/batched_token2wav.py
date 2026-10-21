@@ -1713,6 +1713,17 @@ class BatchedToken2Wav(nn.Module):
         """Whether Whole-Euler graphs also solve ragged (per-row length) batches."""
         return self._whole_euler_active() and self._whole_euler_graph_wrapper.ragged_body is not None
 
+    def _batch_reference_setup_enabled(self) -> bool:
+        """Whether reference setup can use the validated batched CFM solver."""
+        return (
+            not self.float16
+            and self._cfm_tf32
+            and self._ragged_fused_body
+            and self._whole_euler_ragged_active()
+            and self._whole_euler_graph_wrapper.device.type == "cuda"
+            and self._cfm_graph_bucket_frames == 0
+        )
+
     def _ragged_merge_fits(self, states: list[BatchedToken2WavState], token_counts: list[int]) -> bool:
         """Ragged Whole-Euler is on, the rows share a CNN cache shape, and each row's tokens encode at once."""
         return (
@@ -1775,6 +1786,7 @@ class BatchedToken2Wav(nn.Module):
                 spk_dim=int(self.flow.spk_embed_affine_layer.out_features),
                 keep=(prompt_len, _CACHE_TRIM_SUFFIX),
                 tail_frames=(self._pre_lookahead_len() or 0) * int(getattr(self.flow, "token_mel_ratio", 2)),
+                setup_frames=prompt_len if self._batch_reference_setup_enabled() else 0,
             )
 
     def _encode_initial_prompt(
@@ -1802,7 +1814,10 @@ class BatchedToken2Wav(nn.Module):
         self,
         features: PromptFeatures | list[PromptFeatures],
         batch_size: int,
+        *,
+        encoded_prompt: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> list[BatchedToken2WavState]:
+        """Solve prompt states, reusing an M=1 encoding after a batched graph refusal."""
         if isinstance(features, list):
             # Preserve each reference's M=1 encoder and speaker projection.
             # _encode_chunk owns its outputs, including graph replay outputs.
@@ -1813,7 +1828,9 @@ class BatchedToken2Wav(nn.Module):
             projected_speakers = torch.cat([row[3] for row in encoded])
             prompt_mels = torch.cat([feature.mels for feature in features])
         else:
-            hidden, conformer_cnn, conformer_att, projected_speakers = self._encode_initial_prompt(features, batch_size)
+            if encoded_prompt is None:
+                encoded_prompt = self._encode_initial_prompt(features, batch_size)
+            hidden, conformer_cnn, conformer_att, projected_speakers = encoded_prompt
             prompt_mels = features.mels.expand(batch_size, -1, -1)
         with self._autocast(prompt_mels.device):
             # The prompt cache never reaches the trim length; ``att_keep`` only
@@ -1831,7 +1848,10 @@ class BatchedToken2Wav(nn.Module):
             # A full graph budget or failed capture can refuse this batch even
             # while M=1 graphs remain usable. Preserve each reference's solver.
             assert isinstance(features, list)
-            return [self._create_initial_states(feature, 1)[0] for feature in features]
+            return [
+                self._create_initial_states(feature, 1, encoded_prompt=row)[0]
+                for feature, row in zip(features, encoded, strict=True)
+            ]
         _, estimator_cnn, estimator_att = initial
         flow_cache = {
             "conformer_cnn_cache": conformer_cnn,
@@ -1901,15 +1921,7 @@ class BatchedToken2Wav(nn.Module):
         """Initialize unique references in order, batching compatible cold CFM solves."""
         wrapper = self._whole_euler_graph_wrapper
         # Keep other precision policies on their existing M=1 setup path.
-        if (
-            len(features) < 2
-            or self.float16
-            or not self._cfm_tf32
-            or not self._ragged_fused_body
-            or not self._whole_euler_ragged_active()
-            or wrapper.device.type != "cuda"
-            or self._cfm_graph_bucket_frames != 0
-        ):
+        if len(features) < 2 or not self._batch_reference_setup_enabled():
             return [self.setup_batch(feature, 1)[0] for feature in features]
 
         keys = [self._setup_cache_key(feature) for feature in features]

@@ -4,7 +4,7 @@
 import gc
 import subprocess
 import sys
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -578,7 +578,7 @@ def test_setup_references_preserves_single_reference_fallback(monkeypatch, gate)
 
 
 @pytest.mark.parametrize("refusal", ["enabled", "disabled", "full_budget"])
-def test_setup_references_retries_refused_graphs_with_scalar_setup(refusal):
+def test_setup_references_retries_refused_graphs_with_scalar_setup(monkeypatch, refusal):
     adapter = _reference_setup_backend()
     wrapper = adapter._whole_euler_graph_wrapper
     successful_replay = wrapper.replay
@@ -596,6 +596,14 @@ def test_setup_references_retries_refused_graphs_with_scalar_setup(refusal):
     graph_cache._stats = {"hits": 0}
     graph_cache.max_graphs = 1
     replay_batches = []
+    encode = adapter._encode_initial_prompt
+    encoded_rows = []
+
+    def encode_once(feature, batch_size):
+        encoded_rows.append((feature.cache_key, batch_size))
+        return encode(feature, batch_size)
+
+    monkeypatch.setattr(adapter, "_encode_initial_prompt", encode_once)
 
     def replay(**kwargs):
         batch = int(kwargs["x"].shape[0])
@@ -624,6 +632,9 @@ def test_setup_references_retries_refused_graphs_with_scalar_setup(refusal):
     states = adapter.setup_references(features)
 
     assert len(states) == 4
+    # Both the first refusal and later groups with the memoized unsupported
+    # shape reuse their M=1 encoder and speaker-projection outputs.
+    assert encoded_rows == [(feature.cache_key, 1) for feature in features]
     assert adapter.flow.decoder.estimator.cfg_batches == [2] * 8
     assert replay_batches == ([2] if refusal == "disabled" else [2, 1, 1, 2, 1, 1])
     if refusal == "full_budget":
@@ -640,6 +651,20 @@ def test_setup_references_retries_refused_graphs_with_scalar_setup(refusal):
         ):
             torch.testing.assert_close(value, prior, rtol=0, atol=0)
     torch.testing.assert_close(adapter.flow.decoder.rand_noise, original_noise, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("batched_setup", [True, False])
+def test_precapture_requests_setup_shapes_only_for_eligible_solver(monkeypatch, mocker, batched_setup):
+    adapter = _reference_setup_backend()
+    adapter._ragged_fused_body = batched_setup
+    adapter.flow.spk_embed_affine_layer = nn.Linear(1, 1)
+    wrapper = adapter._whole_euler_graph_wrapper
+    wrapper.precapture = mocker.Mock(return_value=0)
+    monkeypatch.setattr(adapter, "_autocast", lambda device: nullcontext())
+    feature = _reference_feature(0)
+
+    assert adapter.precapture_whole_euler(feature) == 0
+    assert wrapper.precapture.call_args.kwargs["setup_frames"] == (feature.mels.shape[1] if batched_setup else 0)
 
 
 def test_setup_references_failed_later_group_does_not_publish_or_touch_cache(monkeypatch):

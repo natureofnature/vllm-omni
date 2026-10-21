@@ -69,11 +69,21 @@ per reference. With FP32/TF32 CUDA fused ragged Whole-Euler and zero CFM frame p
 compatible cold references share an initial CFM solve, bounded by the configured
 microbatch and graph batch limits. Setup-cache hits are reused, and each
 reference retains its own cached state. A refused graph replay retries setup
-per reference, preserving the existing solver selection. FP16, TF32 opt-out,
+per reference using the already-computed encoder and speaker-projection outputs,
+preserving the existing solver selection. FP16, TF32 opt-out,
 unfused bodies (including BF16 attention caches) and other execution
 configurations keep per-reference initialization. Speaker
 conditioning, attention lengths and cache trimming stay
 per request. Cache epochs remain separate unless cross-turn batching is enabled.
+
+Cold setup shares the `cfm_max_graphs` budget with decode graphs. For eligible
+batched setup, non-slot precapture warms the default prompt's offset-zero graphs
+after decode shapes, using remaining budget with M=1 first. Other reference
+widths capture lazily or fall back to per-reference solves. During batched setup,
+the stacked CFG attention output and independent per-reference cache copies
+coexist, increasing transient memory with the group size. The microbatch bound
+limits this peak; independent copies keep one reference from retaining another
+reference's buffers after cache eviction.
 
 The MiniCPM Code2Wav stage runs CAM++ speaker embedding on CUDA and NPU using
 the in-tree torch model with FP32 weights and inputs, loaded from the
