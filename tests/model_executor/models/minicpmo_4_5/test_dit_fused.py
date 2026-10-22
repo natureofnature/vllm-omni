@@ -12,6 +12,7 @@ from vllm_omni.model_executor.models.minicpmo_4_5.dit_fused import (
     blocks_forward_chunk_fused,
     dit_modulation,
     supports_fused_body,
+    tiled_attention_supported,
 )
 
 pytestmark = [pytest.mark.core_model, *hardware_marks(res={"cuda": "L4"}, num_cards=1)]
@@ -100,11 +101,23 @@ def test_ragged_body_reuses_modulation_without_recomputing_adaln(monkeypatch, ca
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 def test_fp16_fused_body_matches_fp16_ragged_body(monkeypatch):
+    from vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention import cfm_attention
+
     estimator = _upstream_dit("cuda").half()
     driver = BatchedToken2Wav.__new__(BatchedToken2Wav)
     nn.Module.__init__(driver)
     driver._ragged_fused_body = True
     calls = []
+    attention_calls = []
+
+    def tiled(*args, **kwargs):
+        attention_calls.append(True)
+        return cfm_attention(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "vllm_omni.model_executor.models.minicpmo_4_5.cfm_attention.cfm_attention",
+        tiled,
+    )
 
     def fused(*args, **kwargs):
         calls.append(True)
@@ -125,6 +138,7 @@ def test_fp16_fused_body_matches_fp16_ragged_body(monkeypatch):
         )
         actual = _run(driver._ragged_body, estimator, rows=4, frames=6, cached=5, lengths=[6, 4])
     assert calls, "FP16 service dispatch must use the fused body"
+    assert bool(attention_calls) == tiled_attention_supported(torch.accelerator.current_device_index())
     for want, got in zip(expected, actual, strict=True):
         torch.testing.assert_close(got, want, rtol=2e-3, atol=2e-3)
 

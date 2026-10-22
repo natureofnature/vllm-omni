@@ -45,9 +45,10 @@ apply to V1 when async chunking/scheduling is enabled. Default V1 behavior must
 therefore be included in end-to-end regression validation.
 
 CFM graph execution defaults to the fused DiT body on CUDA (when TF32 is
-allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses tiled TF32
-attention for FP32; older CUDA devices
-use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
+allowed or FP16 CFM is selected) and on NPU. NVIDIA SM80+ uses the existing
+tiled attention kernel for both FP32 and FP16 Q/K/V, including the non-pooled
+CFM arena. FP32 uses TF32 dots; FP16 uses FP16 dots with FP32 accumulation.
+Older CUDA devices use the fused body's SDPA fallback. NPU uses packed QKV, in-place KV and ACLNN
 AddLayerNorm, independent of TF32. Unsupported DiT layouts and cache types
 retain the original body. CUDA supports matching FP32 or FP16 estimator/cache
 types; NPU supports FP32. Other platforms retain their existing default.
