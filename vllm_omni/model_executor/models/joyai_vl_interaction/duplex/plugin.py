@@ -551,8 +551,10 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             offset = continuation.offset if continuation else 0
             low = offset + 1
             high = min(len(transcript), offset + limit.max_chars) if limit else len(transcript)
-            # Labels are rendered whole even when a retry's tiny raw span
-            # starts inside one; leave room for at least one evidence character.
+            # max_chars caps raw transcript progress. If it ends within a
+            # label, extend to the first evidence character so the fold can
+            # advance. Labels are rendered whole; fits() still enforces the
+            # model token budget, including the reserved summary output.
             first_text = next((max(offset, text_start) for _, text_start, end, _ in spans if end > offset), offset)
             high = max(high, first_text + 1)
 

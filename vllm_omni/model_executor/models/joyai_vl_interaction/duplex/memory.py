@@ -43,7 +43,11 @@ class TextSummaryChunk:
 
 @dataclass(frozen=True)
 class TextSummaryLimit:
-    """A rejected prefix's smaller input budget, retained across its folds."""
+    """A rejected prefix's smaller raw-transcript span, retained across folds.
+
+    Whole speaker labels plus one evidence character form the minimum
+    excerpt; the model token budget remains a hard limit.
+    """
 
     history_length: int
     history_digest: str

@@ -302,6 +302,57 @@ async def test_rejected_second_fold_retries_less_evidence_then_completes(failure
 
 
 @pytest.mark.asyncio
+async def test_tiny_rejected_excerpt_preserves_labels_and_obeys_token_budget():
+    h = await open_joyai(modalities=("text",))
+    try:
+        plugin, state = h.runner.plugin, h.runner.model_state
+        history = (("user", "K"), ("assistant", "A")) + tuple(
+            (role, f"Recent {index} {role}") for index in range(4) for role in ("user", "assistant")
+        )
+
+        async def prepare():
+            return await plugin.prepare_auxiliary_request(
+                history=history, runtime_config=h.session.runtime_config, state=state
+            )
+
+        request = await prepare()
+        for _ in range(2):
+            assert not plugin.apply_auxiliary_result(
+                request=request, output=summary_output("rejected", finish_reason="length"), state=state
+            )
+            request = await prepare()
+            assert request is not None
+        assert state.memory.excerpt_limit.max_chars < len("[1] user: ")
+        assert request.model_source.end_offset == len("[1] user: K")
+        assert not request.model_source.complete
+        assert "[1] user: K" in request.prompt["prompt"]
+
+        original_budget = plugin.max_model_len
+        minimum_budget = (
+            len(plugin.processor.tokenizer(text=[request.prompt["prompt"]])["input_ids"][0])
+            + request.sampling_params.max_tokens
+        )
+        plugin.max_model_len = minimum_budget - 1
+        assert await prepare() is None
+        plugin.max_model_len = minimum_budget
+        retry = await prepare()
+        assert retry is not None and retry.prompt == request.prompt
+        assert plugin.apply_auxiliary_result(request=retry, output=summary_output("first", "K"), state=state)
+        assert state.memory.partial.offset == len("[1] user: K")
+        assert state.memory.covered_messages == 0
+
+        plugin.max_model_len = original_budget
+        final = await prepare()
+        assert final is not None and final.model_source.complete
+        assert "[2] assistant: A" in final.prompt["prompt"]
+        assert plugin.apply_auxiliary_result(request=final, output=summary_output("final", "K: A"), state=state)
+        assert state.memory.covered_messages == 2
+        assert state.memory.partial is None and state.memory.excerpt_limit is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_rejected_whole_prefix_retries_as_smaller_excerpts():
     h = await open_joyai(modalities=("text",))
     try:
