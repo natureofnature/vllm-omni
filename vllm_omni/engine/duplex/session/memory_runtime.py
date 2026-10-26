@@ -27,7 +27,6 @@ from vllm_omni.engine.duplex.contracts import (
 from vllm_omni.engine.duplex.plugin import DuplexAuxiliaryRequest, duplex_text_history
 from vllm_omni.engine.duplex.session import helpers
 from vllm_omni.engine.duplex.session.context import DuplexSessionContext
-from vllm_omni.engine.duplex.session.emitter import SessionEmitter
 
 logger = init_logger(__name__)
 
@@ -40,13 +39,11 @@ class SessionMemoryRuntime:
     def __init__(
         self,
         ctx: DuplexSessionContext,
-        out: SessionEmitter,
         *,
         post: Callable[[str, dict[str, object]], None],
         wake: Callable[[object], None],
     ) -> None:
         self._ctx = ctx
-        self._out = out
         self._post = post
         self._wake = wake
         self._task: asyncio.Task[None] | None = None
@@ -111,10 +108,10 @@ class SessionMemoryRuntime:
                 return True
             self._completion_pending = False
             request = payload["request"]
-            epoch, generation = payload["epoch"], payload["generation"]
+            epoch, config_revision = payload["epoch"], payload["config_revision"]
             assert isinstance(request, DuplexAuxiliaryRequest)
-            assert isinstance(epoch, int) and isinstance(generation, int)
-            if self._context_matches(request, epoch, generation):
+            assert isinstance(epoch, int) and isinstance(config_revision, int)
+            if self._context_matches(request, epoch, config_revision):
                 output = payload["output"]
                 try:
                     applied = output is not None and self._ctx.plugin.apply_auxiliary_result(
@@ -172,8 +169,8 @@ class SessionMemoryRuntime:
         self._clear_interaction_pending()
         self._interaction_active = False
 
-    def _context_matches(self, request: DuplexAuxiliaryRequest, epoch: int, generation: int) -> bool:
-        if self._closing or self._ctx.session.epoch != epoch or self._ctx.session.config_generation != generation:
+    def _context_matches(self, request: DuplexAuxiliaryRequest, epoch: int, config_revision: int) -> bool:
+        if self._closing or self._ctx.session.epoch != epoch or self._ctx.session.config_revision != config_revision:
             return False
         return self._ctx.plugin.auxiliary_source_matches(
             request=request, state=self._ctx.model_state, history=self._current_history()
@@ -225,23 +222,23 @@ class SessionMemoryRuntime:
                 self._task.cancel()
 
     def _schedule_retry(self, request: DuplexAuxiliaryRequest) -> None:
-        """Retry a submitted failure finitely; unchanged traffic cannot reset it."""
+        """Back off submitted failures without letting traffic reset the budget."""
         source = self._source
-        if not request.retry_delays_s or source is None:
+        if source is None or (not request.retry_delays_s and request.retry_cooldown_s is None):
             return
         if self._retry_source != source:
             self.cancel_retry()
             self._retry_source = source
-        self._failures += 1
+        self._failures = min(self._failures + 1, len(request.retry_delays_s) + 1)
         if self._failures > len(request.retry_delays_s):
-            self._out.emit_error(
-                "auxiliary_work_paused",
-                "Background processing paused after repeated failures; new user input can retry it.",
-                retryable=True,
-            )
-            return
+            logger.warning("Duplex background memory exhausted its short retry budget")
+            delay = request.retry_cooldown_s
+            if delay is None:
+                return
+        else:
+            delay = request.retry_delays_s[self._failures - 1]
         self._retry_timer = asyncio.get_running_loop().call_later(
-            request.retry_delays_s[self._failures - 1],
+            delay,
             self._post,
             "auxiliary_retry",
             {"source": source, "operation": self._generation},
@@ -251,6 +248,8 @@ class SessionMemoryRuntime:
         if not self._ctx.plugin.supports_auxiliary_requests or self._closing:
             return
         history = self._current_history()
+        # Policy also advances model-owned camera chunks while summaries run;
+        # unchanged text history alone cannot establish that it is a no-op.
         policy = self._ctx.plugin.auxiliary_policy(
             state=self._ctx.model_state, history_revision=self._ctx.session.history_revision, history=history
         )
@@ -287,7 +286,7 @@ class SessionMemoryRuntime:
             self._source = None
             self.cancel_retry()
             return
-        source = (self._ctx.session.epoch, self._ctx.session.config_generation, policy.source_key)
+        source = (self._ctx.session.epoch, self._ctx.session.config_revision, policy.source_key)
         if self._retry_source is not None and self._retry_source != source:
             self.cancel_retry()
         if self._interaction_pending or self._interaction_active:
@@ -309,7 +308,8 @@ class SessionMemoryRuntime:
 
     async def _run(self, history: tuple[tuple[str, str], ...]) -> None:
         session = self._ctx.session
-        epoch, generation = session.epoch, session.config_generation
+        epoch, config_revision = session.epoch, session.config_revision
+        generation = session.config_generation
         operation = self._generation
         request_id = None
         request = None
@@ -324,13 +324,17 @@ class SessionMemoryRuntime:
                 ),
                 timeout=30.0,
             )
-            if request is None or not self._context_matches(request, epoch, generation):
+            if request is None or not self._context_matches(request, epoch, config_revision):
                 return
             if (
                 not 0 <= request.stage_id < self._ctx.stage_port.stage_count
                 or not math.isfinite(request.timeout_s)
                 or request.timeout_s <= 0
                 or any(not math.isfinite(delay) or delay < 0 for delay in request.retry_delays_s)
+                or (
+                    request.retry_cooldown_s is not None
+                    and (not math.isfinite(request.retry_cooldown_s) or request.retry_cooldown_s <= 0)
+                )
             ):
                 raise ValueError("Invalid auxiliary stage or deadline")
             request_id = duplex_resource_request_id(session.fence, f"auxiliary-{uuid.uuid4().hex}")
@@ -363,7 +367,7 @@ class SessionMemoryRuntime:
                 )
                 if result.request_id != request_id or result.stage_id != request.stage_id:
                     raise RuntimeError("Auxiliary stage submission returned a mismatched identity")
-                if not self._context_matches(request, epoch, generation):
+                if not self._context_matches(request, epoch, config_revision):
                     return None
                 return await output_future
 
@@ -422,7 +426,7 @@ class SessionMemoryRuntime:
                     "request": request,
                     "output": output,
                     "epoch": epoch,
-                    "generation": generation,
+                    "config_revision": config_revision,
                     "operation": operation,
                 },
             )

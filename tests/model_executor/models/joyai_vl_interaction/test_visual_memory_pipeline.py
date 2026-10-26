@@ -3,6 +3,7 @@
 """Visual payload and lifecycle regressions; mocked text is not a quality eval."""
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -125,6 +126,51 @@ async def test_silent_frames_submit_timestamped_images_to_selected_private_stage
         assert len(h.port.submissions) == 5, "Private summaries must not create TTS-stage requests"
         assert ([context.request_id], True) in h.port.cleanups
         assert context.request_id not in h.session.resource_request_ids()
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_camera_only_recovers_after_visual_retry_budget_is_exhausted(mocker):
+    h = await open_joyai(modalities=("text",))
+    try:
+        memory = h.runner.model_state.visual_memory
+        memory.chunk_frames = 2
+        memory.max_pending = 3
+        prepare = h.runner.plugin.prepare_auxiliary_request
+
+        async def short_delays(**kwargs):
+            request = await prepare(**kwargs)
+            if request is None:
+                return None
+            assert request.retry_cooldown_s == 60.0
+            return replace(request, retry_delays_s=(0,))
+
+        mocker.patch.object(h.runner.plugin, "prepare_auxiliary_request", side_effect=short_delays)
+        await camera(h, "red")
+        await camera(h, "blue")
+        for attempt in (1, 2):
+            auxiliary = await wait_auxiliary(h, attempt)
+            events = await finish_summary(h, auxiliary, "")
+            assert not any(event.to_realtime()["type"] == "error" for event in events)
+        timer = h.runner.memory._retry_timer
+        assert timer is not None
+        await camera(h, "green")
+        assert len(memory.pending) == 3
+        assert h.runner.memory._retry_timer is timer
+        # No text/audio input or source change is needed to recover.
+        timer.cancel()
+        h.runner._post_memory_event(
+            "auxiliary_retry",
+            {"source": h.runner.memory._source, "operation": h.runner.memory._generation},
+        )
+        retry = await wait_auxiliary(h, 3)
+        await finish_summary(h, retry, "A red object was followed by a blue object.")
+        assert len(memory.pending) == 1
+        assert len(memory.mid_term) == 1
+        assert h.runner.memory._failures == 0
+        await camera(h, "yellow")
+        assert len(submissions(h, auxiliary=False)) == 4
     finally:
         await h.manager.shutdown()
 

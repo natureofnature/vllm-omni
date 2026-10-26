@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -33,7 +34,7 @@ async def wait_until(predicate):
     await asyncio.wait_for(wait(), timeout=2)
 
 
-def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=(), timeout_s=30.0):
+def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=(), retry_cooldown_s=None, timeout_s=30.0):
     """Supply a small model policy while exercising the actual Session runner."""
     work = SimpleNamespace(ready=True, revision=0, applied=[], histories=[])
     plugin = h.runner.plugin
@@ -54,6 +55,7 @@ def install_work(h, mocker, *, allow_during_response=True, retry_delays_s=(), ti
             history_digest=duplex_history_digest(()),
             model_source=work.revision,
             retry_delays_s=retry_delays_s,
+            retry_cooldown_s=retry_cooldown_s,
             timeout_s=timeout_s,
         )
 
@@ -381,8 +383,69 @@ async def test_retries_are_bounded_by_source_despite_new_history(mocker):
         events = await h.run(Heartbeat())
         assert len(auxiliary_submissions(h)) == 3
         assert h.runner.memory._retry_timer is None
-        assert any(getattr(event, "code", None) == "auxiliary_work_paused" for event in events)
+        assert not any(event.to_realtime()["type"] == "error" for event in events)
         assert not any(duplex_is_auxiliary_request(request_id) for request_id in h.session.resource_request_ids())
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change_settings", [False, True])
+async def test_only_session_settings_invalidate_inflight_memory(mocker, change_settings):
+    h = await open_harness()
+    try:
+        work = install_work(h, mocker)
+        h.submit(Heartbeat())
+        await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
+        submission = auxiliary_submissions(h)[0]
+        generation = h.session.config_generation
+        revision = h.session.config_revision
+        if change_settings:
+            h.session.replace_config(replace(h.session.config, instructions="New instructions"))
+        # Chunk/tool bookkeeping publishes runtime state on ordinary turns.
+        h.session.replace_runtime_config({**h.session.runtime_config, "internal_chunk": "next"})
+        assert h.session.config_generation > generation
+        assert h.session.config_revision == revision + int(change_settings)
+        assert submission.context.config_generation == generation
+        finish_work(h)
+        await h.run(Heartbeat())
+        assert work.applied == ([] if change_settings else [0])
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_delays", [(), (0,)])
+async def test_cooldown_recovers_same_source_and_resets_after_success(mocker, retry_delays):
+    h = await open_harness()
+    try:
+        work = install_work(h, mocker, retry_delays_s=retry_delays, retry_cooldown_s=0.02)
+        h.submit(Heartbeat())
+        for attempt in range(1, len(retry_delays) + 4):
+            await wait_until(lambda: len(auxiliary_submissions(h)) == attempt)
+            finish_work(h, accepted=False)
+        await wait_until(lambda: len(auxiliary_submissions(h)) == len(retry_delays) + 4)
+        assert h.runner.memory._failures == len(retry_delays) + 1
+        events = await h.run(Heartbeat())
+        assert not any(event.to_realtime()["type"] == "error" for event in events)
+        finish_work(h)
+        await wait_until(lambda: work.applied == [0])
+        assert h.runner.memory._failures == 0
+        assert h.runner.memory._retry_timer is None
+    finally:
+        await close_harness(h)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cooldown", [0, -1, float("nan"), float("inf")])
+async def test_invalid_cooldown_never_submits_private_work(mocker, cooldown):
+    h = await open_harness()
+    try:
+        install_work(h, mocker, retry_cooldown_s=cooldown)
+        events = await h.run(Heartbeat())
+        assert not auxiliary_submissions(h)
+        assert not any(event.to_realtime()["type"] == "error" for event in events)
+        assert h.runner.memory._retry_timer is None
     finally:
         await close_harness(h)
 
@@ -431,8 +494,9 @@ async def test_history_edit_reconciles_while_auxiliary_is_running(mocker):
         h.submit(Heartbeat())
         await wait_until(lambda: len(auxiliary_submissions(h)) == 1)
         snapshot = work.histories[-1]
+        calls = len(work.histories)
         h.submit(Heartbeat())
-        await wait_until(lambda: len(work.histories) >= 2)
+        await wait_until(lambda: len(work.histories) > calls)
         assert work.histories[-1] is snapshot
         h.session.register_history_item(
             "image", {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "edited"}}]}

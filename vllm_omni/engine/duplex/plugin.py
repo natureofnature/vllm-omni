@@ -415,6 +415,8 @@ class DuplexAuxiliaryRequest:
     timeout_s: float = 30.0
     model_source: object | None = None
     retry_delays_s: tuple[float, ...] = ()
+    # Continue at this interval after the short retry budget is exhausted.
+    retry_cooldown_s: float | None = None
 
 
 class DuplexModelPlugin(ABC):

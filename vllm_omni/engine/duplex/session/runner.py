@@ -263,7 +263,7 @@ class DuplexSessionRunner:
             tool_calls=self.tool_calls,
         )
         self.out = SessionEmitter(self.ctx, promote_deferred_overlap=self._promote_deferred_overlap_later)
-        self.memory = SessionMemoryRuntime(self.ctx, self.out, post=self._post_memory_event, wake=self._wake_memory)
+        self.memory = SessionMemoryRuntime(self.ctx, post=self._post_memory_event, wake=self._wake_memory)
         calibration = plugin.history_calibrator(manager.runtime_config)
         if calibration is not None:
             self.ctx.history_calibration = HistoryCalibration(

@@ -486,6 +486,23 @@ def test_truncate_history_item_uses_response_alignment_marks():
     assert session.history == ()
 
 
+def test_settings_revision_preserves_runtime_generation_and_rolls_back():
+    session = _session()
+    previous = session.config
+    revision = session.config_revision
+    generation = session.config_generation
+    session.replace_runtime_config({"internal_chunk": "next"})
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+    session.replace_config(DuplexSessionConfig(instructions="New instructions"))
+    assert session.config_revision == revision + 1
+    assert session.config_generation == generation + 2
+    session.restore_config(previous)
+    assert session.config is previous
+    assert session.config_revision == revision
+    assert session.config_generation == generation + 1
+
+
 def test_history_revision_tracks_append_and_same_length_edit():
     session = _session()
     revision = session.history_revision

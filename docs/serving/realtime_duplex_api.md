@@ -324,7 +324,9 @@ The session limit bounds this retained frame storage across sessions (for exampl
 Encoded storage reaching half its budget schedules an earlier frame summary.
 Reaching a retention limit returns a recoverable capacity
 error; the client can retry after summarization progresses. Visual failures retry
-after 1, 5, and 30 seconds, then pause with a warning while retaining their source.
+after 1, 5, and 30 seconds, then once every 60 seconds while retaining their source.
+Failures are logged on the server; successful retries let camera-only sessions
+resume memory processing. Public responses continue independently.
 Observation-only camera commits can queue alongside summarization. An admissible
 user turn preempts it after prompt preparation, so interactive work takes priority
 even with one stage slot. A rejected observation leaves the in-flight summary

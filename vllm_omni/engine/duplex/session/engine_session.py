@@ -203,6 +203,8 @@ class DuplexEngineSession:
     _runtime_config: dict[str, object] = field(default_factory=dict, repr=False)
     #: Bumped on every published session / runtime config change.
     config_generation: int = 0
+    #: User session settings, separate from model-owned chunk/tool state.
+    config_revision: int = 0
     #: Stage request ids reserved or submitted for this session, keyed by ``(stage_id, request_id)``.
     request_resources: dict[tuple[int, str], DuplexRequestResource] = field(default_factory=dict, repr=False)
     #: Highest fence accepted for a stage request (monotonic; reset of the append
@@ -644,6 +646,7 @@ class DuplexEngineSession:
         previous_seed = self.config.initial_user_text
         self.config = config
         self.config_generation += 1
+        self.config_revision += 1
         if config.initial_user_text and config.initial_user_text != previous_seed:
             self.notify_new_user_item()
 
@@ -665,6 +668,8 @@ class DuplexEngineSession:
         self.config = previous
         if self.config_generation > 0:
             self.config_generation -= 1
+        if self.config_revision > 0:
+            self.config_revision -= 1
 
     def transition_turn(self, state: DuplexTurnState) -> None:
         self.turn_state = state
@@ -1730,39 +1735,8 @@ class DuplexEngineSession:
 
         stored_message = self._conversation.item_ids.get(item_id)
         if stored_message is None:
-            pending = self._conversation.pending_item_ids.get(item_id)
-            if pending is None:
-                self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
-                return False
-            message = dict(pending)
-            changed = self._truncate_message_to_audio_ms(
-                message,
-                audio_end_ms=audio_end_ms,
-                marks=self._conversation.pending_item_audio_text_marks.get(item_id),
-                playback=playback,
-            )
-            if not changed or self._message_text_len(message) <= 0:
-                if changed:
-                    self._conversation.pending_item_ids.pop(item_id, None)
-                    self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-                    self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
-                    self._conversation.pending_truncations_ms.pop(item_id, None)
-                    if item_id.startswith("item_"):
-                        self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
-                return changed
-            self.append_history_message(message)
-            self._conversation.item_ids[item_id] = message
-            if item_id in self._conversation.pending_item_audio_text_marks:
-                self._conversation.item_audio_text_marks[item_id] = list(
-                    self._conversation.pending_item_audio_text_marks[item_id]
-                )
-            self._conversation.pending_item_ids.pop(item_id, None)
-            self._conversation.pending_item_audio_text_marks.pop(item_id, None)
-            self._conversation.pending_item_input_commit_seqs.pop(item_id, None)
-            self._conversation.pending_truncations_ms.pop(item_id, None)
-            if item_id.startswith("item_"):
-                self._conversation.assistant_response_snapshots.pop(item_id.removeprefix("item_"), None)
-            return True
+            self._conversation.pending_truncations_ms[item_id] = max(0, int(audio_end_ms))
+            return False
         if not hard and max(playback.sent_ms, playback.generated_ms) == 0:
             # No response snapshot or output cursor remains: this is finalized
             # history. Delayed progress ACKs cannot shorten it; only a new

@@ -20,6 +20,7 @@ from vllm_omni.engine.duplex.commands import (
     CreateItem,
     DeleteItem,
     Heartbeat,
+    UpdateSession,
 )
 from vllm_omni.engine.duplex.contracts import DuplexFence
 from vllm_omni.engine.duplex.messages import CloseDuplexSessionMessage
@@ -188,7 +189,7 @@ async def test_oversized_first_exchange_summarizes_in_full_before_advancing_cove
 
         await asyncio.wait_for(next_exchange(), timeout=2)
         request = requests[-1]
-        assert request.model_source is None
+        assert request.model_source.complete and request.model_source.previous is None
         assert request.history_length == covered + 4
         assert "Partial cabinet fact." in request.prompt["prompt"]
         assert "Recent 0 user" in request.prompt["prompt"]
@@ -230,13 +231,227 @@ async def test_partial_summary_retries_failed_excerpt_and_rejects_changed_source
         )
         assert state.memory.partial == progress
         retry = await prepare()
-        assert retry.prompt == second.prompt and retry.model_source == second.model_source
+        assert retry.prompt != second.prompt
+        assert retry.model_source.previous == progress
+        assert progress.offset < retry.model_source.end_offset < second.model_source.end_offset
+        assert state.memory.excerpt_limit is not None
         history = (("user", "Edited question"), *history[1:]) if mutation == "edit" else history[1:]
         conversation = tuple({"role": role, "content": text} for role, text in history)
         assert not plugin.auxiliary_source_matches(request=retry, state=state, history=conversation)
         plugin.prepare_prompt_config({"conversation": list(conversation)}, state=state, payload={})
         assert state.memory.partial is None
+        assert state.memory.excerpt_limit is None
         assert state.memory.covered_messages == 0 and state.memory.text == ""
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["length", "empty"])
+async def test_rejected_second_fold_retries_less_evidence_then_completes(failure):
+    h = await open_joyai(modalities=("text",))
+    try:
+        history = admitted_large_exchange(h)
+        plugin, state = h.runner.plugin, h.runner.model_state
+
+        async def prepare():
+            return await plugin.prepare_auxiliary_request(
+                history=history, runtime_config=h.session.runtime_config, state=state
+            )
+
+        first = await prepare()
+        assert plugin.apply_auxiliary_result(request=first, output=summary_output("first"), state=state)
+        progress = state.memory.partial
+        assert progress is not None
+        second = await prepare()
+        assert not plugin.apply_auxiliary_result(
+            request=second,
+            output=summary_output(
+                "second",
+                text="" if failure == "empty" else "partial",
+                finish_reason="length" if failure == "length" else "stop",
+            ),
+            state=state,
+        )
+        limit = state.memory.excerpt_limit
+        assert limit is not None and state.memory.partial == progress
+        history = (*history, ("user", "A newer observation must not reset the rejected prefix's budget."))
+        retry = await prepare()
+        assert retry.model_source.previous == progress
+        assert progress.offset < retry.model_source.end_offset < second.model_source.end_offset
+        assert retry.prompt != second.prompt
+        for part in range(20):
+            source = retry.model_source
+            assert plugin.apply_auxiliary_result(
+                request=retry, output=summary_output(f"fold-{part}", "Retained cabinet code K731."), state=state
+            )
+            if source.complete:
+                break
+            assert state.memory.covered_messages == 0 and state.memory.text == ""
+            assert state.memory.partial.offset == source.end_offset
+            assert state.memory.excerpt_limit == limit
+            retry = await prepare()
+            assert retry.model_source.end_offset - retry.model_source.previous.offset <= limit.max_chars
+        else:
+            pytest.fail("smaller excerpts did not finish the rejected exchange")
+        assert state.memory.covered_messages == 2
+        assert state.memory.text == "Retained cabinet code K731."
+        assert state.memory.partial is None and state.memory.excerpt_limit is None
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_rejected_whole_prefix_retries_as_smaller_excerpts():
+    h = await open_joyai(modalities=("text",))
+    try:
+        committed_turns(h.session)
+        history = duplex_text_history(h.session.history)
+        plugin, state = h.runner.plugin, h.runner.model_state
+        request = await plugin.prepare_auxiliary_request(
+            history=history, runtime_config=h.session.runtime_config, state=state
+        )
+        assert request.model_source.complete and request.model_source.previous is None
+        assert not plugin.apply_auxiliary_result(
+            request=request, output=summary_output("full", finish_reason="length"), state=state
+        )
+        retry = await plugin.prepare_auxiliary_request(
+            history=history, runtime_config=h.session.runtime_config, state=state
+        )
+        assert retry.history_digest == request.history_digest
+        assert retry.history_length == request.history_length
+        assert retry.prompt != request.prompt and not retry.model_source.complete
+        assert retry.model_source.end_offset <= request.model_source.end_offset // 2
+        assert state.memory.partial is None and state.memory.covered_messages == 0
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["length", "empty"])
+async def test_runner_retries_rejected_fold_after_committed_history_progress(mocker, failure):
+    h = await open_joyai(modalities=("text",))
+    try:
+        history = admitted_large_exchange(h)
+        for role, text in history:
+            h.session.append_history_message({"role": role, "content": text})
+        plugin, memory = h.runner.plugin, h.runner.model_state.memory
+        requests = []
+        original = plugin.prepare_auxiliary_request
+
+        async def capture(**kwargs):
+            request = await original(**kwargs)
+            if request is not None:
+                requests.append(request)
+            return request
+
+        async def submission_at(index):
+            async def wait_for_submission():
+                while len(h.port.submissions) <= index:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(wait_for_submission(), timeout=2)
+            return h.port.submissions[index]
+
+        mocker.patch.object(plugin, "prepare_auxiliary_request", side_effect=capture)
+        first = await start_summary(h)
+        h.deliver(summary_output(first.context.request_id), stage_id=0, segment_finished=True)
+        second = await submission_at(1)
+        progress = memory.partial
+        assert progress is not None and memory.covered_messages == 0
+        rejected = requests[1]
+        assert rejected.model_source.previous == progress
+        h.deliver(
+            summary_output(
+                second.context.request_id,
+                text="" if failure == "empty" else "partial",
+                finish_reason="length" if failure == "length" else "stop",
+            ),
+            stage_id=0,
+            segment_finished=True,
+        )
+        await h.run(Heartbeat())
+        assert len(h.port.submissions) == 2
+        assert memory.partial == progress and memory.covered_messages == 0
+        assert memory.excerpt_limit is not None
+
+        h.submit(
+            CreateItem(
+                item={
+                    "id": "new-committed-context",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "The newer observation is recorded."}],
+                }
+            )
+        )
+        retry = await submission_at(2)
+        adapted = requests[2]
+        assert adapted.history_digest == rejected.history_digest
+        assert adapted.history_length == rejected.history_length == 2
+        assert adapted.model_source.previous == progress
+        assert progress.offset < adapted.model_source.end_offset < rejected.model_source.end_offset
+        assert len(retry.prompt["prompt"]) < len(second.prompt["prompt"])
+        assert memory.partial == progress and memory.covered_messages == 0
+        assert "auxiliary-" in retry.context.request_id
+        assert retry.context.request_id not in plugin.data_plane.requests
+        assert h.session.active_response_id is None
+
+        for index in range(2, 22):
+            request = requests[index]
+            h.deliver(
+                summary_output(retry.context.request_id, text="Retained cabinet code K731."),
+                stage_id=0,
+                segment_finished=True,
+            )
+            if request.model_source.complete:
+                await h.settle()
+                break
+            retry = await submission_at(index + 1)
+            assert memory.covered_messages == 0
+            assert memory.partial.offset == request.model_source.end_offset
+        else:
+            pytest.fail("runner did not finish the adapted summary prefix")
+        assert memory.covered_messages == 2
+        assert memory.covered_digest == duplex_history_digest(duplex_text_history(h.session.history)[:2])
+        assert memory.text == "Retained cabinet code K731."
+        assert memory.partial is None and memory.excerpt_limit is None
+        assert not any(event.to_realtime()["type"].startswith("response.") for event in h.events)
+    finally:
+        await h.manager.shutdown()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("question", ["cabinet-code " * 800, "K731" * 2200])
+async def test_summary_excerpt_boundaries_and_continued_speaker_labels(question):
+    h = await open_joyai(modalities=("text",))
+    try:
+        plugin, state = h.runner.plugin, h.runner.model_state
+        plugin.max_model_len = 4096
+        history = (("user", question), ("assistant", "Recorded.")) + tuple(
+            (role, f"Recent {index} {role}") for index in range(4) for role in ("user", "assistant")
+        )
+        first = await plugin.prepare_auxiliary_request(
+            history=history, runtime_config=h.session.runtime_config, state=state
+        )
+        source = first.model_source
+        assert source is not None and not source.complete
+        assert "[1] user: " in first.prompt["prompt"]
+        transcript = f"[1] user: {question}\n[2] assistant: Recorded."
+        if " " in question:
+            assert transcript[source.end_offset].isspace()
+        else:
+            assert transcript[source.end_offset] in "K731"
+        assert plugin.apply_auxiliary_result(request=first, output=summary_output("first"), state=state)
+        second = await plugin.prepare_auxiliary_request(
+            history=history, runtime_config=h.session.runtime_config, state=state
+        )
+        assert second.model_source.previous.offset == source.end_offset
+        assert "[1] user: (continued) " in second.prompt["prompt"]
+        assert (
+            len(plugin.processor.tokenizer(text=[second.prompt["prompt"]])["input_ids"][0]) + 512
+            <= plugin.max_model_len
+        )
     finally:
         await h.manager.shutdown()
 
@@ -284,7 +499,9 @@ async def test_summary_rejects_changed_source_or_context(mutation):
         elif mutation == "delete":
             h.session.delete_history_item("user-0")
         elif mutation == "instructions":
-            h.session.replace_runtime_config({**h.session.runtime_config, "instructions": "New instructions"})
+            revision = h.session.config_revision
+            await h.run(UpdateSession(patch={"instructions": "New instructions"}))
+            assert h.session.config_revision == revision + 1
         else:
             h.session.epoch += 1
         h.deliver(summary_output(submission.context.request_id), stage_id=0, segment_finished=True)

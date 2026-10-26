@@ -468,20 +468,24 @@ errors before response policy, speech routing, playback history or response
 metrics. The plugin receives immutable
 committed history and owns prompt/result formatting and source validation. Sources
 can cover text, images or model-owned derived state. The helper checks the epoch,
-configuration generation, operation identity and plugin source validity before
+session configuration revision, operation identity and plugin source validity before
 mailbox writeback. Appending newer history can preserve a stable prefix; editing
 or deleting its evidence invalidates it. Cancellation and close abort owned
 requests. A failed cleanup retains its resource for teardown retry and prevents
 new auxiliary work from accumulating behind it. Each auxiliary cleanup attempt
 uses the shorter of five seconds and the model request timeout, keeping long
 generation deadlines separate from this cancellation-safe cleanup wait.
+The configuration revision tracks adopted Session settings; model-owned chunk
+and tool progress retain their existing stage generation and preserve pending
+memory work while its source remains valid.
 The plugin supplies a stable work key and whether work can enter the existing
 stage queue during an ordinary observation. Explicit user interaction takes
 priority through cancellation after its append plan passes validation, and
 suppresses restart until its turn completes. Rejected input leaves an in-flight
 summary running so it can release memory capacity for the next input.
-Requests may specify bounded retry delays; failures remain keyed to the same
-source as newer observations arrive. Successful application allows the next
+Requests may specify short retry delays and a cooldown for subsequent attempts;
+failures remain keyed to the same source as newer observations arrive. Background
+failures are logged on the server. Successful application allows the next
 bounded chunk to catch up without waiting for new input.
 The session's committed-history revision lets unchanged input events skip history
 snapshotting and hashing. Prefix fingerprints still validate summary writeback.
@@ -491,7 +495,6 @@ the existing mailbox. Model plugins retain the existing policy hooks and own
 content policy, memory tiers, prompts and budgets. Recoverable input-capacity
 rejection releases the unsubmitted request and its reservations while keeping
 the Session open.
-
 
 ### Semantic turn decisions
 

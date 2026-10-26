@@ -41,12 +41,28 @@ class TextSummaryChunk:
     complete: bool
 
 
+@dataclass(frozen=True)
+class TextSummaryLimit:
+    """A rejected prefix's smaller input budget, retained across its folds."""
+
+    history_length: int
+    history_digest: str
+    max_chars: int
+
+    def matches(self, history: tuple[tuple[str, str], ...]) -> bool:
+        return (
+            len(history) >= self.history_length
+            and duplex_history_digest(history[: self.history_length]) == self.history_digest
+        )
+
+
 @dataclass
 class JoyAISummaryMemory:
     text: str = ""
     covered_messages: int = 0
     covered_digest: str = ""
     partial: TextSummaryProgress | None = None
+    excerpt_limit: TextSummaryLimit | None = None
 
     def matches(self, history: tuple[tuple[str, str], ...]) -> bool:
         return not self.covered_messages or (
@@ -61,8 +77,11 @@ class JoyAISummaryMemory:
             self.covered_messages = 0
             self.covered_digest = ""
             self.partial = None
+            self.excerpt_limit = None
         if self.partial is not None and not self.partial.matches(history):
             self.partial = None
+        if self.excerpt_limit is not None and not self.excerpt_limit.matches(history):
+            self.excerpt_limit = None
 
 
 @dataclass(frozen=True)

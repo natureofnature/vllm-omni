@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 import pybase64
+from PIL import Image
 from vllm.config import ModelConfig
 from vllm.multimodal.image import open_image
 from vllm.sampling_params import RequestOutputKind, SamplingParams
@@ -68,6 +69,7 @@ from vllm_omni.model_executor.models.joyai_vl_interaction.duplex.memory import (
     SUMMARY_MAX_TOKENS,
     EncodedVisualImage,
     TextSummaryChunk,
+    TextSummaryLimit,
     TextSummaryProgress,
     VisualClosureReason,
     VisualFrame,
@@ -443,6 +445,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
         covered = state.memory.covered_messages if current else 0
         previous_summary = state.memory.text if current else ""
         partial = state.memory.partial
+        excerpt_limit = state.memory.excerpt_limit
         # Camera-only commits keep their ledger positions for fingerprints but
         # must not displace text from the verbatim recent-history window.
         cutoff = len(history)
@@ -472,14 +475,28 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
             and covered < partial.history_length <= cutoff
             else None
         )
+        limit = (
+            excerpt_limit
+            if current
+            and excerpt_limit is not None
+            and excerpt_limit.matches(history)
+            and covered < excerpt_limit.history_length <= cutoff
+            else None
+        )
 
         def prepare() -> DuplexAuxiliaryRequest | None:
-            def transcript_until(target: int) -> str:
-                return "\n".join(
-                    f"[{index + 1}] {role}: {text}"
-                    for index, (role, text) in enumerate(history[covered:target], start=covered)
-                    if role in {"user", "assistant"} and text
-                )
+            def transcript_until(target: int) -> tuple[str, list[tuple[int, int, int, str]]]:
+                lines, spans = [], []
+                offset = 0
+                for index, (role, text) in enumerate(history[covered:target], start=covered):
+                    if role not in {"user", "assistant"} or not text:
+                        continue
+                    label = f"[{index + 1}] {role}: "
+                    line = label + text
+                    spans.append((offset, offset + len(label), offset + len(line), label))
+                    lines.append(line)
+                    offset += len(line) + 1
+                return "\n".join(lines), spans
 
             def render(transcript: str, target: int) -> str:
                 content = LONG_TERM_COMPRESS_PROMPT.format(
@@ -500,7 +517,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     <= self.max_model_len
                 )
 
-            def request(prompt: str, target: int, source: TextSummaryChunk | None = None) -> DuplexAuxiliaryRequest:
+            def request(prompt: str, target: int, source: TextSummaryChunk) -> DuplexAuxiliaryRequest:
                 return DuplexAuxiliaryRequest(
                     stage_id=self.joyai_stage_id,
                     prompt={"prompt": prompt},
@@ -515,36 +532,72 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     model_source=source,
                 )
 
-            target = continuation.history_length if continuation else end
-            if continuation is None:
+            target = continuation.history_length if continuation else limit.history_length if limit else end
+            if continuation is None and limit is None:
                 while True:
-                    transcript = transcript_until(target)
+                    transcript, spans = transcript_until(target)
                     prompt = render(transcript, target)
                     if fits(prompt):
-                        return request(prompt, target)
+                        return request(prompt, target, TextSummaryChunk(partial, len(transcript), True))
                     smaller = self._summary_boundary(history, covered, target - 1)
                     if smaller <= covered:
                         break
                     target = smaller
             else:
-                transcript = transcript_until(target)
+                transcript, spans = transcript_until(target)
             # An admitted exchange can exceed the compression budget. Fold
             # bounded excerpts into private progress; publish coverage only
             # after the entire Q&A has been consumed.
             offset = continuation.offset if continuation else 0
-            low, high = offset + 1, len(transcript)
+            low = offset + 1
+            high = min(len(transcript), offset + limit.max_chars) if limit else len(transcript)
+            # Labels are rendered whole even when a retry's tiny raw span
+            # starts inside one; leave room for at least one evidence character.
+            first_text = next((max(offset, text_start) for _, text_start, end, _ in spans if end > offset), offset)
+            high = max(high, first_text + 1)
+
+            def excerpt_prompt(stop: int) -> str | None:
+                fragments = []
+                for start, text_start, end, label in spans:
+                    if stop <= start or offset >= end:
+                        continue
+                    first, last = max(offset, text_start), min(stop, end)
+                    if first < last:
+                        continued = "(continued) " if offset > text_start else ""
+                        fragments.append(label + continued + transcript[first:last])
+                if not fragments:
+                    return None
+                excerpt = f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n" + "\n".join(
+                    fragments
+                )
+                return render(excerpt, target)
+
             candidate = None
             while low <= high:
                 stop = (low + high) // 2
-                excerpt = (
-                    f"[Conversation excerpt {offset}:{stop} of {len(transcript)} characters]\n{transcript[offset:stop]}"
-                )
-                prompt = render(excerpt, target)
-                if fits(prompt):
+                prompt = excerpt_prompt(stop)
+                if prompt is None:
+                    low = stop + 1
+                elif fits(prompt):
                     candidate = request(prompt, target, TextSummaryChunk(partial, stop, stop == len(transcript)))
                     low = stop + 1
                 else:
                     high = stop - 1
+            if candidate is None:
+                return None
+            candidate_source = candidate.model_source
+            assert isinstance(candidate_source, TextSummaryChunk)
+            if not candidate_source.complete:
+                stop = candidate_source.end_offset
+                window = transcript[offset:stop]
+                boundary = window.rfind("\n")
+                if boundary <= 0:
+                    boundary = max(window.rfind(" "), window.rfind("\t"))
+                if boundary > 0:
+                    stop = offset + boundary
+                    prompt = excerpt_prompt(stop)
+                    if prompt is not None and fits(prompt):
+                        candidate = request(prompt, target, TextSummaryChunk(partial, stop, False))
             return candidate
 
         return await asyncio.to_thread(prepare)
@@ -646,6 +699,7 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                     ),
                     timeout_s=300.0,
                     retry_delays_s=(1.0, 5.0, 30.0),
+                    retry_cooldown_s=60.0,
                 )
             entries = entries[:-1]
             closure_reason = "context"
@@ -656,13 +710,32 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
     ) -> bool:
         if not isinstance(state, JoyAISessionState):
             raise TypeError("JoyAI requires JoyAISessionState")
+        source = request.model_source
+        if isinstance(source, TextSummaryChunk) and state.memory.partial != source.previous:
+            return False
+
+        def reject() -> bool:
+            if isinstance(source, TextSummaryChunk):
+                previous = source.previous
+                start = (
+                    previous.offset
+                    if previous is not None
+                    and (previous.history_length, previous.history_digest)
+                    == (request.history_length, request.history_digest)
+                    else 0
+                )
+                state.memory.excerpt_limit = TextSummaryLimit(
+                    request.history_length, request.history_digest, max(1, (source.end_offset - start) // 2)
+                )
+            return False
+
         completion = next(iter(getattr(output, "outputs", ()) or ()), None)
         text = (getattr(completion, "text", "") or "").strip()
         # A truncated or action-only completion is not a usable memory replacement.
         if not text or getattr(completion, "finish_reason", None) == "length":
-            return False
+            return reject()
         if any(marker in text for marker in ("</silence>", "</delegation>")):
-            return False
+            return reject()
         text = text.removeprefix("</response>").strip()
         tokens = len(self.processor.tokenizer(text=[text])["input_ids"][0])
         if isinstance(request.model_source, VisualMemorySource):
@@ -677,17 +750,15 @@ class JoyAIDuplexPlugin(DuplexModelPlugin):
                 ]
             return applied
         if not text or tokens > SUMMARY_MAX_TOKENS:
-            return False
-        if isinstance(request.model_source, TextSummaryChunk):
-            source = request.model_source
-            if state.memory.partial != source.previous:
-                return False
+            return reject()
+        if isinstance(source, TextSummaryChunk):
             if not source.complete:
                 state.memory.partial = TextSummaryProgress(
                     request.history_length, request.history_digest, source.end_offset, text
                 )
                 return True
         state.memory.partial = None
+        state.memory.excerpt_limit = None
         state.memory.text = text
         state.memory.covered_messages = request.history_length
         state.memory.covered_digest = request.history_digest
