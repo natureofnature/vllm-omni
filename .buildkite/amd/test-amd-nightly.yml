@@ -1221,9 +1221,13 @@ steps:
           BENCHMARK_DIR: tests/dfx/perf/results
           ACC_BENCH_RESULT_DIR: tests/e2e/accuracy/omni_duplex_eval/results
         artifact_paths:
-          - artifacts/rocm-omni-duplex-eval/**/*
-          - tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5/**/*
+          - artifacts/rocm-omni-duplex-eval/collection.txt
+          - artifacts/rocm-omni-duplex-eval/pytest.log
+          - artifacts/rocm-omni-duplex-eval/pytest.xml
+          - tests/dfx/perf/results/*.json
+          - tests/e2e/accuracy/omni_duplex_eval/results/*.json
         commands:
+          - trap 'rm -rf -- tests/dfx/perf/results/omni_duplex_eval_minicpmo_4_5' EXIT
           - export ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR="$${BUILDKITE_BUILD_CHECKOUT_PATH:?}/artifacts/rocm-omni-duplex-eval"
           - mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR"
           - |
@@ -1250,15 +1254,6 @@ steps:
               2>&1 | tee "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/pytest.log"
             status=$${PIPESTATUS[0]}
             set -e
-            if [[ -d tests/e2e/accuracy/omni_duplex_eval/results ]]; then
-              mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/results"
-              cp -a tests/e2e/accuracy/omni_duplex_eval/results/. "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/results/"
-            fi
-            if [[ -d tests/dfx/perf/results ]]; then
-              mkdir -p "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/perf"
-              cp -a tests/dfx/perf/results/. "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/perf/"
-            fi
-
             exit "$$status"
 
   - group: ":full_moon: Qwen-Image Backend Similarity MI300 Nightly"
