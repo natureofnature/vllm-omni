@@ -1503,7 +1503,15 @@ def test_omni_duplex_eval_is_one_nonblocking_nightly_job() -> None:
     assert "--run-level full_model" in commands
     assert "--collect-only" in commands
     assert "exit 5" in commands
-    assert "pytest.xml" in commands
+    assert step["artifact_paths"] == [
+        "artifacts/rocm-omni-duplex-eval/collection.txt",
+        "tests/dfx/perf/results/*.json",
+        "tests/e2e/accuracy/omni_duplex_eval/results/*.json",
+    ]
+    assert "$$ROCM_OMNI_DUPLEX_EVAL_ARTIFACT_DIR/collection.txt" in commands
+    assert "pytest.xml" not in commands
+    assert "pytest.log" not in commands
+    assert "timeout --signal=INT --kill-after=2m 220m" in commands
     assert step["env"]["BENCHMARK_DIR"] == "tests/dfx/perf/results"
     assert step["env"]["ACC_BENCH_RESULT_DIR"] == "tests/e2e/accuracy/omni_duplex_eval/results"
     assert "test_minicpmo_4_5_omni_duplex_eval.json" in commands
