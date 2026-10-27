@@ -424,13 +424,18 @@ The role is not inferred dynamically. It is injected from the deploy connector w
 This is important because incorrect role assignment would break initialization semantics.
 
 For an async-chunk chain such as Thinker → Talker → Code2Wav, the middle
-worker uses one connector for both directions. Its incoming edge supplies
+stage uses one connector for both directions. Its incoming edge supplies
 `sender_host` and `sender_zmq_port`; its outgoing edge supplies the local
 `host` and `zmq_port`. Stage initialization carries the outgoing edge in an
-internal `outgoing` field, enabling both `get()` and `put()` on that worker.
+internal `outgoing` field, enabling both `get()` and `put()` on that connector.
 The final receive-only stage continues to use `get()` without a listener.
 Both edges of a Mooncake middle stage must use `MooncakeTransferEngineConnector`.
 Each edge's endpoint retains its own stage, TP-rank and replica port offsets.
+
+On the legacy async-chunk path, the scheduler's transfer adapter owns the
+connector and the model runner skips creating a duplicate. Native MRv2 and
+full-payload paths create the connector in the model runner. This keeps one
+owner for each listener endpoint.
 
 #### 5.3 Host Auto-Detection
 
