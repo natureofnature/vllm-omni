@@ -432,9 +432,18 @@ for the command and configuration requirements.
 
 The default `minicpmo_4_5.yaml` selects Triton attention for the CUDA Thinker
 (stage 0). The Talker's backend selection and graph settings are unchanged.
-The vision tower defaults to SDPA on all platforms; explicit engine or
-vision overrides still win. The turn-mode profile inherits this CUDA default
-from the base deployment too. NPU backend selection is unchanged.
+The vision tower defaults to reference attention for CUDA BF16 duplex sessions to
+preserve long-video scene recognition. Turn-mode and non-CUDA vision use
+SDPA by default; explicit engine or vision overrides still win. The turn-mode
+profile also inherits the CUDA Thinker's Triton backend from the base
+deployment. NPU backend selection is unchanged.
+
+The reference vision path fuses scaling and softmax for unmasked CUDA BF16
+inputs, preserving BF16 score/probability rounding and FP32 accumulation.
+Encoder CUDA graphs remain enabled. This avoids the full FP32 probability
+buffer used by eager attention, but still materializes attention scores and
+can reduce vision throughput compared with SDPA at larger image batches.
+An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
 
 To compare vLLM's automatic Thinker backend selection, save the following as
 `minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
