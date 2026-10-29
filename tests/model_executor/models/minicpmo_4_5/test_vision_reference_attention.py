@@ -26,6 +26,22 @@ def test_scaled_softmax_preserves_bf16_rounding(tokens: int) -> None:
 
 @pytest.mark.core_model
 @hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
+@pytest.mark.parametrize("layout", ["transposed", "strided"])
+def test_noncontiguous_scores_use_reference_attention(layout: str) -> None:
+    attention = SiglipAttention(SiglipVisionConfig(hidden_size=32, num_attention_heads=4)).eval()
+    generator = torch.Generator(device="cuda").manual_seed(9517)
+    scores = torch.randn((2, 4, 7, 14), device="cuda", dtype=torch.bfloat16, generator=generator)
+    scores = scores.transpose(-2, -1) if layout == "transposed" else scores[..., ::2]
+    assert not scores.is_contiguous()
+
+    expected = (scores * attention.scale).softmax(-1, dtype=torch.float32).to(scores.dtype)
+    actual = attention._normalize_attention_weights(scores)
+
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@pytest.mark.core_model
+@hardware_test(res={"cuda": ["H100", "B200"]}, num_cards=1)
 def test_reference_attention_replays_encoder_graph() -> None:
     config = SiglipVisionConfig(hidden_size=144, num_attention_heads=2)
     attention = SiglipAttention(config).cuda().to(torch.bfloat16).eval()

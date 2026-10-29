@@ -445,6 +445,13 @@ buffer used by eager attention, but still materializes attention scores and
 can reduce vision throughput compared with SDPA at larger image batches.
 An explicit `vision_config._attn_implementation="sdpa"` keeps the SDPA path.
 
+With reference vision attention, `vision_fused_layers: true` does not enable
+fused encoder layers: `supports_fused_layers()` excludes this attention backend.
+This also applies to the `minicpmo_4_5_duplex_h200.yaml` profile. Packed encoding,
+vision CUDA graphs and the fused scaled softmax remain enabled in that profile.
+Selecting SDPA explicitly allows fused encoder layers, but can change BF16 vision
+outputs and requires rechecking long-video recognition for the workload.
+
 To compare vLLM's automatic Thinker backend selection, save the following as
 `minicpmo_thinker_auto.yaml`, replacing the base path with your checkout:
 

@@ -1140,6 +1140,7 @@ class SiglipAttention(nn.Module):
             scores.is_cuda
             and torch.version.hip is None
             and scores.dtype == torch.bfloat16
+            and scores.is_contiguous()
             and 0 < scores.shape[-1] <= 2048
             and attention_mask is None
             and not self.training
