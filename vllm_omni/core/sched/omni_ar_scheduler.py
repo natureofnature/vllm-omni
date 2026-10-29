@@ -1002,9 +1002,12 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             status_before_stop = request.status
             sampling_validation_failed = False
-            if req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+            model_error = (getattr(model_runner_output, "request_errors", None) or {}).get(req_id)
+            if model_error is None and req_id in getattr(model_runner_output, "invalid_logits_req_ids", ()):
+                model_error = "Sampling received a row with no finite logits"
+            if model_error is not None:
                 request.status = RequestStatus.FINISHED_ERROR
-                request.stop_reason = "Sampling received a row with no finite logits"
+                request.stop_reason = model_error
                 request.resumable = False
                 generated_token_ids = []
                 sampling_validation_failed = True
