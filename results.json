@@ -1,0 +1,597 @@
+{
+  "hardware": "NVIDIA H800 80 GB",
+  "before": "714c0c7991675c5bc5623f59a413a8545f4ae105",
+  "after": "1db21ca892dddf6c8bb3d4e66bb6077366da3426",
+  "official": "a2fa77dd8caeefc41e6607ae0ec17408d3f4ee9f",
+  "weights": "5019f57d168e5816e8f3f701b17cc816bb7cf24b",
+  "prompt": "Change the grass color to red",
+  "num_timesteps": 15,
+  "seed": 52,
+  "cfg_text_scale": 4.0,
+  "cfg_img_scale": 1.5,
+  "cfg_interval": [
+    0.4,
+    1.0
+  ],
+  "timestep_shift": 3.0,
+  "cfg_renorm_type": "global",
+  "cfg_renorm_min": 0.0,
+  "input_sha256": "9df3acd8d65a7b6758b80d73f1f79833ea53529b73733b3cda4cb5f081391a6b",
+  "comparisons": {
+    "pre-controlled_vs_official-controlled": {
+      "mae_0_255": 8.376924060639881,
+      "rmse_0_255": 15.566895342376668,
+      "psnr_db": 24.286763496200365,
+      "max_channel_delta": 205
+    },
+    "post-controlled_vs_official-controlled": {
+      "mae_0_255": 1.5668901715959822,
+      "rmse_0_255": 3.337299058712819,
+      "psnr_db": 37.662901089432516,
+      "max_channel_delta": 176
+    },
+    "pre-raw_vs_post-raw": {
+      "mae_0_255": 8.280515640500992,
+      "rmse_0_255": 15.421371515789813,
+      "psnr_db": 24.368343611356266,
+      "max_channel_delta": 216
+    }
+  },
+  "noise_identity": {
+    "vae_noise": {
+      "all_equal": true,
+      "hashes": {
+        "pre-controlled": [
+          "7728652b2ef8564b2b4baa5e18a7caa58196c5d80441776a5b5a50ccaa365366"
+        ],
+        "post-controlled": [
+          "7728652b2ef8564b2b4baa5e18a7caa58196c5d80441776a5b5a50ccaa365366"
+        ],
+        "official-controlled": [
+          "7728652b2ef8564b2b4baa5e18a7caa58196c5d80441776a5b5a50ccaa365366"
+        ]
+      }
+    },
+    "diffusion_noise": {
+      "all_equal": true,
+      "hashes": {
+        "pre-controlled": [
+          "8dcfa4b53daccb29c33d941505d0ebfe4fec310903cffc78137c4122bb64f605"
+        ],
+        "post-controlled": [
+          "8dcfa4b53daccb29c33d941505d0ebfe4fec310903cffc78137c4122bb64f605"
+        ],
+        "official-controlled": [
+          "8dcfa4b53daccb29c33d941505d0ebfe4fec310903cffc78137c4122bb64f605"
+        ]
+      }
+    }
+  },
+  "runtime_versions": {
+    "pre-controlled": {
+      "torch": "2.14.0",
+      "vllm": "0.34.0",
+      "transformers": "5.22.2"
+    },
+    "post-controlled": {
+      "torch": "2.14.0",
+      "vllm": "0.34.0",
+      "transformers": "5.22.2"
+    },
+    "official-controlled": {
+      "torch": "2.5.1+cu124",
+      "transformers": "4.49.0",
+      "flash-attn": "2.7.4.post1"
+    }
+  },
+  "raw_golden_checks": {
+    "pre-raw": {
+      "old": {
+        "failures_at_tolerance_10": 0,
+        "max_delta": 6,
+        "probes": [
+          {
+            "position": [
+              100,
+              100
+            ],
+            "rgb": [
+              158,
+              173,
+              217
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              400,
+              50
+            ],
+            "rgb": [
+              105,
+              144,
+              217
+            ],
+            "max_delta": 0
+          },
+          {
+            "position": [
+              700,
+              100
+            ],
+            "rgb": [
+              118,
+              158,
+              233
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              150,
+              400
+            ],
+            "rgb": [
+              188,
+              26,
+              59
+            ],
+            "max_delta": 5
+          },
+          {
+            "position": [
+              512,
+              336
+            ],
+            "rgb": [
+              203,
+              217,
+              185
+            ],
+            "max_delta": 6
+          },
+          {
+            "position": [
+              700,
+              400
+            ],
+            "rgb": [
+              191,
+              11,
+              48
+            ],
+            "max_delta": 2
+          },
+          {
+            "position": [
+              100,
+              600
+            ],
+            "rgb": [
+              105,
+              16,
+              27
+            ],
+            "max_delta": 2
+          },
+          {
+            "position": [
+              400,
+              600
+            ],
+            "rgb": [
+              164,
+              30,
+              50
+            ],
+            "max_delta": 5
+          },
+          {
+            "position": [
+              700,
+              600
+            ],
+            "rgb": [
+              101,
+              89,
+              96
+            ],
+            "max_delta": 2
+          },
+          {
+            "position": [
+              256,
+              256
+            ],
+            "rgb": [
+              181,
+              201,
+              221
+            ],
+            "max_delta": 0
+          }
+        ]
+      },
+      "new": {
+        "failures_at_tolerance_10": 5,
+        "max_delta": 30,
+        "probes": [
+          {
+            "position": [
+              100,
+              100
+            ],
+            "rgb": [
+              158,
+              173,
+              217
+            ],
+            "max_delta": 3
+          },
+          {
+            "position": [
+              400,
+              50
+            ],
+            "rgb": [
+              105,
+              144,
+              217
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              700,
+              100
+            ],
+            "rgb": [
+              118,
+              158,
+              233
+            ],
+            "max_delta": 3
+          },
+          {
+            "position": [
+              150,
+              400
+            ],
+            "rgb": [
+              188,
+              26,
+              59
+            ],
+            "max_delta": 20
+          },
+          {
+            "position": [
+              512,
+              336
+            ],
+            "rgb": [
+              203,
+              217,
+              185
+            ],
+            "max_delta": 30
+          },
+          {
+            "position": [
+              700,
+              400
+            ],
+            "rgb": [
+              191,
+              11,
+              48
+            ],
+            "max_delta": 17
+          },
+          {
+            "position": [
+              100,
+              600
+            ],
+            "rgb": [
+              105,
+              16,
+              27
+            ],
+            "max_delta": 18
+          },
+          {
+            "position": [
+              400,
+              600
+            ],
+            "rgb": [
+              164,
+              30,
+              50
+            ],
+            "max_delta": 17
+          },
+          {
+            "position": [
+              700,
+              600
+            ],
+            "rgb": [
+              101,
+              89,
+              96
+            ],
+            "max_delta": 10
+          },
+          {
+            "position": [
+              256,
+              256
+            ],
+            "rgb": [
+              181,
+              201,
+              221
+            ],
+            "max_delta": 2
+          }
+        ]
+      }
+    },
+    "post-raw": {
+      "old": {
+        "failures_at_tolerance_10": 5,
+        "max_delta": 26,
+        "probes": [
+          {
+            "position": [
+              100,
+              100
+            ],
+            "rgb": [
+              154,
+              173,
+              216
+            ],
+            "max_delta": 3
+          },
+          {
+            "position": [
+              400,
+              50
+            ],
+            "rgb": [
+              106,
+              145,
+              217
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              700,
+              100
+            ],
+            "rgb": [
+              119,
+              161,
+              233
+            ],
+            "max_delta": 2
+          },
+          {
+            "position": [
+              150,
+              400
+            ],
+            "rgb": [
+              184,
+              45,
+              71
+            ],
+            "max_delta": 24
+          },
+          {
+            "position": [
+              512,
+              336
+            ],
+            "rgb": [
+              219,
+              189,
+              177
+            ],
+            "max_delta": 26
+          },
+          {
+            "position": [
+              700,
+              400
+            ],
+            "rgb": [
+              177,
+              11,
+              48
+            ],
+            "max_delta": 16
+          },
+          {
+            "position": [
+              100,
+              600
+            ],
+            "rgb": [
+              120,
+              15,
+              38
+            ],
+            "max_delta": 17
+          },
+          {
+            "position": [
+              400,
+              600
+            ],
+            "rgb": [
+              153,
+              13,
+              39
+            ],
+            "max_delta": 15
+          },
+          {
+            "position": [
+              700,
+              600
+            ],
+            "rgb": [
+              111,
+              96,
+              99
+            ],
+            "max_delta": 10
+          },
+          {
+            "position": [
+              256,
+              256
+            ],
+            "rgb": [
+              180,
+              203,
+              222
+            ],
+            "max_delta": 2
+          }
+        ]
+      },
+      "new": {
+        "failures_at_tolerance_10": 0,
+        "max_delta": 8,
+        "probes": [
+          {
+            "position": [
+              100,
+              100
+            ],
+            "rgb": [
+              154,
+              173,
+              216
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              400,
+              50
+            ],
+            "rgb": [
+              106,
+              145,
+              217
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              700,
+              100
+            ],
+            "rgb": [
+              119,
+              161,
+              233
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              150,
+              400
+            ],
+            "rgb": [
+              184,
+              45,
+              71
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              512,
+              336
+            ],
+            "rgb": [
+              219,
+              189,
+              177
+            ],
+            "max_delta": 3
+          },
+          {
+            "position": [
+              700,
+              400
+            ],
+            "rgb": [
+              177,
+              11,
+              48
+            ],
+            "max_delta": 3
+          },
+          {
+            "position": [
+              100,
+              600
+            ],
+            "rgb": [
+              120,
+              15,
+              38
+            ],
+            "max_delta": 8
+          },
+          {
+            "position": [
+              400,
+              600
+            ],
+            "rgb": [
+              153,
+              13,
+              39
+            ],
+            "max_delta": 2
+          },
+          {
+            "position": [
+              700,
+              600
+            ],
+            "rgb": [
+              111,
+              96,
+              99
+            ],
+            "max_delta": 1
+          },
+          {
+            "position": [
+              256,
+              256
+            ],
+            "rgb": [
+              180,
+              203,
+              222
+            ],
+            "max_delta": 1
+          }
+        ]
+      }
+    }
+  }
+}
